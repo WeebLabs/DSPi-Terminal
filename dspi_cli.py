@@ -19,7 +19,7 @@ try:
     import usb.core
     import usb.util
     from prompt_toolkit import PromptSession, Application
-    from prompt_toolkit.completion import WordCompleter, NestedCompleter
+    from prompt_toolkit.completion import WordCompleter, NestedCompleter, Completer, Completion
     from prompt_toolkit.shortcuts import yes_no_dialog
     from prompt_toolkit.layout.containers import Window, HSplit, VSplit
     from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
@@ -510,13 +510,22 @@ def monitor_loop(app: Application):
 
 # --- Completer ---
 
+# Mapping for channel names to IDs
+CHANNEL_MAP = {
+    'master_l': 0, 'master_r': 1, 'out_l': 2, 'out_r': 3, 'sub': 4,
+    '0': 0, '1': 1, '2': 2, '3': 3, '4': 4
+}
+
 base_commands = {
-    'filter': { str(i): { str(b): {'peak': None, 'lowshelf': None, 'highshelf': None, 'lowpass': None, 'highpass': None, 'flat': None} for b in range(10) } for i in range(5) },
+    'set filter': {
+        ch: { str(b): {'peak': None, 'lowshelf': None, 'highshelf': None, 'lowpass': None, 'highpass': None, 'flat': None} for b in range(1, 11) }
+        for ch in ['Master_L', 'Master_R', 'Out_L', 'Out_R', 'Sub']
+    },
     'preamp': None,
-    'delay': { str(i): None for i in range(5) },
+    'delay': { ch: None for ch in ['Master_L', 'Master_R', 'Out_L', 'Out_R', 'Sub'] },
     'bypass': {'on', 'off'},
     'save': None, 'load': None, 'reset': None,
-    'graph': { str(i): None for i in range(5) },
+    'graph': { ch: None for ch in ['Master_L', 'Master_R', 'Out_L', 'Out_R', 'Sub'] },
     'autoeq': {'search': None, 'apply': None},
     'exit': None, 'help': None
 }
@@ -526,7 +535,66 @@ completer_dict = base_commands.copy()
 for cmd, sub in base_commands.items():
     completer_dict[f"/{cmd}"] = sub
 
-command_completer = NestedCompleter.from_nested_dict(completer_dict)
+class DSPiCompleter(Completer):
+    def __init__(self, completion_dict):
+        self.completion_dict = completion_dict
+        self.nested_completer = NestedCompleter.from_nested_dict(completion_dict)
+    
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor.lstrip()
+        
+        # Special handling for "set filter" command which contains a space
+        # This allows the first suggestion to be "set filter" and then traverse to channels
+        for key in ['set filter', '/set filter']:
+            if text.lower().startswith(key + " "):
+                sub_dict = self.completion_dict.get(key)
+                if sub_dict:
+                    # Create a sub-document for the nested completer
+                    remaining = text[len(key)+1:]
+                    sub_doc = Document(remaining, cursor_position=len(remaining))
+                    sub_c = NestedCompleter.from_nested_dict(sub_dict)
+                    
+                    # First, yield from the nested completer (handles ch, band, type)
+                    yielded = False
+                    for c in sub_c.get_completions(sub_doc, complete_event):
+                        yielded = True
+                        yield c
+                    
+                    if yielded:
+                        return
+
+                    # If nested completer is done (past type selection), suggest parameter labels
+                    parts = remaining.split()
+                    idx = len(parts) - 1
+                    if remaining and remaining[-1].isspace():
+                        idx += 1
+                    
+                    # Check if we have a valid filter type selected (index 2)
+                    # Indices in 'remaining': 0:ch, 1:band, 2:type
+                    if idx >= 3 and len(parts) > 2:
+                        ftype_str = parts[2]
+                        ftype = FilterType.from_str(ftype_str)
+                        
+                        # Suggest params based on filter type
+                        if ftype == FilterType.PEAKING:
+                            if idx == 3: yield Completion("freq ", display="freq")
+                            elif idx == 5: yield Completion("q ", display="q")
+                            elif idx == 7: yield Completion("gain ", display="gain")
+                        elif ftype in (FilterType.LOW_SHELF, FilterType.HIGH_SHELF):
+                            if idx == 3: yield Completion("freq ", display="freq")
+                            elif idx == 5: yield Completion("gain ", display="gain")
+                        elif ftype in (FilterType.LOW_PASS, FilterType.HIGH_PASS):
+                            if idx == 3: yield Completion("freq ", display="freq")
+                    return
+        
+        yield from self.nested_completer.get_completions(document, complete_event)
+
+command_completer = DSPiCompleter(completer_dict)
+
+# Helper to parse channel
+def parse_channel(arg: str) -> int:
+    arg = arg.lower().replace(" ", "_")
+    return CHANNEL_MAP.get(arg, -1)
 
 def handle_command(text: str, print_func):
     parts = text.strip().split()
@@ -543,33 +611,100 @@ def handle_command(text: str, print_func):
         elif cmd == 'help':
             print_func(HTML(f"""
 <style color='{COLOR_CYAN}'>Available Commands:</style>
-  <style color='{COLOR_AMBER}'>filter</style> <ch> <band> <type> <freq> <q> <gain>  Set filter parameters
-  <style color='{COLOR_AMBER}'>preamp</style> <db>                               Set global preamp gain
-  <style color='{COLOR_AMBER}'>delay</style> <ch> <ms>                             Set channel delay
-  <style color='{COLOR_AMBER}'>bypass</style> <on|off>                            Toggle global bypass
-  <style color='{COLOR_AMBER}'>save</style>                                      Save to flash
-  <style color='{COLOR_AMBER}'>load</style>                                      Load from flash
-  <style color='{COLOR_AMBER}'>reset</style>                                     Factory reset
-  <style color='{COLOR_AMBER}'>graph</style> <ch>                                  Show graph for channel
-  <style color='{COLOR_AMBER}'>autoeq search</style> <query>                       Search AutoEQ database
-  <style color='{COLOR_AMBER}'>autoeq apply</style> <id>                           Apply AutoEQ profile
+  <style color='{COLOR_AMBER}'>set filter</style> <ch> <band> <type> <freq> <q> <gain>  Set filter parameters
+  <style color='{COLOR_AMBER}'>preamp</style> <db>                                   Set global preamp gain
+  <style color='{COLOR_AMBER}'>delay</style> <ch> <ms>                                 Set channel delay
+  <style color='{COLOR_AMBER}'>bypass</style> <on|off>                                Toggle global bypass
+  <style color='{COLOR_AMBER}'>save</style>                                          Save to flash
+  <style color='{COLOR_AMBER}'>load</style>                                          Load from flash
+  <style color='{COLOR_AMBER}'>reset</style>                                         Factory reset
+  <style color='{COLOR_AMBER}'>graph</style> <ch>                                      Show graph for channel
+  <style color='{COLOR_AMBER}'>autoeq search</style> <query>                           Search AutoEQ database
+  <style color='{COLOR_AMBER}'>autoeq apply</style> <id>                               Apply AutoEQ profile
+  
+  <style color='#888888'>Channels: Master_L, Master_R, Out_L, Out_R, Sub</style>
             """))
 
-        elif cmd == 'filter':
-            # filter 0 0 peak 1000 0.7 5.0
-            if len(parts) < 7:
-                print_func("Usage: filter <ch> <band> <type> <freq> <q> <gain>")
-                return
-            ch = int(parts[1])
-            band = int(parts[2])
-            ftype = FilterType.from_str(parts[3])
-            freq = float(parts[4])
-            q = float(parts[5])
-            gain = float(parts[6])
-            
-            p = FilterParams(ftype, freq, q, gain)
-            handler.set_filter(ch, band, p)
-            print_func(f"Set Ch{ch} Band{band}: {p}")
+        elif cmd == 'set':
+            if len(parts) > 1 and parts[1].lower() == 'filter':
+                # Mandatory parts: set filter <ch> <band> <type>
+                if len(parts) < 5:
+                    print_func("Usage: set filter <ch> <band> <type> [freq <Hz>] [q <val>] [gain <dB>]")
+                    return
+                
+                ch_str = parts[2]
+                ch = parse_channel(ch_str)
+                if ch < 0:
+                    print_func(f"Invalid channel: {ch_str}")
+                    return
+                
+                try:
+                    band = int(parts[3]) - 1
+                    ftype = FilterType.from_str(parts[4])
+                except ValueError:
+                    print_func("Invalid band or type.")
+                    return
+
+                # Defaults
+                freq = 1000.0
+                q = 0.707
+                gain = 0.0
+                
+                # Check for labels in the rest of arguments
+                args = parts[5:]
+                labels = {'freq': 'freq', 'freq(hz)': 'freq', 
+                          'q': 'q', 
+                          'gain': 'gain', 'gain(db)': 'gain'}
+                
+                # Determine allowed parameters based on filter type
+                allowed_params = {'freq'}
+                if ftype == FilterType.PEAKING:
+                    allowed_params.update({'q', 'gain'})
+                elif ftype in (FilterType.LOW_SHELF, FilterType.HIGH_SHELF):
+                    allowed_params.update({'gain'})
+                # LOW_PASS / HIGH_PASS only allow freq
+                
+                has_labels = any(a.lower() in labels for a in args)
+                
+                if has_labels:
+                    i = 0
+                    while i < len(args):
+                        arg = args[i].lower()
+                        val = None
+                        if i + 1 < len(args):
+                            try:
+                                val = float(args[i+1])
+                            except ValueError:
+                                pass
+                        
+                        if arg in labels and val is not None:
+                            key = labels[arg]
+                            if key in allowed_params:
+                                if key == 'freq': freq = val
+                                elif key == 'q': q = val
+                                elif key == 'gain': gain = val
+                            i += 2
+                        else:
+                            i += 1
+                else:
+                    # strict positional with type-aware mapping
+                    # Peak: freq, q, gain
+                    # Shelf: freq, gain
+                    # Pass: freq
+                    if len(args) >= 1: freq = float(args[0])
+                    
+                    if ftype == FilterType.PEAKING:
+                        if len(args) >= 2: q = float(args[1])
+                        if len(args) >= 3: gain = float(args[2])
+                    elif ftype in (FilterType.LOW_SHELF, FilterType.HIGH_SHELF):
+                        if len(args) >= 2: gain = float(args[1])
+                    # Pass filters ignore extra positional args
+                
+                p = FilterParams(ftype, freq, q, gain)
+                handler.set_filter(ch, band, p)
+                print_func(f"Set Ch{ch} ({ch_str}) Band{band + 1}: {p}")
+            else:
+                print_func("Unknown set command.")
 
         elif cmd == 'preamp':
             db = float(parts[1])
@@ -582,7 +717,11 @@ def handle_command(text: str, print_func):
             print_func(f"Bypass: {'ON' if state else 'OFF'}")
 
         elif cmd == 'delay':
-            ch = int(parts[1])
+            ch_str = parts[1]
+            ch = parse_channel(ch_str)
+            if ch < 0:
+                print_func(f"Invalid channel: {ch_str}")
+                return
             ms = float(parts[2])
             handler.set_delay(ch, ms)
             print_func(f"Delay Ch{ch}: {ms} ms")
@@ -602,7 +741,9 @@ def handle_command(text: str, print_func):
         elif cmd == 'graph':
             global graph_channel, show_graph
             if len(parts) > 1:
-                graph_channel = int(parts[1])
+                ch = parse_channel(parts[1])
+                if ch >= 0:
+                    graph_channel = ch
             show_graph = True
             print_func(f"Showing graph for {Channel.NAMES.get(graph_channel)}")
 
