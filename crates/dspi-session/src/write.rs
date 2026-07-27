@@ -120,6 +120,17 @@ impl Session {
         &self.caps
     }
 
+    /// Run something against the raw transport.
+    ///
+    /// Used by the subsystem helpers that speak their own packet formats rather
+    /// than going through the registry, such as control surfaces.
+    pub fn with_transport<T>(
+        &mut self,
+        f: impl FnOnce(&mut dyn Transport) -> dspi_transport::Result<T>,
+    ) -> dspi_transport::Result<T> {
+        f(&mut *self.transport)
+    }
+
     pub fn channel_map(&self) -> &ChannelMap {
         &self.map
     }

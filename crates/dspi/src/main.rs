@@ -13,7 +13,7 @@ use dspi_proto::registry::{Kind, REGISTRY, by_path};
 use dspi_proto::value::Value;
 
 use dspi_session::{Outcome, Session, probe};
-use dspi_transport::{TransportError, UsbTransport, list_devices};
+use dspi_transport::{Transport, TransportError, UsbTransport, list_devices};
 
 /// Exit codes are part of the interface: scripts branch on these.
 mod exit {
@@ -45,6 +45,7 @@ fn main() -> ExitCode {
         Some("params") => cmd_params(),
         Some("completions") => cmd_completions(&positional(&flags)),
         Some("doctor") | Some("--doctor") => doctor::run(),
+        Some("raw") => cmd_raw(serial, &positional(&flags)),
         Some("--install-udev") => doctor::install_udev(),
         Some("screenshot") => cmd_screenshot(serial, &positional(&flags)),
         Some("export") => cmd_export(serial, &positional(&flags)),
@@ -104,6 +105,7 @@ USAGE:
                              (--map-legacy for pre-2026 channel names)
     dspi completions <shell> generate shell completions
     dspi doctor              diagnose connection problems
+    dspi raw <op> <len> [v]  issue any vendor opcode and hex-dump the reply
     dspi --install-udev      install the Linux udev rule (needs root)
     dspi --version           show app and protocol versions
 
@@ -645,6 +647,7 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
     app.rebuild_fields();
     app.load_fields(&mut session);
     app.load_matrix(&mut session);
+    app.load_surfaces(&mut session);
 
     app.panel = match panel {
         "cursor" => {
@@ -656,6 +659,7 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
             app.grid_mode = true;
             dspi_tui::app::Panel::Dashboard
         }
+        "surfaces" => dspi_tui::app::Panel::Surfaces,
         "matrix" => dspi_tui::app::Panel::Matrix,
         "input" => dspi_tui::app::Panel::Input,
         "dynamics" => dspi_tui::app::Panel::Dynamics,
@@ -728,6 +732,60 @@ fn load_bands(session: &mut Session, app: &mut dspi_tui::App) {
             }
         }
         app.recompute(ch);
+    }
+}
+
+/// Issue any vendor opcode directly.
+///
+/// This is the escape hatch that means a firmware feature shipping before app
+/// support is still reachable on the day it lands, and it is the fastest way to
+/// see what a device actually returns when a decode looks wrong.
+fn cmd_raw(serial: Option<&str>, args: &[&str]) -> u8 {
+    let parse_num = |s: &str| -> Option<u32> {
+        s.strip_prefix("0x")
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+            .or_else(|| s.parse().ok())
+    };
+
+    let (Some(op_s), Some(len_s)) = (args.first(), args.get(1)) else {
+        eprintln!("dspi: raw needs an opcode and a length, e.g. `dspi raw 0x87 32`");
+        eprintln!("      an optional third argument is wValue.");
+        return exit::USAGE;
+    };
+    let (Some(opcode), Some(len)) = (parse_num(op_s), parse_num(len_s)) else {
+        eprintln!("dspi: opcode and length must be numbers");
+        return exit::USAGE;
+    };
+    let value = args.get(2).and_then(|v| parse_num(v)).unwrap_or(0) as u16;
+
+    let mut t = match open(serial) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
+
+    match t.control_in(opcode as u8, value, len as u16) {
+        Ok(d) => {
+            for (i, chunk) in d.chunks(16).enumerate() {
+                let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+                let ascii: String = chunk
+                    .iter()
+                    .map(|b| {
+                        if b.is_ascii_graphic() {
+                            *b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                println!("{:04X}  {:<48}  {ascii}", i * 16, hex.join(" "));
+            }
+            println!("\n{} bytes", d.len());
+            exit::OK
+        }
+        Err(e) => {
+            eprintln!("dspi: {e}");
+            exit::TRANSPORT
+        }
     }
 }
 

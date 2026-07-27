@@ -258,6 +258,12 @@ pub struct App {
     pub echo: String,
     pub status: Option<(String, Instant)>,
 
+    /// Control surface bindings, one per slot.
+    pub bindings: Vec<(dspi_session::surfaces::Binding, String)>,
+    pub ir_commands: Vec<dspi_session::surfaces::IrCommand>,
+    pub cs_status: dspi_session::surfaces::Status,
+    pub selected_binding: usize,
+
     /// The crosspoint grid, indexed `[input][output]`.
     pub matrix: Vec<Vec<dspi_session::Crosspoint>>,
     pub outputs: Vec<dspi_session::OutputStrip>,
@@ -303,6 +309,10 @@ impl App {
             candidate_index: 0,
             echo: String::new(),
             status: None,
+            bindings: Vec::new(),
+            ir_commands: Vec::new(),
+            cs_status: Default::default(),
+            selected_binding: 0,
             matrix: Vec::new(),
             outputs: Vec::new(),
             matrix_focus: (0, 0),
@@ -399,6 +409,40 @@ impl App {
             None => Vec::new(),
         };
         self.selected_field = 0;
+    }
+
+    /// Read every binding, its label, and the IR command table.
+    pub fn load_surfaces(&mut self, session: &mut Session) {
+        use dspi_session::surfaces;
+
+        let Some(caps) = session.capabilities().cs.clone() else {
+            return;
+        };
+
+        self.bindings.clear();
+        for slot in 0..caps.max_bindings {
+            let b = session
+                .with_transport(|t| surfaces::read_binding(t, slot))
+                .unwrap_or_default();
+            let name = session
+                .with_transport(|t| surfaces::read_name(t, slot))
+                .unwrap_or_default();
+            self.bindings.push((b, name));
+        }
+
+        self.ir_commands = (0..caps.max_ir_commands)
+            .map(|i| {
+                session
+                    .with_transport(|t| surfaces::read_ir_command(t, i))
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        if let Ok(s) = session
+            .with_transport(|t| surfaces::read_status(t, caps.max_bindings, caps.max_ir_commands))
+        {
+            self.cs_status = s;
+        }
     }
 
     /// Read the routing grid.
@@ -819,6 +863,7 @@ impl App {
             Panel::Dashboard => self.draw_dashboard(f, area),
             Panel::Filters => self.draw_filters(f, area),
             Panel::Matrix => self.draw_matrix(f, area),
+            Panel::Surfaces => self.draw_surfaces(f, area),
             other => match other.group() {
                 Some(_) => self.draw_fields(f, area, other.title()),
                 None => {
@@ -1113,6 +1158,141 @@ impl App {
                 Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
             );
         }
+    }
+
+    /// Control surfaces: every slot in one table.
+    ///
+    /// The Console edits one slot at a time in a form; the whole point of doing
+    /// this in a terminal is that a rig can be audited at a glance.
+    fn draw_surfaces(&self, f: &mut Frame, area: Rect) {
+        // The device reports dirty whenever the live config differs from flash,
+        // which includes a device whose control-surface block has never been
+        // written at all. Calling that "unsaved changes" would send a user
+        // hunting for edits they never made.
+        let configured = self.bindings.iter().any(|(b, _)| !b.is_empty())
+            || self.ir_commands.iter().any(|c| !c.is_empty());
+        let dirty = match (self.cs_status.dirty, configured) {
+            (true, true) => " · unsaved changes ●",
+            (true, false) => " · never saved",
+            _ => "",
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.chrome_style())
+            .title(Span::styled(
+                format!("Control Surfaces · {} slots{dirty}", self.bindings.len()),
+                self.theme.label(),
+            ));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if self.bindings.is_empty() {
+            f.render_widget(
+                Paragraph::new("This firmware reports no control surface support.")
+                    .style(self.theme.label()),
+                inner,
+            );
+            return;
+        }
+
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(
+                    "{:<3}{:<12}{:<24}{:<10}{}",
+                    "#", "component", "does", "pins", "status"
+                ),
+                self.theme.label(),
+            ))),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+
+        let rows = inner.height.saturating_sub(2);
+        for (i, (b, name)) in self.bindings.iter().take(rows as usize).enumerate() {
+            let focused = i == self.selected_binding;
+            let live = self.cs_status.active_mask & (1 << i) != 0;
+
+            let pins = if b.is_empty() {
+                "-".to_string()
+            } else if b.gpio[1] == dspi_session::surfaces::GPIO_UNUSED {
+                b.gpio[0].to_string()
+            } else {
+                format!("{}, {}", b.gpio[0], b.gpio[1])
+            };
+
+            // The "does" column comes from the registry, so a knob bound to a
+            // parameter reads as its name and range rather than as noun 44.
+            let does = if b.is_empty() {
+                "-".to_string()
+            } else if !name.is_empty() {
+                name.clone()
+            } else {
+                describe_noun(b.noun)
+            };
+
+            let status = self
+                .cs_status
+                .slot_status
+                .get(i)
+                .copied()
+                .map(|s| {
+                    if s == 0 && live {
+                        "live".to_string()
+                    } else if s == 0 {
+                        "idle".to_string()
+                    } else {
+                        dspi_session::surfaces::explain_status(s)
+                    }
+                })
+                .unwrap_or_default();
+
+            let style = if focused {
+                self.theme.focused()
+            } else if b.is_empty() {
+                Style::default().fg(self.theme.chrome)
+            } else {
+                self.theme.value()
+            };
+
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{:<3}{:<12}{:<24}{:<10}",
+                            i,
+                            component_name(b.component),
+                            truncate(&does, 23),
+                            pins
+                        ),
+                        style,
+                    ),
+                    Span::styled(
+                        status,
+                        if self.cs_status.slot_status.get(i).copied().unwrap_or(0) != 0 {
+                            Style::default().fg(self.theme.danger)
+                        } else if live {
+                            Style::default().fg(self.theme.ok)
+                        } else {
+                            self.theme.label()
+                        },
+                    ),
+                ])),
+                Rect::new(inner.x, inner.y + 1 + i as u16, inner.width, 1),
+            );
+        }
+
+        let learned = self.ir_commands.iter().filter(|c| !c.is_empty()).count();
+        let hint = if self.cs_status.dirty && configured {
+            "s saves to flash · r discards · live but not stored"
+        } else {
+            "n adds a binding · l learns a remote button"
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{learned} IR commands learned · {hint}"),
+                self.theme.label(),
+            ))),
+            Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+        );
     }
 
     /// The crosspoint grid, sized from the device.
@@ -1592,6 +1772,75 @@ impl App {
             };
             f.render_widget(Paragraph::new(shown), Rect::new(inner.x, y, inner.width, 1));
         }
+    }
+}
+
+/// The component types, as the firmware numbers them.
+pub fn component_name(t: u8) -> &'static str {
+    match t {
+        0 => "-",
+        1 => "Button",
+        2 => "Switch",
+        3 => "Pot",
+        4 => "Encoder",
+        5 => "LED",
+        6 => "LED (PWM)",
+        7 => "IR receiver",
+        _ => "unknown",
+    }
+}
+
+/// What a bound parameter is called.
+///
+/// Nouns are numbered by the firmware and the registry knows the names, so a
+/// binding reads as "Psycho bass drive" rather than as noun 44.
+pub fn describe_noun(noun: u8) -> String {
+    // The order of the firmware's noun table, which the registry mirrors.
+    const NOUNS: &[(u8, &str)] = &[
+        (0, "vol.user"),
+        (1, "vol.master"),
+        (2, "vol.mute"),
+        (3, "loud.on"),
+        (4, "cf.on"),
+        (5, "lev.on"),
+        (9, "bypass"),
+        (13, "lev.amount"),
+        (14, "lev.speed"),
+        (16, "pre"),
+        (17, "out.gain"),
+        (18, "out.mute"),
+        (19, "out.enable"),
+        (20, "eq.freq"),
+        (21, "eq.gain"),
+        (22, "eq.q"),
+        (23, "eq.type"),
+        (24, "eq.bypass"),
+        (35, "up.on"),
+        (38, "up.strength"),
+        (39, "up.width"),
+        (40, "up.presence"),
+        (41, "bass.on"),
+        (42, "bass.cutoff"),
+        (43, "bass.harmonics"),
+        (44, "bass.drive"),
+        (45, "bass.character"),
+        (46, "bass.original"),
+        (47, "out.delay"),
+    ];
+
+    NOUNS
+        .iter()
+        .find(|(n, _)| *n == noun)
+        .and_then(|(_, path)| dspi_proto::registry::by_path(path))
+        .map(|d| d.label.to_string())
+        .unwrap_or_else(|| format!("parameter {noun}"))
+}
+
+fn truncate(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        s.to_string()
+    } else {
+        s.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
     }
 }
 

@@ -6,6 +6,7 @@
 pub mod filterfile;
 pub mod preset_file;
 pub mod probe;
+pub mod surfaces;
 pub mod write;
 
 pub use probe::{Capabilities, Meters, probe, read_bulk, read_meters};
