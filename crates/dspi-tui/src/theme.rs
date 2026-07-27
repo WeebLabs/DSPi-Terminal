@@ -423,6 +423,17 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// A field that is armed: the next keystroke changes the device.
+    ///
+    /// Reverse video rather than a colour, because "this one is live" has to
+    /// read at a glance on a monochrome terminal too, and the surrounding cells
+    /// already use colour to mean focus.
+    pub fn editing(&self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    }
+
     /// In monochrome, channels are told apart by line pattern rather than hue,
     /// which also serves colour-blind users. Callers ask for the dash pattern
     /// instead of assuming colour will carry the distinction.

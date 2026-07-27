@@ -18,7 +18,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
 use crate::fields::{Field, FieldState, Targets, fields_for, nudge};
 use crate::theme::{Glyphs, Theme};
@@ -220,6 +220,16 @@ impl BandField {
         BandField::Q,
     ];
 
+    /// What to call this column in a message to the user.
+    pub fn name(self) -> &'static str {
+        match self {
+            BandField::Type => "type",
+            BandField::Freq => "frequency",
+            BandField::Gain => "gain",
+            BandField::Q => "Q",
+        }
+    }
+
     /// The registry path this column edits.
     pub fn path(self) -> &'static str {
         match self {
@@ -283,6 +293,12 @@ pub struct App {
     pub selected_channel: usize,
     pub selected_band: usize,
     pub selected_field_col: BandField,
+    /// Whether the focused band field is armed for change.
+    ///
+    /// Arrows mean "move the selection" until this is set and "change the
+    /// value" after, so one key never does two things at once and a stray
+    /// arrow cannot alter the device.
+    pub band_edit: bool,
 
     pub device: String,
     pub platform: String,
@@ -351,6 +367,7 @@ impl App {
             selected_channel: 0,
             selected_band: 0,
             selected_field_col: BandField::Freq,
+            band_edit: false,
             device: String::new(),
             platform: String::new(),
             firmware: String::new(),
@@ -433,6 +450,7 @@ impl App {
 
     /// Move the channel list's cursor, which starts at the overview.
     fn move_sidebar(&mut self, delta: isize) {
+        self.band_edit = false;
         if self.channels.is_empty() {
             return;
         }
@@ -977,6 +995,20 @@ impl App {
 
             KeyCode::Tab => self.cycle_panel(1),
             KeyCode::BackTab => self.cycle_panel(-1),
+
+            // In the band table a digit is a band, not a panel: it is the only
+            // list long enough to want direct access, and the panel it would
+            // otherwise jump to is a Tab away. `0` is band 10, as on a phone
+            // keypad, because there is no key for it otherwise.
+            KeyCode::Char(c @ ('0'..='9')) if self.on_bands() && !self.band_edit => {
+                let n = if c == '0' {
+                    10
+                } else {
+                    c as usize - '0' as usize
+                };
+                self.select_band(n);
+            }
+
             KeyCode::Char(c @ '1'..='9') => {
                 let i = c as usize - '1' as usize;
                 if let Some(p) = Panel::ALL.get(i) {
@@ -1005,6 +1037,14 @@ impl App {
             // Enter goes into the content pane, Escape comes back, so the
             // arrows only ever mean one thing at a time.
             KeyCode::Enter if self.focus == Focus::Sidebar => self.focus = Focus::Content,
+
+            // One rung further in: arm the focused field, so the arrows move
+            // between fields until you say which one you mean.
+            KeyCode::Enter if self.on_bands() => self.toggle_band_edit(),
+
+            // Escape unwinds one rung at a time rather than jumping out, so it
+            // is never a surprise which level it left.
+            KeyCode::Esc if self.band_edit => self.band_edit = false,
             KeyCode::Esc => self.focus = Focus::Sidebar,
 
             KeyCode::Up if self.focus == Focus::Sidebar => self.move_sidebar(-1),
@@ -1014,6 +1054,10 @@ impl App {
             KeyCode::Down if self.panel == Panel::Matrix => self.move_matrix(1, 0),
             KeyCode::Left if self.panel == Panel::Matrix => self.move_matrix(0, -1),
             KeyCode::Right if self.panel == Panel::Matrix => self.move_matrix(0, 1),
+            // While a field is armed the arrows belong to its value, which needs
+            // the device, so `run` intercepts them before they reach here.
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right if self.band_edit => {}
+
             KeyCode::Up if !self.fields.is_empty() => self.move_field(-1),
             KeyCode::Down if !self.fields.is_empty() => self.move_field(1),
             KeyCode::Up => self.move_band(-1),
@@ -1137,6 +1181,7 @@ impl App {
     }
 
     fn cycle_panel(&mut self, delta: isize) {
+        self.band_edit = false;
         let n = Panel::ALL.len() as isize;
         // Main is not in the tab bar, so tabbing out of it enters the row from
         // whichever end you were heading towards rather than falling to index 0.
@@ -1146,6 +1191,49 @@ impl App {
             None => Panel::ALL[(n - 1) as usize],
         };
         self.rebuild_fields();
+    }
+
+    /// Whether the band table has the keyboard.
+    ///
+    /// The digit and Enter bindings mean something different here than they do
+    /// anywhere else, so every one of them asks this rather than testing the
+    /// panel and the focus separately and getting one of them wrong.
+    pub fn on_bands(&self) -> bool {
+        self.focus == Focus::Content && self.panel == Panel::Filters
+    }
+
+    /// Jump to a band by its displayed, 1-based number.
+    fn select_band(&mut self, number: usize) {
+        let count = self.selected().map_or(0, |c| c.bands.len());
+        if number == 0 || number > count {
+            self.note(format!("this channel has {count} bands"));
+            return;
+        }
+        self.selected_band = number - 1;
+    }
+
+    /// Arm or disarm the focused field.
+    fn toggle_band_edit(&mut self) {
+        // A field the filter shape does not have cannot be armed; saying so
+        // beats arming something whose arrows would then do nothing.
+        if !self.band_edit
+            && let Some(b) = self
+                .selected()
+                .and_then(|c| c.bands.get(self.selected_band))
+            && !self.selected_field_col.applies_to(b.filter_type)
+        {
+            self.note(format!(
+                "{} has no {}",
+                b.filter_type.label(),
+                self.selected_field_col.name()
+            ));
+            return;
+        }
+
+        self.band_edit = !self.band_edit;
+        if self.band_edit {
+            self.note("← → to change · Enter when done");
+        }
     }
 
     fn move_band(&mut self, delta: isize) {
@@ -2168,23 +2256,26 @@ impl App {
                 };
                 // A field that does not apply to this shape reads as a dash
                 // rather than a stale number nobody is able to change.
-                let cell = |col: BandField, text: String| -> String {
+                let cell = |col: BandField, text: String| -> Cell {
                     if !col.applies_to(b.filter_type) {
-                        "-".into()
-                    } else if focused && col == self.selected_field_col {
-                        format!("[{text}]")
+                        return Cell::from("-");
+                    }
+                    if !focused || col != self.selected_field_col {
+                        return Cell::from(text);
+                    }
+                    // Brackets say "this is the field"; the highlight says "and
+                    // it is live". Both, so the distinction survives a terminal
+                    // that drops the styling.
+                    if self.band_edit {
+                        Cell::from(format!("[{text}]")).style(self.theme.editing())
                     } else {
-                        text
+                        Cell::from(format!("[{text}]"))
                     }
                 };
 
                 Row::new(vec![
-                    format!("{}{}", if focused { "▸" } else { " " }, i + 1),
-                    if b.bypass {
-                        "○".into()
-                    } else {
-                        "●".to_string()
-                    },
+                    Cell::from(format!("{}{}", if focused { "▸" } else { " " }, i + 1)),
+                    Cell::from(if b.bypass { "○" } else { "●" }),
                     cell(BandField::Type, b.filter_type.label()),
                     cell(BandField::Freq, format!("{:.0} Hz", b.freq)),
                     cell(BandField::Gain, format!("{:+.1} dB", b.gain_db)),
@@ -2272,14 +2363,20 @@ impl App {
     fn draw_keys(&self, f: &mut Frame, area: Rect) {
         // Show the keys that matter here, rather than one list that is mostly
         // irrelevant wherever you happen to be.
-        let keys = match (self.focus, self.panel) {
-            (Focus::Sidebar, _) => {
-                "↑↓ channel · Enter edit · Tab panel · ^P palette · : cmd · M meters · q quit"
+        // An armed field takes over the arrows, so it gets its own line: the
+        // usual one would list keys that no longer do what it says.
+        let keys = if self.band_edit {
+            "←→ change · ↑↓ coarse · Enter or Esc when done"
+        } else {
+            match (self.focus, self.panel) {
+                (Focus::Sidebar, _) => {
+                    "↑↓ channel · Enter edit · Tab panel · ^P palette · : cmd · M meters · q quit"
+                }
+                (Focus::Content, Panel::Filters) => {
+                    "↑↓ band · 1-0 jump · ←→ field · Enter change · +/- value · space bypass · Esc back"
+                }
+                _ => "↑↓ field · ←→ adjust · Esc channels · Tab panel · ^P palette · F2 level",
             }
-            (Focus::Content, Panel::Filters) => {
-                "↑↓ band · ←→ field · +/- value · space bypass · Esc back · [ ] zoom · = split"
-            }
-            _ => "↑↓ field · ←→ adjust · Esc channels · Tab panel · ^P palette · F2 level",
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(keys, self.theme.label()))),
@@ -2472,7 +2569,7 @@ pub fn run(mut app: App, session: &mut Session) -> io::Result<()> {
                 // Editing needs the device, so it is routed here rather than
                 // buried in the key handler, which stays free of I/O.
                 let coarse = key.modifiers.contains(KeyModifiers::SHIFT);
-                let editing_band = app.focus == Focus::Content && app.panel == Panel::Filters;
+                let editing_band = app.on_bands();
 
                 match key.code {
                     // Running a command needs the device, so it happens here
@@ -2482,6 +2579,14 @@ pub fn run(mut app: App, session: &mut Session) -> io::Result<()> {
                         if !line.is_empty() {
                             app.run_command(session, &line);
                         }
+                    }
+                    // An armed band field owns the arrows: left and right step
+                    // the value, up and down take it in tens.
+                    KeyCode::Left | KeyCode::Right if app.band_edit => {
+                        app.edit_band(session, key.code == KeyCode::Right, coarse);
+                    }
+                    KeyCode::Up | KeyCode::Down if app.band_edit => {
+                        app.edit_band(session, key.code == KeyCode::Up, true);
                     }
                     KeyCode::Left | KeyCode::Right if !app.fields.is_empty() => {
                         app.edit_focused(session, key.code == KeyCode::Right, coarse);
@@ -3751,10 +3856,229 @@ mod editing_tests {
     #[test]
     fn the_hints_name_the_editing_keys() {
         let a = app();
-        let out = crate::render_to_string(&a, 110, 20);
+        let out = crate::render_to_string(&a, 120, 20);
         assert!(out.contains("+/- value"), "no value hint:\n{out}");
         assert!(out.contains("←→ field"));
+        assert!(out.contains("Enter change"));
+        assert!(out.contains("1-0 jump"));
         assert!(out.contains("space bypass"));
+    }
+
+    // ------------------------------------------------ selecting and arming
+
+    /// The band list is the one list long enough to want direct access, and
+    /// the panel a digit would otherwise reach is a Tab away.
+    #[test]
+    fn a_digit_jumps_straight_to_a_band() {
+        let mut a = with_bands(10);
+        press(&mut a, KeyCode::Char('7'));
+        assert_eq!(a.selected_band, 6, "band 7 is index 6");
+        press(&mut a, KeyCode::Char('1'));
+        assert_eq!(a.selected_band, 0);
+    }
+
+    /// There is no key for 10, so 0 carries it, as on a phone keypad.
+    #[test]
+    fn zero_means_band_ten() {
+        let mut a = with_bands(10);
+        press(&mut a, KeyCode::Char('0'));
+        assert_eq!(a.selected_band, 9);
+    }
+
+    /// A digit past the end must not move the selection somewhere the channel
+    /// does not have, nor silently do nothing.
+    #[test]
+    fn a_digit_past_the_last_band_says_so() {
+        let mut a = with_bands(4);
+        a.selected_band = 1;
+        press(&mut a, KeyCode::Char('9'));
+        assert_eq!(a.selected_band, 1, "selection should not move");
+        assert!(
+            a.status
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("4 bands")),
+            "no explanation: {:?}",
+            a.status
+        );
+    }
+
+    /// Digits only mean bands where the band list has the keyboard. Everywhere
+    /// else they still pick a panel.
+    #[test]
+    fn digits_still_pick_panels_outside_the_band_list() {
+        let mut a = app();
+        a.focus = Focus::Sidebar;
+        press(&mut a, KeyCode::Char('3'));
+        assert_eq!(a.panel, Panel::ALL[2]);
+
+        // And in another panel, where there is no band list at all.
+        let mut b = app();
+        b.panel = Panel::System;
+        press(&mut b, KeyCode::Char('4'));
+        assert_eq!(b.panel, Panel::ALL[3]);
+    }
+
+    /// Enter arms the focused field and Enter again lets it go, so the arrows
+    /// mean one thing at a time.
+    #[test]
+    fn enter_arms_the_field_and_enter_releases_it() {
+        let mut a = app();
+        assert!(!a.band_edit);
+        press(&mut a, KeyCode::Enter);
+        assert!(a.band_edit, "Enter should arm the field");
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.band_edit, "Enter should release it");
+    }
+
+    /// Escape unwinds one rung at a time: out of the field first, out of the
+    /// panel second.
+    #[test]
+    fn escape_leaves_the_field_before_the_panel() {
+        let mut a = app();
+        press(&mut a, KeyCode::Enter);
+        assert!(a.band_edit);
+
+        press(&mut a, KeyCode::Esc);
+        assert!(!a.band_edit);
+        assert_eq!(a.focus, Focus::Content, "should still be in the panel");
+
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.focus, Focus::Sidebar);
+    }
+
+    /// While armed the arrows belong to the value, so they must not also move
+    /// the selection — that would edit one field and land on another.
+    #[test]
+    fn an_armed_field_keeps_the_arrows_off_the_selection() {
+        let mut a = with_bands(10);
+        a.selected_band = 3;
+        a.selected_field_col = BandField::Freq;
+        press(&mut a, KeyCode::Enter);
+
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Up, KeyCode::Down] {
+            press(&mut a, code);
+        }
+        assert_eq!(a.selected_band, 3, "the band moved under an armed field");
+        assert_eq!(a.selected_field_col, BandField::Freq, "the column moved");
+    }
+
+    /// Unarmed, the arrows are navigation again.
+    #[test]
+    fn the_arrows_navigate_when_nothing_is_armed() {
+        let mut a = with_bands(10);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.selected_band, 1);
+        let col = a.selected_field_col;
+        press(&mut a, KeyCode::Right);
+        assert_ne!(a.selected_field_col, col, "→ should move the column");
+    }
+
+    /// Arming a field the shape does not have would give the user arrows that
+    /// do nothing. Refuse, and say why.
+    #[test]
+    fn a_field_the_filter_lacks_cannot_be_armed() {
+        let mut a = app();
+        a.channels[0].bands[0].filter_type = dspi_proto::FilterType::LowShelf;
+        a.selected_field_col = BandField::Q; // a shelf has no Q
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.band_edit, "armed a field that does not exist");
+        assert!(
+            a.status.as_ref().is_some_and(|(m, _)| m.contains("Q")),
+            "no explanation: {:?}",
+            a.status
+        );
+    }
+
+    /// Arming is about one field on one band. Leaving either has to release it,
+    /// or the arrows would come back armed somewhere else.
+    #[test]
+    fn leaving_the_band_list_releases_the_field() {
+        let mut a = app();
+        press(&mut a, KeyCode::Enter);
+        assert!(a.band_edit);
+        press(&mut a, KeyCode::Tab);
+        assert!(!a.band_edit, "still armed in another panel");
+
+        let mut b = app();
+        press(&mut b, KeyCode::Enter);
+        b.focus = Focus::Sidebar;
+        press(&mut b, KeyCode::Down);
+        assert!(!b.band_edit, "still armed on another channel");
+    }
+
+    /// The style of every cell whose row is the selected band.
+    fn band_row_styles(a: &App, w: u16, h: u16) -> Vec<(String, Style)> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test backend");
+        term.draw(|f| a.draw(f)).expect("draw");
+        let buf = term.backend().buffer();
+        let area = *buf.area();
+        // The armed cell is bracketed, so its row is the one to inspect.
+        let row = (0..area.height)
+            .find(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains('[')
+            })
+            .expect("no bracketed field on screen");
+        (0..area.width)
+            .map(|x| {
+                let c = &buf[(x, row)];
+                (c.symbol().to_string(), c.style())
+            })
+            .collect()
+    }
+
+    /// The armed field is marked as live, and nothing else on the row is.
+    ///
+    /// Reverse video rather than a colour, so it reads on a monochrome
+    /// terminal too; the brackets carry the same news for a terminal that
+    /// drops styling entirely.
+    #[test]
+    fn the_armed_field_is_highlighted() {
+        use ratatui::style::Modifier;
+
+        let mut a = with_bands(10);
+        a.selected_field_col = BandField::Freq;
+
+        let calm = band_row_styles(&a, 120, 30);
+        assert!(
+            !calm
+                .iter()
+                .any(|(_, s)| s.add_modifier.contains(Modifier::REVERSED)),
+            "something was highlighted before the field was armed"
+        );
+
+        press(&mut a, KeyCode::Enter);
+        let armed = band_row_styles(&a, 120, 30);
+        let lit: String = armed
+            .iter()
+            .filter(|(_, s)| s.add_modifier.contains(Modifier::REVERSED))
+            .map(|(sym, _)| sym.as_str())
+            .collect();
+        assert!(
+            lit.contains("1000 Hz"),
+            "the armed frequency is not highlighted; lit: {lit:?}"
+        );
+        assert!(
+            !lit.contains("Peaking") && !lit.contains("dB"),
+            "the highlight spilled onto another field: {lit:?}"
+        );
+    }
+
+    /// An armed field takes the arrows over, so the old hints would be lying
+    /// about what they do.
+    #[test]
+    fn the_hints_change_when_a_field_is_armed() {
+        let mut a = app();
+        press(&mut a, KeyCode::Enter);
+        assert!(a.band_edit);
+        let out = crate::render_to_string(&a, 120, 20);
+        assert!(out.contains("←→ change"), "no armed hint:\n{out}");
+        assert!(!out.contains("←→ field"), "still offering field movement");
     }
 
     fn with_bands(n: usize) -> App {
