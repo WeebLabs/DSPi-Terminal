@@ -4,8 +4,11 @@ Cross-platform terminal control for [DSPi](https://github.com/WeebLabs/DSPi)
 audio processors: a full-screen TUI with response graphing and complete
 parameter coverage, plus a scriptable one-shot CLI.
 
-**Status: in development.** M1 (protocol foundations) is landing; there is no UI
-yet. See [`REDESIGN_SPEC.md`](REDESIGN_SPEC.md) for the full design.
+**Status: usable, incomplete.** The interface runs, reads and writes every
+parameter, graphs responses, and exchanges files with the Console. See
+[`REDESIGN_SPEC.md`](REDESIGN_SPEC.md) for the full design and
+[`docs/platforms.md`](docs/platforms.md) for what has actually been verified
+where.
 
 ## What it will do
 
@@ -30,14 +33,46 @@ cargo test --workspace
 Requires Rust 1.90 or newer. There is no C toolchain dependency: USB access goes
 through `nusb`, which talks WinUSB, IOKit and usbfs directly.
 
-## Current commands
+## Commands
 
 ```sh
-dspi list        # every connected DSPi
-dspi dump        # connect and print full discovered state
-dspi dump --json # the same, machine readable
-dspi --version   # app version plus the firmware revision the protocol came from
+dspi                              # open the interface
+dspi doctor                       # why can't it see my device?
+
+dspi get vol.user                 # read anything
+dspi vol.user -18                 # write anything; `set` is optional
+dspi eq usb.1 3 peak 2856 3.58 -8.6
+dspi params                       # every parameter this build knows
+
+dspi export tuning.txt            # Console-compatible filter file
+dspi export room.dspipreset       # whole-device document
+dspi import tuning.txt            # apply one back
+
+dspi autoeq search hd600          # headphone corrections
+dspi autoeq apply <id>
+
+dspi raw 0x87 32                  # any opcode, hex-dumped
+dspi completions zsh              # shell completion
+dspi screenshot 120 40 filters    # render a frame, for docs
 ```
+
+Every command takes `--json` for machine-readable output, `--dry-run` to change
+nothing, and `--device <serial>` to pick a unit. Exit codes distinguish bad
+input (1) from no device (2) from a write the device refused (3) from a
+transport failure (4).
+
+### In the interface
+
+| Key | Does |
+|---|---|
+| `Ctrl-P` | Search every parameter |
+| `:` | Command line, same syntax as the shell |
+| `Tab`, `1`-`0` | Panels |
+| `G` / `M` | Graph and meters, `m` for the all-channel grid |
+| `h` `l` | Graph cursor, with a per-channel readout |
+| `+` `-` | Vertical zoom, shared across every view |
+| `=` | Graph and table split |
+| `F2` | Simple, Advanced or Expert controls |
 
 ## Device access
 

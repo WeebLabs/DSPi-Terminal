@@ -1,6 +1,11 @@
 # DSPi Terminal: Redesign Specification
 
-*Status: draft for review. Revision 2, 2026-07-27.*
+*Status: implemented through M6. Revision 3, 2026-07-27.*
+
+**Implementation notes.** Where the build diverged from this document, the
+document is wrong and the code is right; the divergences are listed in section
+18. The largest is section 3.2 mechanism 2: bulk writes turned out to be
+strictly version-locked rather than tolerant, which the spec had backwards.
 
 **Firmware baseline: `release/v1.1.5` @ `9776c2f` (2026-07-25), in sync with
 `origin/release/v1.1.5`.** All protocol facts here were read from committed
@@ -1453,3 +1458,51 @@ right, M3 through M7 are largely mechanical.
    `release/v1.1.5`. If the Consoles and the firmware ever diverge onto different
    release branches, decide explicitly which `dspi-term` follows. The answer
    should be the firmware, with interchange formats tracked separately.
+
+---
+
+## 18. Where the implementation diverged
+
+Recorded as they were found, because each was a spec assumption that did not
+survive contact with the firmware.
+
+**Bulk writes are version-locked, not tolerant (3.2 mechanism 2).**
+`bulk_params_apply()` rejects any payload whose `format_version` or length is
+not exactly current. The "send a shorter prefix and let older fields default"
+strategy the spec described does not exist; it was inherited from `commands.md`,
+which documents a V14 behaviour the firmware abandoned. `BulkPacket::decode`
+refuses an unknown version outright, and individual `SET_*` opcodes are the
+version-independent fallback.
+
+**EQ bands are written whole, not field by field.** `SET_EQ_PARAM` takes a
+16-byte descriptor and reads nothing from `wValue`. Changing one field is a
+read-modify-write of the band. A plain write stays 16 bytes; padding to 18 would
+reset the stored Linkwitz `Qp` on every ordinary edit.
+
+**The combined status packet is `channels*2 + 7` bytes**, not the `+ 4` in
+`commands.md`: the clip mask widened to 32 bits and a live input count was
+appended. A 16-bit mask cannot represent channel 17's clip flag, which is the
+PDM subwoofer.
+
+**First-order shelves and crossovers follow the firmware, not the textbook.**
+The device runs a one-pole TPT state-variable filter prewarping by `A` rather
+than `sqrt(A)`; an independently derived shelf settled at half the requested
+gain. Crossovers likewise: the prewarp, pole ordering and high-pass pole
+reciprocation all had to come from `crossover.c`.
+
+**`.dspipreset` channels match by id and are never remapped** (open item 1). The
+reference implementation reports what a device lacks rather than translating an
+eight-input document onto a two-input part. Pair-link state applies before the
+channels, because a linked pair mirrors writes to its partner.
+
+**Structured reads do not belong in flat field panels.** Rendering a status
+packet as a scalar produces "1 bytes", which looks like data. They are excluded
+until they have views that can decode them.
+
+**The macOS vendor interface is exclusive.** DSPi Console and this tool cannot
+hold a device simultaneously, and the failure looks like a permission error.
+Every permission message is platform-specific for this reason.
+
+**Not built:** guided flows (6.7), remote transport beyond the trait seam, SVG
+and PNG graph export, applying hardware I/O blocks from a preset, and a hardware
+smoke suite. The Raw panel exists as a command rather than a panel.
