@@ -47,6 +47,8 @@ fn main() -> ExitCode {
         Some("doctor") | Some("--doctor") => doctor::run(),
         Some("--install-udev") => doctor::install_udev(),
         Some("screenshot") => cmd_screenshot(serial, &positional(&flags)),
+        Some("export") => cmd_export(serial, &positional(&flags)),
+        Some("import") => cmd_import(serial, &positional(&flags), &flags),
         Some("dump") => cmd_dump(serial, json),
         // No arguments opens the interface; arguments run one command and exit.
         None => cmd_tui(serial, flags.contains(&"--lite")),
@@ -96,6 +98,9 @@ USAGE:
     dspi <path> [i..] v      the same, without the `set`
     dspi eq <ch> <band> <type> [freq] [q] [gain]
                              set a whole filter band in one transfer
+    dspi export <file>       write all filters to a Console-compatible file
+    dspi import <file>       read a filter file and apply it
+                             (--map-legacy for pre-2026 channel names)
     dspi completions <shell> generate shell completions
     dspi doctor              diagnose connection problems
     dspi --install-udev      install the Linux udev rule (needs root)
@@ -231,6 +236,277 @@ fn cmd_dump(serial: Option<&str>, json: bool) -> u8 {
 ///
 /// Useful for documentation and for checking a layout at a size you do not have
 /// a terminal for, such as the 80x24 floor.
+/// Write every channel's filters to a Console-compatible file.
+fn cmd_export(serial: Option<&str>, args: &[&str]) -> u8 {
+    let Some(path) = args.first() else {
+        eprintln!("dspi: export needs a file name, e.g. `dspi export tuning.txt`");
+        return exit::USAGE;
+    };
+
+    let mut session = match connect(serial) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let caps = session.capabilities().clone();
+
+    let mut file = dspi_session::filterfile::FilterFile {
+        format_version: dspi_session::filterfile::FORMAT_VERSION,
+        channels: Vec::new(),
+    };
+
+    for c in &caps.channels {
+        let mut bank = dspi_session::filterfile::ChannelBank {
+            header: format!(
+                "{} {}: {}",
+                if c.is_output { "Output" } else { "Input" },
+                if c.is_output {
+                    c.index - caps.num_inputs
+                } else {
+                    c.index
+                },
+                c.name
+            ),
+            index: Some(if c.is_output {
+                c.index - caps.num_inputs
+            } else {
+                c.index
+            }),
+            is_output: c.is_output,
+            ..Default::default()
+        };
+
+        if !c.is_output {
+            bank.preamp_db = session
+                .read("pre", &[c.index])
+                .ok()
+                .and_then(|v| v.as_f32());
+        }
+
+        for b in 0..caps.max_bands {
+            if let Ok(p) = session.read_band(c.index, b) {
+                bank.peq.push(dspi_proto::dsp::Band {
+                    filter_type: p.filter_type,
+                    freq: p.freq,
+                    q: p.q,
+                    gain_db: p.gain_db,
+                    bypass: p.bypass,
+                });
+            }
+        }
+        // Crossover bands live at wire indices 20-23 and only on outputs.
+        if c.is_output {
+            for b in 20..24 {
+                if let Ok(p) = session.read_band(c.index, b) {
+                    bank.crossover.push(dspi_proto::dsp::Band {
+                        filter_type: p.filter_type,
+                        freq: p.freq,
+                        q: p.q,
+                        gain_db: p.gain_db,
+                        bypass: p.bypass,
+                    });
+                }
+            }
+        }
+        file.channels.push(bank);
+    }
+
+    let stamp = std::process::Command::new("date")
+        .arg("+%Y-%m-%d %H:%M:%S")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let text = dspi_session::filterfile::write(&file, &stamp);
+    match std::fs::write(path, &text) {
+        Ok(()) => {
+            println!(
+                "Wrote {path}: {} channels, {} bands",
+                file.channels.len(),
+                file.channels.iter().map(|c| c.peq.len()).sum::<usize>()
+            );
+            exit::OK
+        }
+        Err(e) => {
+            eprintln!("dspi: could not write {path}: {e}");
+            exit::TRANSPORT
+        }
+    }
+}
+
+/// Read a filter file and apply it.
+///
+/// Applying goes band by band through the ordinary write path, so every value
+/// gets the same clamping, gating and readback as a typed command. Anything the
+/// file asks for that this device cannot do is reported rather than skipped
+/// quietly.
+fn cmd_import(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
+    let Some(path) = args.first() else {
+        eprintln!("dspi: import needs a file name");
+        return exit::USAGE;
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("dspi: could not read {path}: {e}");
+            return exit::USAGE;
+        }
+    };
+    let file = match dspi_session::filterfile::parse(&text) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("dspi: {e}");
+            return exit::USAGE;
+        }
+    };
+
+    let mut session = match connect(serial) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    if flags.contains(&"--dry-run") {
+        session.dry_run = true;
+    }
+    let caps = session.capabilities().clone();
+
+    let map_legacy = flags.contains(&"--map-legacy");
+    let mut applied = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut mapped: Vec<String> = Vec::new();
+
+    for bank in &file.channels {
+        // A file written for a different device shape will name channels this
+        // one does not have; say so rather than silently dropping them.
+        let Some(channel) = resolve_channel(bank, &caps, map_legacy) else {
+            skipped.push(bank.header.clone());
+            continue;
+        };
+
+        if bank.index.is_none()
+            && !caps
+                .channels
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(bank.header.trim()))
+        {
+            mapped.push(format!(
+                "{} → {}",
+                bank.header,
+                caps.channels
+                    .get(channel as usize)
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("?")
+            ));
+        }
+
+        for (i, b) in bank.peq.iter().enumerate() {
+            if i as u8 >= caps.max_bands {
+                break;
+            }
+            let packet = dspi_proto::value::EqParamPacket {
+                channel,
+                band: i as u8,
+                filter_type: b.filter_type,
+                bypass: b.bypass,
+                freq: b.freq,
+                q: b.q,
+                gain_db: b.gain_db,
+                qp: None,
+            };
+            if session.write_band(&packet).is_ok() {
+                applied += 1;
+            }
+        }
+    }
+
+    println!(
+        "{} {applied} bands from {path}",
+        if session.dry_run {
+            "Would apply"
+        } else {
+            "Applied"
+        }
+    );
+    if !mapped.is_empty() {
+        println!("Mapped older channel names: {}", mapped.join(", "));
+    }
+    if !skipped.is_empty() {
+        println!("Skipped, no matching channel: {}", skipped.join(", "));
+        if !map_legacy
+            && skipped
+                .iter()
+                .any(|s| legacy_channel(&s.to_ascii_lowercase(), &caps).is_some())
+        {
+            println!(
+                "  These look like pre-2026 channel names. Re-run with --map-legacy \
+                 to place them on the current channels."
+            );
+        }
+    }
+    exit::OK
+}
+
+/// Match a file's channel section to a channel on this device.
+///
+/// Index-keyed headers are authoritative. A name-keyed header is matched
+/// against the device's own channel names.
+///
+/// Files written before the firmware's unified channel model use names like
+/// "Master L" and "Sub" for a topology that no longer exists: there is no master
+/// bus now, and inputs are first-class channels. Mapping those onto the current
+/// model is a guess, right for a stereo setup and wrong for an eight-channel
+/// one, so it happens only when the user asks for it with `--map-legacy`.
+fn resolve_channel(
+    bank: &dspi_session::filterfile::ChannelBank,
+    caps: &dspi_session::Capabilities,
+    map_legacy: bool,
+) -> Option<u8> {
+    if let Some(ix) = bank.index {
+        let ch = if bank.is_output {
+            caps.num_inputs.checked_add(ix)?
+        } else {
+            ix
+        };
+        return (ch < caps.num_channels).then_some(ch);
+    }
+
+    let want = bank.header.trim().to_ascii_lowercase();
+    if let Some(c) = caps
+        .channels
+        .iter()
+        .find(|c| c.name.to_ascii_lowercase() == want)
+    {
+        return Some(c.index);
+    }
+
+    if !map_legacy {
+        return None;
+    }
+    legacy_channel(&want, caps)
+}
+
+/// The pre-V16 names, mapped onto the current model on request.
+///
+/// The old master pair becomes the first two inputs, and the old outputs become
+/// the first outputs in order. Stated explicitly on import so the user can see
+/// what was assumed.
+fn legacy_channel(name: &str, caps: &dspi_session::Capabilities) -> Option<u8> {
+    let out = |n: u8| {
+        caps.num_inputs
+            .checked_add(n)
+            .filter(|c| *c < caps.num_channels)
+    };
+    match name {
+        "master l" | "master left" => (caps.num_inputs > 0).then_some(0),
+        "master r" | "master right" => (caps.num_inputs > 1).then_some(1),
+        "out l" | "out left" => out(0),
+        "out r" | "out right" => out(1),
+        // The subwoofer was always the last output.
+        "sub" | "pdm" | "pdm sub" => caps.num_channels.checked_sub(1),
+        _ => None,
+    }
+}
+
 fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
     let width: u16 = args.first().and_then(|a| a.parse().ok()).unwrap_or(120);
     let height: u16 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(40);

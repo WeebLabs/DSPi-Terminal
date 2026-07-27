@@ -3,6 +3,7 @@
 //! No rendering happens here, which is what lets the TUI and the one-shot CLI
 //! share every behaviour rather than reimplementing it.
 
+pub mod filterfile;
 pub mod probe;
 pub mod write;
 
