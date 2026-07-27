@@ -406,3 +406,114 @@ mod tests {
         assert!(matches!(probe(&mut t), Err(TransportError::Disconnected)));
     }
 }
+
+/// Live meter readings: one transfer for the whole device.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Meters {
+    /// Per-channel peak, 0..1.
+    pub peaks: Vec<f32>,
+    /// Sticky per-channel clip latch.
+    pub clipped: Vec<bool>,
+    pub cpu0: u8,
+    pub cpu1: u8,
+    /// How many input channels are actually carrying audio right now, which the
+    /// firmware works out from the active source.
+    pub active_inputs: u8,
+}
+
+/// Read every meter at once.
+///
+/// `GET_STATUS` sub-query 9 returns per-channel peaks, both processor loads, the
+/// sticky clip bitmask and the live input count in a single transfer, which is
+/// why meters can be on screen everywhere without costing anything noticeable.
+///
+/// The layout is `peaks[n]*2, cpu0, cpu1, clip_flags(4), active_inputs(1)`, so
+/// `n*2 + 7` bytes: 41 on RP2350, 21 on RP2040. Note that the released
+/// `commands.md` documents `n*2 + 4` with a 16-bit clip mask, which is two
+/// changes out of date: the mask became 32-bit and the input count was appended.
+/// Reading the documented length would truncate, and a 16-bit mask cannot even
+/// represent channel 17's clip flag.
+pub fn read_meters(t: &mut dyn Transport, num_channels: u8) -> Result<Meters> {
+    let n = num_channels as usize;
+    let len = n * 2 + 7;
+    let d = t.control_in(op::REQ_GET_STATUS, 9, len as u16)?;
+
+    let peaks = (0..n)
+        .map(|i| u16::from_le_bytes([d[i * 2], d[i * 2 + 1]]) as f32 / 65535.0)
+        .collect();
+
+    let base = n * 2;
+    let flags = u32::from_le_bytes([d[base + 2], d[base + 3], d[base + 4], d[base + 5]]);
+
+    Ok(Meters {
+        peaks,
+        // Shift on u32, not u16: channel 17 exists and its bit is real.
+        clipped: (0..n).map(|i| flags & (1u32 << i) != 0).collect(),
+        cpu0: d[base],
+        cpu1: d[base + 1],
+        active_inputs: d[base + 6],
+    })
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::*;
+    use dspi_transport::MockTransport;
+
+    fn packet(peaks: &[u16], cpu: (u8, u8), clip: u32, inputs: u8) -> Vec<u8> {
+        let mut d = Vec::new();
+        for p in peaks {
+            d.extend(p.to_le_bytes());
+        }
+        d.push(cpu.0);
+        d.push(cpu.1);
+        d.extend(clip.to_le_bytes());
+        d.push(inputs);
+        d
+    }
+
+    #[test]
+    fn meters_decode_peaks_cpu_clip_flags_and_input_count() {
+        let d = packet(&[65535, 32768], (34, 8), 0b10, 2);
+        let mut t = MockTransport::new().data(op::REQ_GET_STATUS, d);
+        let m = read_meters(&mut t, 2).unwrap();
+
+        assert!((m.peaks[0] - 1.0).abs() < 1e-4);
+        assert!((m.peaks[1] - 0.5).abs() < 1e-3);
+        assert_eq!((m.cpu0, m.cpu1), (34, 8));
+        assert_eq!(m.clipped, vec![false, true]);
+        assert_eq!(m.active_inputs, 2);
+    }
+
+    /// The packet length follows the channel count, and the documented
+    /// `n*2 + 4` would truncate it.
+    #[test]
+    fn the_read_length_follows_the_channel_count() {
+        let d = packet(&[0; 17], (0, 0), 0, 8);
+        assert_eq!(d.len(), 17 * 2 + 7, "RP2350 status packet is 41 bytes");
+
+        let mut t = MockTransport::new().data(op::REQ_GET_STATUS, d);
+        assert!(read_meters(&mut t, 17).is_ok());
+        assert_eq!(t.log()[0].value, 9, "sub-query 9 is the combined packet");
+    }
+
+    /// Channel 17 has no bit in a 16-bit mask. Shifting on the wrong width
+    /// either overflows or silently loses the PDM subwoofer's clip flag.
+    #[test]
+    fn the_seventeenth_channel_clip_flag_survives() {
+        let d = packet(&[0; 17], (0, 0), 1 << 16, 8);
+        let mut t = MockTransport::new().data(op::REQ_GET_STATUS, d);
+        let m = read_meters(&mut t, 17).unwrap();
+        assert_eq!(m.clipped.len(), 17);
+        assert!(m.clipped[16], "the PDM sub's clip flag was lost");
+        assert!(!m.clipped[15]);
+    }
+
+    #[test]
+    fn an_rp2040_packet_is_twentyone_bytes() {
+        let d = packet(&[0; 7], (12, 0), 0, 2);
+        assert_eq!(d.len(), 21);
+        let mut t = MockTransport::new().data(op::REQ_GET_STATUS, d);
+        assert_eq!(read_meters(&mut t, 7).unwrap().cpu0, 12);
+    }
+}

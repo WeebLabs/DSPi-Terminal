@@ -182,6 +182,14 @@ impl Session {
         Ok(outcome)
     }
 
+    /// Poll every meter in one transfer.
+    pub fn meters(&mut self) -> Result<crate::Meters, WriteError> {
+        Ok(crate::read_meters(
+            &mut *self.transport,
+            self.caps.num_channels,
+        )?)
+    }
+
     /// Read a whole EQ band.
     ///
     /// There is no full-packet read in the protocol, so this costs five

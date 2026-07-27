@@ -42,8 +42,11 @@ fn main() -> ExitCode {
         Some("list") => cmd_list(json),
         Some("params") => cmd_params(),
         Some("completions") => cmd_completions(&positional(&flags)),
-        Some("dump") | None => cmd_dump(serial, json),
-        Some(other) if other.starts_with("--") => cmd_dump(serial, json),
+        Some("screenshot") => cmd_screenshot(serial, &positional(&flags)),
+        Some("dump") => cmd_dump(serial, json),
+        // No arguments opens the interface; arguments run one command and exit.
+        None => cmd_tui(serial),
+        Some(other) if other.starts_with("--") => cmd_tui(serial),
         // Everything else is a command in the shared grammar, so the CLI and the
         // TUI's ':' line accept exactly the same syntax.
         Some(_) => cmd_run(serial, &flags, json),
@@ -80,7 +83,8 @@ fn usage() {
 dspi - terminal control for DSPi audio processors
 
 USAGE:
-    dspi [dump]              connect and print the full device state
+    dspi                     open the interface
+    dspi dump                connect and print the full device state
     dspi list                list every connected DSPi
     dspi params              list every parameter this build knows
     dspi get <path> [i..]    read one parameter
@@ -214,6 +218,93 @@ fn cmd_dump(serial: Option<&str>, json: bool) -> u8 {
     }
 
     exit::OK
+}
+
+/// Render one frame of the interface to stdout.
+///
+/// Useful for documentation and for checking a layout at a size you do not have
+/// a terminal for, such as the 80x24 floor.
+fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
+    let width: u16 = args.first().and_then(|a| a.parse().ok()).unwrap_or(120);
+    let height: u16 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(40);
+    let panel = args.get(2).copied().unwrap_or("dashboard");
+
+    let session = match connect(serial) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let theme = dspi_tui::Theme::dark(
+        dspi_tui::theme::ColorDepth::TrueColor,
+        dspi_tui::app::detect_glyphs(),
+    );
+    let mut app = dspi_tui::App::from_session(theme, &session);
+    let mut session = session;
+    load_bands(&mut session, &mut app);
+    if let Ok(m) = session.meters() {
+        app.apply_meters(&m);
+    }
+
+    app.panel = match panel {
+        "filters" => dspi_tui::app::Panel::Filters,
+        "meters" => {
+            app.meters_expanded = true;
+            dspi_tui::app::Panel::Dashboard
+        }
+        _ => dspi_tui::app::Panel::Dashboard,
+    };
+
+    println!("{}", dspi_tui::render_to_string(&app, width, height));
+    exit::OK
+}
+
+fn cmd_tui(serial: Option<&str>) -> u8 {
+    let session = match connect(serial) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+
+    let theme = dspi_tui::Theme::dark(
+        dspi_tui::theme::ColorDepth::detect(),
+        dspi_tui::app::detect_glyphs(),
+    );
+    let mut app = dspi_tui::App::from_session(theme, &session);
+
+    // Seed the curves from what the device is actually doing, so the first frame
+    // shows the user's tuning rather than a flat line.
+    let mut session = session;
+    load_bands(&mut session, &mut app);
+
+    match dspi_tui::run(app, &mut session) {
+        Ok(()) => exit::OK,
+        Err(e) => {
+            eprintln!("dspi: {e}");
+            exit::TRANSPORT
+        }
+    }
+}
+
+/// Read every band on every channel.
+///
+/// There is no full-packet EQ read in the protocol, so this is five transfers
+/// per band. It is the slowest thing the app does at startup, which is why it
+/// happens once here rather than lazily per panel.
+fn load_bands(session: &mut Session, app: &mut dspi_tui::App) {
+    let channels = app.channels.len();
+    for ch in 0..channels {
+        let bands = app.channels[ch].bands.len();
+        for band in 0..bands {
+            if let Ok(p) = session.read_band(ch as u8, band as u8) {
+                app.channels[ch].bands[band] = dspi_proto::dsp::Band {
+                    filter_type: p.filter_type,
+                    freq: p.freq,
+                    q: p.q,
+                    gain_db: p.gain_db,
+                    bypass: p.bypass,
+                };
+            }
+        }
+        app.recompute(ch);
+    }
 }
 
 fn cmd_completions(args: &[&str]) -> u8 {

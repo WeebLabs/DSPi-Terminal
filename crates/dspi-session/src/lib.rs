@@ -6,5 +6,5 @@
 pub mod probe;
 pub mod write;
 
-pub use probe::{Capabilities, probe, read_bulk};
+pub use probe::{Capabilities, Meters, probe, read_bulk, read_meters};
 pub use write::{JournalEntry, Outcome, Session, WriteError};
