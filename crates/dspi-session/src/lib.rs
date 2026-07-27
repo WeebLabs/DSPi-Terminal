@@ -4,5 +4,7 @@
 //! share every behaviour rather than reimplementing it.
 
 pub mod probe;
+pub mod write;
 
 pub use probe::{Capabilities, probe, read_bulk};
+pub use write::{JournalEntry, Outcome, Session, WriteError};

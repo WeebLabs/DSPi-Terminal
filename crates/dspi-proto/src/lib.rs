@@ -16,6 +16,8 @@ pub mod generated {
 
 pub mod channel;
 pub mod enums;
+pub mod registry;
+pub mod value;
 pub mod wire;
 
 pub use channel::ChannelMap;

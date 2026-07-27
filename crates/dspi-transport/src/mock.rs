@@ -191,10 +191,8 @@ mod tests {
     /// The flash blackout, which is the behaviour most likely to be got wrong.
     #[test]
     fn a_busy_window_recovers_after_backoff() {
-        let mut t = MockTransport::new().reply(
-            0x90,
-            Reply::BusyThen(2, Box::new(Reply::Data(vec![0x00]))),
-        );
+        let mut t =
+            MockTransport::new().reply(0x90, Reply::BusyThen(2, Box::new(Reply::Data(vec![0x00]))));
 
         let r = with_busy_retry(|| t.control_in(0x90, 3, 1), 0x90);
         assert_eq!(r.unwrap(), vec![0x00]);

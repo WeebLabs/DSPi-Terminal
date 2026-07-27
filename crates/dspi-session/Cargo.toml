@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 dspi-proto.workspace = true
 dspi-transport.workspace = true
+thiserror.workspace = true
 serde = { workspace = true, optional = true }
 
 [features]

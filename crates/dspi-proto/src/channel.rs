@@ -229,7 +229,13 @@ mod tests {
     fn device_names_win_over_generated_labels() {
         let map = rp2350().with_names(
             (0..17)
-                .map(|i| if i == 0 { "Turntable".into() } else { String::new() })
+                .map(|i| {
+                    if i == 0 {
+                        "Turntable".into()
+                    } else {
+                        String::new()
+                    }
+                })
                 .collect(),
         );
         assert_eq!(map.label(0), "Turntable");

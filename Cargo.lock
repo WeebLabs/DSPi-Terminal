@@ -43,6 +43,7 @@ dependencies = [
  "dspi-proto",
  "dspi-transport",
  "serde",
+ "thiserror",
 ]
 
 [[package]]

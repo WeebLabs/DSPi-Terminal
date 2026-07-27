@@ -99,11 +99,7 @@ impl FilterType {
     pub fn uses_gain(self) -> bool {
         matches!(
             self,
-            Self::Peaking
-                | Self::LowShelf
-                | Self::HighShelf
-                | Self::LowShelf1
-                | Self::HighShelf1
+            Self::Peaking | Self::LowShelf | Self::HighShelf | Self::LowShelf1 | Self::HighShelf1
         )
     }
 
@@ -268,7 +264,10 @@ mod tests {
 
     #[test]
     fn linkwitz_relabels_its_fields() {
-        assert_eq!(FilterType::LinkwitzTransform.field_labels(), ("f0", "Q0", "fp"));
+        assert_eq!(
+            FilterType::LinkwitzTransform.field_labels(),
+            ("f0", "Q0", "fp")
+        );
         assert_eq!(FilterType::Peaking.field_labels(), ("Freq", "Q", "Gain"));
     }
 

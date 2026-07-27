@@ -111,7 +111,10 @@ fn main() {
     // Group the integer constants into modules.
     let mut by_group: BTreeMap<&str, Vec<(&String, &i64, &String)>> = BTreeMap::new();
     for (name, (v, group, header)) in &ints {
-        by_group.entry(group.as_str()).or_default().push((name, v, header));
+        by_group
+            .entry(group.as_str())
+            .or_default()
+            .push((name, v, header));
     }
 
     for (group, items) in &by_group {
@@ -203,7 +206,11 @@ fn emit_provenance(dir: &Path, out: &mut String) {
     let _ = writeln!(out, "    pub const BRANCH: &str = {:?};", field("branch"));
     let _ = writeln!(out, "    pub const COMMIT: &str = {:?};", field("commit"));
     let _ = writeln!(out, "    pub const SHORT: &str = {:?};", field("short"));
-    let _ = writeln!(out, "    pub const COMMITTED: &str = {:?};", field("committed"));
+    let _ = writeln!(
+        out,
+        "    pub const COMMITTED: &str = {:?};",
+        field("committed")
+    );
     let _ = writeln!(out, "}}\n");
 }
 
@@ -282,7 +289,10 @@ fn emit_wire_layout(ints: &BTreeMap<String, (i64, String, String)>, out: &mut St
         offset += size;
     }
 
-    let _ = writeln!(out, "\n/// Total `WireBulkParams` size, derived from the header constants.");
+    let _ = writeln!(
+        out,
+        "\n/// Total `WireBulkParams` size, derived from the header constants."
+    );
     let _ = writeln!(out, "pub const BULK_SIZE: usize = {offset};");
     let _ = writeln!(
         out,

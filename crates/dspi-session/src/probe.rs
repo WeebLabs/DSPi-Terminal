@@ -298,7 +298,10 @@ mod tests {
                 v.extend([0, 0, 0]);
                 v
             })
-            .data(op::REQ_SIGGEN_GET_CAPS, vec![1, 15, 9, 16, 0xFF, 0x01, 0, 0])
+            .data(
+                op::REQ_SIGGEN_GET_CAPS,
+                vec![1, 15, 9, 16, 0xFF, 0x01, 0, 0],
+            )
     }
 
     #[test]
@@ -381,7 +384,10 @@ mod tests {
             .iter()
             .filter(|e| e.opcode == op::REQ_GET_ALL_PARAMS_CHUNK)
             .count();
-        assert!(chunk_reads > 1, "5944 bytes cannot arrive in one 512-byte transfer");
+        assert!(
+            chunk_reads > 1,
+            "5944 bytes cannot arrive in one 512-byte transfer"
+        );
 
         // Offsets must be sequential from 0: the firmware snapshots at offset 0.
         let offsets: Vec<u16> = t
@@ -397,9 +403,6 @@ mod tests {
     #[test]
     fn a_dead_device_fails_on_the_liveness_read() {
         let mut t = MockTransport::new().reply(op::REQ_GET_PLATFORM, Reply::Disconnect);
-        assert!(matches!(
-            probe(&mut t),
-            Err(TransportError::Disconnected)
-        ));
+        assert!(matches!(probe(&mut t), Err(TransportError::Disconnected)));
     }
 }
