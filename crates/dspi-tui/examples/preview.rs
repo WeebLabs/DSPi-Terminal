@@ -84,5 +84,21 @@ fn main() {
     a.selected_band = 2;
 
     // Colours are the point of a theme review, so emit them.
-    print!("{}", dspi_tui::render_to_ansi(&a, 104, 28));
+    // Size and selection from the command line, so a short window and a
+    // scrolled list can be eyeballed without a device attached.
+    let arg = |n: usize, default: u16| -> u16 {
+        std::env::args()
+            .nth(n)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let (w, h) = (arg(2, 104), arg(3, 28));
+    if let Some(ch) = std::env::args()
+        .nth(4)
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        a.selected_channel = ch.min(a.channels.len().saturating_sub(1));
+        a.panel = dspi_tui::app::Panel::Filters;
+    }
+    print!("{}", dspi_tui::render_to_ansi(&a, w, h));
 }

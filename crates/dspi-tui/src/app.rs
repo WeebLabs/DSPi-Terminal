@@ -166,6 +166,16 @@ pub enum Focus {
     Content,
 }
 
+/// One line of the channel list. Spacing is a row like any other, so scrolling
+/// cannot leave a heading behind or a gap stranded at the top of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarRow {
+    Main,
+    Blank,
+    Heading(&'static str),
+    Channel(usize),
+}
+
 /// What the user is typing into, if anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -1681,6 +1691,37 @@ impl App {
         }
     }
 
+    /// Every row of the sidebar in order, including the spacing.
+    ///
+    /// Built as a list rather than drawn straight out, so that scrolling has
+    /// one thing to move and the blank rows travel with the groups they
+    /// separate.
+    fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        let mut rows = vec![SidebarRow::Main, SidebarRow::Blank];
+        let mut first_group = true;
+        for (title, want_output) in [("INPUTS", false), ("OUTPUTS", true)] {
+            if !self.channels.iter().any(|c| c.is_output == want_output) {
+                continue;
+            }
+            // A blank line between the groups, so the split reads as a gap
+            // rather than resting on the heading alone. Between them only: a
+            // leading blank would just push the list down.
+            if !first_group {
+                rows.push(SidebarRow::Blank);
+            }
+            first_group = false;
+            rows.push(SidebarRow::Heading(title));
+            rows.extend(
+                self.channels
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.is_output == want_output)
+                    .map(|(i, _)| SidebarRow::Channel(i)),
+            );
+        }
+        rows
+    }
+
     /// The channel list: inputs and outputs, each with its own meter.
     ///
     /// Modelled on the Console's sidebar, because a level belongs next to the
@@ -1720,66 +1761,59 @@ impl App {
             .unwrap_or(8)
             .clamp(6, 14) as u16;
 
-        let mut row = 0u16;
+        // Lay the list out before drawing any of it, so it can be scrolled as
+        // one thing. Otherwise a channel below the fold is simply not drawn,
+        // and a selected channel that is not drawn has no marker anywhere.
+        let rows = self.sidebar_rows();
+        let seats = inner.height as usize;
+        let anchor = rows
+            .iter()
+            .position(|r| match r {
+                SidebarRow::Main => self.on_main(),
+                SidebarRow::Channel(i) => !self.on_main() && *i == self.selected_channel,
+                _ => false,
+            })
+            .unwrap_or(0);
+        let first = Self::scroll_to(anchor, rows.len(), seats);
 
-        // The overview sits above the channels, since it summarises them.
-        {
-            let selected = self.on_main();
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        if selected { "▐" } else { " " },
-                        if selected {
-                            Style::default().fg(self.theme.accent)
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                    Span::styled(
-                        "Main",
-                        if selected {
-                            self.theme.focused()
-                        } else {
-                            self.theme.value()
-                        },
-                    ),
-                ])),
-                Rect::new(inner.x, inner.y, inner.width, 1),
-            );
-            row += 2;
-        }
-
-        let section = |f: &mut Frame, row: &mut u16, title: &str| {
-            if *row < inner.height {
-                f.render_widget(
+        for (offset, entry) in rows.iter().skip(first).take(seats).enumerate() {
+            let at = Rect::new(inner.x, inner.y + offset as u16, inner.width, 1);
+            match entry {
+                SidebarRow::Blank => {}
+                SidebarRow::Main => {
+                    let selected = self.on_main();
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(
+                                if selected { "▐" } else { " " },
+                                if selected {
+                                    Style::default().fg(self.theme.accent)
+                                } else {
+                                    Style::default()
+                                },
+                            ),
+                            Span::styled(
+                                "Main",
+                                if selected {
+                                    self.theme.focused()
+                                } else {
+                                    self.theme.value()
+                                },
+                            ),
+                        ])),
+                        at,
+                    );
+                }
+                SidebarRow::Heading(title) => f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
                         format!(" {title}"),
                         Style::default().fg(self.theme.dim),
                     ))),
-                    Rect::new(inner.x, inner.y + *row, inner.width, 1),
-                );
-                *row += 1;
-            }
-        };
-
-        for (group, want_output) in [("INPUTS", false), ("OUTPUTS", true)] {
-            if !self.channels.iter().any(|c| c.is_output == want_output) {
-                continue;
-            }
-            section(f, &mut row, group);
-
-            for (i, c) in self.channels.iter().enumerate() {
-                if c.is_output != want_output || row >= inner.height {
-                    continue;
+                    at,
+                ),
+                SidebarRow::Channel(i) => {
+                    self.draw_channel_row(f, at, *i, &self.channels[*i], name_w)
                 }
-                self.draw_channel_row(
-                    f,
-                    Rect::new(inner.x, inner.y + row, inner.width, 1),
-                    i,
-                    c,
-                    name_w,
-                );
-                row += 1;
             }
         }
     }
@@ -3469,7 +3503,11 @@ mod sidebar_tests {
     /// Just the channel-list column. The panel beside it repeats the selected
     /// channel's name in its title, so a whole-line search finds that instead.
     fn column(a: &App) -> String {
-        let out = render(a, 100, 24);
+        column_at(a, 24)
+    }
+
+    fn column_at(a: &App, height: u16) -> String {
+        let out = render(a, 100, height);
         let width = out
             .lines()
             .find(|l| l.contains("┌Channels"))
@@ -3505,6 +3543,79 @@ mod sidebar_tests {
             "an output leaked into the inputs"
         );
         assert!(out[outputs..].contains("SPDIF 1"));
+    }
+
+    /// The two groups are different kinds of thing, so the split needs to read
+    /// as a gap rather than resting on the heading alone.
+    #[test]
+    fn a_blank_row_separates_the_inputs_from_the_outputs() {
+        let out = column(&app());
+        let lines: Vec<&str> = out.lines().collect();
+        let outputs = lines
+            .iter()
+            .position(|l| l.contains("OUTPUTS"))
+            .expect("no OUTPUTS heading");
+        let above = lines[outputs - 1];
+        assert!(
+            above.trim_matches(['│', ' ']).is_empty(),
+            "no gap above OUTPUTS, found: {above:?}"
+        );
+        // And the last input is directly above that gap, not further away.
+        assert!(
+            lines[outputs - 2].contains("USB 4"),
+            "{:?}",
+            lines[outputs - 2]
+        );
+    }
+
+    /// No leading blank: it would push the whole list down for nothing.
+    #[test]
+    fn the_first_group_is_not_preceded_by_a_gap() {
+        let out = column(&app());
+        let lines: Vec<&str> = out.lines().collect();
+        let inputs = lines.iter().position(|l| l.contains("INPUTS")).unwrap();
+        let main = lines.iter().position(|l| l.contains("Main")).unwrap();
+        assert_eq!(inputs - main, 2, "expected exactly one blank between them");
+    }
+
+    /// The list is the channel selector, so a selected channel that is not on
+    /// screen leaves the user with no idea what they are editing.
+    #[test]
+    fn the_list_scrolls_to_keep_the_selection_visible() {
+        let mut a = app();
+        a.panel = Panel::Filters;
+        // Short enough that the twelve rows of list cannot all fit at once.
+        const H: u16 = 14;
+        assert!(
+            !column_at(&a, H).contains("SPDIF 3"),
+            "the list fits at this height, so nothing is being tested"
+        );
+
+        for i in 0..a.channels.len() {
+            a.selected_channel = i;
+            let name = a.channels[i].name.clone();
+            let shown = column_at(&a, H);
+            let row = shown
+                .lines()
+                .find(|l| l.contains(&name))
+                .unwrap_or_else(|| panic!("{name} is off-screen:\n{shown}"));
+            assert!(row.contains('▐'), "{name} is visible but unmarked: {row}");
+        }
+    }
+
+    /// Main scrolls like anything else, but selecting it must bring it back.
+    #[test]
+    fn selecting_main_brings_it_back_into_view() {
+        let mut a = app();
+        a.panel = Panel::Filters;
+        a.selected_channel = a.channels.len() - 1;
+        a.panel = Panel::Main; // on_main()
+        let shown = column_at(&a, 14);
+        let row = shown
+            .lines()
+            .find(|l| l.contains("Main"))
+            .expect("Main scrolled away while selected");
+        assert!(row.contains('▐'));
     }
 
     /// The overview is reached from the list rather than the tab bar, so it has
