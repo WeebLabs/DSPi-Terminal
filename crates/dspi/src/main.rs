@@ -245,6 +245,15 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
     }
 
     app.panel = match panel {
+        "cursor" => {
+            // Park the cursor on 1 kHz so the readout is exercised.
+            app.cursor = Some(dspi_proto::dsp::POINTS / 2 + 20);
+            dspi_tui::app::Panel::Filters
+        }
+        "grid" => {
+            app.grid_mode = true;
+            dspi_tui::app::Panel::Dashboard
+        }
         "filters" => dspi_tui::app::Panel::Filters,
         "meters" => {
             app.meters_expanded = true;

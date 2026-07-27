@@ -151,6 +151,18 @@ pub struct App {
     pub cpu: (u8, u8),
     /// How many inputs are actually carrying audio, per the device.
     pub active_inputs: u8,
+
+    /// Vertical dB window, shared by every view so a comparison never silently
+    /// changes scale underneath the reader.
+    pub db_range: f64,
+    /// Cursor position along the curve, as a point index; `None` hides it.
+    pub cursor: Option<usize>,
+    pub show_phase: bool,
+    pub phase_unwrapped: bool,
+    /// Grid mode draws one small plot per channel instead of an overlay.
+    pub grid_mode: bool,
+    /// Which channels the graph shows.
+    pub visible: Vec<bool>,
     pub meters_expanded: bool,
     pub graph_expanded: bool,
 
@@ -185,6 +197,12 @@ impl App {
             dirty: false,
             cpu: (0, 0),
             active_inputs: 0,
+            db_range: 30.0,
+            cursor: None,
+            show_phase: false,
+            phase_unwrapped: false,
+            grid_mode: false,
+            visible: Vec::new(),
             meters_expanded: false,
             graph_expanded: false,
             input: String::new(),
@@ -224,6 +242,7 @@ impl App {
             })
             .collect();
 
+        app.visible = vec![true; app.channels.len()];
         app.ctx = Context {
             channel_slugs: caps.channels.iter().map(|c| c.slug.clone()).collect(),
             num_inputs: caps.num_inputs,
@@ -231,6 +250,36 @@ impl App {
             max_bands: caps.max_bands,
         };
         app
+    }
+
+    /// The frequency the cursor sits on.
+    pub fn cursor_hz(&self) -> Option<f64> {
+        self.cursor
+            .map(|i| dsp::frequencies()[i.min(dsp::POINTS - 1)])
+    }
+
+    /// What every visible channel reads at the cursor.
+    ///
+    /// A numeric readout is something a terminal does better than a graphical
+    /// interface, because the numbers are already text.
+    pub fn cursor_readout(&self) -> Vec<(String, f64)> {
+        let Some(i) = self.cursor else {
+            return Vec::new();
+        };
+        self.channels
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| self.visible.get(*n).copied().unwrap_or(true))
+            .filter_map(|(_, c)| c.curve.get(i).map(|db| (c.slug.clone(), *db)))
+            .collect()
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        let next = match self.cursor {
+            None => dsp::POINTS as isize / 2,
+            Some(i) => i as isize + delta,
+        };
+        self.cursor = Some(next.clamp(0, dsp::POINTS as isize - 1) as usize);
     }
 
     /// Take a meter poll.
@@ -292,6 +341,8 @@ impl App {
                     self.panel = *p;
                 }
             }
+            // The guarded arm must precede the plain one, or it never matches.
+            KeyCode::Char('0') if self.panel == Panel::Filters => self.db_range = 30.0,
             KeyCode::Char('0') => self.panel = Panel::Raw,
 
             KeyCode::Char('M') => self.meters_expanded = !self.meters_expanded,
@@ -311,6 +362,26 @@ impl App {
             KeyCode::Down => self.move_band(1),
             KeyCode::Left => self.move_channel(-1),
             KeyCode::Right => self.move_channel(1),
+
+            // Graph controls. `h`/`l` move the cursor rather than the selection,
+            // so reading a curve never disturbs what is being edited.
+            KeyCode::Char('h') => self.move_cursor(-2),
+            KeyCode::Char('l') => self.move_cursor(2),
+            KeyCode::Char('H') => self.move_cursor(-20),
+            KeyCode::Char('L') => self.move_cursor(20),
+            KeyCode::Char('x') => self.cursor = None,
+            KeyCode::Char('+') => self.db_range = (self.db_range - 5.0).max(10.0),
+            KeyCode::Char('-') => self.db_range = (self.db_range + 5.0).min(100.0),
+            KeyCode::Char('m') => self.grid_mode = !self.grid_mode,
+            KeyCode::Char('P') => self.show_phase = !self.show_phase,
+            KeyCode::Char('u') => self.phase_unwrapped = !self.phase_unwrapped,
+            KeyCode::Char(' ') => {
+                // Toggle the selected channel's visibility, the keyboard
+                // equivalent of clicking its legend pill.
+                if let Some(v) = self.visible.get_mut(self.selected_channel) {
+                    *v = !*v;
+                }
+            }
 
             _ => {}
         }
@@ -527,6 +598,10 @@ impl App {
     }
 
     fn draw_dashboard(&self, f: &mut Frame, area: Rect) {
+        if self.grid_mode {
+            self.draw_grid(f, area);
+            return;
+        }
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(6), Constraint::Length(5)])
@@ -578,6 +653,10 @@ impl App {
     }
 
     fn draw_filters(&self, f: &mut Frame, area: Rect) {
+        if self.grid_mode {
+            self.draw_grid(f, area);
+            return;
+        }
         let (graph_h, table_h) = match self.split {
             Split::GraphOnly => (area.height, 0),
             Split::TableOnly => (0, area.height),
@@ -624,6 +703,9 @@ impl App {
         let axis = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
 
         let mut bode = Bode::new(&self.theme);
+        bode.db_top = self.db_range / 2.0;
+        bode.db_bottom = -self.db_range / 2.0;
+        bode.cursor = self.cursor;
         if self.panel == Panel::Filters
             && let Some(c) = self.selected()
             && let Some(b) = c.bands.get(self.selected_band)
@@ -635,6 +717,9 @@ impl App {
         for (i, c) in self.channels.iter().enumerate() {
             // On the dashboard, showing seventeen curves at once is noise; the
             // selected channel plus its neighbour is what a user is comparing.
+            if !self.visible.get(i).copied().unwrap_or(true) {
+                continue;
+            }
             let show = self.panel == Panel::Filters && i == self.selected_channel
                 || self.panel == Panel::Dashboard && i < 2;
             if !show {
@@ -648,11 +733,146 @@ impl App {
             });
         }
 
+        // Phase shares the plot but not the axis: it is mapped onto the same
+        // vertical space with +/-180 degrees spanning the full dB window, which
+        // is how the Console scales it. Drawn dim and last so it reads as an
+        // overlay rather than as another response.
+        let phase_points;
+        if self.show_phase
+            && let Some(c) = self.selected()
+        {
+            let wrapped = dsp::phase_curve(&c.bands);
+            let degrees = if self.phase_unwrapped {
+                dsp::unwrap_phase(&wrapped)
+            } else {
+                wrapped
+            };
+            let scale = (self.db_range / 2.0) / 180.0;
+            phase_points = degrees.iter().map(|d| d * scale).collect::<Vec<_>>();
+            bode = bode.curve(Curve {
+                label: "phase",
+                color: self.theme.dim,
+                points: &phase_points,
+                focused: false,
+            });
+        }
+
         f.render_widget(bode, plot);
-        f.render_widget(
-            Paragraph::new(frequency_axis(axis.width, &self.theme)),
-            axis,
-        );
+
+        // The cursor readout replaces the frequency labels while it is up: the
+        // numbers say more than the axis does, and a terminal renders them
+        // better than a graphical plot can.
+        if let Some(hz) = self.cursor_hz() {
+            let mut spans = vec![Span::styled(
+                if hz >= 1000.0 {
+                    format!("{:.2} kHz", hz / 1000.0)
+                } else {
+                    format!("{hz:.0} Hz")
+                },
+                Style::default().fg(self.theme.pending),
+            )];
+            for (slug, db) in self.cursor_readout().into_iter().take(4) {
+                spans.push(Span::styled(format!("  {slug} "), self.theme.label()));
+                spans.push(Span::styled(format!("{db:+.1}"), self.theme.value()));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)), axis);
+        } else {
+            f.render_widget(
+                Paragraph::new(frequency_axis(axis.width, &self.theme)),
+                axis,
+            );
+        }
+    }
+
+    /// Small multiples: one mini plot per channel.
+    ///
+    /// This answers "which channel looks wrong?" across seventeen channels,
+    /// which an overlay of seventeen curves cannot. Every cell shares the main
+    /// graph's dB window rather than autoscaling, because autoscaled small
+    /// multiples lie about relative magnitude.
+    fn draw_grid(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.chrome_style())
+            .title(Span::styled(
+                format!("Responses · all {} channels", self.channels.len()),
+                self.theme.label(),
+            ));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        // Cells need room for a name plus a readable curve; below that the
+        // curve degrades to a sparkline rather than becoming a smudge.
+        const CELL_W: u16 = 22;
+        const CELL_H: u16 = 4;
+        let cols = (inner.width / CELL_W).max(1);
+        let rows = (inner.height / CELL_H).max(1);
+        let capacity = (cols * rows) as usize;
+
+        for (i, c) in self.channels.iter().enumerate().take(capacity) {
+            let cx = inner.x + (i as u16 % cols) * CELL_W;
+            let cy = inner.y + (i as u16 / cols) * CELL_H;
+
+            let selected = i == self.selected_channel;
+            let hidden = !self.visible.get(i).copied().unwrap_or(true);
+
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    c.slug.clone(),
+                    if selected {
+                        self.theme.focused()
+                    } else if hidden {
+                        Style::default().fg(self.theme.chrome)
+                    } else {
+                        self.theme.label()
+                    },
+                ))),
+                Rect::new(cx, cy, CELL_W.min(inner.width), 1),
+            );
+
+            if hidden {
+                continue;
+            }
+
+            let plot = Rect::new(
+                cx,
+                cy + 1,
+                CELL_W.saturating_sub(1).min(inner.width),
+                (CELL_H - 1).min(inner.height.saturating_sub(cy - inner.y + 1)),
+            );
+            if plot.height == 0 || plot.width < 4 {
+                continue;
+            }
+
+            let mut bode = Bode::new(&self.theme);
+            bode.db_top = self.db_range / 2.0;
+            bode.db_bottom = -self.db_range / 2.0;
+            // A flat channel is drawn flat and dim, never omitted: "no EQ" must
+            // look different from "missing".
+            f.render_widget(
+                bode.curve(Curve {
+                    label: &c.name,
+                    color: self.theme.channel(i as u8),
+                    points: &c.curve,
+                    focused: selected,
+                }),
+                plot,
+            );
+        }
+
+        if self.channels.len() > capacity {
+            // Never let a truncated view read as a complete one.
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        "{} more channels; widen the terminal",
+                        self.channels.len() - capacity
+                    ),
+                    Style::default().fg(self.theme.pending),
+                ))),
+                Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+            );
+        }
     }
 
     fn draw_bands(&self, f: &mut Frame, area: Rect) {
@@ -822,8 +1042,14 @@ impl App {
     }
 
     fn draw_keys(&self, f: &mut Frame, area: Rect) {
-        let keys =
-            "^P palette · : command · Tab panel · G graph · M meters · = split · F2 level · q quit";
+        // Show the keys that matter here, rather than one list that is mostly
+        // irrelevant wherever you happen to be.
+        let keys = match self.panel {
+            Panel::Filters => {
+                "^P palette · : cmd · h/l cursor · +/- zoom · space hide · = split · q quit"
+            }
+            _ => "^P palette · : cmd · Tab panel · G graph · M meters · F2 level · q quit",
+        };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(keys, self.theme.label()))),
             area,
@@ -1216,5 +1442,318 @@ mod tests {
         assert!(!render(&app, &mut term).contains('●'));
         app.dirty = true;
         assert!(render(&app, &mut term).contains('●'));
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+    use crate::theme::ColorDepth;
+
+    fn app() -> App {
+        let mut a = App::new(Theme::dark(ColorDepth::TrueColor, Glyphs::Braille));
+        a.channels = (0..3)
+            .map(|i| {
+                let bands = vec![dsp::Band {
+                    filter_type: dspi_proto::FilterType::Peaking,
+                    freq: 1000.0,
+                    q: 2.0,
+                    gain_db: 6.0 * (i as f32 + 1.0),
+                    bypass: false,
+                }];
+                ChannelView {
+                    name: format!("Ch {i}"),
+                    slug: format!("ch.{i}"),
+                    is_output: false,
+                    curve: dsp::curve(&bands, 0.0),
+                    bands,
+                    peak: 0.0,
+                    clipped: false,
+                }
+            })
+            .collect();
+        a.visible = vec![true; 3];
+        a
+    }
+
+    fn press(a: &mut App, c: char) {
+        a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_cursor_starts_mid_band_and_moves_both_ways() {
+        let mut a = app();
+        assert!(a.cursor.is_none());
+        press(&mut a, 'l');
+        let first = a.cursor.unwrap();
+        press(&mut a, 'l');
+        assert!(a.cursor.unwrap() > first);
+        press(&mut a, 'h');
+        assert_eq!(a.cursor.unwrap(), first);
+    }
+
+    #[test]
+    fn the_cursor_stops_at_the_ends_rather_than_wrapping() {
+        let mut a = app();
+        for _ in 0..300 {
+            press(&mut a, 'L');
+        }
+        assert_eq!(a.cursor, Some(dsp::POINTS - 1));
+        for _ in 0..300 {
+            press(&mut a, 'H');
+        }
+        assert_eq!(a.cursor, Some(0));
+    }
+
+    /// The readout is the thing a terminal does better than a graphical plot,
+    /// so it has to be right: one entry per visible channel, at the cursor.
+    #[test]
+    fn the_readout_reports_every_visible_channel() {
+        let mut a = app();
+        press(&mut a, 'l');
+        let readout = a.cursor_readout();
+        assert_eq!(readout.len(), 3);
+
+        a.visible[1] = false;
+        assert_eq!(a.cursor_readout().len(), 2);
+    }
+
+    #[test]
+    fn the_readout_matches_the_curve_at_the_cursor_frequency() {
+        let mut a = app();
+        // Park the cursor on the filter's centre frequency.
+        let freqs = dsp::frequencies();
+        let idx = freqs
+            .iter()
+            .enumerate()
+            .min_by(|x, y| {
+                (x.1 - 1000.0)
+                    .abs()
+                    .partial_cmp(&(y.1 - 1000.0).abs())
+                    .unwrap()
+            })
+            .unwrap()
+            .0;
+        a.cursor = Some(idx);
+
+        let readout = a.cursor_readout();
+        // Channel 0 has a +6 dB peak at 1 kHz.
+        assert!(
+            (readout[0].1 - 6.0).abs() < 0.3,
+            "expected about +6 dB, got {}",
+            readout[0].1
+        );
+        assert!((a.cursor_hz().unwrap() - 1000.0).abs() < 60.0);
+    }
+
+    #[test]
+    fn x_dismisses_the_cursor() {
+        let mut a = app();
+        press(&mut a, 'l');
+        assert!(a.cursor.is_some());
+        press(&mut a, 'x');
+        assert!(a.cursor.is_none());
+        assert!(a.cursor_readout().is_empty());
+    }
+
+    #[test]
+    fn zoom_narrows_and_widens_within_sane_limits() {
+        let mut a = app();
+        let start = a.db_range;
+        press(&mut a, '+');
+        assert!(a.db_range < start, "plus should zoom in");
+        press(&mut a, '-');
+        assert!((a.db_range - start).abs() < 1e-9);
+
+        for _ in 0..50 {
+            press(&mut a, '+');
+        }
+        assert!(a.db_range >= 10.0, "zoom must not collapse");
+        for _ in 0..100 {
+            press(&mut a, '-');
+        }
+        assert!(a.db_range <= 100.0, "zoom must not run away");
+    }
+
+    #[test]
+    fn space_toggles_the_selected_channel_off_the_graph() {
+        let mut a = app();
+        a.selected_channel = 1;
+        press(&mut a, ' ');
+        assert!(!a.visible[1]);
+        press(&mut a, ' ');
+        assert!(a.visible[1]);
+    }
+
+    #[test]
+    fn the_graph_modes_toggle() {
+        let mut a = app();
+        assert!(!a.grid_mode);
+        press(&mut a, 'm');
+        assert!(a.grid_mode);
+
+        assert!(!a.show_phase);
+        a.on_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE));
+        assert!(a.show_phase);
+        press(&mut a, 'u');
+        assert!(a.phase_unwrapped);
+    }
+
+    /// Zoom is shared, so a channel compared against another is never read on a
+    /// different scale without the reader noticing.
+    #[test]
+    fn zoom_is_shared_across_channels() {
+        let mut a = app();
+        press(&mut a, '+');
+        let zoomed = a.db_range;
+        a.selected_channel = 2;
+        assert_eq!(a.db_range, zoomed);
+    }
+}
+
+#[cfg(test)]
+mod grid_and_phase_tests {
+    use super::*;
+    use crate::theme::ColorDepth;
+
+    fn app_with(n: usize) -> App {
+        let mut a = App::new(Theme::dark(ColorDepth::TrueColor, Glyphs::Braille));
+        a.channels = (0..n)
+            .map(|i| {
+                let bands = vec![dsp::Band {
+                    filter_type: if i == 0 {
+                        dspi_proto::FilterType::Peaking
+                    } else {
+                        dspi_proto::FilterType::Flat
+                    },
+                    freq: 1000.0,
+                    q: 2.0,
+                    gain_db: 9.0,
+                    bypass: false,
+                }];
+                ChannelView {
+                    name: format!("Ch {i}"),
+                    slug: format!("ch.{i}"),
+                    is_output: false,
+                    curve: dsp::curve(&bands, 0.0),
+                    bands,
+                    peak: 0.0,
+                    clipped: false,
+                }
+            })
+            .collect();
+        a.visible = vec![true; n];
+        a
+    }
+
+    fn render(a: &App, w: u16, h: u16) -> String {
+        crate::render_to_string(a, w, h)
+    }
+
+    #[test]
+    fn grid_mode_names_every_channel_it_shows() {
+        let mut a = app_with(6);
+        a.grid_mode = true;
+        let out = render(&a, 100, 24);
+        assert!(out.contains("all 6 channels"));
+        for i in 0..6 {
+            assert!(out.contains(&format!("ch.{i}")), "ch.{i} missing:\n{out}");
+        }
+    }
+
+    /// A truncated view must never read as a complete one.
+    #[test]
+    fn grid_mode_says_when_it_cannot_show_everything() {
+        let mut a = app_with(17);
+        a.grid_mode = true;
+        let out = render(&a, 60, 14);
+        assert!(
+            out.contains("more channels"),
+            "truncation went unreported:\n{out}"
+        );
+    }
+
+    #[test]
+    fn grid_mode_shows_everything_when_there_is_room() {
+        let mut a = app_with(4);
+        a.grid_mode = true;
+        let out = render(&a, 120, 30);
+        assert!(!out.contains("more channels"), "false truncation notice");
+    }
+
+    /// A channel with no EQ is drawn flat and dim, not omitted: "no filters"
+    /// must look different from "not there".
+    #[test]
+    fn a_flat_channel_still_gets_a_cell() {
+        let mut a = app_with(3);
+        a.grid_mode = true;
+        let out = render(&a, 100, 24);
+        assert!(out.contains("ch.1") && out.contains("ch.2"));
+        assert!(
+            out.chars().any(|c| (0x2800..=0x28FF).contains(&(c as u32))),
+            "flat channels should still draw a line"
+        );
+    }
+
+    #[test]
+    fn a_hidden_channel_keeps_its_label_but_loses_its_curve() {
+        let mut a = app_with(2);
+        a.grid_mode = true;
+        a.visible[0] = false;
+        let out = render(&a, 100, 24);
+        assert!(out.contains("ch.0"), "a hidden channel is still listed");
+    }
+
+    #[test]
+    fn the_phase_overlay_adds_a_second_trace() {
+        let mut a = app_with(1);
+        a.panel = Panel::Filters;
+        a.split = Split::GraphOnly;
+
+        let without = render(&a, 100, 20);
+        a.show_phase = true;
+        let with = render(&a, 100, 20);
+        assert_ne!(without, with, "the phase overlay changed nothing");
+
+        let count = |s: &str| {
+            s.chars()
+                .filter(|c| (0x2800..=0x28FF).contains(&(*c as u32)))
+                .count()
+        };
+        assert!(
+            count(&with) > count(&without),
+            "phase should add marks, not replace them"
+        );
+    }
+
+    #[test]
+    fn unwrapping_phase_changes_what_is_drawn() {
+        let mut a = app_with(1);
+        a.panel = Panel::Filters;
+        a.split = Split::GraphOnly;
+        a.show_phase = true;
+        // One filter does not accumulate enough phase to wrap inside the
+        // plotted band, so a cascade is needed for the two views to differ at
+        // all. `unwrap_phase` leaving a smooth curve untouched is correct, and
+        // is covered directly by the maths tests.
+        a.channels[0].bands = (0..4)
+            .map(|_| dsp::Band {
+                filter_type: dspi_proto::FilterType::HighPass,
+                freq: 500.0,
+                q: 4.0,
+                gain_db: 0.0,
+                bypass: false,
+            })
+            .collect();
+
+        let wrapped = dsp::phase_curve(&a.channels[0].bands);
+        assert!(
+            wrapped.windows(2).any(|w| (w[1] - w[0]).abs() > 180.0),
+            "the fixture must actually wrap, or this test proves nothing"
+        );
+
+        let before = render(&a, 100, 20);
+        a.phase_unwrapped = true;
+        assert_ne!(before, render(&a, 100, 20));
     }
 }

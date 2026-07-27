@@ -31,6 +31,8 @@ pub struct Bode<'a> {
     pub db_bottom: f64,
     /// A vertical marker, e.g. the focused band's centre frequency.
     pub marker_hz: Option<f64>,
+    /// A readout cursor, as an index into the curve.
+    pub cursor: Option<usize>,
 }
 
 impl<'a> Bode<'a> {
@@ -41,6 +43,7 @@ impl<'a> Bode<'a> {
             db_top: 15.0,
             db_bottom: -15.0,
             marker_hz: None,
+            cursor: None,
         }
     }
 
@@ -91,6 +94,17 @@ impl Widget for Bode<'_> {
                         .set_symbol("│")
                         .set_style(Style::default().fg(self.theme.accent));
                 }
+            }
+        }
+
+        // The cursor draws before the curves so a curve is never hidden by it.
+        if let Some(i) = self.cursor {
+            let t = i as f64 / (dsp::POINTS - 1) as f64;
+            let x = area.x + ((t * (area.width - 1) as f64).round() as u16).min(area.width - 1);
+            for y in area.y..area.y + area.height {
+                buf[(x, y)]
+                    .set_symbol("┊")
+                    .set_style(Style::default().fg(self.theme.pending));
             }
         }
 

@@ -202,6 +202,12 @@ fn w_over_two_tan(w: f64) -> f64 {
     (w / 2.0).tan()
 }
 
+/// Magnitude of one biquad at a frequency, as a power ratio. Public so the
+/// crossover module can reuse it for its cascades.
+pub fn magnitude_squared_of(c: &Coeffs, freq: f64) -> f64 {
+    magnitude_squared(c, freq)
+}
+
 /// Magnitude of one biquad at a frequency, as a power ratio.
 fn magnitude_squared(c: &Coeffs, freq: f64) -> f64 {
     let w = 2.0 * std::f64::consts::PI * freq / SAMPLE_RATE;
@@ -562,5 +568,164 @@ mod first_order_tests {
             close(mid, 6.0, 0.6),
             "corner should sit near half the 12 dB gain, got {mid}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase
+// ---------------------------------------------------------------------------
+
+/// Phase of one biquad at a frequency, in radians.
+fn phase_of(c: &Coeffs, freq: f64) -> f64 {
+    let w = 2.0 * std::f64::consts::PI * freq / SAMPLE_RATE;
+    let (cos_w, sin_w) = (w.cos(), w.sin());
+    let (cos_2w, sin_2w) = ((2.0 * w).cos(), (2.0 * w).sin());
+
+    let num_r = c.b0 + c.b1 * cos_w + c.b2 * cos_2w;
+    let num_i = -(c.b1 * sin_w + c.b2 * sin_2w);
+    let den_r = 1.0 + c.a1 * cos_w + c.a2 * cos_2w;
+    let den_i = -(c.a1 * sin_w + c.a2 * sin_2w);
+
+    num_i.atan2(num_r) - den_i.atan2(den_r)
+}
+
+/// Combined phase of a cascade at one frequency, in degrees, wrapped to +/-180.
+pub fn phase_at(freq: f64, bands: &[Band]) -> f64 {
+    let mut radians = 0.0;
+    for b in bands {
+        if b.bypass || matches!(b.filter_type, FilterType::Flat) {
+            continue;
+        }
+        radians += phase_of(&coefficients(b), freq);
+    }
+    let deg = radians.to_degrees();
+    // Wrap into +/-180 so the plot does not run off its axis.
+    let wrapped = (deg + 180.0).rem_euclid(360.0) - 180.0;
+    if wrapped.is_finite() { wrapped } else { 0.0 }
+}
+
+/// The whole phase curve, wrapped.
+pub fn phase_curve(bands: &[Band]) -> Vec<f64> {
+    frequencies().iter().map(|f| phase_at(*f, bands)).collect()
+}
+
+/// Remove the +/-180 discontinuities from a wrapped phase curve.
+///
+/// A wrapped curve is what the Console shows by default, but a steep filter
+/// wraps several times and the jumps read as features that are not there.
+/// Unwrapping is offered as an option for exactly that reason.
+pub fn unwrap_phase(wrapped: &[f64]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(wrapped.len());
+    let mut offset = 0.0;
+    let mut prev = wrapped.first().copied().unwrap_or(0.0);
+
+    for (i, p) in wrapped.iter().enumerate() {
+        if i > 0 {
+            let delta = p - prev;
+            // A jump of more than half a turn is a wrap, not a real excursion.
+            if delta > 180.0 {
+                offset -= 360.0;
+            } else if delta < -180.0 {
+                offset += 360.0;
+            }
+        }
+        prev = *p;
+        out.push(p + offset);
+    }
+    out
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+
+    fn peaking(freq: f32, q: f32, gain: f32) -> Band {
+        Band {
+            filter_type: FilterType::Peaking,
+            freq,
+            q,
+            gain_db: gain,
+            bypass: false,
+        }
+    }
+
+    #[test]
+    fn a_flat_chain_has_no_phase_shift() {
+        assert_eq!(phase_at(1000.0, &[]), 0.0);
+    }
+
+    /// A minimum-phase peaking filter crosses zero at its centre and has
+    /// opposite-signed phase either side.
+    #[test]
+    fn a_peaking_filter_is_zero_phase_at_centre() {
+        let b = [peaking(1000.0, 2.0, 6.0)];
+        assert!(phase_at(1000.0, &b).abs() < 0.5);
+        let below = phase_at(600.0, &b);
+        let above = phase_at(1600.0, &b);
+        assert!(
+            below * above < 0.0,
+            "phase should change sign across centre: {below} then {above}"
+        );
+    }
+
+    /// A first-order low pass approaches -90 degrees well above its corner.
+    #[test]
+    fn a_low_pass_lags() {
+        let b = [Band {
+            filter_type: FilterType::LowPass,
+            freq: 1000.0,
+            q: 0.707,
+            gain_db: 0.0,
+            bypass: false,
+        }];
+        assert!(
+            phase_at(1000.0, &b) < -80.0,
+            "a low pass lags at its corner"
+        );
+    }
+
+    #[test]
+    fn phase_is_always_within_the_plotted_axis() {
+        let b = [
+            peaking(100.0, 8.0, 12.0),
+            peaking(1000.0, 8.0, -12.0),
+            Band {
+                filter_type: FilterType::HighPass,
+                freq: 80.0,
+                q: 0.707,
+                gain_db: 0.0,
+                bypass: false,
+            },
+        ];
+        for p in phase_curve(&b) {
+            assert!((-180.0..=180.0).contains(&p), "phase {p} is off the axis");
+            assert!(p.is_finite());
+        }
+    }
+
+    #[test]
+    fn unwrapping_removes_the_jumps_without_moving_the_start() {
+        let wrapped = vec![170.0, 179.0, -179.0, -170.0];
+        let out = unwrap_phase(&wrapped);
+        assert_eq!(out[0], 170.0);
+        // The wrap becomes a continuous climb rather than a 358 degree drop.
+        assert!((out[2] - 181.0).abs() < 1e-9, "{out:?}");
+        assert!((out[3] - 190.0).abs() < 1e-9, "{out:?}");
+        for w in out.windows(2) {
+            assert!((w[1] - w[0]).abs() < 180.0, "a jump survived: {out:?}");
+        }
+    }
+
+    #[test]
+    fn unwrapping_leaves_a_smooth_curve_alone() {
+        let smooth = vec![0.0, -10.0, -20.0, -30.0];
+        assert_eq!(unwrap_phase(&smooth), smooth);
+    }
+
+    #[test]
+    fn a_bypassed_band_contributes_no_phase() {
+        let mut b = peaking(1000.0, 8.0, 12.0);
+        b.bypass = true;
+        assert_eq!(phase_at(700.0, &[b]), 0.0);
     }
 }

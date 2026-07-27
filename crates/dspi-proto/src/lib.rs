@@ -20,6 +20,7 @@ pub mod enums;
 pub mod registry;
 pub mod value;
 pub mod wire;
+pub mod xover;
 
 pub use channel::ChannelMap;
 pub use enums::FilterType;
