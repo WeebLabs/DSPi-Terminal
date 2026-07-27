@@ -4,6 +4,8 @@
 //! grammar arrive in later milestones; this binary exists now so that every
 //! layer below it is exercised against real hardware rather than only the mock.
 
+mod doctor;
+
 use std::process::ExitCode;
 
 use dspi_cmd::{Command, Context};
@@ -42,11 +44,13 @@ fn main() -> ExitCode {
         Some("list") => cmd_list(json),
         Some("params") => cmd_params(),
         Some("completions") => cmd_completions(&positional(&flags)),
+        Some("doctor") | Some("--doctor") => doctor::run(),
+        Some("--install-udev") => doctor::install_udev(),
         Some("screenshot") => cmd_screenshot(serial, &positional(&flags)),
         Some("dump") => cmd_dump(serial, json),
         // No arguments opens the interface; arguments run one command and exit.
-        None => cmd_tui(serial),
-        Some(other) if other.starts_with("--") => cmd_tui(serial),
+        None => cmd_tui(serial, flags.contains(&"--lite")),
+        Some(other) if other.starts_with("--") => cmd_tui(serial, flags.contains(&"--lite")),
         // Everything else is a command in the shared grammar, so the CLI and the
         // TUI's ':' line accept exactly the same syntax.
         Some(_) => cmd_run(serial, &flags, json),
@@ -93,6 +97,8 @@ USAGE:
     dspi eq <ch> <band> <type> [freq] [q] [gain]
                              set a whole filter band in one transfer
     dspi completions <shell> generate shell completions
+    dspi doctor              diagnose connection problems
+    dspi --install-udev      install the Linux udev rule (needs root)
     dspi --version           show app and protocol versions
 
 EXAMPLES:
@@ -106,6 +112,7 @@ EXAMPLES:
 OPTIONS:
     --device <serial>        target a specific device
     --json                   machine-readable output
+    --lite                   reduce redraw rate, for a Pi or a slow link
 "
     );
 }
@@ -266,7 +273,7 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
     exit::OK
 }
 
-fn cmd_tui(serial: Option<&str>) -> u8 {
+fn cmd_tui(serial: Option<&str>, lite: bool) -> u8 {
     let session = match connect(serial) {
         Ok(s) => s,
         Err(c) => return c,
@@ -277,6 +284,9 @@ fn cmd_tui(serial: Option<&str>) -> u8 {
         dspi_tui::app::detect_glyphs(),
     );
     let mut app = dspi_tui::App::from_session(theme, &session);
+    if lite {
+        app.perf = dspi_tui::app::Performance::lite();
+    }
 
     // Seed the curves from what the device is actually doing, so the first frame
     // shows the user's tuning rather than a flat line.

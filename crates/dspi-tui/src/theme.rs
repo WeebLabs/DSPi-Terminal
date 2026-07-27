@@ -16,24 +16,86 @@ pub enum ColorDepth {
     Mono,
 }
 
-impl ColorDepth {
-    /// Work it out from the environment, honouring `NO_COLOR`.
+/// What the environment says about the terminal.
+///
+/// Gathered into a struct so the decision is a pure function and can be tested
+/// for every platform, rather than only for whatever shell happens to be
+/// running the test suite.
+#[derive(Debug, Clone, Default)]
+pub struct TermEnv {
+    pub no_color: bool,
+    pub colorterm: Option<String>,
+    pub term: Option<String>,
+    /// Windows Terminal sets this; conhost does not.
+    pub wt_session: bool,
+    /// ConEmu sets this to "ON" when it is handling ANSI itself.
+    pub conemu_ansi: Option<String>,
+    pub term_program: Option<String>,
+    pub windows: bool,
+    /// Set by the user to force the coarser renderer.
+    pub force_no_unicode: bool,
+}
+
+impl TermEnv {
     pub fn detect() -> Self {
-        if std::env::var_os("NO_COLOR").is_some() {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        Self {
+            no_color: std::env::var_os("NO_COLOR").is_some(),
+            colorterm: var("COLORTERM"),
+            term: var("TERM"),
+            wt_session: std::env::var_os("WT_SESSION").is_some(),
+            conemu_ansi: var("ConEmuANSI"),
+            term_program: var("TERM_PROGRAM"),
+            windows: cfg!(target_os = "windows"),
+            force_no_unicode: std::env::var_os("DSPI_NO_UNICODE").is_some(),
+        }
+    }
+}
+
+impl ColorDepth {
+    pub fn detect() -> Self {
+        Self::from_env(&TermEnv::detect())
+    }
+
+    /// Work out the colour depth without touching the environment.
+    ///
+    /// Windows needs its own path: it normally sets neither `TERM` nor
+    /// `COLORTERM`, so the usual Unix sniffing would report 16 colours for
+    /// Windows Terminal, which in fact does full truecolor.
+    pub fn from_env(e: &TermEnv) -> Self {
+        if e.no_color {
             return Self::Mono;
         }
-        match std::env::var("COLORTERM").as_deref() {
-            Ok("truecolor" | "24bit") => Self::TrueColor,
-            _ => {
-                let term = std::env::var("TERM").unwrap_or_default();
-                if term == "dumb" {
-                    Self::Mono
-                } else if term.contains("256") {
-                    Self::Ansi256
-                } else {
-                    Self::Ansi16
-                }
+        if e.term.as_deref() == Some("dumb") {
+            return Self::Mono;
+        }
+
+        if matches!(e.colorterm.as_deref(), Some("truecolor" | "24bit")) {
+            return Self::TrueColor;
+        }
+
+        if e.windows {
+            // Windows Terminal and ConEmu both do truecolor; the classic
+            // console does not.
+            if e.wt_session || e.conemu_ansi.as_deref() == Some("ON") {
+                return Self::TrueColor;
             }
+            return Self::Ansi16;
+        }
+
+        // Some terminals advertise truecolor only through TERM_PROGRAM.
+        if matches!(
+            e.term_program.as_deref(),
+            Some("iTerm.app" | "WezTerm" | "vscode" | "Apple_Terminal")
+        ) && e.term_program.as_deref() != Some("Apple_Terminal")
+        {
+            return Self::TrueColor;
+        }
+
+        match e.term.as_deref() {
+            Some(t) if t.contains("256") => Self::Ansi256,
+            Some(_) => Self::Ansi16,
+            None => Self::Ansi16,
         }
     }
 }
@@ -257,5 +319,121 @@ mod tests {
     fn monochrome_asks_for_pattern_distinction_instead_of_colour() {
         assert!(Theme::dark(ColorDepth::Mono, Glyphs::Ascii).needs_pattern_distinction());
         assert!(!Theme::dark(ColorDepth::TrueColor, Glyphs::Braille).needs_pattern_distinction());
+    }
+}
+
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+    use crate::app::glyphs_for;
+
+    fn env() -> TermEnv {
+        TermEnv::default()
+    }
+
+    /// Windows sets neither TERM nor COLORTERM, so the usual Unix sniffing would
+    /// report 16 colours for Windows Terminal, which does full truecolor.
+    #[test]
+    fn windows_terminal_gets_truecolor_and_braille() {
+        let e = TermEnv {
+            windows: true,
+            wt_session: true,
+            ..env()
+        };
+        assert_eq!(ColorDepth::from_env(&e), ColorDepth::TrueColor);
+        assert_eq!(glyphs_for(&e), Glyphs::Braille);
+    }
+
+    /// The classic console renders braille as boxes in most fonts, so it gets
+    /// blocks even though it can handle Unicode.
+    #[test]
+    fn the_windows_classic_console_gets_blocks() {
+        let e = TermEnv {
+            windows: true,
+            ..env()
+        };
+        assert_eq!(ColorDepth::from_env(&e), ColorDepth::Ansi16);
+        assert_eq!(glyphs_for(&e), Glyphs::Blocks);
+    }
+
+    #[test]
+    fn conemu_is_treated_like_windows_terminal() {
+        let e = TermEnv {
+            windows: true,
+            conemu_ansi: Some("ON".into()),
+            ..env()
+        };
+        assert_eq!(ColorDepth::from_env(&e), ColorDepth::TrueColor);
+        assert_eq!(glyphs_for(&e), Glyphs::Braille);
+    }
+
+    #[test]
+    fn colorterm_wins_everywhere() {
+        for windows in [true, false] {
+            let e = TermEnv {
+                windows,
+                colorterm: Some("truecolor".into()),
+                ..env()
+            };
+            assert_eq!(ColorDepth::from_env(&e), ColorDepth::TrueColor);
+        }
+    }
+
+    #[test]
+    fn unix_terminals_are_read_from_term() {
+        let e = TermEnv {
+            term: Some("xterm-256color".into()),
+            ..env()
+        };
+        assert_eq!(ColorDepth::from_env(&e), ColorDepth::Ansi256);
+
+        let e = TermEnv {
+            term: Some("xterm".into()),
+            ..env()
+        };
+        assert_eq!(ColorDepth::from_env(&e), ColorDepth::Ansi16);
+    }
+
+    /// NO_COLOR is a cross-ecosystem convention and overrides everything.
+    #[test]
+    fn no_color_beats_every_other_signal() {
+        let e = TermEnv {
+            no_color: true,
+            colorterm: Some("truecolor".into()),
+            wt_session: true,
+            windows: true,
+            ..env()
+        };
+        assert_eq!(ColorDepth::from_env(&e), ColorDepth::Mono);
+    }
+
+    #[test]
+    fn a_dumb_terminal_gets_no_colour_and_plain_ascii() {
+        let e = TermEnv {
+            term: Some("dumb".into()),
+            colorterm: Some("truecolor".into()),
+            ..env()
+        };
+        assert_eq!(ColorDepth::from_env(&e), ColorDepth::Mono);
+        assert_eq!(glyphs_for(&e), Glyphs::Ascii);
+    }
+
+    #[test]
+    fn the_user_can_force_the_coarser_renderer() {
+        let e = TermEnv {
+            force_no_unicode: true,
+            colorterm: Some("truecolor".into()),
+            ..env()
+        };
+        assert_eq!(glyphs_for(&e), Glyphs::Blocks);
+    }
+
+    /// A bare Linux console or a Raspberry Pi over SSH with no TERM should still
+    /// render, just conservatively.
+    #[test]
+    fn an_unknown_environment_still_works() {
+        let e = env();
+        assert_eq!(ColorDepth::from_env(&e), ColorDepth::Ansi16);
+        assert_eq!(glyphs_for(&e), Glyphs::Braille);
     }
 }

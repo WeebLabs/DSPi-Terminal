@@ -6,6 +6,14 @@ pub mod widgets;
 
 pub use app::{App, run};
 
+/// The terminal's current size, or `None` when stdout is not a terminal.
+///
+/// Exposed here so callers do not need their own crossterm dependency, which
+/// could drift to a different version than the one actually drawing.
+pub fn terminal_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size().ok()
+}
+
 /// Render one frame to text, without a terminal.
 ///
 /// Used by the golden-frame tests and by `dspi screenshot`, so what the tests

@@ -21,6 +21,73 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table};
 use crate::theme::{Glyphs, Theme};
 use crate::widgets::{Bode, Curve, Meter, frequency_axis};
 
+/// How hard the interface is allowed to work.
+///
+/// A Raspberry Pi reached over SSH pays for every repaint in bytes on the wire,
+/// not in processor time, so the useful lever is how often the screen changes
+/// rather than how fast it can be drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Performance {
+    /// How often to poll the device's meters.
+    pub meter_interval: Duration,
+    /// How long to wait for a keypress before redrawing.
+    pub event_timeout: Duration,
+    pub animate: bool,
+}
+
+impl Default for Performance {
+    fn default() -> Self {
+        Self {
+            meter_interval: Duration::from_millis(50),
+            event_timeout: Duration::from_millis(30),
+            animate: true,
+        }
+    }
+}
+
+impl Performance {
+    /// The conservative profile: meters at 10 Hz and no animation.
+    pub fn lite() -> Self {
+        Self {
+            meter_interval: Duration::from_millis(100),
+            event_timeout: Duration::from_millis(100),
+            animate: false,
+        }
+    }
+
+    /// Pick a profile from the machine and the connection.
+    ///
+    /// A single-core part or an ARMv6 (a Pi Zero or an original Pi) gets the
+    /// lite profile, as does any session reached over SSH, where the cost of a
+    /// repaint is the link rather than the processor.
+    pub fn detect() -> Self {
+        if is_low_powered() || over_ssh() {
+            Self::lite()
+        } else {
+            Self::default()
+        }
+    }
+}
+
+/// True for a single-core machine or an ARMv6 part.
+fn is_low_powered() -> bool {
+    if std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        <= 1
+    {
+        return true;
+    }
+    // Only Linux exposes this, and it is the only place a Pi Zero appears.
+    std::fs::read_to_string("/proc/cpuinfo")
+        .map(|s| s.contains("ARMv6"))
+        .unwrap_or(false)
+}
+
+fn over_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
 /// The panels, in signal-flow order. Crossover folds into Filters as a sub-tab
 /// and Output folds into Matrix, keeping the bar on one line at 80 columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +243,7 @@ pub struct App {
     pub status: Option<(String, Instant)>,
 
     pub ctx: Context,
+    pub perf: Performance,
     pub should_quit: bool,
 }
 
@@ -211,6 +279,7 @@ impl App {
             echo: String::new(),
             status: None,
             ctx: Context::default(),
+            perf: Performance::detect(),
             should_quit: false,
         }
     }
@@ -1129,16 +1198,13 @@ impl App {
 /// transfer for the whole device. Everything else waits on the notification
 /// endpoint, so the poll rate only has to keep the meters looking alive.
 pub fn run(mut app: App, session: &mut Session) -> io::Result<()> {
-    /// Fast enough to look live, slow enough that a Pi over SSH is not spending
-    /// its evening repainting bars.
-    const METER_INTERVAL: Duration = Duration::from_millis(50);
-
+    let perf = app.perf;
     let mut terminal = ratatui::init();
-    let mut last_poll = Instant::now() - METER_INTERVAL;
+    let mut last_poll = Instant::now() - perf.meter_interval;
 
     let result = (|| -> io::Result<()> {
         loop {
-            if last_poll.elapsed() >= METER_INTERVAL {
+            if last_poll.elapsed() >= perf.meter_interval {
                 if let Ok(m) = session.meters() {
                     app.apply_meters(&m);
                 }
@@ -1147,7 +1213,7 @@ pub fn run(mut app: App, session: &mut Session) -> io::Result<()> {
 
             terminal.draw(|f| app.draw(f))?;
 
-            if event::poll(Duration::from_millis(30))?
+            if event::poll(perf.event_timeout)?
                 && let Event::Key(key) = event::read()?
                 && key.kind == event::KeyEventKind::Press
             {
@@ -1164,14 +1230,25 @@ pub fn run(mut app: App, session: &mut Session) -> io::Result<()> {
 
 /// Choose glyphs the terminal can actually render.
 pub fn detect_glyphs() -> Glyphs {
-    let term = std::env::var("TERM").unwrap_or_default();
-    if term == "dumb" {
-        Glyphs::Ascii
-    } else if std::env::var_os("DSPI_NO_UNICODE").is_some() {
-        Glyphs::Blocks
-    } else {
-        Glyphs::Braille
+    glyphs_for(&crate::theme::TermEnv::detect())
+}
+
+/// Pick a glyph set without touching the environment.
+///
+/// The Windows classic console renders braille as boxes in most fonts, so it
+/// gets blocks even though it is perfectly capable of Unicode. Windows Terminal
+/// handles braille correctly and is detected separately.
+pub fn glyphs_for(e: &crate::theme::TermEnv) -> Glyphs {
+    if e.term.as_deref() == Some("dumb") {
+        return Glyphs::Ascii;
     }
+    if e.force_no_unicode {
+        return Glyphs::Blocks;
+    }
+    if e.windows && !e.wt_session && e.conemu_ansi.as_deref() != Some("ON") {
+        return Glyphs::Blocks;
+    }
+    Glyphs::Braille
 }
 
 #[cfg(test)]
@@ -1755,5 +1832,36 @@ mod grid_and_phase_tests {
         let before = render(&a, 100, 20);
         a.phase_unwrapped = true;
         assert_ne!(before, render(&a, 100, 20));
+    }
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+
+    #[test]
+    fn the_lite_profile_redraws_less_and_stops_animating() {
+        let full = Performance::default();
+        let lite = Performance::lite();
+        assert!(lite.meter_interval > full.meter_interval);
+        assert!(lite.event_timeout > full.event_timeout);
+        assert!(full.animate && !lite.animate);
+    }
+
+    /// Both profiles must stay responsive enough to feel alive: a meter that
+    /// updates once a second reads as broken rather than as economical.
+    #[test]
+    fn both_profiles_stay_within_useful_bounds() {
+        for p in [Performance::default(), Performance::lite()] {
+            assert!(p.meter_interval <= Duration::from_millis(200));
+            assert!(p.event_timeout <= Duration::from_millis(200));
+            assert!(p.meter_interval >= Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn detection_returns_one_of_the_two_profiles() {
+        let p = Performance::detect();
+        assert!(p == Performance::default() || p == Performance::lite());
     }
 }
