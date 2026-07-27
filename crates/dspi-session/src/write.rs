@@ -16,8 +16,10 @@
 //! wrong. There is one implementation, and the outcome type makes a silent
 //! rejection impossible to ignore.
 
+use dspi_proto::FilterType;
+use dspi_proto::generated::opcodes as op;
 use dspi_proto::registry::{Hazard, Kind, ParamDesc, Requires, Target, WValue, by_path};
-use dspi_proto::value::{Repr, Value, ValueError};
+use dspi_proto::value::{EqParamPacket, Repr, Value, ValueError, decode_qp};
 use dspi_proto::{ChannelMap, Dir, Platform};
 use dspi_transport::{Transport, TransportError, with_busy_retry};
 
@@ -150,6 +152,16 @@ impl Session {
             return Ok(outcome);
         }
 
+        // An EQ band is written as one whole packet, never field by field: the
+        // firmware's SET_EQ_PARAM takes a 16-byte descriptor and carries nothing
+        // in wValue. Changing one field therefore means reading the band,
+        // editing it, and writing it back.
+        if matches!(d.wvalue, WValue::EqScalar(_)) {
+            let outcome = self.write_eq_field(d, indices[0], indices[1], &value)?;
+            self.record(d, indices, before, value, outcome.clone());
+            return Ok(outcome);
+        }
+
         let wvalue = self.build_wvalue(d, indices, &value)?;
         let repr = d.kind.repr();
 
@@ -168,6 +180,103 @@ impl Session {
         let outcome = self.confirm(d, indices, &value)?;
         self.record(d, indices, before, value, outcome.clone());
         Ok(outcome)
+    }
+
+    /// Read a whole EQ band.
+    ///
+    /// There is no full-packet read in the protocol, so this costs five
+    /// transfers, plus a sixth for the Linkwitz Transform's `Qp`.
+    pub fn read_band(&mut self, channel: u8, band: u8) -> Result<EqParamPacket, WriteError> {
+        let scalar = |s: &mut Self, param: u8, len: u16| -> Result<Vec<u8>, WriteError> {
+            let wvalue = ((channel as u16) << 8) | ((band as u16) << 3) | param as u16;
+            Ok(with_busy_retry(
+                || s.transport.control_in(op::REQ_GET_EQ_PARAM, wvalue, len),
+                op::REQ_GET_EQ_PARAM,
+            )?)
+        };
+        let f32_at = |s: &mut Self, param: u8| -> Result<f32, WriteError> {
+            let b = scalar(s, param, 4)?;
+            Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+
+        let filter_type = FilterType::from_raw(scalar(self, 0, 4)?[0]);
+        let freq = f32_at(self, 1)?;
+        let q = f32_at(self, 2)?;
+        let gain_db = f32_at(self, 3)?;
+        let bypass = scalar(self, 4, 4)?[0] != 0;
+
+        // Only fetch the sidecar when it means something; on other types the
+        // firmware stores zero there and reading it would just cost a transfer.
+        let qp = if filter_type.is_linkwitz() {
+            let raw = scalar(self, 5, 4)?;
+            Some(decode_qp(u16::from_le_bytes([raw[0], raw[1]])))
+        } else {
+            None
+        };
+
+        Ok(EqParamPacket {
+            channel,
+            band,
+            filter_type,
+            bypass,
+            freq,
+            q,
+            gain_db,
+            qp,
+        })
+    }
+
+    /// Write a whole EQ band in one transfer.
+    ///
+    /// Prefer this over setting fields one at a time: it is one transfer rather
+    /// than seven, and it cannot leave the band in a half-updated state if the
+    /// device disappears midway.
+    pub fn write_band(&mut self, packet: &EqParamPacket) -> Result<Outcome, WriteError> {
+        if self.dry_run {
+            return Ok(Outcome::Accepted);
+        }
+        self.transport
+            .control_out(op::REQ_SET_EQ_PARAM, 0, &packet.encode())?;
+
+        let actual = self.read_band(packet.channel, packet.band)?;
+        Ok(if bands_agree(packet, &actual) {
+            Outcome::Confirmed(Value::Bytes(packet.encode()))
+        } else {
+            Outcome::Rejected {
+                sent: Value::Bytes(packet.encode()),
+                actual: Value::Bytes(actual.encode()),
+            }
+        })
+    }
+
+    /// Change one field of a band, preserving the rest.
+    fn write_eq_field(
+        &mut self,
+        d: &ParamDesc,
+        channel: u8,
+        band: u8,
+        value: &Value,
+    ) -> Result<Outcome, WriteError> {
+        let mut packet = self.read_band(channel, band)?;
+
+        match d.path {
+            "eq.type" => {
+                packet.filter_type = FilterType::from_raw(value.as_u8().unwrap_or(0));
+                // Switching to a Linkwitz Transform needs a Qp to send; the
+                // firmware reads 0 as "use the 0.707 default".
+                if packet.filter_type.is_linkwitz() && packet.qp.is_none() {
+                    packet.qp = Some(0.707);
+                }
+            }
+            "eq.freq" => packet.freq = value.as_f32().unwrap_or(packet.freq),
+            "eq.q" => packet.q = value.as_f32().unwrap_or(packet.q),
+            "eq.gain" => packet.gain_db = value.as_f32().unwrap_or(packet.gain_db),
+            other => {
+                return Err(WriteError::UnknownParam(other.into()));
+            }
+        }
+
+        self.write_band(&packet)
     }
 
     /// Read one parameter back.
@@ -425,6 +534,18 @@ fn decode_read(d: &ParamDesc, bytes: &[u8]) -> Value {
     }
 }
 
+/// Compare a whole band, field by field, with the same float tolerance scalars
+/// use. Comparing encoded bytes would report spurious rejections, because the
+/// device re-quantises what it stores.
+fn bands_agree(sent: &EqParamPacket, actual: &EqParamPacket) -> bool {
+    let close = |a: f32, b: f32| (a - b).abs() <= a.abs().max(1.0) * 1e-3;
+    sent.filter_type == actual.filter_type
+        && sent.bypass == actual.bypass
+        && close(sent.freq, actual.freq)
+        && close(sent.q, actual.q)
+        && close(sent.gain_db, actual.gain_db)
+}
+
 /// Compare what we sent against what came back.
 ///
 /// Floats need a tolerance: the device stores single precision and several
@@ -454,7 +575,7 @@ mod tests {
     use dspi_transport::MockTransport;
     use dspi_transport::mock::{Direction, Reply};
 
-    fn caps(platform: Platform, features: &[(&str, bool)]) -> Capabilities {
+    pub(super) fn caps(platform: Platform, features: &[(&str, bool)]) -> Capabilities {
         Capabilities {
             serial: "TEST".into(),
             platform,
@@ -493,7 +614,7 @@ mod tests {
     }
 
     /// Fixed-width NUL-padded text, as the device actually returns it.
-    fn padded(s: &str) -> Vec<u8> {
+    pub(super) fn padded(s: &str) -> Vec<u8> {
         let mut v = vec![0u8; 32];
         v[..s.len()].copy_from_slice(s.as_bytes());
         v
@@ -761,6 +882,93 @@ mod tests {
     fn mock_log_shows_direction_for_out_writes() {
         let mut t = MockTransport::new();
         let _ = t.control_out(op::REQ_SET_USER_VOLUME, 0, &[0, 0, 0, 0]);
-        assert_eq!(t.log[0].direction, Direction::Out);
+        assert_eq!(t.log()[0].direction, Direction::Out);
+    }
+}
+
+#[cfg(test)]
+mod eq_tests {
+    use super::tests::caps;
+    use super::*;
+    use dspi_proto::generated::opcodes as op;
+    use dspi_transport::MockTransport;
+    use dspi_transport::mock::Direction;
+
+    /// The bug this replaced: a scalar write to 0x42 sends four bytes with a
+    /// packed wValue, but the firmware wants a 16-byte descriptor and reads
+    /// nothing from wValue. It would have been rejected on hardware.
+    /// Build a session over a mock, keeping a handle on the wire log.
+    fn rig(reply: [u8; 4]) -> (Session, dspi_transport::mock::LogHandle) {
+        let t = MockTransport::new().data(op::REQ_GET_EQ_PARAM, reply.to_vec());
+        let log = t.log_handle();
+        let s = Session::new(Box::new(t), caps(Platform::Rp2350, &[])).unwrap();
+        (s, log)
+    }
+
+    #[test]
+    fn changing_one_field_sends_a_whole_band_packet() {
+        let (mut s, log) = rig(1000.0f32.to_le_bytes());
+
+        s.write("eq.freq", &[8, 3], Value::Float(2856.0)).unwrap();
+
+        let writes: Vec<_> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.direction == Direction::Out && e.opcode == op::REQ_SET_EQ_PARAM)
+            .cloned()
+            .collect();
+
+        assert_eq!(writes.len(), 1, "exactly one band write");
+        let w = &writes[0];
+        assert_eq!(
+            w.payload.len(),
+            16,
+            "the firmware wants a 16-byte descriptor"
+        );
+        assert_eq!(w.value, 0, "wValue carries nothing for this opcode");
+        assert_eq!(w.payload[0], 8, "channel travels in the payload");
+        assert_eq!(w.payload[1], 3, "so does the band");
+        assert_eq!(
+            &w.payload[4..8],
+            &2856.0f32.to_le_bytes(),
+            "the new frequency"
+        );
+    }
+
+    /// Fields the user did not touch must survive the round trip.
+    #[test]
+    fn untouched_fields_are_preserved() {
+        let (mut s, log) = rig(3.5f32.to_le_bytes());
+
+        s.write("eq.gain", &[8, 3], Value::Float(-6.0)).unwrap();
+
+        let w = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.opcode == op::REQ_SET_EQ_PARAM)
+            .cloned()
+            .unwrap();
+        // Freq and Q came from the read, not from defaults.
+        assert_eq!(&w.payload[4..8], &3.5f32.to_le_bytes());
+        assert_eq!(&w.payload[8..12], &3.5f32.to_le_bytes());
+        assert_eq!(&w.payload[12..16], &(-6.0f32).to_le_bytes());
+    }
+
+    /// A plain band write must stay 16 bytes, or it would clobber the stored Qp.
+    #[test]
+    fn non_linkwitz_writes_never_grow_to_eighteen_bytes() {
+        let (mut s, log) = rig(1000.0f32.to_le_bytes());
+        s.write("eq.q", &[8, 3], Value::Float(2.0)).unwrap();
+
+        let w = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.opcode == op::REQ_SET_EQ_PARAM)
+            .cloned()
+            .unwrap();
+        assert_eq!(w.payload.len(), 16);
     }
 }

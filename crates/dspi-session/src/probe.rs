@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(packet.as_bytes().len(), generated::BULK_SIZE);
 
         let chunk_reads = t
-            .log
+            .log()
             .iter()
             .filter(|e| e.opcode == op::REQ_GET_ALL_PARAMS_CHUNK)
             .count();
@@ -391,7 +391,7 @@ mod tests {
 
         // Offsets must be sequential from 0: the firmware snapshots at offset 0.
         let offsets: Vec<u16> = t
-            .log
+            .log()
             .iter()
             .filter(|e| e.opcode == op::REQ_GET_ALL_PARAMS_CHUNK)
             .map(|e| e.value)

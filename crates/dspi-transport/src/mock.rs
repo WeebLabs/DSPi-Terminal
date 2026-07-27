@@ -7,6 +7,7 @@
 //! hardware and expensive to get wrong in the field.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::{DeviceDescriptor, Result, Transport, TransportError};
 
@@ -45,10 +46,17 @@ pub enum Direction {
     Out,
 }
 
+/// A shared handle to the recorded exchanges.
+///
+/// The log is shared rather than owned so a test can keep watching it after the
+/// transport has been moved into a `Session`, which is exactly when asserting on
+/// the wire matters most.
+pub type LogHandle = Arc<Mutex<Vec<Exchange>>>;
+
 #[derive(Default)]
 pub struct MockTransport {
     replies: HashMap<u8, Reply>,
-    pub log: Vec<Exchange>,
+    log: LogHandle,
     descriptor: Option<DeviceDescriptor>,
     max_transfer: Option<usize>,
 }
@@ -86,9 +94,19 @@ impl MockTransport {
         self
     }
 
+    /// A handle that keeps working once this transport has been handed away.
+    pub fn log_handle(&self) -> LogHandle {
+        Arc::clone(&self.log)
+    }
+
+    /// Everything recorded so far.
+    pub fn log(&self) -> Vec<Exchange> {
+        self.log.lock().unwrap().clone()
+    }
+
     /// Every opcode the code under test touched, in order.
     pub fn opcodes_seen(&self) -> Vec<u8> {
-        self.log.iter().map(|e| e.opcode).collect()
+        self.log.lock().unwrap().iter().map(|e| e.opcode).collect()
     }
 
     fn resolve(&mut self, opcode: u8, value: u16) -> Result<Vec<u8>> {
@@ -117,7 +135,7 @@ impl MockTransport {
 
 impl Transport for MockTransport {
     fn control_in(&mut self, opcode: u8, value: u16, len: u16) -> Result<Vec<u8>> {
-        self.log.push(Exchange {
+        self.log.lock().unwrap().push(Exchange {
             direction: Direction::In,
             opcode,
             value,
@@ -139,7 +157,7 @@ impl Transport for MockTransport {
     }
 
     fn control_out(&mut self, opcode: u8, value: u16, data: &[u8]) -> Result<()> {
-        self.log.push(Exchange {
+        self.log.lock().unwrap().push(Exchange {
             direction: Direction::Out,
             opcode,
             value,
@@ -205,7 +223,7 @@ mod tests {
         let mut t = MockTransport::new();
         let _ = t.control_out(0x42, 0, &[1, 2, 3]);
         assert_eq!(
-            t.log[0],
+            t.log()[0],
             Exchange {
                 direction: Direction::Out,
                 opcode: 0x42,

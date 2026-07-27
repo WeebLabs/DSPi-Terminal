@@ -6,6 +6,7 @@
 
 use std::process::ExitCode;
 
+use dspi_cmd::{Command, Context};
 use dspi_proto::registry::{Kind, REGISTRY, by_path};
 use dspi_proto::value::Value;
 
@@ -40,15 +41,12 @@ fn main() -> ExitCode {
         }
         Some("list") => cmd_list(json),
         Some("params") => cmd_params(),
-        Some("get") => cmd_get(serial, &flags, json),
-        Some("set") => cmd_set(serial, &flags, json),
+        Some("completions") => cmd_completions(&positional(&flags)),
         Some("dump") | None => cmd_dump(serial, json),
         Some(other) if other.starts_with("--") => cmd_dump(serial, json),
-        Some(other) => {
-            eprintln!("dspi: unknown command `{other}`\n");
-            usage();
-            exit::USAGE
-        }
+        // Everything else is a command in the shared grammar, so the CLI and the
+        // TUI's ':' line accept exactly the same syntax.
+        Some(_) => cmd_run(serial, &flags, json),
     };
 
     ExitCode::from(code)
@@ -87,6 +85,10 @@ USAGE:
     dspi params              list every parameter this build knows
     dspi get <path> [i..]    read one parameter
     dspi set <path> [i..] v  write one parameter, and confirm it
+    dspi <path> [i..] v      the same, without the `set`
+    dspi eq <ch> <band> <type> [freq] [q] [gain]
+                             set a whole filter band in one transfer
+    dspi completions <shell> generate shell completions
     dspi --version           show app and protocol versions
 
 EXAMPLES:
@@ -94,6 +96,8 @@ EXAMPLES:
     dspi set vol.user -18
     dspi get eq.freq 8 3
     dspi set bass.drive 12
+    dspi eq usb.1 3 peak 2856 3.58 -8.6
+    dspi ch.delay i2s.1.l 5
 
 OPTIONS:
     --device <serial>        target a specific device
@@ -212,6 +216,176 @@ fn cmd_dump(serial: Option<&str>, json: bool) -> u8 {
     exit::OK
 }
 
+fn cmd_completions(args: &[&str]) -> u8 {
+    let Some(shell) = args.first() else {
+        eprintln!(
+            "dspi: which shell? one of: {}",
+            dspi_cmd::shell::SHELLS.join(", ")
+        );
+        return exit::USAGE;
+    };
+    match dspi_cmd::shell::generate(shell) {
+        Some(script) => {
+            print!("{script}");
+            exit::OK
+        }
+        None => {
+            eprintln!(
+                "dspi: no completions for `{shell}`; try one of: {}",
+                dspi_cmd::shell::SHELLS.join(", ")
+            );
+            exit::USAGE
+        }
+    }
+}
+
+/// Parse with the shared grammar, then run it.
+///
+/// Parsing needs the device's channel names, so this connects first. That costs
+/// a little latency on a bad command, but it means `dspi ch.delay i2s.1.l 5`
+/// works with the names the device actually reports.
+fn cmd_run(serial: Option<&str>, flags: &[&str], json: bool) -> u8 {
+    let args = positional_all(flags);
+    let mut s = match connect(serial) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    if flags.contains(&"--dry-run") {
+        s.dry_run = true;
+    }
+
+    let ctx = context_for(&s);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let cmd = match dspi_cmd::parse(&refs, &ctx) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("dspi: {e}");
+            return exit::USAGE;
+        }
+    };
+
+    run(&mut s, cmd, json, flags.contains(&"--quiet"))
+}
+
+fn context_for(s: &Session) -> Context {
+    let caps = s.capabilities();
+    Context {
+        channel_slugs: caps.channels.iter().map(|c| c.slug.clone()).collect(),
+        num_inputs: caps.num_inputs,
+        num_outputs: caps.num_outputs,
+        max_bands: caps.max_bands,
+    }
+}
+
+fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool) -> u8 {
+    match cmd {
+        Command::Get { path, indices } => {
+            let d = by_path(path).expect("the parser only returns known paths");
+            match s.read(path, &indices) {
+                Ok(v) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "path": path, "value": show(d.kind, &v) })
+                        );
+                    } else {
+                        println!("{}", show(d.kind, &v));
+                    }
+                    exit::OK
+                }
+                Err(e) => {
+                    eprintln!("dspi: {e}");
+                    write_exit(&e)
+                }
+            }
+        }
+
+        Command::Set {
+            path,
+            indices,
+            value,
+        } => {
+            let d = by_path(path).expect("the parser only returns known paths");
+            match s.write(path, &indices, value.clone()) {
+                Ok(Outcome::Rejected { sent, actual }) => {
+                    eprintln!(
+                        "dspi: {path} was not applied. Asked for {}, device kept {}.",
+                        show(d.kind, &sent),
+                        show(d.kind, &actual)
+                    );
+                    exit::REJECTED
+                }
+                Ok(outcome) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "path": path,
+                                "value": show(d.kind, &value),
+                                "outcome": format!("{outcome:?}"),
+                            })
+                        );
+                    } else if !quiet {
+                        println!("{path} = {}", show(d.kind, &value));
+                    }
+                    exit::OK
+                }
+                Err(e) => {
+                    eprintln!("dspi: {e}");
+                    write_exit(&e)
+                }
+            }
+        }
+
+        Command::SetBand {
+            channel,
+            band,
+            filter_type,
+            freq,
+            q,
+            gain,
+        } => {
+            // One transfer for the whole band, which is how the firmware stores
+            // it; setting fields one at a time would be six round trips.
+            let packet = dspi_proto::value::EqParamPacket {
+                channel,
+                band,
+                filter_type: dspi_proto::FilterType::from_raw(filter_type),
+                bypass: false,
+                freq,
+                q,
+                gain_db: gain,
+                qp: None,
+            };
+            match s.write_band(&packet) {
+                Ok(Outcome::Rejected { .. }) => {
+                    eprintln!("dspi: the band was not applied as sent");
+                    exit::REJECTED
+                }
+                Ok(_) => {
+                    if !quiet {
+                        println!(
+                            "band {} on channel {channel} = {} {freq} Hz Q {q} {gain:+} dB",
+                            band + 1,
+                            dspi_proto::FilterType::from_raw(filter_type).label()
+                        );
+                    }
+                    exit::OK
+                }
+                Err(e) => {
+                    eprintln!("dspi: {e}");
+                    write_exit(&e)
+                }
+            }
+        }
+
+        Command::Verb { name, .. } => {
+            eprintln!("dspi: `{name}` is not usable here");
+            exit::USAGE
+        }
+    }
+}
+
 fn cmd_params() -> u8 {
     for d in REGISTRY {
         let arity = d.target.arity();
@@ -238,6 +412,27 @@ fn cmd_params() -> u8 {
         );
     }
     exit::OK
+}
+
+/// Every positional token, including the first, for the shared grammar.
+fn positional_all(flags: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for f in flags {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if *f == "--device" {
+            skip = true;
+            continue;
+        }
+        if f.starts_with("--") {
+            continue;
+        }
+        out.push((*f).to_string());
+    }
+    out
 }
 
 /// Positional arguments after the command, excluding flags and their values.
@@ -271,111 +466,6 @@ fn connect(serial: Option<&str>) -> Result<Session, u8> {
     })
 }
 
-fn cmd_get(serial: Option<&str>, flags: &[&str], json: bool) -> u8 {
-    let args = positional(flags);
-    let Some(path) = args.first() else {
-        eprintln!("dspi: get needs a parameter path, e.g. `dspi get vol.user`");
-        return exit::USAGE;
-    };
-    let Some(d) = by_path(path) else {
-        eprintln!("dspi: no parameter called `{path}`. Try `dspi params`.");
-        return exit::USAGE;
-    };
-    let indices: Vec<u8> = args[1..].iter().filter_map(|a| a.parse().ok()).collect();
-
-    let mut s = match connect(serial) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-
-    match s.read(path, &indices) {
-        Ok(v) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({ "path": path, "value": show(d.kind, &v) })
-                );
-            } else {
-                // Bare value, so it captures cleanly in a shell.
-                println!("{}", show(d.kind, &v));
-            }
-            exit::OK
-        }
-        Err(e) => {
-            eprintln!("dspi: {e}");
-            exit::TRANSPORT
-        }
-    }
-}
-
-fn cmd_set(serial: Option<&str>, flags: &[&str], json: bool) -> u8 {
-    let args = positional(flags);
-    if args.len() < 2 {
-        eprintln!("dspi: set needs a path and a value, e.g. `dspi set vol.user -18`");
-        return exit::USAGE;
-    }
-    let path = args[0];
-    let Some(d) = by_path(path) else {
-        eprintln!("dspi: no parameter called `{path}`. Try `dspi params`.");
-        return exit::USAGE;
-    };
-
-    // Everything between the path and the final value is an index.
-    let raw_value = *args.last().unwrap();
-    let indices: Vec<u8> = args[1..args.len() - 1]
-        .iter()
-        .filter_map(|a| a.parse().ok())
-        .collect();
-
-    let value = match parse_value(d.kind, raw_value) {
-        Some(v) => v,
-        None => {
-            eprintln!("dspi: `{raw_value}` is not a valid value for {path}");
-            return exit::USAGE;
-        }
-    };
-
-    let mut s = match connect(serial) {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-    if flags.contains(&"--dry-run") {
-        s.dry_run = true;
-    }
-
-    match s.write(path, &indices, value.clone()) {
-        Ok(Outcome::Rejected { sent, actual }) => {
-            // The device accepted the request and then did something else. This
-            // must not exit zero: a script needs to notice.
-            eprintln!(
-                "dspi: {path} was not applied. Asked for {}, device kept {}.",
-                show(d.kind, &sent),
-                show(d.kind, &actual)
-            );
-            exit::REJECTED
-        }
-        Ok(outcome) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "path": path,
-                        "value": show(d.kind, &value),
-                        "outcome": format!("{outcome:?}"),
-                    })
-                );
-            } else if !flags.contains(&"--quiet") {
-                println!("{} = {}", path, show(d.kind, &value));
-            }
-            exit::OK
-        }
-        Err(e) => {
-            eprintln!("dspi: {e}");
-            write_exit(&e)
-        }
-    }
-}
-
 /// Distinguish "you typed something wrong" from "the device is unhappy".
 ///
 /// A script needs to tell these apart: bad input is worth reporting to a human,
@@ -402,33 +492,6 @@ fn show(kind: Kind, v: &Value) -> String {
         return (*name).to_string();
     }
     v.display(kind.unit())
-}
-
-fn parse_value(kind: Kind, raw: &str) -> Option<Value> {
-    Some(match kind {
-        Kind::Bool => match raw.to_ascii_lowercase().as_str() {
-            "on" | "true" | "yes" | "1" => Value::Bool(true),
-            "off" | "false" | "no" | "0" => Value::Bool(false),
-            _ => return None,
-        },
-        Kind::Trigger => Value::Trigger,
-        Kind::Choice(variants) => {
-            let lower = raw.to_ascii_lowercase();
-            let by_name = variants.iter().find(|(_, n)| *n == lower);
-            match by_name {
-                Some((v, _)) => Value::Choice(*v),
-                None => Value::Choice(raw.parse().ok()?),
-            }
-        }
-        Kind::Text { .. } => Value::Text(raw.to_string()),
-        Kind::Int { .. } => Value::Int(raw.parse().ok()?),
-        Kind::Mask => Value::Mask(if let Some(hex) = raw.strip_prefix("0x") {
-            u32::from_str_radix(hex, 16).ok()?
-        } else {
-            raw.parse().ok()?
-        }),
-        _ => Value::Float(raw.parse().ok()?),
-    })
 }
 
 fn open(serial: Option<&str>) -> dspi_transport::Result<UsbTransport> {
