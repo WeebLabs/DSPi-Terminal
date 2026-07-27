@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table};
 
 use crate::fields::{Field, FieldState, Targets, fields_for, nudge};
 use crate::theme::{Glyphs, Theme};
-use crate::widgets::{Bode, Curve, Meter, frequency_axis};
+use crate::widgets::{Bode, Curve, InlineMeter, Meter, frequency_axis};
 
 /// How hard the interface is allowed to work.
 ///
@@ -150,6 +150,17 @@ impl Panel {
     }
 }
 
+/// Which pane the arrow keys act on.
+///
+/// The channel list is always visible, as it is in the Console, so it needs to
+/// be reachable without stealing a key the content pane wants. Enter goes in,
+/// Escape comes back, and the arrows only ever mean one thing at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Sidebar,
+    Content,
+}
+
 /// What the user is typing into, if anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -273,6 +284,8 @@ pub struct App {
     pub fields: Vec<Field>,
     pub selected_field: usize,
 
+    pub focus: Focus,
+
     pub ctx: Context,
     pub perf: Performance,
     pub should_quit: bool,
@@ -318,6 +331,7 @@ impl App {
             matrix_focus: (0, 0),
             fields: Vec::new(),
             selected_field: 0,
+            focus: Focus::Sidebar,
             ctx: Context::default(),
             perf: Performance::detect(),
             should_quit: false,
@@ -613,6 +627,14 @@ impl App {
                 self.rebuild_fields();
             }
 
+            // Enter goes into the content pane, Escape comes back, so the
+            // arrows only ever mean one thing at a time.
+            KeyCode::Enter if self.focus == Focus::Sidebar => self.focus = Focus::Content,
+            KeyCode::Esc => self.focus = Focus::Sidebar,
+
+            KeyCode::Up if self.focus == Focus::Sidebar => self.move_channel(-1),
+            KeyCode::Down if self.focus == Focus::Sidebar => self.move_channel(1),
+
             KeyCode::Up if self.panel == Panel::Matrix => self.move_matrix(-1, 0),
             KeyCode::Down if self.panel == Panel::Matrix => self.move_matrix(1, 0),
             KeyCode::Left if self.panel == Panel::Matrix => self.move_matrix(0, -1),
@@ -621,8 +643,6 @@ impl App {
             KeyCode::Down if !self.fields.is_empty() => self.move_field(1),
             KeyCode::Up => self.move_band(-1),
             KeyCode::Down => self.move_band(1),
-            KeyCode::Left => self.move_channel(-1),
-            KeyCode::Right => self.move_channel(1),
 
             // Graph controls. `h`/`l` move the cursor rather than the selection,
             // so reading a curve never disturbs what is being edited.
@@ -757,6 +777,8 @@ impl App {
         }
         let n = self.channels.len() as isize;
         self.selected_channel = ((self.selected_channel as isize + delta).rem_euclid(n)) as usize;
+        // A different channel has different bands, so the band cursor cannot
+        // stay where it was and still mean anything.
         self.selected_band = 0;
     }
 
@@ -804,12 +826,23 @@ impl App {
         if self.meters_expanded {
             self.draw_meter_bridge(f, rows[2]);
         } else {
+            // Meters live inline in the channel list, so there is no separate
+            // meter column competing for width.
+            let name_w = self
+                .channels
+                .iter()
+                .map(|c| c.name.chars().count())
+                .max()
+                .unwrap_or(8)
+                .clamp(6, 14) as u16;
+            let sidebar_w = (name_w + 15).min(area.width / 3);
+
             let body = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(30), Constraint::Length(26)])
+                .constraints([Constraint::Length(sidebar_w), Constraint::Min(30)])
                 .split(rows[2]);
-            self.draw_panel(f, body[0]);
-            self.draw_meter_rail(f, body[1]);
+            self.draw_sidebar(f, body[0]);
+            self.draw_panel(f, body[1]);
         }
 
         self.draw_echo(f, rows[3]);
@@ -1156,6 +1189,140 @@ impl App {
                     Style::default().fg(self.theme.pending),
                 ))),
                 Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+            );
+        }
+    }
+
+    /// The channel list: inputs and outputs, each with its own meter.
+    ///
+    /// Modelled on the Console's sidebar, because a level belongs next to the
+    /// channel it describes rather than in a separate column the eye has to
+    /// pair up by position.
+    fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+        let focused = self.focus == Focus::Sidebar;
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if focused {
+                Style::default().fg(self.theme.accent)
+            } else {
+                self.theme.chrome_style()
+            })
+            .title(Span::styled(
+                "Channels",
+                if focused {
+                    self.theme.focused()
+                } else {
+                    self.theme.label()
+                },
+            ));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if inner.height == 0 {
+            return;
+        }
+
+        // Name column sized to the device's own names, so nothing is truncated
+        // into something that reads as a different channel.
+        let name_w = self
+            .channels
+            .iter()
+            .map(|c| c.name.chars().count())
+            .max()
+            .unwrap_or(8)
+            .clamp(6, 14) as u16;
+
+        let mut row = 0u16;
+        let section = |f: &mut Frame, row: &mut u16, title: &str| {
+            if *row < inner.height {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" {title}"),
+                        Style::default().fg(self.theme.dim),
+                    ))),
+                    Rect::new(inner.x, inner.y + *row, inner.width, 1),
+                );
+                *row += 1;
+            }
+        };
+
+        for (group, want_output) in [("INPUTS", false), ("OUTPUTS", true)] {
+            if !self.channels.iter().any(|c| c.is_output == want_output) {
+                continue;
+            }
+            section(f, &mut row, group);
+
+            for (i, c) in self.channels.iter().enumerate() {
+                if c.is_output != want_output || row >= inner.height {
+                    continue;
+                }
+                self.draw_channel_row(
+                    f,
+                    Rect::new(inner.x, inner.y + row, inner.width, 1),
+                    i,
+                    c,
+                    name_w,
+                );
+                row += 1;
+            }
+        }
+    }
+
+    fn draw_channel_row(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        index: usize,
+        c: &ChannelView,
+        name_w: u16,
+    ) {
+        let selected = index == self.selected_channel;
+        let colour = self.theme.channel(index as u8);
+
+        // A bar in the margin, as the Console does, rather than a highlight:
+        // it survives a monochrome terminal, where a background colour does not.
+        let marker = if selected { "▐" } else { " " };
+        let marker_style = if selected {
+            Style::default().fg(self.theme.accent)
+        } else {
+            Style::default()
+        };
+
+        let hidden = !self.visible.get(index).copied().unwrap_or(true);
+        let name_style = if selected {
+            self.theme.focused()
+        } else if hidden {
+            Style::default().fg(self.theme.chrome)
+        } else {
+            self.theme.value()
+        };
+
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(marker, marker_style),
+                Span::styled(
+                    format!(
+                        "{:<w$} ",
+                        truncate(&c.name, name_w as usize),
+                        w = name_w as usize
+                    ),
+                    name_style,
+                ),
+            ])),
+            Rect::new(area.x, area.y, (2 + name_w).min(area.width), 1),
+        );
+
+        // The meter sits inline, in the channel's own colour.
+        let meter_x = area.x + 2 + name_w;
+        if meter_x < area.x + area.width {
+            f.render_widget(
+                InlineMeter {
+                    level: c.peak,
+                    clipped: c.clipped,
+                    color: colour,
+                    theme: &self.theme,
+                },
+                Rect::new(meter_x, area.y, area.x + area.width - meter_x, 1),
             );
         }
     }
@@ -1582,73 +1749,6 @@ impl App {
         f.render_widget(table, inner);
     }
 
-    fn draw_meter_rail(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.chrome_style())
-            .title(Span::styled("Levels", self.theme.label()));
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        // The rail follows context: it shows what the current panel is about
-        // rather than every channel, which would not fit and would not help.
-        let shown: Vec<usize> = match self.panel {
-            Panel::Filters => {
-                let s = self.selected_channel;
-                let mate = if s.is_multiple_of(2) {
-                    s + 1
-                } else {
-                    s.saturating_sub(1)
-                };
-                vec![s, mate]
-                    .into_iter()
-                    .filter(|i| *i < self.channels.len())
-                    .collect()
-            }
-            _ => (0..self.channels.len())
-                .take(inner.height as usize - 1)
-                .collect(),
-        };
-
-        // Size the label column to the device's own names. A fixed width
-        // truncates "spdif.2.l" to "spdif.2.", which is indistinguishable from
-        // its pair; the names come from the device, so the width must too.
-        let label_width = shown
-            .iter()
-            .map(|i| self.channels[*i].slug.chars().count())
-            .max()
-            .unwrap_or(6)
-            .clamp(6, 12) as u16;
-
-        for (row, i) in shown.iter().enumerate() {
-            if row as u16 >= inner.height.saturating_sub(1) {
-                break;
-            }
-            let c = &self.channels[*i];
-            f.render_widget(
-                Meter {
-                    label: &c.slug,
-                    level: c.peak,
-                    clipped: c.clipped,
-                    color: self.theme.channel(*i as u8),
-                    theme: &self.theme,
-                    label_width,
-                },
-                Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
-            );
-        }
-
-        if inner.height > 1 {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!("CPU {}/{}%", self.cpu.0, self.cpu.1),
-                    self.theme.label(),
-                ))),
-                Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
-            );
-        }
-    }
-
     fn draw_meter_bridge(&self, f: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1696,11 +1796,14 @@ impl App {
     fn draw_keys(&self, f: &mut Frame, area: Rect) {
         // Show the keys that matter here, rather than one list that is mostly
         // irrelevant wherever you happen to be.
-        let keys = match self.panel {
-            Panel::Filters => {
-                "^P palette · : cmd · h/l cursor · +/- zoom · space hide · = split · q quit"
+        let keys = match (self.focus, self.panel) {
+            (Focus::Sidebar, _) => {
+                "↑↓ channel · Enter edit · Tab panel · ^P palette · : cmd · M meters · q quit"
             }
-            _ => "^P palette · : cmd · Tab panel · G graph · M meters · F2 level · q quit",
+            (Focus::Content, Panel::Filters) => {
+                "↑↓ band · ←→ adjust · Esc channels · h/l cursor · +/- zoom · = split"
+            }
+            _ => "↑↓ field · ←→ adjust · Esc channels · Tab panel · ^P palette · F2 level",
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(keys, self.theme.label()))),
@@ -2020,7 +2123,11 @@ mod tests {
         assert!(out.contains("Preset 3"));
         assert!(out.contains("Dashboard"));
         assert!(out.contains("Response"));
-        assert!(out.contains("Levels"));
+        assert!(
+            out.contains("Channels"),
+            "the channel list should be visible"
+        );
+        assert!(out.contains("INPUTS"));
         assert!(out.contains("palette"));
     }
 
@@ -2158,10 +2265,11 @@ mod tests {
     #[test]
     fn navigation_wraps_rather_than_sticking() {
         let (mut app, _term) = demo_app(120, 40);
+        app.focus = Focus::Sidebar;
         app.selected_channel = 16;
-        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.selected_channel, 0);
-        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.selected_channel, 16);
     }
 
@@ -2652,6 +2760,7 @@ mod matrix_panel_tests {
     fn navigation_moves_around_the_grid_and_wraps() {
         let mut a = app();
         a.panel = Panel::Matrix;
+        a.focus = Focus::Content;
         a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(a.matrix_focus, (0, 1));
         a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -2685,5 +2794,178 @@ mod matrix_panel_tests {
         a.matrix.clear();
         let out = crate::render_to_string(&a, 90, 18);
         assert!(out.contains("No routing read yet"));
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::*;
+    use crate::theme::ColorDepth;
+
+    fn app() -> App {
+        let mut a = App::new(Theme::dark(ColorDepth::TrueColor, Glyphs::Braille));
+        a.ctx.num_inputs = 4;
+        a.ctx.num_outputs = 3;
+        a.platform = "RP2350".into();
+        a.firmware = "1.1.5".into();
+        a.channels = (0..7)
+            .map(|i| {
+                let is_output = i >= 4;
+                let bands = vec![dsp::Band {
+                    filter_type: if i == 0 {
+                        dspi_proto::FilterType::LowShelf
+                    } else {
+                        dspi_proto::FilterType::Flat
+                    },
+                    freq: 105.0,
+                    q: 0.707,
+                    gain_db: 8.8,
+                    bypass: false,
+                }];
+                ChannelView {
+                    name: if is_output {
+                        format!("SPDIF {}", i - 3)
+                    } else {
+                        format!("USB {}", i + 1)
+                    },
+                    slug: format!("ch.{i}"),
+                    is_output,
+                    curve: dsp::curve(&bands, 0.0),
+                    bands,
+                    peak: if i == 0 { 0.6 } else { 0.0 },
+                    clipped: i == 6,
+                }
+            })
+            .collect();
+        a.visible = vec![true; 7];
+        a
+    }
+
+    fn render(a: &App, w: u16, h: u16) -> String {
+        crate::render_to_string(a, w, h)
+    }
+
+    #[test]
+    fn channels_are_grouped_into_inputs_and_outputs() {
+        let out = render(&app(), 100, 24);
+        let inputs = out.find("INPUTS").expect("no INPUTS heading");
+        let outputs = out.find("OUTPUTS").expect("no OUTPUTS heading");
+        assert!(inputs < outputs, "inputs should come first");
+
+        // Every channel is listed, under the right heading.
+        let before = &out[inputs..outputs];
+        assert!(before.contains("USB 1") && before.contains("USB 4"));
+        assert!(
+            !before.contains("SPDIF"),
+            "an output leaked into the inputs"
+        );
+        assert!(out[outputs..].contains("SPDIF 1"));
+    }
+
+    /// The level belongs beside the channel it describes, rather than in a
+    /// separate column the eye has to pair up by position.
+    #[test]
+    fn each_channel_carries_its_own_meter() {
+        let out = render(&app(), 100, 24);
+        let row = out
+            .lines()
+            .find(|l| l.contains("USB 1"))
+            .expect("USB 1 row missing");
+        assert!(row.contains('▓'), "no level on the selected row: {row}");
+        assert!(row.contains('░'), "no meter track: {row}");
+    }
+
+    #[test]
+    fn a_silent_channel_still_shows_its_track() {
+        let out = render(&app(), 100, 24);
+        let row = out.lines().find(|l| l.contains("USB 2")).unwrap();
+        assert!(row.contains('░'));
+        assert!(!row.contains('▓'), "USB 2 is silent: {row}");
+    }
+
+    #[test]
+    fn a_clipped_channel_flags_itself_in_the_list() {
+        let out = render(&app(), 100, 24);
+        let row = out.lines().find(|l| l.contains("SPDIF 3")).unwrap();
+        assert!(row.contains('▌'), "clip flag missing: {row}");
+    }
+
+    /// A margin bar rather than a background highlight, so selection survives a
+    /// monochrome terminal.
+    #[test]
+    fn the_selected_channel_is_marked_in_the_margin() {
+        let mut a = app();
+        a.selected_channel = 2;
+        let out = render(&a, 100, 24);
+        let row = out.lines().find(|l| l.contains("USB 3")).unwrap();
+        assert!(row.contains('▐'), "no selection marker: {row}");
+
+        let other = out.lines().find(|l| l.contains("USB 4")).unwrap();
+        assert!(!other.contains('▐'), "two rows marked at once");
+    }
+
+    #[test]
+    fn moving_through_the_list_crosses_from_inputs_to_outputs() {
+        let mut a = app();
+        a.selected_channel = 3; // last input
+        a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(a.selected_channel, 4);
+        assert!(a.channels[a.selected_channel].is_output);
+    }
+
+    /// Arrows must mean one thing at a time, so the focus decides whether they
+    /// move the channel or act inside the panel.
+    #[test]
+    fn focus_moves_between_the_list_and_the_panel() {
+        let mut a = app();
+        a.panel = Panel::Filters;
+        assert_eq!(a.focus, Focus::Sidebar);
+
+        a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(a.selected_channel, 1, "sidebar focus moves the channel");
+        assert_eq!(a.selected_band, 0);
+
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(a.focus, Focus::Content);
+
+        a.channels[1].bands = vec![dsp::Band::default(); 4];
+        a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(a.selected_band, 1, "content focus moves the band");
+        assert_eq!(a.selected_channel, 1, "and leaves the channel alone");
+
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(a.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn changing_channel_resets_the_band_cursor() {
+        let mut a = app();
+        a.channels[0].bands = vec![dsp::Band::default(); 6];
+        a.selected_band = 4;
+        a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            a.selected_band, 0,
+            "band 4 means nothing on another channel"
+        );
+    }
+
+    #[test]
+    fn the_key_hints_follow_the_focus() {
+        let mut a = app();
+        a.panel = Panel::Filters;
+        assert!(render(&a, 100, 24).contains("Enter edit"));
+        a.focus = Focus::Content;
+        assert!(render(&a, 100, 24).contains("Esc channels"));
+    }
+
+    #[test]
+    fn the_layout_still_fits_at_eighty_columns() {
+        let a = app();
+        let out = render(&a, 80, 24);
+        assert!(out.contains("INPUTS"));
+        assert!(out.contains("Response") || out.contains("Dashboard"));
+        for line in out.lines() {
+            assert!(line.chars().count() <= 80, "overflows: {line}");
+        }
     }
 }

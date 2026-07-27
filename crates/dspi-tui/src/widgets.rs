@@ -91,8 +91,8 @@ impl Widget for Bode<'_> {
                 let x = area.x + col as u16;
                 for y in area.y..area.y + area.height {
                     buf[(x, y)]
-                        .set_symbol("│")
-                        .set_style(Style::default().fg(self.theme.accent));
+                        .set_symbol("┆")
+                        .set_style(Style::default().fg(self.theme.chrome));
                 }
             }
         }
@@ -518,5 +518,104 @@ mod tests {
             .render(area, buf);
         });
         assert!(as_text(&buf).trim().is_empty());
+    }
+}
+
+/// A meter sized to sit inline beside a channel name.
+///
+/// The full [`Meter`] carries a label and a numeric readout; in a channel list
+/// the name is already there and the number would crowd out the bar, so this
+/// draws the bar and the clip flag only. The level is still logarithmic: a
+/// linear bar spends most of its length on the top 6 dB.
+pub struct InlineMeter<'a> {
+    pub level: f32,
+    pub clipped: bool,
+    pub color: Color,
+    pub theme: &'a Theme,
+}
+
+impl Widget for InlineMeter<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 || area.width < 3 {
+            return;
+        }
+
+        // One column is reserved for the clip flag, which must stay visible even
+        // when the bar has fallen back: the latch is what matters, not the
+        // current level.
+        let bar_w = area.width - 1;
+        let filled = (Meter::fraction(self.level) * bar_w as f32).round() as u16;
+
+        for i in 0..bar_w {
+            let (ch, style) = if i < filled {
+                ("▓", Style::default().fg(self.color))
+            } else {
+                ("░", Style::default().fg(self.theme.chrome))
+            };
+            buf[(area.x + i, area.y)].set_symbol(ch).set_style(style);
+        }
+
+        let (ch, style) = if self.clipped {
+            ("▌", Style::default().fg(self.theme.danger))
+        } else {
+            (" ", Style::default())
+        };
+        buf[(area.x + bar_w, area.y)]
+            .set_symbol(ch)
+            .set_style(style);
+    }
+}
+
+#[cfg(test)]
+mod inline_meter_tests {
+    use super::*;
+    use crate::theme::ColorDepth;
+
+    fn render(level: f32, clipped: bool, width: u16) -> String {
+        let theme = Theme::dark(ColorDepth::TrueColor, Glyphs::Braille);
+        let area = Rect::new(0, 0, width, 1);
+        let mut buf = Buffer::empty(area);
+        InlineMeter {
+            level,
+            clipped,
+            color: theme.fg,
+            theme: &theme,
+        }
+        .render(area, &mut buf);
+        (0..width).map(|x| buf[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn the_bar_fills_with_level() {
+        let quiet = render(0.001, false, 12);
+        let loud = render(1.0, false, 12);
+        assert!(quiet.matches('▓').count() < loud.matches('▓').count());
+        assert!(loud.starts_with('▓'));
+    }
+
+    #[test]
+    fn silence_draws_an_empty_bar_rather_than_nothing() {
+        let s = render(0.0, false, 12);
+        assert!(s.contains('░'), "an empty channel still needs a bar: {s}");
+        assert!(!s.contains('▓'));
+    }
+
+    /// The clip latch is what matters, not the current level, so the flag must
+    /// show even on a channel that has fallen silent since.
+    #[test]
+    fn the_clip_flag_survives_a_quiet_bar() {
+        assert!(render(0.0, true, 12).contains('▌'));
+        assert!(!render(1.0, false, 12).contains('▌'));
+    }
+
+    #[test]
+    fn a_full_bar_still_leaves_room_for_the_flag() {
+        let s = render(1.0, true, 12);
+        assert!(s.ends_with('▌'), "the flag was overwritten: {s}");
+    }
+
+    #[test]
+    fn a_hopeless_width_draws_nothing_rather_than_a_stub() {
+        assert_eq!(render(1.0, false, 2).trim(), "");
     }
 }
