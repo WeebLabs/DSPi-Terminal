@@ -1678,7 +1678,7 @@ impl App {
                         field.display(),
                         crate::fields::display_value(d, actual)
                     ),
-                    Style::default().fg(self.theme.danger),
+                    self.theme.alarm(),
                 ),
                 _ => (field.display(), self.theme.value()),
             };

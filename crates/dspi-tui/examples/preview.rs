@@ -5,10 +5,14 @@
 
 use dspi_proto::dsp;
 use dspi_tui::app::{App, ChannelView, Focus, Panel};
-use dspi_tui::theme::{ColorDepth, Glyphs, Theme};
+use dspi_tui::theme::{ColorDepth, Glyphs, Palette, Theme};
 
 fn main() {
-    let mut a = App::new(Theme::dark(ColorDepth::TrueColor, Glyphs::Braille));
+    let palette = std::env::args()
+        .nth(1)
+        .and_then(|a| Palette::parse(&a))
+        .unwrap_or(Palette::Amber);
+    let mut a = App::new(Theme::new(palette, ColorDepth::TrueColor, Glyphs::Braille));
     a.platform = "RP2350".into();
     a.firmware = "1.1.5".into();
     a.preset = "Preset 3".into();
@@ -73,5 +77,6 @@ fn main() {
     a.focus = Focus::Content;
     a.selected_band = 2;
 
-    println!("{}", dspi_tui::render_to_string(&a, 104, 28));
+    // Colours are the point of a theme review, so emit them.
+    print!("{}", dspi_tui::render_to_ansi(&a, 104, 28));
 }

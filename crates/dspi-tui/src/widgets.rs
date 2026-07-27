@@ -318,7 +318,7 @@ impl Widget for Meter<'_> {
         let flag_x = bar_x + bar_w + readout.len() as u16 + 1;
         if flag_x < area.x + area.width {
             let (ch, style) = if self.clipped {
-                ("▌", Style::default().fg(self.theme.danger))
+                ("▌", self.theme.alarm())
             } else {
                 (" ", Style::default())
             };
@@ -556,7 +556,7 @@ impl Widget for InlineMeter<'_> {
         }
 
         let (ch, style) = if self.clipped {
-            ("▌", Style::default().fg(self.theme.danger))
+            ("▌", self.theme.alarm())
         } else {
             (" ", Style::default())
         };

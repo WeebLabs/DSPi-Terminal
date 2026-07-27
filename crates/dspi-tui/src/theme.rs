@@ -115,6 +115,7 @@ pub enum Glyphs {
 pub struct Theme {
     pub depth: ColorDepth,
     pub glyphs: Glyphs,
+    pub palette: Palette,
 
     pub bg: Color,
     /// Values, curves, meters: the things worth looking at.
@@ -133,13 +134,139 @@ pub struct Theme {
     pub channels: Vec<Color>,
 }
 
+/// Which palette to draw with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Palette {
+    /// Amber phosphor, after the monitors this kind of instrument used to be
+    /// driven from. The default.
+    Amber,
+    /// A conventional dark theme, for anyone who would rather have hues.
+    Dark,
+}
+
+impl Palette {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "amber" => Some(Self::Amber),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    pub const NAMES: &'static [&'static str] = &["amber", "dark"];
+}
+
 impl Default for Theme {
     fn default() -> Self {
-        Self::dark(ColorDepth::detect(), Glyphs::Braille)
+        Self::new(Palette::Amber, ColorDepth::detect(), Glyphs::Braille)
     }
 }
 
 impl Theme {
+    pub fn new(palette: Palette, depth: ColorDepth, glyphs: Glyphs) -> Self {
+        match palette {
+            Palette::Amber => Self::amber(depth, glyphs),
+            Palette::Dark => Self::dark(depth, glyphs),
+        }
+    }
+
+    /// Amber phosphor.
+    ///
+    /// A real amber monitor had one phosphor and told things apart by
+    /// brightness, not hue. That is almost right here: brightness alone cannot
+    /// separate seventeen traces on one graph, so the channel ramp walks a
+    /// narrow band from pale yellow-amber through to deep orange-amber. It
+    /// still reads as one screen rather than a rainbow, and the curves stay
+    /// distinguishable, which a strict single-hue ramp would not manage.
+    ///
+    /// Emphasis is brightness and reverse video, as it was on the hardware,
+    /// rather than a second colour.
+    pub fn amber(depth: ColorDepth, glyphs: Glyphs) -> Self {
+        let channels = match depth {
+            ColorDepth::TrueColor => (0..17)
+                .map(|i| {
+                    // Pale yellow-amber to deep orange-amber, so a channel is
+                    // identifiable without leaving the phosphor's range.
+                    let t = i as f32 / 16.0;
+                    let r = 255.0;
+                    let g = 214.0 - 96.0 * t;
+                    let b = 130.0 - 122.0 * t;
+                    Color::Rgb(r as u8, g as u8, b as u8)
+                })
+                .collect(),
+            // The 256-colour cube's amber and orange run, light to dark.
+            ColorDepth::Ansi256 => (0..17)
+                .map(|i| {
+                    Color::Indexed(
+                        [
+                            229, 223, 222, 221, 220, 214, 215, 216, 209, 208, 202, 172, 166, 178,
+                            179, 180, 137,
+                        ][i],
+                    )
+                })
+                .collect(),
+            ColorDepth::Ansi16 => (0..17)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        Color::Yellow
+                    } else {
+                        Color::LightYellow
+                    }
+                })
+                .collect(),
+            ColorDepth::Mono => vec![Color::Reset; 17],
+        };
+
+        let (fg, chrome, dim, accent, ok, pending, danger) = match depth {
+            ColorDepth::Mono => (
+                Color::Reset,
+                Color::Reset,
+                Color::Reset,
+                Color::Reset,
+                Color::Reset,
+                Color::Reset,
+                Color::Reset,
+            ),
+            ColorDepth::TrueColor => (
+                // The classic P3 amber, with the chrome well below it so the
+                // data is what the eye lands on.
+                Color::Rgb(0xFF, 0xB0, 0x00),
+                Color::Rgb(0x6B, 0x44, 0x00),
+                Color::Rgb(0xB8, 0x76, 0x00),
+                Color::Rgb(0xFF, 0xE0, 0xA8),
+                Color::Rgb(0xFF, 0xC8, 0x40),
+                Color::Rgb(0xFF, 0xE0, 0xA8),
+                // The saturated peak of the phosphor. It blooms toward white
+                // without becoming it, which is what the tube actually did.
+                Color::Rgb(0xFF, 0xEB, 0xB9),
+            ),
+            _ => (
+                Color::Yellow,
+                Color::DarkGray,
+                Color::Yellow,
+                Color::LightYellow,
+                Color::Yellow,
+                Color::LightYellow,
+                Color::LightYellow,
+            ),
+        };
+
+        Self {
+            depth,
+            glyphs,
+            palette: Palette::Amber,
+            bg: Color::Reset,
+            fg,
+            chrome,
+            dim,
+            accent,
+            ok,
+            pending,
+            danger,
+            channels,
+        }
+    }
+
     pub fn dark(depth: ColorDepth, glyphs: Glyphs) -> Self {
         // Seventeen distinguishable hues is a real constraint at 256 colours and
         // with common colour-vision deficiencies, so the ramp deliberately walks
@@ -234,6 +361,7 @@ impl Theme {
         Self {
             depth,
             glyphs,
+            palette: Palette::Dark,
             bg: Color::Reset,
             fg,
             chrome,
@@ -273,6 +401,20 @@ impl Theme {
     /// instead of assuming colour will carry the distinction.
     pub fn needs_pattern_distinction(&self) -> bool {
         self.depth == ColorDepth::Mono
+    }
+
+    /// How to draw something that must not be missed, such as a clip.
+    ///
+    /// A single-phosphor screen had no second colour to reach for, so it used
+    /// reverse video. That reads as deliberate rather than as a limitation, and
+    /// it survives every colour depth including none.
+    pub fn alarm(&self) -> Style {
+        match self.palette {
+            Palette::Amber => Style::default()
+                .fg(self.danger)
+                .add_modifier(Modifier::REVERSED),
+            Palette::Dark => Style::default().fg(self.danger),
+        }
     }
 }
 
@@ -435,5 +577,111 @@ mod detection_tests {
         let e = env();
         assert_eq!(ColorDepth::from_env(&e), ColorDepth::Ansi16);
         assert_eq!(glyphs_for(&e), Glyphs::Braille);
+    }
+}
+
+#[cfg(test)]
+mod amber_tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    fn rgb(c: Color) -> (u8, u8, u8) {
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("expected an RGB colour, got {other:?}"),
+        }
+    }
+
+    fn amber() -> Theme {
+        Theme::amber(ColorDepth::TrueColor, Glyphs::Braille)
+    }
+
+    /// The whole point of the palette: nothing on screen leaves the phosphor's
+    /// range. Red or green anywhere would break the illusion instantly.
+    #[test]
+    fn every_colour_stays_within_amber() {
+        let t = amber();
+        let mut all = vec![t.fg, t.chrome, t.dim, t.accent, t.ok, t.pending, t.danger];
+        all.extend(t.channels.iter().copied());
+
+        for c in all {
+            let (r, g, b) = rgb(c);
+            assert!(r >= g, "{c:?} is not warm: red should lead");
+            assert!(g >= b, "{c:?} is not amber: green should lead blue");
+            assert!(b < 200, "{c:?} has too much blue for a phosphor");
+        }
+    }
+
+    /// Data bright, chrome dim. If the borders are as loud as the values, the
+    /// eye lands in the wrong place.
+    #[test]
+    fn chrome_sits_well_below_the_data() {
+        let t = amber();
+        let lum = |c: Color| {
+            let (r, g, b) = rgb(c);
+            0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
+        };
+        assert!(lum(t.chrome) < lum(t.dim), "chrome should be below labels");
+        assert!(lum(t.dim) < lum(t.fg), "labels should be below values");
+        assert!(lum(t.fg) < lum(t.accent), "focus should be the brightest");
+    }
+
+    #[test]
+    fn the_classic_phosphor_is_the_foreground() {
+        // P3 amber, near enough: the colour the screen is meant to be.
+        assert_eq!(rgb(amber().fg), (0xFF, 0xB0, 0x00));
+    }
+
+    /// Seventeen traces cannot be told apart by brightness alone, so the ramp
+    /// walks a narrow band inside the amber range.
+    #[test]
+    fn channels_are_distinguishable_without_leaving_the_range() {
+        let t = amber();
+        let mut seen = std::collections::HashSet::new();
+        for c in &t.channels {
+            assert!(seen.insert(rgb(*c)), "duplicate channel colour {c:?}");
+        }
+        assert_eq!(t.channels.len(), 17);
+
+        // The ends of the ramp must actually differ, or the middle is wasted.
+        let (_, g0, b0) = rgb(t.channels[0]);
+        let (_, g16, b16) = rgb(t.channels[16]);
+        assert!(g0 > g16 + 60, "the ramp barely moves: {g0} to {g16}");
+        assert!(b0 > b16, "{b0} to {b16}");
+    }
+
+    /// A single-phosphor screen had no second colour for emphasis, so it used
+    /// reverse video. That reads as deliberate rather than as a shortage.
+    #[test]
+    fn an_alarm_uses_reverse_video_on_amber() {
+        assert!(amber().alarm().add_modifier.contains(Modifier::REVERSED));
+        // The conventional theme has hues to spare and does not need it.
+        assert!(
+            !Theme::dark(ColorDepth::TrueColor, Glyphs::Braille)
+                .alarm()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn the_palette_survives_a_poorer_terminal() {
+        for depth in [ColorDepth::Ansi256, ColorDepth::Ansi16, ColorDepth::Mono] {
+            let t = Theme::amber(depth, Glyphs::Blocks);
+            assert_eq!(t.channels.len(), 17, "{depth:?} lost channel colours");
+            assert_eq!(t.palette, Palette::Amber);
+        }
+    }
+
+    #[test]
+    fn amber_is_what_you_get_by_default() {
+        assert_eq!(Theme::default().palette, Palette::Amber);
+    }
+
+    #[test]
+    fn themes_are_selectable_by_name() {
+        assert_eq!(Palette::parse("amber"), Some(Palette::Amber));
+        assert_eq!(Palette::parse("Dark"), Some(Palette::Dark));
+        assert_eq!(Palette::parse("chartreuse"), None);
     }
 }

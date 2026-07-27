@@ -31,6 +31,19 @@ fn main() -> ExitCode {
 
     let json = flags.contains(&"--json");
     let serial = flag_value(&flags, "--device");
+    let palette = match flag_value(&flags, "--theme") {
+        Some(name) => match dspi_tui::theme::Palette::parse(name) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "dspi: no theme called `{name}`; try one of: {}",
+                    dspi_tui::theme::Palette::NAMES.join(", ")
+                );
+                return ExitCode::from(exit::USAGE);
+            }
+        },
+        None => dspi_tui::theme::Palette::Amber,
+    };
 
     let code = match flags.first().copied() {
         Some("--help" | "-h") => {
@@ -53,8 +66,10 @@ fn main() -> ExitCode {
         Some("import") => cmd_import(serial, &positional(&flags), &flags),
         Some("dump") => cmd_dump(serial, json),
         // No arguments opens the interface; arguments run one command and exit.
-        None => cmd_tui(serial, flags.contains(&"--lite")),
-        Some(other) if other.starts_with("--") => cmd_tui(serial, flags.contains(&"--lite")),
+        None => cmd_tui(serial, flags.contains(&"--lite"), palette),
+        Some(other) if other.starts_with("--") => {
+            cmd_tui(serial, flags.contains(&"--lite"), palette)
+        }
         // Everything else is a command in the shared grammar, so the CLI and the
         // TUI's ':' line accept exactly the same syntax.
         Some(_) => cmd_run(serial, &flags, json),
@@ -124,6 +139,7 @@ OPTIONS:
     --device <serial>        target a specific device
     --json                   machine-readable output
     --lite                   reduce redraw rate, for a Pi or a slow link
+    --theme amber|dark       colour scheme; amber is the default
 "
     );
 }
@@ -637,7 +653,8 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
         Ok(s) => s,
         Err(c) => return c,
     };
-    let theme = dspi_tui::Theme::dark(
+    let theme = dspi_tui::Theme::new(
+        dspi_tui::theme::Palette::Amber,
         dspi_tui::theme::ColorDepth::TrueColor,
         dspi_tui::app::detect_glyphs(),
     );
@@ -685,13 +702,14 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
     exit::OK
 }
 
-fn cmd_tui(serial: Option<&str>, lite: bool) -> u8 {
+fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) -> u8 {
     let session = match connect(serial) {
         Ok(s) => s,
         Err(c) => return c,
     };
 
-    let theme = dspi_tui::Theme::dark(
+    let theme = dspi_tui::Theme::new(
+        palette,
         dspi_tui::theme::ColorDepth::detect(),
         dspi_tui::app::detect_glyphs(),
     );
