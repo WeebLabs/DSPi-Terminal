@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dspi-proto",
+    "crates/dspi-transport",
+    "crates/dspi-session",
+    "crates/dspi-cmd",
+    "crates/dspi-tui",
+    "crates/dspi",
+    "xtask",
+]
+
+[workspace.package]
+version = "2.0.0-dev"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/WeebLabs/DSPi-Terminal"
+
+[workspace.dependencies]
+dspi-proto = { path = "crates/dspi-proto" }
+dspi-transport = { path = "crates/dspi-transport" }
+dspi-session = { path = "crates/dspi-session" }
+dspi-cmd = { path = "crates/dspi-cmd" }
+dspi-tui = { path = "crates/dspi-tui" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

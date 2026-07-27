@@ -1,0 +1,21 @@
+[package]
+name = "dspi-proto"
+description = "DSPi wire protocol: opcodes, bulk-params codec, DSP math, parameter registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[build-dependencies]
+# The generator parses the vendored firmware headers. Deliberately dependency
+# free: it is a small, purpose-built scanner, not a general C parser, so it has
+# no build cost and nothing to keep up to date.

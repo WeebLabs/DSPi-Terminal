@@ -1,0 +1,17 @@
+[package]
+name = "dspi-session"
+description = "Connect, discover, read and write DSPi device state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dspi-proto.workspace = true
+dspi-transport.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "dspi-proto/serde"]

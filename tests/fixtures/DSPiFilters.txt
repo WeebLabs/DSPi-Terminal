@@ -1,0 +1,63 @@
+# DSPi Console Filter Settings
+# Exported: 2026-02-02 06:17:15
+
+[Master L]
+Filter  1: ON  LS      Fc   105.0 Hz  Gain  +8.8 dB
+Filter  2: ON  PK      Fc    64.0 Hz  Gain  -6.2 dB  Q  0.30
+Filter  3: ON  PK      Fc  2856.0 Hz  Gain  -8.6 dB  Q  3.58
+Filter  4: ON  PK      Fc  1880.0 Hz  Gain  +3.6 dB  Q  1.69
+Filter  5: ON  PK      Fc   783.0 Hz  Gain  +2.7 dB  Q  1.22
+Filter  6: ON  HS      Fc 10000.0 Hz  Gain  -0.8 dB
+Filter  7: ON  PK      Fc  6749.0 Hz  Gain  +4.0 dB  Q  4.74
+Filter  8: ON  PK      Fc  4924.0 Hz  Gain  +4.0 dB  Q  3.71
+Filter  9: ON  PK      Fc  3380.0 Hz  Gain  -2.3 dB  Q  6.00
+Filter 10: ON  PK      Fc   118.0 Hz  Gain  +0.4 dB  Q  1.98
+
+[Master R]
+Filter  1: ON  LS      Fc   105.0 Hz  Gain  +8.8 dB
+Filter  2: ON  PK      Fc    64.0 Hz  Gain  -6.2 dB  Q  0.30
+Filter  3: ON  PK      Fc  2856.0 Hz  Gain  -8.6 dB  Q  3.58
+Filter  4: ON  PK      Fc  1880.0 Hz  Gain  +3.6 dB  Q  1.69
+Filter  5: ON  PK      Fc   783.0 Hz  Gain  +2.7 dB  Q  1.22
+Filter  6: ON  HS      Fc 10000.0 Hz  Gain  -0.8 dB
+Filter  7: ON  PK      Fc  6749.0 Hz  Gain  +4.0 dB  Q  4.74
+Filter  8: ON  PK      Fc  4924.0 Hz  Gain  +4.0 dB  Q  3.71
+Filter  9: ON  PK      Fc  3380.0 Hz  Gain  -2.3 dB  Q  6.00
+Filter 10: ON  PK      Fc   118.0 Hz  Gain  +0.4 dB  Q  1.98
+
+[Out L]
+Filter  1: ON  HP      Fc    80.0 Hz
+Filter  2: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  3: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  4: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  5: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  6: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  7: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  8: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  9: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter 10: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+
+[Out R]
+Filter  1: ON  HP      Fc    80.0 Hz
+Filter  2: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  3: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  4: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  5: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  6: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  7: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  8: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  9: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter 10: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+
+[Sub]
+Filter  1: ON  LP      Fc    80.0 Hz
+Filter  2: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  3: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  4: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  5: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  6: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  7: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  8: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter  9: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+Filter 10: ON  PK      Fc  1000.0 Hz  Gain  +0.0 dB  Q  0.71
+

@@ -1,0 +1,13 @@
+# Weeb Labs DSPi: allow non-root access to the vendor control interface.
+#
+# Install:  sudo dspi --install-udev && sudo udevadm control --reload
+#           then unplug and replug the device.
+#
+# uaccess grants the physically-logged-in user access, which is what you want on
+# a desktop. The 0666 fallback covers headless setups (a Raspberry Pi reached
+# over SSH), where there is no seat for uaccess to apply to.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e8b", ATTR{idProduct}=="feaa", TAG+="uaccess", MODE="0666"
+
+# The RP2 UF2 bootloader the device re-enumerates as after `dspi firmware update`.
+# Without this, a firmware update appears to hang at exactly the wrong moment.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="0003", TAG+="uaccess", MODE="0666"

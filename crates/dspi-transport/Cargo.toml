@@ -1,0 +1,13 @@
+[package]
+name = "dspi-transport"
+description = "USB transport for DSPi devices, with the remote seam left open"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dspi-proto.workspace = true
+thiserror.workspace = true
+nusb = "0.2"
