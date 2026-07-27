@@ -170,14 +170,18 @@ impl Theme {
         }
     }
 
-    /// Amber phosphor.
+    /// Amber, in the orange-to-red half of it.
     ///
-    /// A real amber monitor had one phosphor and told things apart by
-    /// brightness, not hue. That is almost right here: brightness alone cannot
-    /// separate seventeen traces on one graph, so the channel ramp walks a
-    /// narrow band from pale yellow-amber through to deep orange-amber. It
-    /// still reads as one screen rather than a rainbow, and the curves stay
-    /// distinguishable, which a strict single-hue ramp would not manage.
+    /// Not a strict phosphor simulation. A true amber tube sits around yellow-
+    /// gold, which reads green next to anything else on a modern display, so the
+    /// palette is pulled into orange and red where "amber" actually lives in
+    /// most people's heads. The channel ramp runs from light orange to deep
+    /// red-amber: enough spread to tell seventeen traces apart, narrow enough
+    /// that the screen still reads as one thing rather than a rainbow.
+    ///
+    /// Text is deliberately lighter than the ramp. A monitor would have drawn
+    /// everything in the one phosphor; here the values want to be legible more
+    /// than they want to be authentic.
     ///
     /// Emphasis is brightness and reverse video, as it was on the hardware,
     /// rather than a second colour.
@@ -185,22 +189,25 @@ impl Theme {
         let channels = match depth {
             ColorDepth::TrueColor => (0..17)
                 .map(|i| {
-                    // Pale yellow-amber to deep orange-amber, so a channel is
-                    // identifiable without leaving the phosphor's range.
+                    // Light orange to deep red-amber. Green stays well under
+                    // red throughout, which is what keeps it out of the yellow
+                    // and gold that read as green on screen.
                     let t = i as f32 / 16.0;
-                    let r = 255.0;
-                    let g = 214.0 - 96.0 * t;
-                    let b = 130.0 - 122.0 * t;
+                    let r = 255.0 - 41.0 * t;
+                    let g = 176.0 - 118.0 * t;
+                    let b = 96.0 - 64.0 * t;
                     Color::Rgb(r as u8, g as u8, b as u8)
                 })
                 .collect(),
             // The 256-colour cube's amber and orange run, light to dark.
+            // The cube's orange and red run, light to dark, avoiding the
+            // yellows entirely.
             ColorDepth::Ansi256 => (0..17)
                 .map(|i| {
                     Color::Indexed(
                         [
-                            229, 223, 222, 221, 220, 214, 215, 216, 209, 208, 202, 172, 166, 178,
-                            179, 180, 137,
+                            216, 215, 209, 208, 214, 202, 203, 210, 173, 172, 166, 167, 160, 161,
+                            124, 131, 130,
                         ][i],
                     )
                 })
@@ -228,17 +235,18 @@ impl Theme {
                 Color::Reset,
             ),
             ColorDepth::TrueColor => (
-                // The classic P3 amber, with the chrome well below it so the
-                // data is what the eye lands on.
-                Color::Rgb(0xFF, 0xB0, 0x00),
-                Color::Rgb(0x6B, 0x44, 0x00),
-                Color::Rgb(0xB8, 0x76, 0x00),
-                Color::Rgb(0xFF, 0xE0, 0xA8),
-                Color::Rgb(0xFF, 0xC8, 0x40),
-                Color::Rgb(0xFF, 0xE0, 0xA8),
-                // The saturated peak of the phosphor. It blooms toward white
-                // without becoming it, which is what the tube actually did.
-                Color::Rgb(0xFF, 0xEB, 0xB9),
+                // Text is a light warm tint rather than the ramp's orange, so
+                // values stay easy to read against the chrome.
+                Color::Rgb(0xFF, 0xDC, 0xC4),
+                // Chrome is a deep burnt orange, far enough below the text that
+                // the eye lands on the data and not the borders.
+                Color::Rgb(0x6E, 0x30, 0x18),
+                Color::Rgb(0xD1, 0x7A, 0x4E),
+                Color::Rgb(0xFF, 0xEC, 0xD6),
+                Color::Rgb(0xFF, 0x9E, 0x5A),
+                Color::Rgb(0xFF, 0xB0, 0x74),
+                // The hottest point, blooming toward white without reaching it.
+                Color::Rgb(0xFF, 0xE6, 0xD0),
             ),
             _ => (
                 Color::Yellow,
@@ -596,19 +604,36 @@ mod amber_tests {
         Theme::amber(ColorDepth::TrueColor, Glyphs::Braille)
     }
 
-    /// The whole point of the palette: nothing on screen leaves the phosphor's
-    /// range. Red or green anywhere would break the illusion instantly.
+    /// Everything on screen stays warm, with red leading. A colour where green
+    /// catches up reads as yellow or gold, which next to anything else looks
+    /// green, and that is exactly what this palette is not.
     #[test]
-    fn every_colour_stays_within_amber() {
+    fn every_colour_is_warm_with_red_leading() {
         let t = amber();
         let mut all = vec![t.fg, t.chrome, t.dim, t.accent, t.ok, t.pending, t.danger];
         all.extend(t.channels.iter().copied());
 
         for c in all {
             let (r, g, b) = rgb(c);
-            assert!(r >= g, "{c:?} is not warm: red should lead");
-            assert!(g >= b, "{c:?} is not amber: green should lead blue");
-            assert!(b < 200, "{c:?} has too much blue for a phosphor");
+            assert!(r > g, "{c:?}: red must lead green");
+            assert!(g >= b, "{c:?}: green must lead blue");
+            assert!(
+                r as i32 - b as i32 >= 40,
+                "{c:?} is too close to grey to read as amber"
+            );
+        }
+    }
+
+    /// The channel ramp is the part most likely to drift toward gold, so it
+    /// carries a tighter rule than the chrome does.
+    #[test]
+    fn the_channel_ramp_is_orange_not_gold() {
+        for c in amber().channels {
+            let (r, g, _) = rgb(c);
+            assert!(
+                r as i32 - g as i32 >= 70,
+                "{c:?} has too much green: that reads as yellow, not orange"
+            );
         }
     }
 
@@ -626,10 +651,21 @@ mod amber_tests {
         assert!(lum(t.fg) < lum(t.accent), "focus should be the brightest");
     }
 
+    /// Text is lighter than the ramp on purpose: legibility beat authenticity
+    /// here, and a real single-phosphor screen is not the goal.
     #[test]
-    fn the_classic_phosphor_is_the_foreground() {
-        // P3 amber, near enough: the colour the screen is meant to be.
-        assert_eq!(rgb(amber().fg), (0xFF, 0xB0, 0x00));
+    fn text_is_lighter_than_the_channel_colours() {
+        let t = amber();
+        let lum = |c: Color| {
+            let (r, g, b) = rgb(c);
+            0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
+        };
+        for c in &t.channels {
+            assert!(
+                lum(t.fg) > lum(*c),
+                "text should sit above the ramp, but {c:?} is brighter"
+            );
+        }
     }
 
     /// Seventeen traces cannot be told apart by brightness alone, so the ramp
