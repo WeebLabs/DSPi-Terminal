@@ -20,6 +20,7 @@ use dspi_proto::FilterType;
 use dspi_proto::generated::opcodes as op;
 use dspi_proto::registry::{Hazard, Kind, ParamDesc, Requires, Target, WValue, by_path};
 use dspi_proto::value::{EqParamPacket, Repr, Value, ValueError, decode_qp};
+use dspi_proto::wire::BulkPacket;
 use dspi_proto::{ChannelMap, Dir, Platform};
 use dspi_transport::{Transport, TransportError, with_busy_retry};
 
@@ -201,10 +202,21 @@ impl Session {
         )?)
     }
 
+    /// Read the whole device state in one chunked transfer.
+    ///
+    /// Everything the bulk packet covers can be decoded from here instead of
+    /// asked for one scalar at a time. Prefer this whenever more than a couple
+    /// of values are wanted: it is six transfers for all 5944 bytes, against
+    /// five transfers per EQ band alone.
+    pub fn snapshot(&mut self) -> Result<BulkPacket, WriteError> {
+        Ok(crate::probe::read_bulk(&mut *self.transport)?)
+    }
+
     /// Read a whole EQ band.
     ///
-    /// There is no full-packet read in the protocol, so this costs five
-    /// transfers, plus a sixth for the Linkwitz Transform's `Qp`.
+    /// Five transfers, plus a sixth for the Linkwitz Transform's `Qp`. For more
+    /// than a band or two, [`Session::snapshot`] carries the same table for the
+    /// cost of one read.
     pub fn read_band(&mut self, channel: u8, band: u8) -> Result<EqParamPacket, WriteError> {
         let scalar = |s: &mut Self, param: u8, len: u16| -> Result<Vec<u8>, WriteError> {
             let wvalue = ((channel as u16) << 8) | ((band as u16) << 3) | param as u16;
@@ -603,7 +615,8 @@ mod tests {
             num_channels: 17,
             num_inputs: 8,
             num_outputs: 9,
-            max_bands: 12,
+            max_bands: 10,
+            band_storage: 12,
             channels: (0..17)
                 .map(|i| ChannelInfo {
                     index: i,
@@ -1143,7 +1156,8 @@ mod matrix_tests {
             num_channels: 17,
             num_inputs: 8,
             num_outputs: 9,
-            max_bands: 12,
+            max_bands: 10,
+            band_storage: 12,
             channels: Vec::new(),
             features: Vec::new(),
             cs: None,

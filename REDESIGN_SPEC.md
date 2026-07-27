@@ -1506,3 +1506,14 @@ Every permission message is platform-specific for this reason.
 **Not built:** guided flows (6.7), remote transport beyond the trait seam, SVG
 and PNG graph export, applying hardware I/O blocks from a preset, and a hardware
 smoke suite. The Raw panel exists as a command rather than a panel.
+
+**The bulk packet is the only fast way to read the EQ, and the header's band
+count is not a band count.** The spec's §3 table said 10 active PEQ bands and
+was right, but the implementation took the count from the bulk header's
+`max_bands`, which is the wire array's depth (12) rather than the number of live
+bands. The two extra rows were editable and did nothing. `max_bands` is now
+measured with a four-transfer binary search, so a firmware that grows its PEQ is
+picked up without a change here. Separately, reading the EQ through
+`GET_EQ_PARAM` costs five transfers per band — 24 seconds for a whole RP2350 —
+against 20 ms for the same table decoded out of one bulk snapshot. See
+`docs/firmware-notes.md` §9 and §10.

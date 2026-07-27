@@ -107,3 +107,55 @@ concurrent access anywhere.
 8 on RP2040, 16 on RP2350. The build-time generator detects the conflicting
 definition and refuses to emit it, so it cannot become a compiled-in assumption.
 It must come from `SIGGEN_GET_CAPS` instead, which reports it per device.
+
+---
+
+## 9. `max_bands` is storage depth, not the number of bands
+
+The bulk header's `max_bands` field reports **12**, and `bulk_params.h`
+describes it as "bands per channel in this payload". It is the width of the
+wire array, not a count of anything usable. `config.h` is explicit:
+
+```c
+#define MAX_BANDS        12
+// MAX_BANDS (12) is the PEQ storage depth; only bands 0..9 are active today.
+// ...
+// Band indices in [channel_band_counts[ch] .. XOVER_BAND_BASE) are rejected
+// by the vendor handlers today.
+```
+
+So the live count is **10**, held per channel in `channel_band_counts[]`, and
+`REQ_GET_EQ_PARAM` stalls for bands 10 and 11. Confirmed on hardware: every
+channel of an RP2350 at 1.1.5 answers for bands 0-9 and stalls for 10-11.
+
+There is no opcode that reports the count. `channel_band_counts` is firmware
+internal and is not carried in the bulk packet. Taking the header at face value
+therefore offers the user two bands per channel that silently do nothing — which
+this app did until it was measured.
+
+`probe_band_count()` measures it instead: the boundary is monotonic, so a binary
+search finds it in four transfers. That also means a firmware that grows its PEQ
+(the comment notes room to reach 20 bands) is picked up without a code change.
+`Capabilities::max_bands` is the live count; `band_storage` is the wire depth,
+which is what a bulk packet is indexed by.
+
+---
+
+## 10. The bulk packet is the only fast way to read the EQ
+
+There is no whole-band read opcode: `REQ_GET_EQ_PARAM` returns one scalar per
+transfer, so a band costs five transfers and a full RP2350 costs 850. Measured
+on hardware, that is **24 seconds** — a control transfer averages 3 ms, and the
+firmware's own busy-window stalls push the total well past the arithmetic.
+
+The `eq` section of the bulk packet is the same table, and the whole 5944-byte
+snapshot arrives in six chunked transfers in **20 ms**. All 170 live bands decode
+identically to what the scalar path reports, so this is a strictly better read.
+
+Anything that wants more than a band or two should use `Session::snapshot()`.
+The same applies to the `crossovers` section, which mirrors the EQ layout at
+four columns instead of twelve.
+
+Note the addressing differs between the two paths, which is easy to get wrong:
+crossover bands are wire indices **20-23** for `GET`/`SET_EQ_PARAM`, but columns
+**0-3** of the `crossovers` section in the bulk packet.

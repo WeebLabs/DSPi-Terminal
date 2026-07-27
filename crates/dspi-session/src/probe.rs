@@ -25,7 +25,14 @@ pub struct Capabilities {
     pub num_channels: u8,
     pub num_inputs: u8,
     pub num_outputs: u8,
+    /// PEQ bands per channel that the firmware will actually accept.
+    ///
+    /// Not the header's `max_bands`, which is the wire array's depth. See
+    /// [`probe_band_count`].
     pub max_bands: u8,
+    /// Depth of the wire EQ array, which is what a bulk packet is indexed by.
+    /// Larger than `max_bands` whenever the firmware reserves room to grow.
+    pub band_storage: u8,
     pub channels: Vec<ChannelInfo>,
     /// Features answered a probe. Absent means this firmware stalled on it.
     pub features: Vec<Feature>,
@@ -152,13 +159,52 @@ pub fn probe(t: &mut dyn Transport) -> Result<Capabilities> {
         num_channels: h.num_channels,
         num_inputs: h.num_input_channels,
         num_outputs: h.num_output_channels,
-        max_bands: h.max_bands,
+        max_bands: probe_band_count(t, h.max_bands),
+        band_storage: h.max_bands,
         channels,
         features,
         cs,
         siggen,
         active_preset,
     })
+}
+
+/// How many PEQ bands the firmware will actually accept per channel.
+///
+/// The header's `max_bands` is the depth of the wire array, not the number of
+/// live bands: `config.h` reserves 12 slots and says "only bands 0..9 are
+/// active today", with the vendor handlers rejecting everything between the
+/// live count and the crossover base. Trusting the header therefore offers the
+/// user two bands that silently do nothing.
+///
+/// No opcode reports the count, so it is measured: `GET_EQ_PARAM` answers for a
+/// live band and stalls for a reserved one, and that boundary is monotonic, so
+/// a binary search finds it in four transfers. Measuring rather than hardcoding
+/// means a firmware that grows to 20 bands is picked up without a code change.
+///
+/// Deliberately not wrapped in `with_busy_retry`: here a stall is the answer,
+/// and retrying it would cost 600 ms per probe.
+fn probe_band_count(t: &mut dyn Transport, storage: u8) -> u8 {
+    // Channel 0, param 0 (filter type). Any live band answers; reserved ones stall.
+    let live = |t: &mut dyn Transport, band: u8| {
+        t.control_in(op::REQ_GET_EQ_PARAM, (band as u16) << 3, 4)
+            .is_ok()
+    };
+
+    // If even band 0 will not answer, the device is not in a state to be
+    // measured. Report the header's depth rather than claiming it has no EQ.
+    if storage == 0 || !live(t, 0) {
+        return storage;
+    }
+
+    // Invariant: `lo` is live, `hi` is not. `storage` is past the array, so it
+    // is dead by construction, and the count is the first dead index.
+    let (mut lo, mut hi) = (0u8, storage);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if live(t, mid) { lo = mid } else { hi = mid }
+    }
+    hi
 }
 
 /// Channel names live in the bulk packet, so they cost nothing extra to read.
@@ -269,6 +315,86 @@ mod tests {
     use super::*;
     use dspi_transport::MockTransport;
     use dspi_transport::mock::Reply;
+
+    /// A device with a given number of live PEQ bands.
+    ///
+    /// The shared mock keys its replies on the opcode alone, but band validity
+    /// is carried in `wValue`, so it cannot express "answers for band 9, stalls
+    /// for band 10" — which is the whole of what the probe reads.
+    struct BandLimited {
+        live: u8,
+        descriptor: dspi_transport::DeviceDescriptor,
+        /// Every band index asked about, in order.
+        asked: Vec<u8>,
+    }
+
+    impl BandLimited {
+        fn new(live: u8) -> Self {
+            Self {
+                live,
+                descriptor: dspi_transport::DeviceDescriptor {
+                    serial: "TEST".into(),
+                    bus_id: "001".into(),
+                    address: 1,
+                },
+                asked: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for BandLimited {
+        fn control_in(&mut self, opcode: u8, value: u16, len: u16) -> Result<Vec<u8>> {
+            if opcode == op::REQ_GET_EQ_PARAM {
+                // wValue: channel in the high byte, band in bits 3..7.
+                let band = ((value >> 3) & 0x1F) as u8;
+                self.asked.push(band);
+                if band >= self.live {
+                    return Err(TransportError::Stalled { opcode });
+                }
+            }
+            Ok(vec![0u8; len as usize])
+        }
+
+        fn control_out(&mut self, _opcode: u8, _value: u16, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn descriptor(&self) -> &dspi_transport::DeviceDescriptor {
+            &self.descriptor
+        }
+    }
+
+    /// The header's `max_bands` is the wire array's depth, not the live count.
+    /// Believing it offers the user bands the firmware silently rejects.
+    #[test]
+    fn the_live_band_count_is_measured_not_taken_from_the_header() {
+        for live in 1..=12u8 {
+            let mut t = BandLimited::new(live);
+            assert_eq!(probe_band_count(&mut t, 12), live, "with {live} live");
+        }
+    }
+
+    /// Four transfers, not twelve: the probe runs on every connect, and a linear
+    /// walk would put the cost back into startup.
+    #[test]
+    fn the_probe_is_a_binary_search() {
+        let mut t = BandLimited::new(10);
+        probe_band_count(&mut t, 12);
+        assert!(
+            t.asked.len() <= 5,
+            "took {} transfers: {:?}",
+            t.asked.len(),
+            t.asked
+        );
+    }
+
+    /// A device that will not answer at all is not evidence that it has no EQ,
+    /// so the header's depth is the safer report.
+    #[test]
+    fn an_unresponsive_device_falls_back_to_the_header() {
+        let mut t = BandLimited::new(0);
+        assert_eq!(probe_band_count(&mut t, 12), 12);
+    }
 
     fn bulk_bytes() -> Vec<u8> {
         let mut b = vec![0u8; generated::BULK_SIZE];

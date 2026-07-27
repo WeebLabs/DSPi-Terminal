@@ -147,7 +147,9 @@ fn channel_candidates(ctx: &Context) -> Vec<Candidate> {
 }
 
 fn band_candidates(ctx: &Context) -> Vec<Candidate> {
-    let mut out: Vec<Candidate> = (1..=ctx.max_bands.max(10))
+    // The live count, not the wire array's depth: offering a reserved band
+    // would complete to something the firmware rejects.
+    let mut out: Vec<Candidate> = (1..=ctx.max_bands)
         .map(|b| Candidate::new(b.to_string(), "filter band", CandidateKind::Band))
         .collect();
     // Crossover bands keep their wire numbers, and are only valid on outputs.

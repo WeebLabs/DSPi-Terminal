@@ -15,7 +15,9 @@
 //! independent.
 
 use crate::ChannelMap;
+use crate::enums::FilterType;
 use crate::generated::{self, wire::WIRE_FORMAT_VERSION};
+use crate::value::{EqParamPacket, decode_qp};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WireError {
@@ -186,7 +188,58 @@ impl BulkPacket {
     pub fn channel_map(&self) -> Option<ChannelMap> {
         self.header.channel_map()
     }
+
+    /// One EQ band, decoded from the snapshot.
+    ///
+    /// The `eq` section is the same table `REQ_GET_EQ_PARAM` answers from, so
+    /// this is the whole-table read the protocol otherwise lacks: one bulk
+    /// transfer instead of five scalar ones per band. `None` for an index the
+    /// wire format has no room for.
+    pub fn band(&self, channel: u8, band: u8) -> Option<EqParamPacket> {
+        self.band_in("eq", generated::wire::WIRE_MAX_BANDS, channel, band)
+    }
+
+    /// One crossover band. The `crossovers` section mirrors `eq` exactly, but
+    /// four columns wide rather than twelve.
+    pub fn xover_band(&self, channel: u8, band: u8) -> Option<EqParamPacket> {
+        self.band_in(
+            "crossovers",
+            generated::wire::WIRE_MAX_XOVER_BANDS,
+            channel,
+            band,
+        )
+    }
+
+    fn band_in(&self, section: &str, stride: u16, channel: u8, band: u8) -> Option<EqParamPacket> {
+        if channel as u16 >= generated::wire::WIRE_MAX_CHANNELS || band as u16 >= stride {
+            return None;
+        }
+        let table = self.section(section)?;
+        let at = (channel as usize * stride as usize + band as usize) * WIRE_BAND_SIZE;
+        let b: &[u8; WIRE_BAND_SIZE] = table.get(at..at + WIRE_BAND_SIZE)?.try_into().ok()?;
+
+        let filter_type = FilterType::from_raw(b[0]);
+        let f32_at = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        Some(EqParamPacket {
+            channel,
+            band,
+            filter_type,
+            // The firmware's rule is "1 means bypassed", not "non-zero".
+            bypass: b[1] == 1,
+            freq: f32_at(4),
+            q: f32_at(8),
+            gain_db: f32_at(12),
+            // The reserved pair carries the Linkwitz target Q and nothing else,
+            // so reading it on another type would report a Q that is not there.
+            qp: filter_type
+                .is_linkwitz()
+                .then(|| decode_qp(u16::from_le_bytes([b[2], b[3]]))),
+        })
+    }
 }
+
+/// `WireBandParams`: type, bypass, two reserved bytes, then three floats.
+const WIRE_BAND_SIZE: usize = 16;
 
 /// Decode a `+1`-encoded optional byte.
 ///
@@ -237,6 +290,120 @@ mod tests {
 
     fn valid() -> Vec<u8> {
         header_bytes(26, 8, 9, 17, generated::BULK_SIZE as u16)
+    }
+
+    /// One `WireBandParams`: type, bypass, the reserved pair, then the floats.
+    fn band_bytes(ty: u8, bypass: u8, freq: f32, q: f32, gain: f32, reserved: u16) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0] = ty;
+        b[1] = bypass;
+        b[2..4].copy_from_slice(&reserved.to_le_bytes());
+        b[4..8].copy_from_slice(&freq.to_le_bytes());
+        b[8..12].copy_from_slice(&q.to_le_bytes());
+        b[12..16].copy_from_slice(&gain.to_le_bytes());
+        b
+    }
+
+    /// Place a band by the row-major rule the header states: channel 0 bands
+    /// 0..n-1, then channel 1, and so on.
+    fn put_band(raw: &mut [u8], section: &str, stride: usize, at: (usize, usize), b: [u8; 16]) {
+        let (_, off, _) = generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == section)
+            .unwrap();
+        let start = off + (at.0 * stride + at.1) * WIRE_BAND_SIZE;
+        raw[start..start + WIRE_BAND_SIZE].copy_from_slice(&b);
+    }
+
+    /// The EQ table is row-major, so an off-by-one in the stride reads a
+    /// neighbouring channel's band and looks entirely plausible.
+    #[test]
+    fn bands_decode_from_their_own_row() {
+        let mut raw = valid();
+        put_band(
+            &mut raw,
+            "eq",
+            12,
+            (0, 0),
+            band_bytes(1, 0, 105.0, 0.707, 8.8, 0),
+        );
+        put_band(
+            &mut raw,
+            "eq",
+            12,
+            (3, 7),
+            band_bytes(2, 1, 2856.0, 3.58, -8.6, 0),
+        );
+        let p = BulkPacket::decode(raw).unwrap();
+
+        let first = p.band(0, 0).unwrap();
+        assert_eq!((first.channel, first.band), (0, 0));
+        assert_eq!(first.freq, 105.0);
+        assert!(!first.bypass);
+
+        let other = p.band(3, 7).unwrap();
+        assert_eq!(other.freq, 2856.0);
+        assert_eq!(other.gain_db, -8.6);
+        assert!(other.bypass, "the bypass byte was 1");
+
+        // A slot nobody wrote reads as zeroes, not as its neighbour.
+        assert_eq!(p.band(3, 8).unwrap().freq, 0.0);
+        assert_eq!(p.band(4, 0).unwrap().freq, 0.0);
+    }
+
+    /// `Qp` rides in the reserved pair and means nothing on other types, so
+    /// reporting it everywhere would invent a Q that is not there.
+    #[test]
+    fn the_linkwitz_sidecar_is_read_only_for_linkwitz() {
+        let mut raw = valid();
+        let lt = FilterType::LinkwitzTransform.to_raw();
+        put_band(
+            &mut raw,
+            "eq",
+            12,
+            (1, 0),
+            band_bytes(lt, 0, 30.0, 0.707, 0.0, 512),
+        );
+        // Same reserved bytes, ordinary type.
+        put_band(
+            &mut raw,
+            "eq",
+            12,
+            (1, 1),
+            band_bytes(2, 0, 30.0, 0.707, 0.0, 512),
+        );
+        let p = BulkPacket::decode(raw).unwrap();
+
+        assert_eq!(p.band(1, 0).unwrap().qp, Some(1.0));
+        assert_eq!(p.band(1, 1).unwrap().qp, None);
+    }
+
+    /// Crossover rows are four wide where EQ rows are twelve. Sharing the
+    /// stride would put every channel but the first in the wrong place.
+    #[test]
+    fn crossover_bands_use_their_own_stride() {
+        let mut raw = valid();
+        put_band(
+            &mut raw,
+            "crossovers",
+            4,
+            (2, 1),
+            band_bytes(5, 0, 80.0, 0.707, 0.0, 0),
+        );
+        let p = BulkPacket::decode(raw).unwrap();
+
+        assert_eq!(p.xover_band(2, 1).unwrap().freq, 80.0);
+        assert_eq!(p.xover_band(2, 0).unwrap().freq, 0.0);
+        // Four columns, so there is no band 4 to ask for.
+        assert_eq!(p.xover_band(2, 4), None);
+    }
+
+    #[test]
+    fn a_band_outside_the_wire_array_is_none() {
+        let p = BulkPacket::decode(valid()).unwrap();
+        assert_eq!(p.band(17, 0), None, "only 17 channels, indexed 0..16");
+        assert_eq!(p.band(0, 12), None, "only 12 slots per channel");
+        assert!(p.band(16, 11).is_some(), "the last slot is addressable");
     }
 
     #[test]

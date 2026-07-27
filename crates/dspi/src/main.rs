@@ -733,17 +733,24 @@ fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) 
     }
 }
 
-/// Read every band on every channel.
+/// Read every band on every channel, from one bulk snapshot.
 ///
-/// There is no full-packet EQ read in the protocol, so this is five transfers
-/// per band. It is the slowest thing the app does at startup, which is why it
-/// happens once here rather than lazily per panel.
+/// The EQ table is a section of the bulk packet, so the whole thing arrives in
+/// six transfers. Asking `GET_EQ_PARAM` for each field instead costs five
+/// transfers per band — 850 of them on an RP2350 — and took 24 seconds on real
+/// hardware against 20 ms for the snapshot.
+///
+/// Falls back to the scalar path if the snapshot fails, so a device whose wire
+/// format this build does not know still populates what it can.
 fn load_bands(session: &mut Session, app: &mut dspi_tui::App) {
-    let channels = app.channels.len();
-    for ch in 0..channels {
-        let bands = app.channels[ch].bands.len();
-        for band in 0..bands {
-            if let Ok(p) = session.read_band(ch as u8, band as u8) {
+    let snapshot = session.snapshot().ok();
+    for ch in 0..app.channels.len() {
+        for band in 0..app.channels[ch].bands.len() {
+            let read = match &snapshot {
+                Some(s) => s.band(ch as u8, band as u8),
+                None => session.read_band(ch as u8, band as u8).ok(),
+            };
+            if let Some(p) = read {
                 app.channels[ch].bands[band] = dspi_proto::dsp::Band {
                     filter_type: p.filter_type,
                     freq: p.freq,
