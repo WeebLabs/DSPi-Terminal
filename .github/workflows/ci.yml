@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The tests are platform-independent by design, but running them on all three
+  # is what proves it rather than assuming it.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # A real link, not just a type-check. This is the step that would have
+      # caught anything cargo check cannot.
+      - name: Build
+        run: cargo build --workspace --release
+
+  # The Raspberry Pi targets have no runner, so they are cross-compiled. This
+  # links, which is more than `cargo check` proves.
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Build
+        run: cross build --workspace --release --target ${{ matrix.target }}
+
+  # The generated shell completions have to be valid scripts, not merely
+  # produced without error.
+  completions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check generated completions parse
+        run: |
+          cargo build --release
+          ./target/release/dspi completions bash > /tmp/dspi.bash
+          ./target/release/dspi completions zsh  > /tmp/_dspi
+          ./target/release/dspi completions fish > /tmp/dspi.fish
+          bash -n /tmp/dspi.bash
+          sudo apt-get update && sudo apt-get install -y zsh fish
+          zsh -n /tmp/_dspi
+          fish --no-execute /tmp/dspi.fish
