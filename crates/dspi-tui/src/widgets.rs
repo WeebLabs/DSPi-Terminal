@@ -213,6 +213,128 @@ fn set_dot(cells: &mut [u16], area: Rect, dx: usize, dy: usize) {
     cells[cy * area.width as usize + cx] |= BRAILLE_DOTS[dy % 4][dx % 2];
 }
 
+/// A "nice" tick step: 1, 2 or 5 times a power of ten.
+///
+/// Ticks a reader can do arithmetic with. Dividing the span into a fixed number
+/// of equal parts would give steps like 4.3 dB, which are correct and useless.
+fn nice_step(rough: f64) -> f64 {
+    if rough <= 0.0 {
+        return 1.0;
+    }
+    let decade = 10f64.powf(rough.log10().floor());
+    let scaled = rough / decade;
+    let step = if scaled <= 1.0 {
+        1.0
+    } else if scaled <= 2.0 {
+        2.0
+    } else if scaled <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    step * decade
+}
+
+/// The dB between labels: the smallest nice step whose labels neither crowd
+/// each other nor take over the plot.
+///
+/// Two constraints, because either alone is wrong. A minimum row spacing keeps
+/// labels off adjacent lines on a short plot; a maximum count stops a tall plot
+/// from filling its gutter with numbers. Shared by [`db_axis`] and
+/// [`db_axis_width`] so the gutter is always as wide as what goes in it.
+fn tick_step(span: f64, furthest: f64, rows: f64) -> f64 {
+    const MIN_ROWS_APART: f64 = 1.5;
+    const MAX_LABELS: usize = 9;
+
+    let mut step = nice_step(span / rows.max(1.0));
+    // The ladder is 1-2-5 per decade, so this terminates well before the guard.
+    for _ in 0..12 {
+        let apart = step / span * (rows - 1.0).max(1.0);
+        let labels = 2 * (furthest / step).floor() as usize + 1;
+        if apart >= MIN_ROWS_APART && labels <= MAX_LABELS {
+            break;
+        }
+        step = nice_step(step * 1.5);
+    }
+    step
+}
+
+/// dB labels for the y-axis, one line per plot row.
+///
+/// The zoom keys change the visible span, so a fixed scale would be wrong at
+/// every setting but one. The step is chosen from the span, always includes
+/// zero, and thins out rather than overprinting when the plot is short.
+///
+/// Returns exactly `height` lines, aligned to the same rows the plot uses.
+pub fn db_axis(height: u16, db_top: f64, db_bottom: f64, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(""); height as usize];
+    if height == 0 {
+        return lines;
+    }
+    let span = (db_top - db_bottom).max(1.0);
+    let rows = height as f64;
+    let step = tick_step(span, db_top.abs().max(db_bottom.abs()), rows);
+
+    let width = label_width(db_top, db_bottom, step);
+    let mut taken: Vec<bool> = vec![false; height as usize];
+
+    // From zero outwards, so the axis is symmetric and 0 is never the label
+    // that gets dropped.
+    let furthest = db_top.abs().max(db_bottom.abs());
+    let mut ticks: Vec<f64> = vec![0.0];
+    let mut v = step;
+    while v <= furthest + 1e-9 {
+        ticks.push(v);
+        ticks.push(-v);
+        v += step;
+    }
+
+    for db in ticks {
+        if db > db_top + 1e-9 || db < db_bottom - 1e-9 {
+            continue;
+        }
+        let norm = (db - db_bottom) / span;
+        let row = ((1.0 - norm) * (rows - 1.0)).round() as usize;
+        if row >= taken.len() || taken[row] {
+            continue;
+        }
+        taken[row] = true;
+        let text = format!("{:>width$} ", format_db(db), width = width);
+        lines[row] = Line::from(Span::styled(
+            text,
+            Style::default().fg(if db == 0.0 { theme.chrome } else { theme.dim }),
+        ));
+    }
+    lines
+}
+
+/// Width of the widest label the axis will draw, so the gutter is stable across
+/// a redraw rather than shifting the plot sideways.
+fn label_width(db_top: f64, db_bottom: f64, step: f64) -> usize {
+    let furthest = db_top.abs().max(db_bottom.abs());
+    let extreme = (furthest / step).floor() * step;
+    format_db(extreme).len().max(format_db(-extreme).len())
+}
+
+fn format_db(db: f64) -> String {
+    if db == 0.0 {
+        "0".into()
+    } else if (db.fract()).abs() < 1e-9 {
+        format!("{db:+.0}")
+    } else {
+        format!("{db:+.1}")
+    }
+}
+
+/// How wide a gutter [`db_axis`] needs for this span, including its trailing
+/// space. Callers reserve this before laying the plot out.
+pub fn db_axis_width(height: u16, db_top: f64, db_bottom: f64) -> u16 {
+    let span = (db_top - db_bottom).max(1.0);
+    let furthest = db_top.abs().max(db_bottom.abs());
+    let step = tick_step(span, furthest, height as f64);
+    label_width(db_top, db_bottom, step) as u16 + 1
+}
+
 /// Frequency labels for the x-axis, at the decades a listener thinks in.
 pub fn frequency_axis(width: u16, theme: &Theme) -> Line<'static> {
     let marks: [(f64, &str); 7] = [
@@ -380,6 +502,163 @@ mod tests {
             drawn.iter().all(|r| *r > 0 && *r < rows.len() - 1),
             "a 0 dB curve should sit mid-plot, drew on rows {drawn:?}"
         );
+    }
+
+    // ------------------------------------------------------- the dB scale
+
+    fn axis_labels(height: u16, range: f64) -> Vec<(usize, String)> {
+        let theme = Theme::dark(crate::theme::ColorDepth::TrueColor, Glyphs::Braille);
+        db_axis(height, range / 2.0, -range / 2.0, &theme)
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                (
+                    i,
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        .trim()
+                        .to_string(),
+                )
+            })
+            .filter(|(_, t)| !t.is_empty())
+            .collect()
+    }
+
+    /// The whole point: the zoom keys change the span, so a scale that did not
+    /// follow would be wrong at every setting but one.
+    #[test]
+    fn the_scale_follows_the_zoom() {
+        let tight = axis_labels(20, 10.0);
+        let wide = axis_labels(20, 100.0);
+        assert_ne!(tight, wide, "the scale did not change with the span");
+
+        // The topmost label is the highest tick inside the span, not the span
+        // itself: at ±5 dB the step is 2, so it reads +4 rather than +5.
+        let top = |v: &[(usize, String)]| v.first().unwrap().1.clone();
+        assert_eq!(top(&tight), "+4");
+        assert_eq!(top(&wide), "+40");
+    }
+
+    /// Every label has to name a value the plot is actually showing, or it
+    /// invites the user to read off a number that is not on screen.
+    #[test]
+    fn no_label_falls_outside_the_visible_span() {
+        for range in [10.0f64, 15.0, 30.0, 55.0, 100.0] {
+            for height in [6u16, 9, 14, 30] {
+                for (_, text) in axis_labels(height, range) {
+                    let db: f64 = text.parse().expect(&text);
+                    assert!(
+                        db.abs() <= range / 2.0 + 1e-9,
+                        "{db} is outside ±{} at height {height}",
+                        range / 2.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// Zero is the line the eye returns to, so it is never the label that gets
+    /// dropped when the plot is short.
+    #[test]
+    fn zero_is_always_labelled() {
+        for range in [10.0f64, 15.0, 30.0, 55.0, 100.0] {
+            for height in [4u16, 6, 9, 14, 30] {
+                let labels = axis_labels(height, range);
+                assert!(
+                    labels.iter().any(|(_, t)| t == "0"),
+                    "no zero at ±{} over {height} rows: {labels:?}",
+                    range / 2.0
+                );
+            }
+        }
+    }
+
+    /// A label on the wrong row is worse than none: it misreads the curve.
+    /// The zero label must land on the row the plot draws its zero line.
+    #[test]
+    fn the_labels_line_up_with_the_plot() {
+        let theme = Theme::dark(crate::theme::ColorDepth::TrueColor, Glyphs::Braille);
+        for range in [10.0f64, 30.0, 100.0] {
+            for height in [6u16, 9, 14, 25] {
+                let buf = render_to(40, height, |area, buf| {
+                    Bode {
+                        curves: Vec::new(),
+                        theme: &theme,
+                        db_top: range / 2.0,
+                        db_bottom: -range / 2.0,
+                        marker_hz: None,
+                        cursor: None,
+                    }
+                    .render(area, buf);
+                });
+                let plot_zero = as_text(&buf)
+                    .lines()
+                    .position(|l| l.starts_with('─'))
+                    .expect("no zero line");
+                let label_zero = axis_labels(height, range)
+                    .into_iter()
+                    .find(|(_, t)| t == "0")
+                    .expect("no zero label")
+                    .0;
+                assert_eq!(
+                    label_zero,
+                    plot_zero,
+                    "zero label and zero line disagree at ±{} over {height} rows",
+                    range / 2.0
+                );
+            }
+        }
+    }
+
+    /// The gutter is reserved before the labels are drawn, so if it is too
+    /// narrow the numbers are silently clipped.
+    #[test]
+    fn the_gutter_fits_the_widest_label() {
+        for range in [10.0f64, 15.0, 30.0, 55.0, 100.0] {
+            for height in [6u16, 9, 14, 30] {
+                let (top, bottom) = (range / 2.0, -range / 2.0);
+                let reserved = db_axis_width(height, top, bottom);
+                let widest = axis_labels(height, range)
+                    .iter()
+                    .map(|(_, t)| t.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    reserved as usize > widest,
+                    "gutter {reserved} cannot hold a {widest}-char label at ±{top}"
+                );
+            }
+        }
+    }
+
+    /// One line per row, or the labels drift out of step with the plot.
+    #[test]
+    fn the_axis_returns_a_line_per_row() {
+        let theme = Theme::dark(crate::theme::ColorDepth::TrueColor, Glyphs::Braille);
+        for height in [0u16, 1, 5, 40] {
+            assert_eq!(db_axis(height, 15.0, -15.0, &theme).len(), height as usize);
+        }
+    }
+
+    /// Labels a reader can do arithmetic with. Splitting the span into equal
+    /// parts would give steps like 4.3 dB, which are correct and useless.
+    #[test]
+    fn steps_are_round_numbers() {
+        for range in [10.0f64, 15.0, 30.0, 55.0, 100.0] {
+            let labels = axis_labels(20, range);
+            let values: Vec<f64> = labels.iter().map(|(_, t)| t.parse().unwrap()).collect();
+            for pair in values.windows(2) {
+                let step = (pair[0] - pair[1]).abs();
+                let decade = 10f64.powf(step.log10().floor());
+                let scaled = step / decade;
+                assert!(
+                    [1.0, 2.0, 5.0].iter().any(|n| (scaled - n).abs() < 1e-9),
+                    "{step} is not a 1-2-5 step (from {values:?})"
+                );
+            }
+        }
     }
 
     #[test]

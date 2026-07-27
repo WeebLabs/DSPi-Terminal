@@ -22,6 +22,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
 use crate::fields::{Field, FieldState, Targets, fields_for, nudge};
 use crate::theme::{Glyphs, Theme};
+use crate::widgets;
 use crate::widgets::{Bode, Curve, InlineMeter, Meter, frequency_axis};
 
 /// How hard the interface is allowed to work.
@@ -1492,13 +1493,42 @@ impl App {
             return;
         }
 
-        // The bottom row carries the frequency labels.
-        let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
-        let axis = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        // The bottom row carries the frequency labels; a gutter down the left
+        // carries the dB scale. The scale is only worth its width once there is
+        // a plot left over, so a narrow pane drops it rather than the curve.
+        let (db_top, db_bottom) = (self.db_range / 2.0, -self.db_range / 2.0);
+        let plot_h = inner.height - 1;
+        let gutter_w = widgets::db_axis_width(plot_h, db_top, db_bottom);
+        let gutter_w = if inner.width >= gutter_w + 24 {
+            gutter_w
+        } else {
+            0
+        };
+
+        let gutter = Rect::new(inner.x, inner.y, gutter_w, plot_h);
+        let plot = Rect::new(inner.x + gutter_w, inner.y, inner.width - gutter_w, plot_h);
+        let axis = Rect::new(
+            inner.x + gutter_w,
+            inner.y + inner.height - 1,
+            inner.width - gutter_w,
+            1,
+        );
+
+        if gutter_w > 0 {
+            f.render_widget(
+                Paragraph::new(widgets::db_axis(
+                    gutter.height,
+                    db_top,
+                    db_bottom,
+                    &self.theme,
+                )),
+                gutter,
+            );
+        }
 
         let mut bode = Bode::new(&self.theme);
-        bode.db_top = self.db_range / 2.0;
-        bode.db_bottom = -self.db_range / 2.0;
+        bode.db_top = db_top;
+        bode.db_bottom = db_bottom;
         bode.cursor = self.cursor;
         if self.panel == Panel::Filters
             && let Some(c) = self.selected()

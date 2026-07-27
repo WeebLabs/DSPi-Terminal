@@ -84,8 +84,10 @@ fn main() {
     a.selected_band = 2;
 
     // Colours are the point of a theme review, so emit them.
-    // Size and selection from the command line, so a short window and a
-    // scrolled list can be eyeballed without a device attached.
+    //
+    // Everything else comes from the command line, so a short window, a
+    // scrolled list or a zoom level can be eyeballed without a device:
+    //   preview [palette] [width] [height] [channel] [db_range]
     let arg = |n: usize, default: u16| -> u16 {
         std::env::args()
             .nth(n)
@@ -99,6 +101,9 @@ fn main() {
     {
         a.selected_channel = ch.min(a.channels.len().saturating_sub(1));
         a.panel = dspi_tui::app::Panel::Filters;
+    }
+    if let Some(r) = std::env::args().nth(5).and_then(|v| v.parse::<f64>().ok()) {
+        a.db_range = r;
     }
     print!("{}", dspi_tui::render_to_ansi(&a, w, h));
 }
