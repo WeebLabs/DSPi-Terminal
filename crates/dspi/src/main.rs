@@ -99,7 +99,8 @@ USAGE:
     dspi eq <ch> <band> <type> [freq] [q] [gain]
                              set a whole filter band in one transfer
     dspi export <file>       write all filters to a Console-compatible file
-    dspi import <file>       read a filter file and apply it
+    dspi import <file>       apply a filter file or .dspipreset
+                             (--volume, --hardware to include those blocks)
                              (--map-legacy for pre-2026 channel names)
     dspi completions <shell> generate shell completions
     dspi doctor              diagnose connection problems
@@ -243,6 +244,11 @@ fn cmd_export(serial: Option<&str>, args: &[&str]) -> u8 {
         return exit::USAGE;
     };
 
+    // The extension picks the format: a filter bank, or a whole-device document.
+    if path.ends_with(dspi_session::preset_file::FILE_EXTENSION) {
+        return export_preset(serial, path);
+    }
+
     let mut session = match connect(serial) {
         Ok(s) => s,
         Err(c) => return c,
@@ -325,6 +331,35 @@ fn cmd_export(serial: Option<&str>, args: &[&str]) -> u8 {
                 "Wrote {path}: {} channels, {} bands",
                 file.channels.len(),
                 file.channels.iter().map(|c| c.peq.len()).sum::<usize>()
+            );
+            exit::OK
+        }
+        Err(e) => {
+            eprintln!("dspi: could not write {path}: {e}");
+            exit::TRANSPORT
+        }
+    }
+}
+
+/// Capture everything the device is doing into a `.dspipreset`.
+fn export_preset(serial: Option<&str>, path: &str) -> u8 {
+    let mut session = match connect(serial) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+
+    let name = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+    let doc = dspi_session::preset_file::capture(&mut session, name);
+
+    match std::fs::write(path, dspi_session::preset_file::write(&doc)) {
+        Ok(()) => {
+            println!(
+                "Wrote {path}: {} channels, {} crosspoints",
+                doc.channels.len(),
+                doc.matrix.len()
             );
             exit::OK
         }
@@ -490,34 +525,40 @@ fn import_preset(text: &str, path: &str, flags: &[&str]) -> u8 {
         println!("Carries: {}", features.join(", "));
     }
 
-    // Compare against the device before promising anything.
-    match connect(flag_value(flags, "--device")) {
-        Ok(session) => {
-            let caps = session.capabilities();
-            let ids: Vec<i32> = caps.channels.iter().map(|c| c.index as i32).collect();
-            let (usable, missing) = preset_file::resolve_channels(&doc, &ids);
-
-            println!(
-                "This device can take {} of {} channels.",
-                usable.len(),
-                doc.channels.len()
-            );
-            if !missing.is_empty() {
-                println!("Not on this device: {}", missing.join(", "));
-            }
-            if doc.meta.wire_format_version != 0
-                && doc.meta.wire_format_version != caps.wire_format as i32
-            {
-                println!(
-                    "Note: written for wire format V{}, this device is V{}.",
-                    doc.meta.wire_format_version, caps.wire_format
-                );
-            }
-        }
-        Err(_) => println!("No device connected, so this is a file check only."),
+    let mut session = match connect(flag_value(flags, "--device")) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    if flags.contains(&"--dry-run") {
+        session.dry_run = true;
     }
 
-    println!("\nApplying .dspipreset files is not implemented yet; use a filter file for now.");
+    // Volume and wiring are opt-in: they describe a room and a board, and
+    // changing either without being asked is the kind of surprise that loses
+    // trust in a tool.
+    let options = preset_file::ApplyOptions {
+        audio_processing: true,
+        volume_levels: flags.contains(&"--volume"),
+        hardware_io: flags.contains(&"--hardware"),
+    };
+
+    let report = preset_file::apply(&mut session, &doc, options);
+
+    println!(
+        "\n{} {} channels, {} bands, {} crossover bands, {} crosspoints",
+        if session.dry_run {
+            "Would apply"
+        } else {
+            "Applied"
+        },
+        report.channels_applied,
+        report.bands_applied,
+        report.crossover_bands_applied,
+        report.crosspoints_applied
+    );
+    if !report.skipped.is_empty() {
+        println!("Skipped: {}", report.skipped.join("; "));
+    }
     exit::OK
 }
 

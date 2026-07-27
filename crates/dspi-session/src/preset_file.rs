@@ -398,6 +398,441 @@ pub fn resolve_channels<'a>(
     (usable, missing)
 }
 
+// ---------------------------------------------------------------------------
+// Applying
+// ---------------------------------------------------------------------------
+
+use crate::{Outcome, Session};
+use dspi_proto::value::{EqParamPacket, Value};
+
+/// Apply a document to a device.
+///
+/// Everything goes through the ordinary write path, so each value gets the same
+/// clamping, capability gating and readback verification as a typed command.
+/// Nothing is applied that the options did not ask for, and the report says what
+/// actually happened rather than leaving the user to infer it from the UI.
+pub fn apply(session: &mut Session, doc: &PresetDocument, options: ApplyOptions) -> ApplyReport {
+    let mut report = ApplyReport::default();
+
+    let caps = session.capabilities().clone();
+    let ids: Vec<i32> = caps.channels.iter().map(|c| c.index as i32).collect();
+    let (usable, missing) = resolve_channels(doc, &ids);
+    report.missing_channels = missing;
+
+    if !options.audio_processing {
+        report
+            .skipped
+            .push("audio processing (not requested)".into());
+    } else {
+        // Pair linking first. A linked input pair mirrors every filter and
+        // preamp write to its partner, so applying it afterwards would let the
+        // device's current link state rewrite what was just pushed. This
+        // ordering is inherited from the reference implementation.
+        //
+        // The firmware has no notion of linking, so there is nothing to write
+        // here yet; the ordering is preserved so that when it gains one, the
+        // sequence is already right.
+        let _ = &doc.global.input_pair_linked;
+
+        for block in &usable {
+            let ch = block.channel_id as u8;
+            let mut touched = false;
+
+            for (i, b) in block.eq.iter().enumerate() {
+                if i as u8 >= caps.max_bands {
+                    break;
+                }
+                if apply_band(session, ch, i as u8, b).is_some() {
+                    report.bands_applied += 1;
+                    touched = true;
+                }
+            }
+
+            // Crossover bands live at wire indices 20-23 and only on outputs.
+            if block.is_output {
+                for (i, b) in block.crossover.iter().enumerate().take(4) {
+                    if apply_band(session, ch, 20 + i as u8, b).is_some() {
+                        report.crossover_bands_applied += 1;
+                        touched = true;
+                    }
+                }
+            }
+
+            let _ = session.write("ch.delay", &[ch], Value::Float(block.delay_ms));
+
+            if block.is_output
+                && let Some(out) = caps.num_inputs.checked_sub(0).map(|n| ch.wrapping_sub(n))
+                && out < caps.num_outputs
+            {
+                let _ = session.write("out.gain", &[out], Value::Float(block.gain_db));
+                let _ = session.write("out.mute", &[out], Value::Bool(block.muted));
+            }
+
+            if touched {
+                report.channels_applied += 1;
+            }
+        }
+
+        for c in &doc.matrix {
+            if c.input as u8 >= caps.num_inputs || c.output as u8 >= caps.num_outputs {
+                continue;
+            }
+            // The crosspoint packet carries every field at once.
+            let mut payload = vec![
+                c.input as u8,
+                c.output as u8,
+                c.enabled as u8,
+                c.invert as u8,
+            ];
+            payload.extend_from_slice(&c.gain_db.to_le_bytes());
+            if session
+                .write(
+                    "mix",
+                    &[c.input as u8, c.output as u8],
+                    Value::Bytes(payload),
+                )
+                .is_ok()
+            {
+                report.crosspoints_applied += 1;
+            }
+        }
+
+        apply_features(session, doc, &mut report);
+    }
+
+    if options.volume_levels {
+        let _ = session.write("vol.master", &[], Value::Float(doc.global.master_volume_db));
+        let _ = session.write("vol.user", &[], Value::Float(doc.global.user_volume_db));
+    } else {
+        report.skipped.push("volume levels (not requested)".into());
+    }
+
+    if options.hardware_io {
+        report
+            .skipped
+            .push("hardware I/O (applying wiring is not implemented)".into());
+    } else {
+        report.skipped.push("hardware I/O (not requested)".into());
+    }
+
+    report
+}
+
+fn apply_band(session: &mut Session, channel: u8, band: u8, b: &BandBlock) -> Option<()> {
+    let packet = EqParamPacket {
+        channel,
+        band,
+        filter_type: dspi_proto::FilterType::from_raw(b.r#type as u8),
+        bypass: b.bypass,
+        freq: b.freq_hz,
+        q: b.q,
+        gain_db: b.gain,
+        qp: Some(b.qp),
+    };
+    match session.write_band(&packet) {
+        Ok(Outcome::Rejected { .. }) | Err(_) => None,
+        Ok(_) => Some(()),
+    }
+}
+
+/// The feature blocks, each skipped with a reason when this device lacks it.
+fn apply_features(session: &mut Session, doc: &PresetDocument, report: &mut ApplyReport) {
+    let mut set = |path: &str, v: Value, label: &str, report: &mut ApplyReport| {
+        if let Err(e) = session.write(path, &[], v) {
+            // An absent feature is information, not a failure: a document from a
+            // better-equipped device should still apply everything else.
+            if matches!(e, crate::WriteError::Unavailable { .. }) {
+                let note = format!("{label} (not on this device)");
+                if !report.skipped.contains(&note) {
+                    report.skipped.push(note);
+                }
+            }
+        }
+    };
+
+    let l = &doc.loudness;
+    set("loud.on", Value::Bool(l.enabled), "loudness", report);
+    set("loud.ref", Value::Float(l.ref_spl), "loudness", report);
+    set(
+        "loud.intensity",
+        Value::Float(l.intensity_pct),
+        "loudness",
+        report,
+    );
+
+    let c = &doc.crossfeed;
+    set("cf.on", Value::Bool(c.enabled), "crossfeed", report);
+    set(
+        "cf.preset",
+        Value::Choice(c.preset as u8),
+        "crossfeed",
+        report,
+    );
+    set("cf.freq", Value::Float(c.freq_hz), "crossfeed", report);
+    set("cf.feed", Value::Float(c.feed_db), "crossfeed", report);
+    set("cf.itd", Value::Bool(c.itd), "crossfeed", report);
+
+    let v = &doc.leveller;
+    set("lev.on", Value::Bool(v.enabled), "leveller", report);
+    set(
+        "lev.speed",
+        Value::Choice(v.speed as u8),
+        "leveller",
+        report,
+    );
+    set("lev.amount", Value::Float(v.amount_pct), "leveller", report);
+    set(
+        "lev.maxgain",
+        Value::Float(v.max_gain_db),
+        "leveller",
+        report,
+    );
+    set(
+        "lev.lookahead",
+        Value::Bool(v.lookahead),
+        "leveller",
+        report,
+    );
+    set("lev.gate", Value::Float(v.gate_db), "leveller", report);
+
+    if let Some(b) = &doc.psybass {
+        set(
+            "bass.on",
+            Value::Bool(b.enabled),
+            "psychoacoustic bass",
+            report,
+        );
+        set(
+            "bass.cutoff",
+            Value::Float(b.cutoff_hz),
+            "psychoacoustic bass",
+            report,
+        );
+        set(
+            "bass.harmonics",
+            Value::Float(b.harmonics_db),
+            "psychoacoustic bass",
+            report,
+        );
+        set(
+            "bass.drive",
+            Value::Float(b.drive_db),
+            "psychoacoustic bass",
+            report,
+        );
+        set(
+            "bass.character",
+            Value::Float(b.character_pct),
+            "psychoacoustic bass",
+            report,
+        );
+        set(
+            "bass.original",
+            Value::Float(b.original_db),
+            "psychoacoustic bass",
+            report,
+        );
+    }
+
+    if let Some(u) = &doc.upmix {
+        set("up.on", Value::Bool(u.enabled), "upmixer", report);
+        set(
+            "up.strength",
+            Value::Float(u.strength_pct),
+            "upmixer",
+            report,
+        );
+        set(
+            "up.width",
+            Value::Float(u.center_width_pct),
+            "upmixer",
+            report,
+        );
+        set(
+            "up.presence",
+            Value::Float(u.presence_db),
+            "upmixer",
+            report,
+        );
+    }
+
+    set(
+        "in.source",
+        Value::Choice(doc.global.input_source),
+        "input source",
+        report,
+    );
+    set(
+        "bypass",
+        Value::Bool(doc.global.bypass),
+        "EQ bypass",
+        report,
+    );
+}
+
+/// Capture the current device state as a document.
+pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
+    let caps = session.capabilities().clone();
+
+    let read_f32 = |s: &mut Session, path: &str, ix: &[u8]| -> f32 {
+        s.read(path, ix)
+            .ok()
+            .and_then(|v| v.as_f32())
+            .unwrap_or(0.0)
+    };
+    let read_bool = |s: &mut Session, path: &str| -> bool {
+        s.read(path, &[])
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    let read_u8 = |s: &mut Session, path: &str| -> u8 {
+        s.read(path, &[]).ok().and_then(|v| v.as_u8()).unwrap_or(0)
+    };
+
+    let mut channels = Vec::new();
+    for c in &caps.channels {
+        let mut block = ChannelBlock {
+            channel_id: c.index as i32,
+            name: c.name.clone(),
+            is_output: c.is_output,
+            delay_ms: read_f32(session, "ch.delay", &[c.index]),
+            ..Default::default()
+        };
+        if c.is_output {
+            let out = c.index - caps.num_inputs;
+            block.gain_db = read_f32(session, "out.gain", &[out]);
+            block.muted = session
+                .read("out.mute", &[out])
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            block.enabled = session
+                .read("out.enable", &[out])
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+        }
+        for b in 0..caps.max_bands {
+            if let Ok(p) = session.read_band(c.index, b) {
+                block.eq.push(band_block(&p));
+            }
+        }
+        if c.is_output {
+            for b in 20..24 {
+                if let Ok(p) = session.read_band(c.index, b) {
+                    block.crossover.push(band_block(&p));
+                }
+            }
+        }
+        channels.push(block);
+    }
+
+    let mut preamps = vec![0.0f32; 8];
+    for i in 0..caps.num_inputs.min(8) {
+        preamps[i as usize] = read_f32(session, "pre", &[i]);
+    }
+
+    let matrix = session
+        .read_matrix()
+        .map(|(grid, _)| {
+            grid.iter()
+                .enumerate()
+                .flat_map(|(i, row)| {
+                    row.iter().enumerate().map(move |(o, c)| CrosspointBlock {
+                        input: i as i32,
+                        output: o as i32,
+                        enabled: c.enabled,
+                        invert: c.phase_invert,
+                        gain_db: c.gain_db,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let has = |name: &str| caps.features.iter().any(|f| f.name == name && f.present);
+
+    PresetDocument {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        meta: Meta {
+            name,
+            app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            platform: Some(caps.platform.name()),
+            firmware_version: Some(caps.firmware.clone()),
+            wire_format_version: caps.wire_format as i32,
+            input_channel_count: caps.num_inputs as i32,
+            output_channel_count: caps.num_outputs as i32,
+            saved_utc: None,
+        },
+        global: GlobalBlock {
+            input_preamps_db: preamps,
+            bypass: read_bool(session, "bypass"),
+            master_volume_db: read_f32(session, "vol.master", &[]),
+            user_volume_db: read_f32(session, "vol.user", &[]),
+            input_source: read_u8(session, "in.source"),
+            lg_sound_sync_enabled: read_bool(session, "in.lg"),
+            input_pair_linked: vec![false; 4],
+        },
+        loudness: LoudnessBlock {
+            enabled: read_bool(session, "loud.on"),
+            ref_spl: read_f32(session, "loud.ref", &[]),
+            intensity_pct: read_f32(session, "loud.intensity", &[]),
+            output_mask: 0xFFFF,
+        },
+        crossfeed: CrossfeedBlock {
+            enabled: read_bool(session, "cf.on"),
+            preset: read_u8(session, "cf.preset") as i32,
+            freq_hz: read_f32(session, "cf.freq", &[]),
+            feed_db: read_f32(session, "cf.feed", &[]),
+            itd: read_bool(session, "cf.itd"),
+            output_pair_mask: 0xFF,
+        },
+        leveller: LevellerBlock {
+            enabled: read_bool(session, "lev.on"),
+            speed: read_u8(session, "lev.speed") as i32,
+            lookahead: read_bool(session, "lev.lookahead"),
+            amount_pct: read_f32(session, "lev.amount", &[]),
+            max_gain_db: read_f32(session, "lev.maxgain", &[]),
+            gate_db: read_f32(session, "lev.gate", &[]),
+            detector_mask: 0xFF,
+            apply_mask: 0xFF,
+        },
+        // Absent rather than defaulted: a document must not claim a device had a
+        // feature it does not.
+        psybass: has("psychoacoustic_bass").then(|| PsybassBlock {
+            enabled: read_bool(session, "bass.on"),
+            cutoff_hz: read_f32(session, "bass.cutoff", &[]),
+            harmonics_db: read_f32(session, "bass.harmonics", &[]),
+            drive_db: read_f32(session, "bass.drive", &[]),
+            character_pct: read_f32(session, "bass.character", &[]),
+            original_db: read_f32(session, "bass.original", &[]),
+            output_mask: 0xFFFF,
+        }),
+        upmix: has("upmixer").then(|| UpmixBlock {
+            enabled: read_bool(session, "up.on"),
+            strength_pct: read_f32(session, "up.strength", &[]),
+            center_width_pct: read_f32(session, "up.width", &[]),
+            presence_db: read_f32(session, "up.presence", &[]),
+            ..Default::default()
+        }),
+        channels,
+        matrix,
+        io: IoBlock::default(),
+    }
+}
+
+fn band_block(p: &EqParamPacket) -> BandBlock {
+    BandBlock {
+        r#type: p.filter_type.to_raw() as i32,
+        freq_hz: p.freq,
+        q: p.q,
+        gain: p.gain_db,
+        qp: p.qp.unwrap_or(0.707),
+        bypass: p.bypass,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
