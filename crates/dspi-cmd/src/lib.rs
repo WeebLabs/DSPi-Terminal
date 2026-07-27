@@ -294,7 +294,9 @@ fn parse_band(token: &str, ctx: &Context) -> Result<u8, ParseError> {
     if (20..24).contains(&n) {
         return Ok(n as u8);
     }
-    let top = ctx.max_bands.max(10) as u16;
+    // The live count, not a floor of 10: on a device with fewer bands, `.max(10)`
+    // would accept numbers the firmware then stalls on.
+    let top = ctx.max_bands as u16;
     if n >= 1 && n <= top {
         return Ok((n - 1) as u8);
     }
@@ -517,7 +519,8 @@ mod tests {
                 .collect(),
             num_inputs: 8,
             num_outputs: 9,
-            max_bands: 12,
+            // The live count, as a real device reports it.
+            max_bands: 10,
         }
     }
 
@@ -630,6 +633,54 @@ mod tests {
     #[test]
     fn band_zero_is_rejected_rather_than_wrapping() {
         assert!(p("eq.freq i2s.1.l 0 2856").is_err());
+    }
+
+    /// The top of the range is the other end of the same off-by-one: the last
+    /// band a user can type must reach the last band the firmware has.
+    #[test]
+    fn the_last_band_is_reachable_and_the_next_one_is_not() {
+        let top = ctx().max_bands; // 10
+        match p(&format!("eq.freq usb.1 {top} 2856")).unwrap() {
+            Command::Set { indices, .. } => assert_eq!(indices, vec![0, top - 1]),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            p(&format!("eq.freq usb.1 {} 2856", top + 1)).is_err(),
+            "band {} is past the live count",
+            top + 1
+        );
+    }
+
+    /// The range follows the device rather than a constant, so a part with
+    /// fewer bands does not accept numbers the firmware then stalls on.
+    #[test]
+    fn the_band_range_tracks_the_device() {
+        let small = Context {
+            max_bands: 4,
+            ..ctx()
+        };
+        let parse = |line: &str| {
+            let toks = tokenize(line);
+            let refs: Vec<&str> = toks.iter().map(String::as_str).collect();
+            super::parse(&refs, &small)
+        };
+        assert!(parse("eq.freq usb.1 4 2856").is_ok());
+        assert!(parse("eq.freq usb.1 5 2856").is_err());
+    }
+
+    /// What the echo line prints has to be what the parser accepts, or copying a
+    /// line out of the interface into a shell silently edits a different band.
+    #[test]
+    fn a_formatted_band_parses_back_to_the_same_band() {
+        for typed in [1u8, 5, 10, 20, 23] {
+            let cmd = p(&format!("eq.freq usb.1 {typed} 2856")).unwrap();
+            let text = format(&cmd, &ctx());
+            assert!(
+                text.contains(&format!(" {typed} ")),
+                "band {typed} came back as `{text}`"
+            );
+            assert_eq!(p(&text).unwrap(), cmd, "`{text}` did not round-trip");
+        }
     }
 
     #[test]

@@ -2123,21 +2123,42 @@ impl App {
     }
 
     fn draw_bands(&self, f: &mut Frame, area: Rect) {
+        let Some(ch) = self.selected() else {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(self.theme.chrome_style())
+                .title(Span::styled("Bands", self.theme.label()));
+            f.render_widget(block, area);
+            return;
+        };
+
+        // The graph takes most of the height, so the table rarely shows every
+        // band. Scroll it rather than clip it: a selected band the user cannot
+        // see is a band they cannot tell they are editing.
+        let seats = area.height.saturating_sub(3) as usize; // borders and header
+        let total = ch.bands.len();
+        let first = Self::scroll_to(self.selected_band, total, seats);
+        let last = (first + seats).min(total);
+
+        let title = if seats >= total || total == 0 {
+            "Bands".to_string()
+        } else {
+            // Say which rows these are, so a short window is obviously a window.
+            format!("Bands {}-{} of {}", first + 1, last, total)
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.theme.chrome_style())
-            .title(Span::styled("Bands", self.theme.label()));
+            .title(Span::styled(title, self.theme.label()));
         let inner = block.inner(area);
         f.render_widget(block, area);
-
-        let Some(ch) = self.selected() else {
-            return;
-        };
 
         let rows: Vec<Row> = ch
             .bands
             .iter()
             .enumerate()
+            .skip(first)
+            .take(seats)
             .map(|(i, b)| {
                 let focused = i == self.selected_band;
                 let style = if focused {
@@ -2187,6 +2208,21 @@ impl App {
         .header(Row::new(vec!["#", "on", "type", "freq", "gain", "Q"]).style(self.theme.label()));
 
         f.render_widget(table, inner);
+    }
+
+    /// First visible row, keeping `selected` in view and the window full.
+    ///
+    /// Anchored rather than incremental, so it is correct however the selection
+    /// got there — a jump, a wrap, or a resize that shrank the window.
+    fn scroll_to(selected: usize, total: usize, seats: usize) -> usize {
+        if seats == 0 || total <= seats {
+            return 0;
+        }
+        // Centre the selection, then clamp so the last screen stays full rather
+        // than trailing blank rows past the end of the list.
+        selected
+            .saturating_sub(seats / 2)
+            .min(total.saturating_sub(seats))
     }
 
     fn draw_meter_bridge(&self, f: &mut Frame, area: Rect) {
@@ -3719,5 +3755,112 @@ mod editing_tests {
         assert!(out.contains("+/- value"), "no value hint:\n{out}");
         assert!(out.contains("←→ field"));
         assert!(out.contains("space bypass"));
+    }
+
+    fn with_bands(n: usize) -> App {
+        let mut a = app();
+        a.channels[0].bands = vec![
+            dsp::Band {
+                filter_type: dspi_proto::FilterType::Peaking,
+                freq: 1000.0,
+                q: 1.0,
+                gain_db: 0.0,
+                bypass: false,
+            };
+            n
+        ];
+        a
+    }
+
+    /// The numbers on the visible rows, in order.
+    fn band_numbers(a: &App, w: u16, h: u16) -> Vec<String> {
+        crate::render_to_string(a, w, h)
+            .lines()
+            .skip_while(|l| !l.contains("Bands"))
+            .filter(|l| l.contains("Peaking"))
+            .map(|l| {
+                // The selected row carries a `▸` against its number.
+                l.split_whitespace()
+                    .map(|t| t.trim_start_matches(['▸', '│']))
+                    .find(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The table is what a user reads a band number off before typing it into
+    /// the command line, so its numbering has to be the grammar's: 1-based,
+    /// counting up, with no band 0.
+    #[test]
+    fn the_band_table_is_numbered_from_one() {
+        let a = with_bands(10);
+        let numbers = band_numbers(&a, 100, 60);
+        assert_eq!(
+            numbers,
+            (1..=10).map(|n| n.to_string()).collect::<Vec<_>>(),
+            "rows should read 1 to 10, not 0 to 9"
+        );
+    }
+
+    /// Editing the top row must reach wire band 0. A table that rendered 1..10
+    /// over wire bands 1..10 would look right and silently skip a band.
+    #[test]
+    fn the_first_row_is_wire_band_zero() {
+        let a = app();
+        let echo = dspi_cmd::format(
+            &dspi_cmd::Command::Set {
+                path: "eq.freq",
+                indices: vec![0, 0],
+                value: Value::Float(105.0),
+            },
+            &a.ctx,
+        );
+        assert!(
+            echo.contains(" 1 "),
+            "wire band 0 should echo as band 1: {echo}"
+        );
+    }
+
+    /// The graph takes most of the height, so the table is usually a window
+    /// onto the bands. A selection outside it is a band the user is editing
+    /// blind.
+    #[test]
+    fn the_table_scrolls_to_keep_the_selection_visible() {
+        let mut a = with_bands(10);
+        for band in 0..10usize {
+            a.selected_band = band;
+            let shown = band_numbers(&a, 100, 30);
+            assert!(!shown.is_empty(), "nothing rendered for band {band}");
+            assert!(
+                shown.contains(&(band + 1).to_string()),
+                "band {} is off-screen; showing {shown:?}",
+                band + 1
+            );
+        }
+    }
+
+    /// A partial view says so, rather than looking like the whole list.
+    #[test]
+    fn a_scrolled_table_says_what_it_is_showing() {
+        let mut a = with_bands(10);
+        a.selected_band = 9;
+        let out = crate::render_to_string(&a, 100, 30);
+        assert!(out.contains(" of 10"), "no range in the title:\n{out}");
+
+        // With room for all ten there is nothing to qualify.
+        let all = crate::render_to_string(&a, 100, 60);
+        assert!(!all.contains(" of 10"), "qualified a complete list");
+    }
+
+    /// The last screen stays full: scrolling past the end would trail blank
+    /// rows and make the list look shorter than it is.
+    #[test]
+    fn the_window_never_runs_off_the_end() {
+        assert_eq!(App::scroll_to(9, 10, 4), 6, "last four rows are 7-10");
+        assert_eq!(App::scroll_to(0, 10, 4), 0);
+        assert_eq!(App::scroll_to(5, 10, 4), 3, "centred");
+        assert_eq!(App::scroll_to(3, 10, 10), 0, "no scroll when it all fits");
+        assert_eq!(App::scroll_to(3, 10, 0), 0, "no room, no panic");
     }
 }
