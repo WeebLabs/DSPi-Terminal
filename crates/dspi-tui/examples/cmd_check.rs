@@ -10,7 +10,7 @@ fn main() {
     let caps = probe(&mut t).expect("probe failed");
     let mut session = Session::new(Box::new(t), caps).expect("session");
 
-    let theme = Theme::new(Palette::Amber, ColorDepth::TrueColor, Glyphs::Braille);
+    let theme = Theme::new(Palette::Amber, ColorDepth::detect(), Glyphs::Braille);
     let mut app = App::from_session(theme, &session);
 
     let before = session.read("bass.drive", &[]).unwrap();

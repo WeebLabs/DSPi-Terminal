@@ -205,9 +205,13 @@ impl Theme {
             ColorDepth::Ansi256 => (0..17)
                 .map(|i| {
                     Color::Indexed(
+                        // Walked down the cube from light orange to dark red,
+                        // every entry checked to resolve with red leading and
+                        // green well clear of it. Chosen by hand, one of these
+                        // was magenta.
                         [
-                            216, 215, 209, 208, 214, 202, 203, 210, 173, 172, 166, 167, 160, 161,
-                            124, 131, 130,
+                            216, 215, 214, 209, 208, 203, 202, 179, 173, 172, 167, 166, 160, 131,
+                            130, 124, 94,
                         ][i],
                     )
                 })
@@ -248,6 +252,21 @@ impl Theme {
                 // The hottest point, blooming toward white without reaching it.
                 Color::Rgb(0xFF, 0xE6, 0xD0),
             ),
+            // The 256-colour cube can express this palette perfectly well, so it
+            // gets real colours rather than the crude ANSI names. Apple Terminal
+            // has no truecolor at all, which makes this the branch a good number
+            // of people actually see.
+            ColorDepth::Ansi256 => (
+                Color::Indexed(223), // 255,215,175 warm cream text
+                Color::Indexed(130), // 175,95,0 burnt orange chrome
+                Color::Indexed(173), // 215,135,95 mid orange labels
+                Color::Indexed(224), // 255,215,215 the hottest highlight
+                Color::Indexed(208), // 255,135,0
+                Color::Indexed(215), // 255,175,95
+                Color::Indexed(224),
+            ),
+            // Sixteen colours has no orange at all; yellow is the closest warm
+            // tone available, so the character survives even if the hue cannot.
             _ => (
                 Color::Yellow,
                 Color::DarkGray,
@@ -719,5 +738,105 @@ mod amber_tests {
         assert_eq!(Palette::parse("amber"), Some(Palette::Amber));
         assert_eq!(Palette::parse("Dark"), Some(Palette::Dark));
         assert_eq!(Palette::parse("chartreuse"), None);
+    }
+}
+
+#[cfg(test)]
+mod indexed_palette_tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    /// Resolve an xterm-256 index to its RGB value.
+    ///
+    /// Indices 16-231 are a 6x6x6 cube; 232-255 are a grey ramp. Without this
+    /// the indexed palette cannot be checked against the same rules as the
+    /// truecolor one, which is how it drifted in the first place.
+    fn resolve(c: Color) -> (u8, u8, u8) {
+        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            Color::Indexed(i) if (16..232).contains(&i) => {
+                let n = i - 16;
+                (
+                    LEVELS[(n / 36) as usize],
+                    LEVELS[((n % 36) / 6) as usize],
+                    LEVELS[(n % 6) as usize],
+                )
+            }
+            Color::Indexed(i) if i >= 232 => {
+                let v = 8 + 10 * (i - 232);
+                (v, v, v)
+            }
+            other => panic!("cannot resolve {other:?}"),
+        }
+    }
+
+    fn indexed() -> Theme {
+        Theme::amber(ColorDepth::Ansi256, Glyphs::Braille)
+    }
+
+    /// The failure this whole module exists to catch: the truecolor palette was
+    /// tuned while the 256-colour one, which is what Apple Terminal and plenty
+    /// of others actually get, was left on plain ANSI yellow and grey.
+    #[test]
+    fn the_indexed_palette_is_warm_like_the_truecolor_one() {
+        let t = indexed();
+        let mut all = vec![t.fg, t.chrome, t.dim, t.accent, t.ok, t.pending, t.danger];
+        all.extend(t.channels.iter().copied());
+
+        for c in all {
+            let (r, g, b) = resolve(c);
+            assert!(r > g, "{c:?} resolves to ({r},{g},{b}): red must lead");
+            assert!(
+                g >= b,
+                "{c:?} resolves to ({r},{g},{b}): green must lead blue"
+            );
+        }
+    }
+
+    #[test]
+    fn no_plain_ansi_names_survive_at_256_colours() {
+        let t = indexed();
+        for c in [t.fg, t.chrome, t.dim, t.accent, t.ok, t.pending, t.danger] {
+            assert!(
+                matches!(c, Color::Indexed(_)),
+                "{c:?} is a crude ANSI name where the cube was available"
+            );
+        }
+    }
+
+    #[test]
+    fn the_indexed_ramp_is_orange_not_gold() {
+        for c in indexed().channels {
+            let (r, g, _) = resolve(c);
+            assert!(
+                r as i32 - g as i32 >= 40,
+                "{c:?} resolves to ({r},{g},..): too much green for orange"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_text_still_sits_above_the_chrome() {
+        let t = indexed();
+        let lum = |c: Color| {
+            let (r, g, b) = resolve(c);
+            0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
+        };
+        assert!(lum(t.chrome) < lum(t.dim), "chrome should be below labels");
+        assert!(lum(t.dim) < lum(t.fg), "labels should be below text");
+    }
+
+    /// Sixteen colours has no orange, so yellow is the honest fallback; the rule
+    /// is only that nothing goes cold.
+    #[test]
+    fn sixteen_colours_stays_warm_even_without_orange() {
+        let t = Theme::amber(ColorDepth::Ansi16, Glyphs::Blocks);
+        for c in [t.fg, t.dim, t.accent] {
+            assert!(
+                matches!(c, Color::Yellow | Color::LightYellow),
+                "{c:?} is not a warm tone"
+            );
+        }
     }
 }

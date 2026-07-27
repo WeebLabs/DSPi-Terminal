@@ -12,7 +12,13 @@ fn main() {
         .nth(1)
         .and_then(|a| Palette::parse(&a))
         .unwrap_or(Palette::Amber);
-    let mut a = App::new(Theme::new(palette, ColorDepth::TrueColor, Glyphs::Braille));
+
+    // Detect rather than assume truecolor. Hardcoding it meant this previewed a
+    // palette the person running it could not actually see: Apple Terminal is
+    // 256-colour only, and that branch went untuned for exactly that reason.
+    let depth = ColorDepth::detect();
+    eprintln!("rendering at {depth:?}");
+    let mut a = App::new(Theme::new(palette, depth, Glyphs::Braille));
     a.platform = "RP2350".into();
     a.firmware = "1.1.5".into();
     a.preset = "Preset 3".into();
