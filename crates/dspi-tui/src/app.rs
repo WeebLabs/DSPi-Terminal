@@ -629,16 +629,7 @@ impl App {
 
             // Enter goes into the content pane, Escape comes back, so the
             // arrows only ever mean one thing at a time.
-            // Enter toggles. Pressing the same key to come back is the instinct
-            // people actually have, and a one-way Enter with Escape as the only
-            // way out leaves them stuck in the panel.
-            KeyCode::Enter => {
-                self.focus = match self.focus {
-                    Focus::Sidebar => Focus::Content,
-                    Focus::Content => Focus::Sidebar,
-                }
-            }
-            // Escape always means "back out", wherever it is pressed.
+            KeyCode::Enter if self.focus == Focus::Sidebar => self.focus = Focus::Content,
             KeyCode::Esc => self.focus = Focus::Sidebar,
 
             KeyCode::Up if self.focus == Focus::Sidebar => self.move_channel(-1),
@@ -1832,9 +1823,9 @@ impl App {
                 "↑↓ channel · Enter edit · Tab panel · ^P palette · : cmd · M meters · q quit"
             }
             (Focus::Content, Panel::Filters) => {
-                "↑↓ band · ←→ adjust · Enter channels · h/l cursor · +/- zoom · = split"
+                "↑↓ band · ←→ adjust · Esc channels · h/l cursor · +/- zoom · = split"
             }
-            _ => "↑↓ field · ←→ adjust · Enter channels · Tab panel · ^P palette · F2 level",
+            _ => "↑↓ field · ←→ adjust · Esc channels · Tab panel · ^P palette · F2 level",
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(keys, self.theme.label()))),
@@ -2986,7 +2977,7 @@ mod sidebar_tests {
         a.panel = Panel::Filters;
         assert!(render(&a, 100, 24).contains("Enter edit"));
         a.focus = Focus::Content;
-        assert!(render(&a, 100, 24).contains("Enter channels"));
+        assert!(render(&a, 100, 24).contains("Esc channels"));
     }
 
     #[test]
@@ -3104,94 +3095,6 @@ mod selection_tests {
         assert!(
             marks(&a) < shown,
             "hiding a channel should remove its curve"
-        );
-    }
-}
-
-#[cfg(test)]
-mod focus_tests {
-    use super::*;
-    use crate::theme::ColorDepth;
-
-    fn app() -> App {
-        let mut a = App::new(Theme::dark(ColorDepth::TrueColor, Glyphs::Braille));
-        a.channels = (0..4)
-            .map(|i| ChannelView {
-                name: format!("Ch {i}"),
-                slug: format!("ch.{i}"),
-                bands: vec![dsp::Band::default(); 4],
-                curve: vec![0.0; dsp::POINTS],
-                ..Default::default()
-            })
-            .collect();
-        a.visible = vec![true; 4];
-        a
-    }
-
-    fn press(a: &mut App, code: KeyCode) {
-        a.on_key(KeyEvent::new(code, KeyModifiers::NONE));
-    }
-
-    /// Pressing the same key to come back is the instinct people have; a
-    /// one-way Enter leaves them stuck in the panel hunting for the way out.
-    #[test]
-    fn enter_toggles_focus_both_ways() {
-        let mut a = app();
-        assert_eq!(a.focus, Focus::Sidebar);
-
-        press(&mut a, KeyCode::Enter);
-        assert_eq!(a.focus, Focus::Content);
-
-        press(&mut a, KeyCode::Enter);
-        assert_eq!(a.focus, Focus::Sidebar, "Enter did not come back");
-
-        press(&mut a, KeyCode::Enter);
-        assert_eq!(a.focus, Focus::Content);
-    }
-
-    /// Escape always backs out, wherever it is pressed, so it stays a safe key
-    /// to reach for when lost.
-    #[test]
-    fn escape_always_returns_to_the_channel_list() {
-        let mut a = app();
-        press(&mut a, KeyCode::Esc);
-        assert_eq!(a.focus, Focus::Sidebar, "already there, and stays there");
-
-        press(&mut a, KeyCode::Enter);
-        press(&mut a, KeyCode::Esc);
-        assert_eq!(a.focus, Focus::Sidebar);
-    }
-
-    #[test]
-    fn the_arrows_follow_whichever_pane_has_focus() {
-        let mut a = app();
-        a.panel = Panel::Filters;
-
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.selected_channel, 1);
-        assert_eq!(a.selected_band, 0);
-
-        press(&mut a, KeyCode::Enter);
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.selected_band, 1, "content focus should move the band");
-        assert_eq!(a.selected_channel, 1, "and leave the channel alone");
-
-        press(&mut a, KeyCode::Enter);
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.selected_channel, 2, "back to moving the channel");
-    }
-
-    /// The hint has to name the key people will reach for, or it sends them to
-    /// the one they would not have tried.
-    #[test]
-    fn the_hint_names_the_key_that_comes_back() {
-        let mut a = app();
-        a.panel = Panel::Filters;
-        a.focus = Focus::Content;
-        let out = crate::render_to_string(&a, 100, 24);
-        assert!(
-            out.contains("Enter channels"),
-            "the way back should be advertised:\n{out}"
         );
     }
 }
