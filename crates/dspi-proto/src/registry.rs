@@ -17,7 +17,7 @@ use crate::value::{Repr, Unit, Value, ValueError};
 /// Which panel owns a parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
-    Dashboard,
+    Main,
     Input,
     Filters,
     Matrix,
@@ -388,7 +388,7 @@ pub static REGISTRY: &[ParamDesc] = &[
         "vol.user",
         "Volume",
         "The listening volume, shared with the OS volume slider",
-        Dashboard,
+        Main,
         Simple,
         Float {
             unit: Unit::Db,
@@ -408,7 +408,7 @@ pub static REGISTRY: &[ParamDesc] = &[
         "vol.mute",
         "Mute",
         "Silence the output, independently of the OS mute",
-        Dashboard,
+        Main,
         Simple,
         Bool,
         Tg::None,
@@ -424,7 +424,7 @@ pub static REGISTRY: &[ParamDesc] = &[
         "vol.master",
         "Master volume",
         "A ceiling on output level; -128 means muted",
-        Dashboard,
+        Main,
         Advanced,
         Float {
             unit: Unit::Db,
@@ -2446,7 +2446,7 @@ pub static REGISTRY: &[ParamDesc] = &[
         "meters",
         "Meters",
         "Per-channel levels, clip flags and processor load",
-        Dashboard,
+        Main,
         Simple,
         Status,
         Tg::None,
@@ -2462,7 +2462,7 @@ pub static REGISTRY: &[ParamDesc] = &[
         "meters.clear",
         "Clear clip indicators",
         "Reset the clip latches",
-        Dashboard,
+        Main,
         Simple,
         Trigger,
         Tg::None,

@@ -95,7 +95,9 @@ fn over_ssh() -> bool {
 /// and Output folds into Matrix, keeping the bar on one line at 80 columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
-    Dashboard,
+    /// The overview. Reached from the top of the channel list rather than the
+    /// tab bar, because it is not a per-channel view like the others are.
+    Main,
     Input,
     Filters,
     Matrix,
@@ -108,8 +110,10 @@ pub enum Panel {
 }
 
 impl Panel {
-    pub const ALL: [Panel; 10] = [
-        Panel::Dashboard,
+    /// The tabs, which are all per-channel views. `Main` is deliberately absent:
+    /// it is selected from the channel list, alongside the channels it
+    /// summarises.
+    pub const ALL: [Panel; 9] = [
         Panel::Input,
         Panel::Filters,
         Panel::Matrix,
@@ -137,7 +141,7 @@ impl Panel {
 
     pub fn title(self) -> &'static str {
         match self {
-            Panel::Dashboard => "Dashboard",
+            Panel::Main => "Main",
             Panel::Input => "Input",
             Panel::Filters => "Filters",
             Panel::Matrix => "Matrix",
@@ -339,7 +343,7 @@ impl App {
     pub fn new(theme: Theme) -> Self {
         Self {
             theme,
-            panel: Panel::Dashboard,
+            panel: Panel::Main,
             mode: Mode::Browse,
             level: Level::Advanced,
             split: Split::Split,
@@ -418,6 +422,39 @@ impl App {
             max_bands: caps.max_bands,
         };
         app
+    }
+
+    /// Whether the channel list's cursor is on the overview rather than a
+    /// channel. The list is the primary selector now, so it has to be able to
+    /// point at something that is not a channel.
+    pub fn on_main(&self) -> bool {
+        self.panel == Panel::Main
+    }
+
+    /// Move the channel list's cursor, which starts at the overview.
+    fn move_sidebar(&mut self, delta: isize) {
+        if self.channels.is_empty() {
+            return;
+        }
+        // Position 0 is the overview; the channels follow it.
+        let current = if self.on_main() {
+            0
+        } else {
+            self.selected_channel as isize + 1
+        };
+        let n = self.channels.len() as isize + 1;
+        let next = (current + delta).rem_euclid(n);
+
+        if next == 0 {
+            self.panel = Panel::Main;
+        } else {
+            if self.on_main() {
+                // Leaving the overview lands on the view a channel is for.
+                self.panel = Panel::Filters;
+            }
+            self.selected_channel = (next - 1) as usize;
+            self.selected_band = 0;
+        }
     }
 
     /// The frequency the cursor sits on.
@@ -970,8 +1007,8 @@ impl App {
             KeyCode::Enter if self.focus == Focus::Sidebar => self.focus = Focus::Content,
             KeyCode::Esc => self.focus = Focus::Sidebar,
 
-            KeyCode::Up if self.focus == Focus::Sidebar => self.move_channel(-1),
-            KeyCode::Down if self.focus == Focus::Sidebar => self.move_channel(1),
+            KeyCode::Up if self.focus == Focus::Sidebar => self.move_sidebar(-1),
+            KeyCode::Down if self.focus == Focus::Sidebar => self.move_sidebar(1),
 
             KeyCode::Up if self.panel == Panel::Matrix => self.move_matrix(-1, 0),
             KeyCode::Down if self.panel == Panel::Matrix => self.move_matrix(1, 0),
@@ -1100,24 +1137,15 @@ impl App {
     }
 
     fn cycle_panel(&mut self, delta: isize) {
-        let i = Panel::ALL
-            .iter()
-            .position(|p| *p == self.panel)
-            .unwrap_or(0) as isize;
         let n = Panel::ALL.len() as isize;
-        self.panel = Panel::ALL[((i + delta).rem_euclid(n)) as usize];
+        // Main is not in the tab bar, so tabbing out of it enters the row from
+        // whichever end you were heading towards rather than falling to index 0.
+        self.panel = match Panel::ALL.iter().position(|p| *p == self.panel) {
+            Some(i) => Panel::ALL[((i as isize + delta).rem_euclid(n)) as usize],
+            None if delta >= 0 => Panel::ALL[0],
+            None => Panel::ALL[(n - 1) as usize],
+        };
         self.rebuild_fields();
-    }
-
-    fn move_channel(&mut self, delta: isize) {
-        if self.channels.is_empty() {
-            return;
-        }
-        let n = self.channels.len() as isize;
-        self.selected_channel = ((self.selected_channel as isize + delta).rem_euclid(n)) as usize;
-        // A different channel has different bands, so the band cursor cannot
-        // stay where it was and still mean anything.
-        self.selected_band = 0;
     }
 
     fn move_band(&mut self, delta: isize) {
@@ -1147,22 +1175,30 @@ impl App {
             return;
         }
 
+        // Breathing room, but only where there is height to spare: on a short
+        // terminal every row of chrome is a row the graph does not get.
+        let airy = area.height >= 26;
+        let gap = if airy { 1 } else { 0 };
+
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1), // title
+                Constraint::Length(gap),
                 Constraint::Length(1), // tabs
-                Constraint::Min(3),    // body
+                Constraint::Length(gap),
+                Constraint::Min(3), // body
+                Constraint::Length(gap),
                 Constraint::Length(1), // echo
                 Constraint::Length(1), // keys
             ])
             .split(area);
 
         self.draw_title(f, rows[0]);
-        self.draw_tabs(f, rows[1]);
+        self.draw_tabs(f, rows[2]);
 
         if self.meters_expanded {
-            self.draw_meter_bridge(f, rows[2]);
+            self.draw_meter_bridge(f, rows[4]);
         } else {
             // Meters live inline in the channel list, so there is no separate
             // meter column competing for width.
@@ -1178,13 +1214,13 @@ impl App {
             let body = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(sidebar_w), Constraint::Min(30)])
-                .split(rows[2]);
+                .split(rows[4]);
             self.draw_sidebar(f, body[0]);
             self.draw_panel(f, body[1]);
         }
 
-        self.draw_echo(f, rows[3]);
-        self.draw_keys(f, rows[4]);
+        self.draw_echo(f, rows[6]);
+        self.draw_keys(f, rows[7]);
 
         if self.mode != Mode::Browse {
             self.draw_input_overlay(f, area);
@@ -1224,14 +1260,14 @@ impl App {
             } else {
                 self.theme.label()
             };
-            spans.push(Span::styled(format!(" {} ", p.title()), style));
+            spans.push(Span::styled(format!("  {}  ", p.title()), style));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_panel(&self, f: &mut Frame, area: Rect) {
         match self.panel {
-            Panel::Dashboard => self.draw_dashboard(f, area),
+            Panel::Main => self.draw_dashboard(f, area),
             Panel::Filters => self.draw_filters(f, area),
             Panel::Matrix => self.draw_matrix(f, area),
             Panel::Surfaces => self.draw_surfaces(f, area),
@@ -1320,7 +1356,11 @@ impl App {
             // three decades, so it gets the full width and a modest slice of the
             // rows, with the band table below.
             Split::Split => {
-                let g = (area.height / 2).clamp(6, 14);
+                // The curve is the point of this view, so it takes the larger
+                // share; the band table only needs enough rows to work in.
+                let g = (area.height * 2 / 3).clamp(8, 26);
+                // The table still needs enough rows to be worth reading.
+                let g = g.min(area.height.saturating_sub(7));
                 (g, area.height.saturating_sub(g))
             }
         };
@@ -1389,7 +1429,7 @@ impl App {
                 // A partner only counts if it is on the same side of the
                 // input/output divide; pairing an input with an output would be
                 // an accident of numbering.
-                Panel::Dashboard => {
+                Panel::Main => {
                     i == self.selected_channel
                         || (i == partner
                             && self.channels.get(i).map(|p| p.is_output)
@@ -1593,6 +1633,34 @@ impl App {
             .clamp(6, 14) as u16;
 
         let mut row = 0u16;
+
+        // The overview sits above the channels, since it summarises them.
+        {
+            let selected = self.on_main();
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        if selected { "▐" } else { " " },
+                        if selected {
+                            Style::default().fg(self.theme.accent)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    Span::styled(
+                        "Main",
+                        if selected {
+                            self.theme.focused()
+                        } else {
+                            self.theme.value()
+                        },
+                    ),
+                ])),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+            row += 2;
+        }
+
         let section = |f: &mut Frame, row: &mut u16, title: &str| {
             if *row < inner.height {
                 f.render_widget(
@@ -1636,7 +1704,7 @@ impl App {
         c: &ChannelView,
         name_w: u16,
     ) {
-        let selected = index == self.selected_channel;
+        let selected = index == self.selected_channel && !self.on_main();
         let colour = self.theme.channel(index as u8);
 
         // A bar in the margin, as the Console does, rather than a highlight:
@@ -2501,13 +2569,14 @@ mod tests {
     }
 
     #[test]
-    fn the_dashboard_renders_at_a_normal_size() {
+    fn the_main_view_renders_at_a_normal_size() {
         let (app, mut term) = demo_app(120, 40);
         let out = render(&app, &mut term);
         assert!(out.contains("DSPi"));
         assert!(out.contains("RP2350"));
         assert!(out.contains("Preset 3"));
-        assert!(out.contains("Dashboard"));
+        // Main is the top row of the channel list, not a tab.
+        assert!(out.contains("Main"));
         assert!(out.contains("Response"));
         assert!(
             out.contains("Channels"),
@@ -2522,7 +2591,7 @@ mod tests {
     fn everything_still_fits_at_eighty_by_twentyfour() {
         let (app, mut term) = demo_app(80, 24);
         let out = render(&app, &mut term);
-        assert!(out.contains("Dashboard"));
+        assert!(out.contains("Main"));
         assert!(out.contains("Response"));
         for line in out.lines() {
             assert!(
@@ -2649,24 +2718,46 @@ mod tests {
     }
 
     #[test]
+    /// The list wraps through Main, which sits above the first channel, so
+    /// running off either end costs one extra press rather than sticking.
     fn navigation_wraps_rather_than_sticking() {
         let (mut app, _term) = demo_app(120, 40);
         app.focus = Focus::Sidebar;
+        app.panel = Panel::Filters;
         app.selected_channel = 16;
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.on_main(), "past the last channel is Main");
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.selected_channel, 0);
+
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(app.on_main());
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.selected_channel, 16);
     }
 
     #[test]
+    /// Tab walks the tab bar, which Main is not part of: it is reached from the
+    /// top of the channel list. So tabbing out of Main enters the row and stays.
     fn tab_moves_between_panels() {
         let (mut app, _term) = demo_app(120, 40);
-        assert_eq!(app.panel, Panel::Dashboard);
+        assert_eq!(app.panel, Panel::Main);
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.panel, Panel::Input);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.panel, Panel::Filters);
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
-        assert_eq!(app.panel, Panel::Dashboard);
+        assert_eq!(app.panel, Panel::Input);
+    }
+
+    /// Backwards out of Main enters from the far end rather than snapping to the
+    /// first tab, so Shift-Tab is a real inverse of Tab.
+    #[test]
+    fn tabbing_backwards_out_of_main_lands_on_the_last_panel() {
+        let (mut app, _term) = demo_app(120, 40);
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.panel, *Panel::ALL.last().unwrap());
     }
 
     /// The Raw panel can issue any opcode, so it stays out of sight until the
@@ -3224,6 +3315,9 @@ mod sidebar_tests {
             })
             .collect();
         a.visible = vec![true; 7];
+        // These are tests about the channel list, so start on a channel panel
+        // rather than Main, which parks the cursor above the first channel.
+        a.panel = Panel::Filters;
         a
     }
 
@@ -3231,9 +3325,33 @@ mod sidebar_tests {
         crate::render_to_string(a, w, h)
     }
 
+    /// Just the channel-list column. The panel beside it repeats the selected
+    /// channel's name in its title, so a whole-line search finds that instead.
+    fn column(a: &App) -> String {
+        let out = render(a, 100, 24);
+        let width = out
+            .lines()
+            .find(|l| l.contains("┌Channels"))
+            .and_then(|l| l.chars().position(|c| c == '┐'))
+            .expect("no channel list")
+            + 1;
+        out.lines()
+            .map(|l| l.chars().take(width).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn row(a: &App, name: &str) -> String {
+        column(a)
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("no {name} row"))
+            .to_string()
+    }
+
     #[test]
     fn channels_are_grouped_into_inputs_and_outputs() {
-        let out = render(&app(), 100, 24);
+        let out = column(&app());
         let inputs = out.find("INPUTS").expect("no INPUTS heading");
         let outputs = out.find("OUTPUTS").expect("no OUTPUTS heading");
         assert!(inputs < outputs, "inputs should come first");
@@ -3248,31 +3366,49 @@ mod sidebar_tests {
         assert!(out[outputs..].contains("SPDIF 1"));
     }
 
+    /// The overview is reached from the list rather than the tab bar, so it has
+    /// to be visible there or it cannot be found at all.
+    #[test]
+    fn main_sits_above_the_channels() {
+        let out = column(&app());
+        let main = out.find(" Main").expect("no Main row");
+        let inputs = out.find("INPUTS").expect("no INPUTS heading");
+        assert!(main < inputs, "Main belongs at the top of the list");
+    }
+
+    #[test]
+    fn selecting_main_clears_the_channel_marker() {
+        let mut a = app();
+        a.panel = Panel::Main;
+        let out = column(&a);
+        let main = out.lines().find(|l| l.contains("Main")).unwrap();
+        assert!(main.contains('▐'), "Main is not marked: {main}");
+        assert_eq!(
+            out.lines().filter(|l| l.contains('▐')).count(),
+            1,
+            "a channel is still marked while Main is selected"
+        );
+    }
+
     /// The level belongs beside the channel it describes, rather than in a
     /// separate column the eye has to pair up by position.
     #[test]
     fn each_channel_carries_its_own_meter() {
-        let out = render(&app(), 100, 24);
-        let row = out
-            .lines()
-            .find(|l| l.contains("USB 1"))
-            .expect("USB 1 row missing");
+        let row = row(&app(), "USB 1");
         assert!(row.contains('▓'), "no level on the selected row: {row}");
         assert!(row.contains('░'), "no meter track: {row}");
     }
 
     #[test]
     fn a_silent_channel_still_shows_its_track() {
-        let out = render(&app(), 100, 24);
-        let row = out.lines().find(|l| l.contains("USB 2")).unwrap();
+        let row = row(&app(), "USB 2");
         assert!(row.contains('░'));
         assert!(!row.contains('▓'), "USB 2 is silent: {row}");
     }
 
     #[test]
     fn a_clipped_channel_flags_itself_in_the_list() {
-        let out = render(&app(), 100, 24);
-        let row = out.lines().find(|l| l.contains("SPDIF 3")).unwrap();
+        let row = row(&app(), "SPDIF 3");
         assert!(row.contains('▌'), "clip flag missing: {row}");
     }
 
@@ -3282,11 +3418,10 @@ mod sidebar_tests {
     fn the_selected_channel_is_marked_in_the_margin() {
         let mut a = app();
         a.selected_channel = 2;
-        let out = render(&a, 100, 24);
-        let row = out.lines().find(|l| l.contains("USB 3")).unwrap();
-        assert!(row.contains('▐'), "no selection marker: {row}");
+        let marked = row(&a, "USB 3");
+        assert!(marked.contains('▐'), "no selection marker: {marked}");
 
-        let other = out.lines().find(|l| l.contains("USB 4")).unwrap();
+        let other = row(&a, "USB 4");
         assert!(!other.contains('▐'), "two rows marked at once");
     }
 
@@ -3349,7 +3484,7 @@ mod sidebar_tests {
         let a = app();
         let out = render(&a, 80, 24);
         assert!(out.contains("INPUTS"));
-        assert!(out.contains("Response") || out.contains("Dashboard"));
+        assert!(out.contains("Response"), "no graph beside the list");
         for line in out.lines() {
             assert!(line.chars().count() <= 80, "overflows: {line}");
         }
@@ -3403,7 +3538,7 @@ mod selection_tests {
     #[test]
     fn the_dashboard_graph_follows_the_selected_channel() {
         let mut a = app();
-        a.panel = Panel::Dashboard;
+        a.panel = Panel::Main;
 
         a.selected_channel = 0;
         let first = crate::render_to_string(&a, 100, 24);
@@ -3433,7 +3568,7 @@ mod selection_tests {
     #[test]
     fn the_dashboard_pairs_only_within_inputs_or_outputs() {
         let mut a = app();
-        a.panel = Panel::Dashboard;
+        a.panel = Panel::Main;
 
         // Channel 3 is the last input; its numeric partner, 2, is also an input.
         a.selected_channel = 3;

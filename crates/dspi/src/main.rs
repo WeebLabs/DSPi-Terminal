@@ -677,9 +677,10 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
         }
         "grid" => {
             app.grid_mode = true;
-            dspi_tui::app::Panel::Dashboard
+            dspi_tui::app::Panel::Main
         }
         "surfaces" => dspi_tui::app::Panel::Surfaces,
+        "main" => dspi_tui::app::Panel::Main,
         "matrix" => dspi_tui::app::Panel::Matrix,
         "input" => dspi_tui::app::Panel::Input,
         "dynamics" => dspi_tui::app::Panel::Dynamics,
@@ -689,9 +690,9 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
         "filters" => dspi_tui::app::Panel::Filters,
         "meters" => {
             app.meters_expanded = true;
-            dspi_tui::app::Panel::Dashboard
+            dspi_tui::app::Panel::Main
         }
-        _ => dspi_tui::app::Panel::Dashboard,
+        _ => dspi_tui::app::Panel::Main,
     };
 
     // The panel changed after the initial load, so refresh for the new one.
