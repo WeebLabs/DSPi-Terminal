@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         Some("completions") => cmd_completions(&positional(&flags)),
         Some("doctor") | Some("--doctor") => doctor::run(),
         Some("raw") => cmd_raw(serial, &positional(&flags)),
+        Some("autoeq") => cmd_autoeq(serial, &positional(&flags), &flags),
         Some("--install-udev") => doctor::install_udev(),
         Some("screenshot") => cmd_screenshot(serial, &positional(&flags)),
         Some("export") => cmd_export(serial, &positional(&flags)),
@@ -106,6 +107,8 @@ USAGE:
     dspi completions <shell> generate shell completions
     dspi doctor              diagnose connection problems
     dspi raw <op> <len> [v]  issue any vendor opcode and hex-dump the reply
+    dspi autoeq search <q>   find a headphone correction profile
+    dspi autoeq apply <id>   apply one to the input channels
     dspi --install-udev      install the Linux udev rule (needs root)
     dspi --version           show app and protocol versions
 
@@ -732,6 +735,179 @@ fn load_bands(session: &mut Session, app: &mut dspi_tui::App) {
             }
         }
         app.recompute(ch);
+    }
+}
+
+/// Search the AutoEQ database, or apply a profile.
+fn cmd_autoeq(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
+    use dspi_session::autoeq;
+
+    let db = match autoeq::load() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("dspi: {e}");
+            return exit::USAGE;
+        }
+    };
+
+    match args.first().copied() {
+        Some("search") => {
+            let query = args[1..].join(" ");
+            if query.is_empty() {
+                eprintln!("dspi: autoeq search needs something to look for");
+                return exit::USAGE;
+            }
+            let hits = db.search(&query);
+            if hits.is_empty() {
+                println!("Nothing matching \"{query}\".");
+                return exit::OK;
+            }
+            for e in hits.iter().take(20) {
+                println!(
+                    "{:<44}{} bands, preamp {:+.1} dB",
+                    e.id,
+                    e.filters.len(),
+                    e.preamp
+                );
+            }
+            if hits.len() > 20 {
+                println!("... and {} more; narrow the search.", hits.len() - 20);
+            }
+            exit::OK
+        }
+
+        Some("apply") => {
+            let Some(id) = args.get(1) else {
+                eprintln!("dspi: autoeq apply needs a profile id from `autoeq search`");
+                return exit::USAGE;
+            };
+            let Some(entry) = db.get(id) else {
+                eprintln!("dspi: no profile called `{id}`");
+                return exit::USAGE;
+            };
+
+            let mut session = match connect(serial) {
+                Ok(s) => s,
+                Err(c) => return c,
+            };
+            if flags.contains(&"--dry-run") {
+                session.dry_run = true;
+            }
+
+            // Default to every input: a headphone correction belongs on what is
+            // being listened to, and applying it to one side only would be worse
+            // than not applying it.
+            let caps = session.capabilities().clone();
+            let channels: Vec<u8> = match args.get(2) {
+                Some(name) => {
+                    match caps
+                        .channels
+                        .iter()
+                        .find(|c| c.slug == *name || c.name == *name)
+                    {
+                        Some(c) => vec![c.index],
+                        None => {
+                            eprintln!("dspi: no channel called `{name}`");
+                            return exit::USAGE;
+                        }
+                    }
+                }
+                None => (0..caps.num_inputs).collect(),
+            };
+
+            let mut applied = 0usize;
+            let mut unsupported: Vec<&str> = Vec::new();
+
+            for ch in &channels {
+                let _ = session.write("pre", &[*ch], dspi_proto::value::Value::Float(entry.preamp));
+
+                for (i, f) in entry.filters.iter().enumerate() {
+                    if i as u8 >= caps.max_bands {
+                        break;
+                    }
+                    let Some(kind) = autoeq::filter_type(&f.kind) else {
+                        if !unsupported.contains(&f.kind.as_str()) {
+                            unsupported.push(&f.kind);
+                        }
+                        continue;
+                    };
+                    let packet = dspi_proto::value::EqParamPacket {
+                        channel: *ch,
+                        band: i as u8,
+                        filter_type: kind,
+                        bypass: false,
+                        freq: f.freq,
+                        q: f.q,
+                        gain_db: f.gain,
+                        qp: None,
+                    };
+                    if session.write_band(&packet).is_ok() {
+                        applied += 1;
+                    }
+                }
+
+                // Bands the profile does not use must be cleared, or whatever
+                // was there before survives underneath the correction.
+                for i in entry.filters.len()..caps.max_bands as usize {
+                    let packet = dspi_proto::value::EqParamPacket {
+                        channel: *ch,
+                        band: i as u8,
+                        filter_type: dspi_proto::FilterType::Flat,
+                        bypass: false,
+                        freq: 1000.0,
+                        q: 0.707,
+                        gain_db: 0.0,
+                        qp: None,
+                    };
+                    let _ = session.write_band(&packet);
+                }
+            }
+
+            println!(
+                "{} {} to {} channel(s): {applied} bands, preamp {:+.1} dB",
+                if session.dry_run {
+                    "Would apply"
+                } else {
+                    "Applied"
+                },
+                entry.id,
+                channels.len(),
+                entry.preamp
+            );
+            if entry.filters.len() > caps.max_bands as usize {
+                println!(
+                    "Note: the profile has {} bands, this device has {}; the rest were dropped.",
+                    entry.filters.len(),
+                    caps.max_bands
+                );
+            }
+            if !unsupported.is_empty() {
+                println!(
+                    "Shapes this build does not know: {}",
+                    unsupported.join(", ")
+                );
+            }
+            exit::OK
+        }
+
+        _ => {
+            println!(
+                "AutoEQ database: {} profiles, {} copy{}",
+                db.entries.len(),
+                match db.origin {
+                    autoeq::Origin::User => "your",
+                    autoeq::Origin::Bundled => "the built-in",
+                },
+                if db.generated_at.is_empty() {
+                    String::new()
+                } else {
+                    format!(", generated {}", db.generated_at)
+                }
+            );
+            println!("\n  dspi autoeq search <words>");
+            println!("  dspi autoeq apply <id> [channel]");
+            exit::OK
+        }
     }
 }
 

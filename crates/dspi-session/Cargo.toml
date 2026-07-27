@@ -15,5 +15,8 @@ serde_json.workspace = true
 serde = { workspace = true }
 
 [features]
-default = ["serde"]
+default = ["serde", "bundled-autoeq"]
+# About 5 MB of the binary. Off for a build where that matters, such as an
+# armv7 Pi; a user-supplied database still works without it.
+bundled-autoeq = []
 serde = ["dspi-proto/serde"]

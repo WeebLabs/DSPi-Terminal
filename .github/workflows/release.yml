@@ -29,13 +29,20 @@ jobs:
         if: matrix.cross
         run: cargo install cross --locked
 
+      # The bundled AutoEQ database is about 5 MB of a 6.6 MB binary. The
+      # 32-bit Pi target drops it: those machines are the most storage
+      # constrained, and a user-supplied database still works there.
       - name: Build
         shell: bash
         run: |
+          FEATURES=""
+          if [ "${{ matrix.target }}" = "armv7-unknown-linux-gnueabihf" ]; then
+            FEATURES="--no-default-features --features serde"
+          fi
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release --target ${{ matrix.target }} $FEATURES
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --target ${{ matrix.target }} $FEATURES
           fi
 
       - name: Package
