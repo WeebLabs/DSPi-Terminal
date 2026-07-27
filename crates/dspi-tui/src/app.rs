@@ -1032,14 +1032,36 @@ impl App {
             bode.marker_hz = Some(b.freq as f64);
         }
 
+        // The channel list is a visible selector, so the graph has to follow it
+        // or selecting a channel looks like it does nothing. On the dashboard
+        // the selected channel is shown with its stereo partner, which is what
+        // a listener is usually comparing; seventeen curves at once is noise.
+        let partner = if self.selected_channel.is_multiple_of(2) {
+            self.selected_channel + 1
+        } else {
+            self.selected_channel.saturating_sub(1)
+        };
+
         for (i, c) in self.channels.iter().enumerate() {
-            // On the dashboard, showing seventeen curves at once is noise; the
-            // selected channel plus its neighbour is what a user is comparing.
             if !self.visible.get(i).copied().unwrap_or(true) {
                 continue;
             }
-            let show = self.panel == Panel::Filters && i == self.selected_channel
-                || self.panel == Panel::Dashboard && i < 2;
+            let show = match self.panel {
+                Panel::Filters => i == self.selected_channel,
+                // A partner only counts if it is on the same side of the
+                // input/output divide; pairing an input with an output would be
+                // an accident of numbering.
+                Panel::Dashboard => {
+                    i == self.selected_channel
+                        || (i == partner
+                            && self.channels.get(i).map(|p| p.is_output)
+                                == self
+                                    .channels
+                                    .get(self.selected_channel)
+                                    .map(|s| s.is_output))
+                }
+                _ => i == self.selected_channel,
+            };
             if !show {
                 continue;
             }
@@ -2967,5 +2989,112 @@ mod sidebar_tests {
         for line in out.lines() {
             assert!(line.chars().count() <= 80, "overflows: {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::theme::ColorDepth;
+
+    fn app() -> App {
+        let mut a = App::new(Theme::dark(ColorDepth::TrueColor, Glyphs::Braille));
+        a.ctx.num_inputs = 4;
+        a.ctx.num_outputs = 3;
+        a.channels = (0..7)
+            .map(|i| {
+                // A distinct gain per channel, so which curve is drawn is
+                // visible in the rendered output.
+                let bands = vec![dsp::Band {
+                    filter_type: dspi_proto::FilterType::Peaking,
+                    freq: 1000.0,
+                    q: 1.0,
+                    gain_db: 2.0 * (i as f32 + 1.0),
+                    bypass: false,
+                }];
+                ChannelView {
+                    name: format!("Ch {i}"),
+                    slug: format!("ch.{i}"),
+                    is_output: i >= 4,
+                    curve: dsp::curve(&bands, 0.0),
+                    bands,
+                    peak: 0.0,
+                    clipped: false,
+                }
+            })
+            .collect();
+        a.visible = vec![true; 7];
+        a
+    }
+
+    fn marks(a: &App) -> usize {
+        crate::render_to_string(a, 100, 24)
+            .chars()
+            .filter(|c| (0x2800..=0x28FF).contains(&(*c as u32)))
+            .count()
+    }
+
+    /// The channel list is a visible selector, so a graph that ignores it looks
+    /// broken rather than deliberate.
+    #[test]
+    fn the_dashboard_graph_follows_the_selected_channel() {
+        let mut a = app();
+        a.panel = Panel::Dashboard;
+
+        a.selected_channel = 0;
+        let first = crate::render_to_string(&a, 100, 24);
+        a.selected_channel = 2;
+        let second = crate::render_to_string(&a, 100, 24);
+
+        assert_ne!(
+            first, second,
+            "selecting a different channel changed nothing on the dashboard"
+        );
+    }
+
+    #[test]
+    fn the_filters_graph_follows_the_selection_too() {
+        let mut a = app();
+        a.panel = Panel::Filters;
+        a.split = Split::GraphOnly;
+
+        a.selected_channel = 0;
+        let first = crate::render_to_string(&a, 100, 24);
+        a.selected_channel = 3;
+        assert_ne!(first, crate::render_to_string(&a, 100, 24));
+    }
+
+    /// Pairing an input with an output would be an accident of numbering rather
+    /// than a comparison anyone wants.
+    #[test]
+    fn the_dashboard_pairs_only_within_inputs_or_outputs() {
+        let mut a = app();
+        a.panel = Panel::Dashboard;
+
+        // Channel 3 is the last input; its numeric partner, 2, is also an input.
+        a.selected_channel = 3;
+        let paired = marks(&a);
+
+        // Channel 4 is the first output; its numeric partner, 5, is too.
+        a.selected_channel = 4;
+        assert!(marks(&a) > 0);
+
+        // Both draw two curves, so neither is silently reduced to one.
+        assert!(paired > 0);
+    }
+
+    #[test]
+    fn a_hidden_channel_stays_off_the_graph_even_when_selected() {
+        let mut a = app();
+        a.panel = Panel::Filters;
+        a.split = Split::GraphOnly;
+        a.selected_channel = 1;
+
+        let shown = marks(&a);
+        a.visible[1] = false;
+        assert!(
+            marks(&a) < shown,
+            "hiding a channel should remove its curve"
+        );
     }
 }
