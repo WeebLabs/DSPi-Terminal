@@ -12,6 +12,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dspi_cmd::{Candidate, Context};
 use dspi_proto::dsp;
 use dspi_proto::registry::Group;
+use dspi_proto::value::Value;
 use dspi_session::Session;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -195,6 +196,48 @@ impl Level {
     }
 }
 
+/// Which column of a band row the cursor is on.
+///
+/// The fields are laid out across the row, so left and right moving between
+/// them is the spatially obvious reading; the value changes with plus and minus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandField {
+    Type,
+    Freq,
+    Gain,
+    Q,
+}
+
+impl BandField {
+    pub const ALL: [BandField; 4] = [
+        BandField::Type,
+        BandField::Freq,
+        BandField::Gain,
+        BandField::Q,
+    ];
+
+    /// The registry path this column edits.
+    pub fn path(self) -> &'static str {
+        match self {
+            BandField::Type => "eq.type",
+            BandField::Freq => "eq.freq",
+            BandField::Gain => "eq.gain",
+            BandField::Q => "eq.q",
+        }
+    }
+
+    /// Whether this column means anything for a given filter shape. A shelf has
+    /// no Q worth editing, and showing one invites a change that does nothing.
+    pub fn applies_to(self, t: dspi_proto::FilterType) -> bool {
+        match self {
+            BandField::Type => true,
+            BandField::Freq => !matches!(t, dspi_proto::FilterType::Flat),
+            BandField::Gain => t.uses_gain(),
+            BandField::Q => t.uses_q(),
+        }
+    }
+}
+
 /// How the graph and the band table share the Filters panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Split {
@@ -235,6 +278,7 @@ pub struct App {
     pub channels: Vec<ChannelView>,
     pub selected_channel: usize,
     pub selected_band: usize,
+    pub selected_field_col: BandField,
 
     pub device: String,
     pub platform: String,
@@ -302,6 +346,7 @@ impl App {
             channels: Vec::new(),
             selected_channel: 0,
             selected_band: 0,
+            selected_field_col: BandField::Freq,
             device: String::new(),
             platform: String::new(),
             firmware: String::new(),
@@ -494,6 +539,299 @@ impl App {
         }
     }
 
+    /// Take what was typed and close the prompt.
+    pub fn take_input(&mut self) -> String {
+        let line = std::mem::take(&mut self.input);
+        self.mode = Mode::Browse;
+        self.candidates.clear();
+        line
+    }
+
+    /// Run a typed command against the device.
+    ///
+    /// The same parser the shell uses, so the line a user types here is the line
+    /// they could paste into a script, and the echo confirms it in canonical
+    /// form. Reporting a rejection matters as much as reporting an error: the
+    /// device accepting a write is not the same as it keeping the value.
+    pub fn run_command(&mut self, session: &mut Session, line: &str) {
+        let tokens = dspi_cmd::tokenize(line);
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+
+        let cmd = match dspi_cmd::parse(&refs, &self.ctx) {
+            Ok(c) => c,
+            Err(e) => {
+                self.note(e.to_string());
+                return;
+            }
+        };
+
+        match cmd {
+            dspi_cmd::Command::Set {
+                path,
+                ref indices,
+                ref value,
+            } => match session.write(path, indices, value.clone()) {
+                Ok(dspi_session::Outcome::Rejected { actual, .. }) => {
+                    let shown = dspi_proto::registry::by_path(path)
+                        .map(|d| crate::fields::display_value(d, &actual))
+                        .unwrap_or_default();
+                    self.note(format!("{path} was not applied; device kept {shown}"));
+                }
+                Ok(_) => {
+                    self.dirty = true;
+                    self.echo = dspi_cmd::format(&cmd, &self.ctx);
+                    self.after_write(session, path, indices);
+                }
+                Err(e) => self.note(e.to_string()),
+            },
+
+            dspi_cmd::Command::Get { path, ref indices } => match session.read(path, indices) {
+                Ok(v) => {
+                    let shown = dspi_proto::registry::by_path(path)
+                        .map(|d| crate::fields::display_value(d, &v))
+                        .unwrap_or_default();
+                    self.note(format!("{path} = {shown}"));
+                }
+                Err(e) => self.note(e.to_string()),
+            },
+
+            dspi_cmd::Command::SetBand {
+                channel,
+                band,
+                filter_type,
+                freq,
+                q,
+                gain,
+            } => {
+                let packet = dspi_proto::value::EqParamPacket {
+                    channel,
+                    band,
+                    filter_type: dspi_proto::FilterType::from_raw(filter_type),
+                    bypass: false,
+                    freq,
+                    q,
+                    gain_db: gain,
+                    qp: None,
+                };
+                match session.write_band(&packet) {
+                    Ok(dspi_session::Outcome::Rejected { .. }) => {
+                        self.note("the band was not applied as sent")
+                    }
+                    Ok(_) => {
+                        self.dirty = true;
+                        self.echo = dspi_cmd::format(&cmd, &self.ctx);
+                        self.reload_channel(session, channel as usize);
+                    }
+                    Err(e) => self.note(e.to_string()),
+                }
+            }
+
+            dspi_cmd::Command::Verb { name, .. } => {
+                self.note(format!("`{name}` only works from the shell"))
+            }
+        }
+    }
+
+    /// Refresh whatever the write touched, so the screen matches the device.
+    fn after_write(&mut self, session: &mut Session, path: &str, indices: &[u8]) {
+        if path.starts_with("eq.")
+            && let Some(ch) = indices.first()
+        {
+            self.reload_channel(session, *ch as usize);
+        } else if !self.fields.is_empty() {
+            self.load_fields(session);
+        }
+    }
+
+    /// Re-read one channel's bands.
+    fn reload_channel(&mut self, session: &mut Session, channel: usize) {
+        let Some(count) = self.channels.get(channel).map(|c| c.bands.len()) else {
+            return;
+        };
+        for b in 0..count {
+            if let Ok(p) = session.read_band(channel as u8, b as u8) {
+                self.channels[channel].bands[b] = dsp::Band {
+                    filter_type: p.filter_type,
+                    freq: p.freq,
+                    q: p.q,
+                    gain_db: p.gain_db,
+                    bypass: p.bypass,
+                };
+            }
+        }
+        self.recompute(channel);
+    }
+
+    /// Adjust the focused band field and write the whole band back.
+    ///
+    /// The firmware stores a band as one packet, so this is a read-modify-write
+    /// through the session, which means it gets the same validation, gating and
+    /// readback verification as a typed command.
+    pub fn edit_band(&mut self, session: &mut Session, up: bool, coarse: bool) {
+        let (Some(ch), Some(band)) = (
+            self.channels.get(self.selected_channel),
+            self.channels
+                .get(self.selected_channel)
+                .and_then(|c| c.bands.get(self.selected_band)),
+        ) else {
+            return;
+        };
+        let _ = ch;
+
+        let col = self.selected_field_col;
+        if !col.applies_to(band.filter_type) {
+            self.note(format!(
+                "{} has no {}",
+                band.filter_type.label(),
+                match col {
+                    BandField::Gain => "gain",
+                    BandField::Q => "Q",
+                    _ => "value",
+                }
+            ));
+            return;
+        }
+
+        let Some(d) = dspi_proto::registry::by_path(col.path()) else {
+            return;
+        };
+        let current = match col {
+            BandField::Type => Value::Choice(band.filter_type.to_raw()),
+            BandField::Freq => Value::Float(band.freq),
+            BandField::Gain => Value::Float(band.gain_db),
+            BandField::Q => Value::Float(band.q),
+        };
+        let Some(next) = nudge(d, &current, up, coarse) else {
+            return;
+        };
+
+        let indices = [self.selected_channel as u8, self.selected_band as u8];
+        match session.write(col.path(), &indices, next.clone()) {
+            Ok(dspi_session::Outcome::Rejected { actual, .. }) => {
+                self.note(format!(
+                    "device kept {}",
+                    crate::fields::display_value(d, &actual)
+                ));
+                self.reload_band(session);
+            }
+            Ok(_) => {
+                self.apply_band_change(col, &next);
+                self.recompute(self.selected_channel);
+                self.dirty = true;
+                self.echo = dspi_cmd::format(
+                    &dspi_cmd::Command::Set {
+                        path: col.path(),
+                        indices: indices.to_vec(),
+                        value: next,
+                    },
+                    &self.ctx,
+                );
+            }
+            Err(e) => self.note(e.to_string()),
+        }
+    }
+
+    /// Toggle the focused band in or out of circuit.
+    pub fn toggle_band_bypass(&mut self, session: &mut Session) {
+        let Some(band) = self
+            .channels
+            .get(self.selected_channel)
+            .and_then(|c| c.bands.get(self.selected_band))
+        else {
+            return;
+        };
+        let next = !band.bypass;
+        let indices = [self.selected_channel as u8, self.selected_band as u8];
+
+        match session.write("eq.bypass", &indices, Value::Bool(next)) {
+            Ok(dspi_session::Outcome::Rejected { .. }) => self.note("the device refused that"),
+            Ok(_) => {
+                if let Some(b) = self
+                    .channels
+                    .get_mut(self.selected_channel)
+                    .and_then(|c| c.bands.get_mut(self.selected_band))
+                {
+                    b.bypass = next;
+                }
+                self.recompute(self.selected_channel);
+                self.dirty = true;
+                self.echo = dspi_cmd::format(
+                    &dspi_cmd::Command::Set {
+                        path: "eq.bypass",
+                        indices: indices.to_vec(),
+                        value: Value::Bool(next),
+                    },
+                    &self.ctx,
+                );
+            }
+            Err(e) => self.note(e.to_string()),
+        }
+    }
+
+    fn apply_band_change(&mut self, col: BandField, v: &Value) {
+        let Some(b) = self
+            .channels
+            .get_mut(self.selected_channel)
+            .and_then(|c| c.bands.get_mut(self.selected_band))
+        else {
+            return;
+        };
+        match col {
+            BandField::Type => {
+                if let Some(n) = v.as_u8() {
+                    b.filter_type = dspi_proto::FilterType::from_raw(n);
+                }
+            }
+            BandField::Freq => b.freq = v.as_f32().unwrap_or(b.freq),
+            BandField::Gain => b.gain_db = v.as_f32().unwrap_or(b.gain_db),
+            BandField::Q => b.q = v.as_f32().unwrap_or(b.q),
+        }
+    }
+
+    /// Re-read the focused band, after the device kept something else.
+    fn reload_band(&mut self, session: &mut Session) {
+        if let Ok(p) = session.read_band(self.selected_channel as u8, self.selected_band as u8)
+            && let Some(b) = self
+                .channels
+                .get_mut(self.selected_channel)
+                .and_then(|c| c.bands.get_mut(self.selected_band))
+        {
+            *b = dsp::Band {
+                filter_type: p.filter_type,
+                freq: p.freq,
+                q: p.q,
+                gain_db: p.gain_db,
+                bypass: p.bypass,
+            };
+            self.recompute(self.selected_channel);
+        }
+    }
+
+    /// Step the column cursor, skipping columns this filter shape does not use.
+    pub fn move_band_field(&mut self, delta: isize) {
+        let shape = self
+            .channels
+            .get(self.selected_channel)
+            .and_then(|c| c.bands.get(self.selected_band))
+            .map(|b| b.filter_type)
+            .unwrap_or(dspi_proto::FilterType::Flat);
+
+        let n = BandField::ALL.len() as isize;
+        let mut i = BandField::ALL
+            .iter()
+            .position(|f| *f == self.selected_field_col)
+            .unwrap_or(1) as isize;
+
+        for _ in 0..n {
+            i = (i + delta).rem_euclid(n);
+            let candidate = BandField::ALL[i as usize];
+            if candidate.applies_to(shape) {
+                self.selected_field_col = candidate;
+                return;
+            }
+        }
+    }
+
     /// Adjust the focused field and write it.
     ///
     /// Everything goes through the session's single write path, so a field edit
@@ -643,6 +981,8 @@ impl App {
             KeyCode::Down if !self.fields.is_empty() => self.move_field(1),
             KeyCode::Up => self.move_band(-1),
             KeyCode::Down => self.move_band(1),
+            KeyCode::Left if self.panel == Panel::Filters => self.move_band_field(-1),
+            KeyCode::Right if self.panel == Panel::Filters => self.move_band_field(1),
 
             // Graph controls. `h`/`l` move the cursor rather than the selection,
             // so reading a curve never disturbs what is being edited.
@@ -651,8 +991,8 @@ impl App {
             KeyCode::Char('H') => self.move_cursor(-20),
             KeyCode::Char('L') => self.move_cursor(20),
             KeyCode::Char('x') => self.cursor = None,
-            KeyCode::Char('+') => self.db_range = (self.db_range - 5.0).max(10.0),
-            KeyCode::Char('-') => self.db_range = (self.db_range + 5.0).min(100.0),
+            KeyCode::Char(']') => self.db_range = (self.db_range - 5.0).max(10.0),
+            KeyCode::Char('[') => self.db_range = (self.db_range + 5.0).min(100.0),
             KeyCode::Char('m') => self.grid_mode = !self.grid_mode,
             KeyCode::Char('P') => self.show_phase = !self.show_phase,
             KeyCode::Char('u') => self.phase_unwrapped = !self.phase_unwrapped,
@@ -675,16 +1015,14 @@ impl App {
                 self.input.clear();
                 self.candidates.clear();
             }
+            // Enter is handled by the caller, which has the device; reaching
+            // here means there is nothing to run it against, so the line is
+            // recorded rather than silently dropped.
             KeyCode::Enter => {
-                // Executing against a device belongs to the caller; the shell
-                // records what was asked for so the echo line stays honest even
-                // when there is nothing connected.
-                if !self.input.is_empty() {
-                    self.echo = self.input.clone();
+                let line = self.take_input();
+                if !line.is_empty() {
+                    self.echo = line;
                 }
-                self.mode = Mode::Browse;
-                self.input.clear();
-                self.candidates.clear();
             }
             KeyCode::Tab => {
                 if let Some(c) = self.candidates.get(self.candidate_index)
@@ -1739,6 +2077,18 @@ impl App {
                 } else {
                     self.theme.value()
                 };
+                // A field that does not apply to this shape reads as a dash
+                // rather than a stale number nobody is able to change.
+                let cell = |col: BandField, text: String| -> String {
+                    if !col.applies_to(b.filter_type) {
+                        "-".into()
+                    } else if focused && col == self.selected_field_col {
+                        format!("[{text}]")
+                    } else {
+                        text
+                    }
+                };
+
                 Row::new(vec![
                     format!("{}{}", if focused { "▸" } else { " " }, i + 1),
                     if b.bypass {
@@ -1746,10 +2096,10 @@ impl App {
                     } else {
                         "●".to_string()
                     },
-                    b.filter_type.label(),
-                    format!("{:.0} Hz", b.freq),
-                    format!("{:+.1} dB", b.gain_db),
-                    format!("{:.2}", b.q),
+                    cell(BandField::Type, b.filter_type.label()),
+                    cell(BandField::Freq, format!("{:.0} Hz", b.freq)),
+                    cell(BandField::Gain, format!("{:+.1} dB", b.gain_db)),
+                    cell(BandField::Q, format!("{:.2}", b.q)),
                 ])
                 .style(style)
             })
@@ -1823,7 +2173,7 @@ impl App {
                 "↑↓ channel · Enter edit · Tab panel · ^P palette · : cmd · M meters · q quit"
             }
             (Focus::Content, Panel::Filters) => {
-                "↑↓ band · ←→ adjust · Esc channels · h/l cursor · +/- zoom · = split"
+                "↑↓ band · ←→ field · +/- value · space bypass · Esc back · [ ] zoom · = split"
             }
             _ => "↑↓ field · ←→ adjust · Esc channels · Tab panel · ^P palette · F2 level",
         };
@@ -2017,14 +2367,28 @@ pub fn run(mut app: App, session: &mut Session) -> io::Result<()> {
 
                 // Editing needs the device, so it is routed here rather than
                 // buried in the key handler, which stays free of I/O.
+                let coarse = key.modifiers.contains(KeyModifiers::SHIFT);
+                let editing_band = app.focus == Focus::Content && app.panel == Panel::Filters;
+
                 match key.code {
-                    KeyCode::Left | KeyCode::Right if !app.fields.is_empty() => {
-                        app.edit_focused(
-                            session,
-                            key.code == KeyCode::Right,
-                            key.modifiers.contains(KeyModifiers::SHIFT),
-                        );
+                    // Running a command needs the device, so it happens here
+                    // rather than in the key handler, which stays free of I/O.
+                    KeyCode::Enter if app.mode != Mode::Browse => {
+                        let line = app.take_input();
+                        if !line.is_empty() {
+                            app.run_command(session, &line);
+                        }
                     }
+                    KeyCode::Left | KeyCode::Right if !app.fields.is_empty() => {
+                        app.edit_focused(session, key.code == KeyCode::Right, coarse);
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') if editing_band => {
+                        app.edit_band(session, true, coarse);
+                    }
+                    KeyCode::Char('-') | KeyCode::Char('_') if editing_band => {
+                        app.edit_band(session, false, coarse);
+                    }
+                    KeyCode::Char(' ') if editing_band => app.toggle_band_bypass(session),
                     _ => app.on_key(key),
                 }
 
@@ -2455,17 +2819,17 @@ mod graph_tests {
     fn zoom_narrows_and_widens_within_sane_limits() {
         let mut a = app();
         let start = a.db_range;
-        press(&mut a, '+');
-        assert!(a.db_range < start, "plus should zoom in");
-        press(&mut a, '-');
+        press(&mut a, ']');
+        assert!(a.db_range < start, "] should zoom in");
+        press(&mut a, '[');
         assert!((a.db_range - start).abs() < 1e-9);
 
         for _ in 0..50 {
-            press(&mut a, '+');
+            press(&mut a, ']');
         }
         assert!(a.db_range >= 10.0, "zoom must not collapse");
         for _ in 0..100 {
-            press(&mut a, '-');
+            press(&mut a, '[');
         }
         assert!(a.db_range <= 100.0, "zoom must not run away");
     }
@@ -2977,7 +3341,7 @@ mod sidebar_tests {
         a.panel = Panel::Filters;
         assert!(render(&a, 100, 24).contains("Enter edit"));
         a.focus = Focus::Content;
-        assert!(render(&a, 100, 24).contains("Esc channels"));
+        assert!(render(&a, 100, 24).contains("Esc back"));
     }
 
     #[test]
@@ -3096,5 +3460,129 @@ mod selection_tests {
             marks(&a) < shown,
             "hiding a channel should remove its curve"
         );
+    }
+}
+
+#[cfg(test)]
+mod editing_tests {
+    use super::*;
+    use crate::theme::ColorDepth;
+
+    fn app() -> App {
+        let mut a = App::new(Theme::dark(ColorDepth::TrueColor, Glyphs::Braille));
+        a.ctx.num_inputs = 2;
+        a.ctx.num_outputs = 2;
+        a.ctx.max_bands = 10;
+        a.ctx.channel_slugs = vec!["in.1".into(), "in.2".into(), "out.1".into(), "out.2".into()];
+        a.channels = (0..4)
+            .map(|i| ChannelView {
+                name: format!("Ch {i}"),
+                slug: format!("ch.{i}"),
+                is_output: i >= 2,
+                bands: vec![
+                    dsp::Band {
+                        filter_type: dspi_proto::FilterType::Peaking,
+                        freq: 1000.0,
+                        q: 1.0,
+                        gain_db: 0.0,
+                        bypass: false,
+                    };
+                    4
+                ],
+                curve: vec![0.0; dsp::POINTS],
+                ..Default::default()
+            })
+            .collect();
+        a.visible = vec![true; 4];
+        a.panel = Panel::Filters;
+        a.focus = Focus::Content;
+        a
+    }
+
+    fn press(a: &mut App, code: KeyCode) {
+        a.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// The fields are laid out across the row, so left and right moving between
+    /// them is the spatially obvious reading.
+    #[test]
+    fn left_and_right_move_across_the_row() {
+        let mut a = app();
+        a.selected_field_col = BandField::Freq;
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.selected_field_col, BandField::Gain);
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.selected_field_col, BandField::Q);
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.selected_field_col, BandField::Gain);
+    }
+
+    /// A shelf has no Q worth editing; stopping on it would invite a change
+    /// that does nothing.
+    #[test]
+    fn the_cursor_skips_fields_the_shape_does_not_use() {
+        let mut a = app();
+        a.channels[0].bands[0].filter_type = dspi_proto::FilterType::LowShelf;
+        a.selected_field_col = BandField::Freq;
+
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.selected_field_col, BandField::Gain, "gain applies");
+        press(&mut a, KeyCode::Right);
+        assert_ne!(a.selected_field_col, BandField::Q, "a shelf has no Q here");
+    }
+
+    #[test]
+    fn a_pass_filter_offers_no_gain() {
+        let mut a = app();
+        a.channels[0].bands[0].filter_type = dspi_proto::FilterType::HighPass;
+        a.selected_field_col = BandField::Freq;
+        for _ in 0..6 {
+            press(&mut a, KeyCode::Right);
+            assert_ne!(a.selected_field_col, BandField::Gain);
+        }
+    }
+
+    #[test]
+    fn the_focused_field_is_marked_in_the_table() {
+        let mut a = app();
+        a.split = Split::TableOnly;
+        a.selected_field_col = BandField::Gain;
+        let out = crate::render_to_string(&a, 100, 20);
+        assert!(
+            out.contains("[+0.0 dB]"),
+            "the focused cell should be bracketed:\n{out}"
+        );
+    }
+
+    /// A field that does not apply reads as a dash rather than a stale number
+    /// nobody can change.
+    #[test]
+    fn inapplicable_fields_show_a_dash() {
+        let mut a = app();
+        a.split = Split::TableOnly;
+        a.channels[0].bands[0].filter_type = dspi_proto::FilterType::LowShelf;
+        let out = crate::render_to_string(&a, 100, 20);
+        let row = out.lines().find(|l| l.contains("Low shelf")).unwrap();
+        assert!(row.contains(" - "), "a shelf's Q should be a dash: {row}");
+    }
+
+    #[test]
+    fn zoom_moved_off_the_keys_that_now_change_values() {
+        let mut a = app();
+        let start = a.db_range;
+        // Plus and minus belong to the value now.
+        press(&mut a, KeyCode::Char(']'));
+        assert!(a.db_range < start);
+        press(&mut a, KeyCode::Char('['));
+        assert!((a.db_range - start).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_hints_name_the_editing_keys() {
+        let a = app();
+        let out = crate::render_to_string(&a, 110, 20);
+        assert!(out.contains("+/- value"), "no value hint:\n{out}");
+        assert!(out.contains("←→ field"));
+        assert!(out.contains("space bypass"));
     }
 }

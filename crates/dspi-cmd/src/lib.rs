@@ -454,7 +454,17 @@ fn format_value(path: &str, v: &Value) -> String {
                 t.clone()
             }
         }
-        (_, Value::Float(f)) => format!("{f}"),
+        // The echo is meant to be pasted into a shell, so it needs to read as
+        // a value someone would type. Full float precision is technically
+        // faithful and practically noise.
+        (_, Value::Float(f)) => {
+            let rounded = (f * 100.0).round() / 100.0;
+            if rounded.fract() == 0.0 {
+                format!("{rounded:.0}")
+            } else {
+                format!("{rounded}")
+            }
+        }
         (_, Value::Int(i)) => format!("{i}"),
         (_, Value::Mask(m)) => format!("0x{m:X}"),
         _ => v.display(d.kind.unit()),
@@ -727,5 +737,56 @@ mod tests {
     fn an_unknown_word_suggests_where_to_look() {
         let e = p("wobble 3").unwrap_err();
         assert!(e.to_string().contains("dspi params"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::*;
+    use crate::tests::ctx;
+
+    fn rendered(path: &'static str, indices: Vec<u8>, value: Value) -> String {
+        format(
+            &Command::Set {
+                path,
+                indices,
+                value,
+            },
+            &ctx(),
+        )
+    }
+
+    /// The echo exists to be pasted into a shell, so it has to read as a value
+    /// someone would type.
+    #[test]
+    fn floats_are_rounded_to_something_typeable() {
+        assert_eq!(
+            rendered("eq.freq", vec![0, 0], Value::Float(111.243_63)),
+            "eq.freq usb.1 1 111.24"
+        );
+        assert_eq!(
+            rendered("vol.user", vec![], Value::Float(-18.0)),
+            "vol.user -18"
+        );
+        assert_eq!(
+            rendered("eq.q", vec![0, 0], Value::Float(3.58)),
+            "eq.q usb.1 1 3.58"
+        );
+    }
+
+    /// Rounding must not break the round trip, or the echo teaches a line that
+    /// produces a different result than the one it describes.
+    #[test]
+    fn a_rounded_echo_still_parses_back() {
+        let line = rendered("eq.freq", vec![0, 0], Value::Float(111.243_63));
+        let toks = tokenize(&line);
+        let refs: Vec<&str> = toks.iter().map(String::as_str).collect();
+        match parse(&refs, &ctx()).unwrap() {
+            Command::Set { value, indices, .. } => {
+                assert_eq!(indices, vec![0, 0]);
+                assert_eq!(value, Value::Float(111.24));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
