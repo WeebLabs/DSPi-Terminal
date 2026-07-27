@@ -250,6 +250,9 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
     if let Ok(m) = session.meters() {
         app.apply_meters(&m);
     }
+    app.rebuild_fields();
+    app.load_fields(&mut session);
+    app.load_matrix(&mut session);
 
     app.panel = match panel {
         "cursor" => {
@@ -261,6 +264,12 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
             app.grid_mode = true;
             dspi_tui::app::Panel::Dashboard
         }
+        "matrix" => dspi_tui::app::Panel::Matrix,
+        "input" => dspi_tui::app::Panel::Input,
+        "dynamics" => dspi_tui::app::Panel::Dynamics,
+        "spatial" => dspi_tui::app::Panel::Spatial,
+        "system" => dspi_tui::app::Panel::System,
+        "presets" => dspi_tui::app::Panel::Presets,
         "filters" => dspi_tui::app::Panel::Filters,
         "meters" => {
             app.meters_expanded = true;
@@ -268,6 +277,10 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
         }
         _ => dspi_tui::app::Panel::Dashboard,
     };
+
+    // The panel changed after the initial load, so refresh for the new one.
+    app.rebuild_fields();
+    app.load_fields(&mut session);
 
     println!("{}", dspi_tui::render_to_string(&app, width, height));
     exit::OK

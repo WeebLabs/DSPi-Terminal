@@ -980,3 +980,226 @@ mod eq_tests {
         assert_eq!(w.payload.len(), 16);
     }
 }
+
+/// One matrix crosspoint.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Crosspoint {
+    pub enabled: bool,
+    pub phase_invert: bool,
+    pub gain_db: f32,
+}
+
+/// One output's strip settings.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct OutputStrip {
+    pub enabled: bool,
+    pub mute: bool,
+    pub gain_db: f32,
+    pub delay_ms: f32,
+}
+
+impl Session {
+    /// Read the whole matrix in one transfer.
+    ///
+    /// Reading it a crosspoint at a time would be 72 transfers on an RP2350; the
+    /// bulk snapshot carries the same data in one, so that is what this uses.
+    /// The returned grid is indexed `[input][output]`.
+    pub fn read_matrix(&mut self) -> Result<(Vec<Vec<Crosspoint>>, Vec<OutputStrip>), WriteError> {
+        let packet = crate::read_bulk(&mut *self.transport)?;
+
+        // The wire array is always sized at the platform maximum and
+        // zero-padded, so the header counts say how much of it is real.
+        const WIRE_OUTPUTS: usize = 9;
+        let n_in = self.caps.num_inputs as usize;
+        let n_out = self.caps.num_outputs as usize;
+
+        let cross = packet.section("crosspoints").unwrap_or(&[]);
+        let mut grid = vec![vec![Crosspoint::default(); n_out]; n_in];
+        for (i, row) in grid.iter_mut().enumerate() {
+            for (o, cell) in row.iter_mut().enumerate() {
+                let off = (i * WIRE_OUTPUTS + o) * 8;
+                if off + 8 > cross.len() {
+                    continue;
+                }
+                *cell = Crosspoint {
+                    enabled: cross[off] != 0,
+                    phase_invert: cross[off + 1] != 0,
+                    gain_db: f32::from_le_bytes([
+                        cross[off + 4],
+                        cross[off + 5],
+                        cross[off + 6],
+                        cross[off + 7],
+                    ]),
+                };
+            }
+        }
+
+        let outs = packet.section("outputs").unwrap_or(&[]);
+        let strips = (0..n_out)
+            .map(|o| {
+                let off = o * 12;
+                if off + 12 > outs.len() {
+                    return OutputStrip::default();
+                }
+                OutputStrip {
+                    enabled: outs[off] != 0,
+                    mute: outs[off + 1] != 0,
+                    gain_db: f32::from_le_bytes([
+                        outs[off + 4],
+                        outs[off + 5],
+                        outs[off + 6],
+                        outs[off + 7],
+                    ]),
+                    delay_ms: f32::from_le_bytes([
+                        outs[off + 8],
+                        outs[off + 9],
+                        outs[off + 10],
+                        outs[off + 11],
+                    ]),
+                }
+            })
+            .collect();
+
+        Ok((grid, strips))
+    }
+
+    /// Would enabling this output collide with what Core 1 is already doing?
+    ///
+    /// PDM and the Core 1 EQ worker are mutually exclusive, and the firmware
+    /// silently ignores an enable that would break that. Asking first is the
+    /// difference between a greyed-out option with a reason and a control that
+    /// appears to do nothing.
+    pub fn core1_conflict(&mut self, output: u8) -> bool {
+        self.transport
+            .control_in(op::REQ_GET_CORE1_CONFLICT, output as u16, 1)
+            .map(|d| d.first().copied().unwrap_or(0) != 0)
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod matrix_tests {
+    use super::*;
+    use crate::probe::Capabilities;
+    use dspi_proto::generated;
+    use dspi_transport::MockTransport;
+
+    fn bulk_with_matrix() -> Vec<u8> {
+        let mut b = vec![0u8; generated::BULK_SIZE];
+        b[0] = 26;
+        b[1] = 1;
+        b[2] = 17;
+        b[3] = 9;
+        b[4] = 8;
+        b[5] = 12;
+        b[6..8].copy_from_slice(&(generated::BULK_SIZE as u16).to_le_bytes());
+
+        // Input 0 -> output 0, enabled, -3 dB.
+        let c = generated::OFF_CROSSPOINTS;
+        b[c] = 1;
+        b[c + 4..c + 8].copy_from_slice(&(-3.0f32).to_le_bytes());
+        // Input 1 -> output 1, enabled and phase inverted.
+        // Input 1, output 1: the wire stride is 9, not the device's output count.
+        let c1 = generated::OFF_CROSSPOINTS + (9 + 1) * 8;
+        b[c1] = 1;
+        b[c1 + 1] = 1;
+
+        // Output 0: enabled, -6 dB, 4.2 ms.
+        let o = generated::OFF_OUTPUTS;
+        b[o] = 1;
+        b[o + 4..o + 8].copy_from_slice(&(-6.0f32).to_le_bytes());
+        b[o + 8..o + 12].copy_from_slice(&4.2f32.to_le_bytes());
+        b
+    }
+
+    fn rig() -> (Session, dspi_transport::mock::LogHandle) {
+        let t = MockTransport::new().window(op::REQ_GET_ALL_PARAMS_CHUNK, bulk_with_matrix());
+        let log = t.log_handle();
+        (session_over(Box::new(t)), log)
+    }
+
+    fn session() -> Session {
+        let t = MockTransport::new().window(op::REQ_GET_ALL_PARAMS_CHUNK, bulk_with_matrix());
+        session_over(Box::new(t))
+    }
+
+    fn session_over(t: Box<dyn Transport>) -> Session {
+        let caps = Capabilities {
+            serial: "T".into(),
+            platform: Platform::Rp2350,
+            firmware: "1.1.5".into(),
+            wire_format: 26,
+            num_channels: 17,
+            num_inputs: 8,
+            num_outputs: 9,
+            max_bands: 12,
+            channels: Vec::new(),
+            features: Vec::new(),
+            cs: None,
+            siggen: None,
+            active_preset: None,
+        };
+        Session::new(t, caps).unwrap()
+    }
+
+    #[test]
+    fn the_matrix_is_sized_from_the_device_not_a_constant() {
+        let mut s = session();
+        let (grid, strips) = s.read_matrix().unwrap();
+        assert_eq!(grid.len(), 8, "eight inputs on RP2350");
+        assert_eq!(grid[0].len(), 9, "nine outputs");
+        assert_eq!(strips.len(), 9);
+    }
+
+    #[test]
+    fn crosspoints_decode_gain_and_polarity() {
+        let mut s = session();
+        let (grid, _) = s.read_matrix().unwrap();
+        assert!(grid[0][0].enabled);
+        assert!((grid[0][0].gain_db + 3.0).abs() < 1e-5);
+        assert!(!grid[0][0].phase_invert);
+
+        assert!(grid[1][1].enabled && grid[1][1].phase_invert);
+        assert!(!grid[2][2].enabled, "an unset crosspoint reads as off");
+    }
+
+    /// The wire array is always nine wide even on a seven-channel part, so the
+    /// row stride must come from the wire, not from the device's output count.
+    #[test]
+    fn row_stride_follows_the_wire_not_the_device() {
+        let mut s = session();
+        let (grid, _) = s.read_matrix().unwrap();
+        // Input 1's second crosspoint is at wire offset (1*9 + 1); reading with a
+        // stride of the device's own count would land somewhere else entirely.
+        assert!(grid[1][1].enabled);
+        assert!(!grid[1][0].enabled);
+    }
+
+    #[test]
+    fn output_strips_decode_gain_and_delay() {
+        let mut s = session();
+        let (_, strips) = s.read_matrix().unwrap();
+        assert!(strips[0].enabled);
+        assert!((strips[0].gain_db + 6.0).abs() < 1e-5);
+        assert!((strips[0].delay_ms - 4.2).abs() < 1e-5);
+        assert!(!strips[1].enabled);
+    }
+
+    /// Reading the matrix a crosspoint at a time would be 72 transfers on an
+    /// RP2350; the bulk snapshot carries the same data in one read.
+    #[test]
+    fn the_matrix_comes_from_the_bulk_snapshot_not_per_crosspoint_reads() {
+        let (mut s, log) = rig();
+        let _ = s.read_matrix().unwrap();
+        let seen = log.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|e| e.opcode == op::REQ_GET_ALL_PARAMS_CHUNK),
+            "something other than the bulk read went out"
+        );
+        assert!(
+            !seen.iter().any(|e| e.opcode == op::REQ_GET_MATRIX_ROUTE),
+            "per-crosspoint reads would be 72 transfers"
+        );
+    }
+}

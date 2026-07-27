@@ -1,6 +1,7 @@
 //! The DSPi terminal interface.
 
 pub mod app;
+pub mod fields;
 pub mod theme;
 pub mod widgets;
 

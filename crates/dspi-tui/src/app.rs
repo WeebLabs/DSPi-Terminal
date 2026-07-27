@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dspi_cmd::{Candidate, Context};
 use dspi_proto::dsp;
+use dspi_proto::registry::Group;
 use dspi_session::Session;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -18,6 +19,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table};
 
+use crate::fields::{Field, FieldState, Targets, fields_for, nudge};
 use crate::theme::{Glyphs, Theme};
 use crate::widgets::{Bode, Curve, Meter, frequency_axis};
 
@@ -117,6 +119,20 @@ impl Panel {
         Panel::System,
         Panel::Raw,
     ];
+
+    /// Which registry group supplies this panel's fields, when it is a plain
+    /// field list rather than a bespoke layout.
+    pub fn group(self) -> Option<Group> {
+        Some(match self {
+            Panel::Input => Group::Input,
+            Panel::Dynamics => Group::Dynamics,
+            Panel::Spatial => Group::Spatial,
+            Panel::Presets => Group::Presets,
+            Panel::System => Group::System,
+            Panel::Surfaces => Group::Surfaces,
+            _ => return None,
+        })
+    }
 
     pub fn title(self) -> &'static str {
         match self {
@@ -242,6 +258,15 @@ pub struct App {
     pub echo: String,
     pub status: Option<(String, Instant)>,
 
+    /// The crosspoint grid, indexed `[input][output]`.
+    pub matrix: Vec<Vec<dspi_session::Crosspoint>>,
+    pub outputs: Vec<dspi_session::OutputStrip>,
+    pub matrix_focus: (usize, usize),
+
+    /// The current panel's rows, when it is a field list.
+    pub fields: Vec<Field>,
+    pub selected_field: usize,
+
     pub ctx: Context,
     pub perf: Performance,
     pub should_quit: bool,
@@ -278,6 +303,11 @@ impl App {
             candidate_index: 0,
             echo: String::new(),
             status: None,
+            matrix: Vec::new(),
+            outputs: Vec::new(),
+            matrix_focus: (0, 0),
+            fields: Vec::new(),
+            selected_field: 0,
             ctx: Context::default(),
             perf: Performance::detect(),
             should_quit: false,
@@ -351,6 +381,116 @@ impl App {
         self.cursor = Some(next.clamp(0, dsp::POINTS as isize - 1) as usize);
     }
 
+    /// Rebuild the current panel's field list.
+    ///
+    /// Called on panel and level changes. The list comes from the registry, so
+    /// a firmware parameter added tomorrow appears here with no work.
+    pub fn rebuild_fields(&mut self) {
+        self.fields = match self.panel.group() {
+            Some(g) => fields_for(
+                g,
+                self.level,
+                &Targets {
+                    inputs: self.ctx.num_inputs,
+                    outputs: self.ctx.num_outputs,
+                    channels: self.ctx.num_channels(),
+                },
+            ),
+            None => Vec::new(),
+        };
+        self.selected_field = 0;
+    }
+
+    /// Read the routing grid.
+    pub fn load_matrix(&mut self, session: &mut Session) {
+        if let Ok((grid, strips)) = session.read_matrix() {
+            self.matrix = grid;
+            self.outputs = strips;
+        }
+    }
+
+    /// Read every row of the current panel from the device.
+    ///
+    /// A parameter the device does not have is marked unavailable with the
+    /// reason, rather than left blank or silently dropped: "this firmware has no
+    /// upmixer" is useful, an empty row is not.
+    pub fn load_fields(&mut self, session: &mut Session) {
+        for i in 0..self.fields.len() {
+            let (path, indices) = (self.fields[i].path, self.fields[i].indices.clone());
+            match session.read(path, &indices) {
+                Ok(v) => {
+                    self.fields[i].value = Some(v);
+                    self.fields[i].state = FieldState::Settled;
+                    self.fields[i].unavailable = None;
+                }
+                Err(dspi_session::WriteError::Unavailable { why, .. }) => {
+                    self.fields[i].unavailable = Some(why);
+                    self.fields[i].state = FieldState::Unknown;
+                }
+                Err(_) => {
+                    // A read that fails for another reason leaves the row blank
+                    // rather than claiming a value we do not have.
+                    self.fields[i].state = FieldState::Unknown;
+                }
+            }
+        }
+    }
+
+    /// Adjust the focused field and write it.
+    ///
+    /// Everything goes through the session's single write path, so a field edit
+    /// gets the same validation, capability gating and readback verification as
+    /// a typed command. The outcome is recorded on the row, which is how a
+    /// silent rejection becomes visible.
+    pub fn edit_focused(&mut self, session: &mut Session, up: bool, coarse: bool) {
+        let Some(field) = self.fields.get(self.selected_field) else {
+            return;
+        };
+        if !field.is_editable() {
+            return;
+        }
+        let (Some(d), Some(current)) = (field.desc(), field.value.clone()) else {
+            return;
+        };
+        let Some(next) = nudge(d, &current, up, coarse) else {
+            return;
+        };
+
+        let (path, indices) = (field.path, field.indices.clone());
+        let i = self.selected_field;
+        self.fields[i].state = FieldState::Pending;
+
+        match session.write(path, &indices, next.clone()) {
+            Ok(dspi_session::Outcome::Rejected { actual, .. }) => {
+                self.fields[i].value = Some(actual.clone());
+                self.fields[i].state = FieldState::Rejected(actual);
+            }
+            Ok(_) => {
+                self.fields[i].value = Some(next.clone());
+                self.fields[i].state = FieldState::Settled;
+                self.dirty = true;
+                // Echo the change as a command, so the interface teaches the
+                // syntax simply by being used.
+                self.echo = dspi_cmd::format(
+                    &dspi_cmd::Command::Set {
+                        path,
+                        indices,
+                        value: next,
+                    },
+                    &self.ctx,
+                );
+            }
+            Err(e) => {
+                self.fields[i].state = FieldState::Unknown;
+                self.note(e.to_string());
+            }
+        }
+    }
+
+    pub fn focused_field(&self) -> Option<&Field> {
+        self.fields.get(self.selected_field)
+    }
+
     /// Take a meter poll.
     pub fn apply_meters(&mut self, m: &dspi_session::Meters) {
         for (i, c) in self.channels.iter_mut().enumerate() {
@@ -408,6 +548,7 @@ impl App {
                 let i = c as usize - '1' as usize;
                 if let Some(p) = Panel::ALL.get(i) {
                     self.panel = *p;
+                    self.rebuild_fields();
                 }
             }
             // The guarded arm must precede the plain one, or it never matches.
@@ -425,8 +566,15 @@ impl App {
                 self.level = self.level.next();
                 let l = self.level.name();
                 self.note(format!("showing {l} controls"));
+                self.rebuild_fields();
             }
 
+            KeyCode::Up if self.panel == Panel::Matrix => self.move_matrix(-1, 0),
+            KeyCode::Down if self.panel == Panel::Matrix => self.move_matrix(1, 0),
+            KeyCode::Left if self.panel == Panel::Matrix => self.move_matrix(0, -1),
+            KeyCode::Right if self.panel == Panel::Matrix => self.move_matrix(0, 1),
+            KeyCode::Up if !self.fields.is_empty() => self.move_field(-1),
+            KeyCode::Down if !self.fields.is_empty() => self.move_field(1),
             KeyCode::Up => self.move_band(-1),
             KeyCode::Down => self.move_band(1),
             KeyCode::Left => self.move_channel(-1),
@@ -531,6 +679,24 @@ impl App {
         self.candidate_index = 0;
     }
 
+    fn move_matrix(&mut self, di: isize, dobj: isize) {
+        if self.matrix.is_empty() {
+            return;
+        }
+        let rows = self.matrix.len() as isize;
+        let cols = self.matrix[0].len() as isize;
+        self.matrix_focus.0 = ((self.matrix_focus.0 as isize + di).rem_euclid(rows)) as usize;
+        self.matrix_focus.1 = ((self.matrix_focus.1 as isize + dobj).rem_euclid(cols)) as usize;
+    }
+
+    fn move_field(&mut self, delta: isize) {
+        if self.fields.is_empty() {
+            return;
+        }
+        let n = self.fields.len() as isize;
+        self.selected_field = ((self.selected_field as isize + delta).rem_euclid(n)) as usize;
+    }
+
     fn cycle_panel(&mut self, delta: isize) {
         let i = Panel::ALL
             .iter()
@@ -538,6 +704,7 @@ impl App {
             .unwrap_or(0) as isize;
         let n = Panel::ALL.len() as isize;
         self.panel = Panel::ALL[((i + delta).rem_euclid(n)) as usize];
+        self.rebuild_fields();
     }
 
     fn move_channel(&mut self, delta: isize) {
@@ -651,18 +818,22 @@ impl App {
         match self.panel {
             Panel::Dashboard => self.draw_dashboard(f, area),
             Panel::Filters => self.draw_filters(f, area),
-            other => {
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(self.theme.chrome_style())
-                    .title(other.title());
-                f.render_widget(
-                    Paragraph::new("Not built yet.")
-                        .style(self.theme.label())
-                        .block(block),
-                    area,
-                );
-            }
+            Panel::Matrix => self.draw_matrix(f, area),
+            other => match other.group() {
+                Some(_) => self.draw_fields(f, area, other.title()),
+                None => {
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(self.theme.chrome_style())
+                        .title(other.title());
+                    f.render_widget(
+                        Paragraph::new("Not built yet.")
+                            .style(self.theme.label())
+                            .block(block),
+                        area,
+                    );
+                }
+            },
         }
     }
 
@@ -944,6 +1115,238 @@ impl App {
         }
     }
 
+    /// The crosspoint grid, sized from the device.
+    ///
+    /// On an RP2350 this is 8 inputs by 9 outputs, which does not fit a fixed
+    /// layout, so the grid scrolls around a focus reticle rather than assuming
+    /// it can show everything.
+    fn draw_matrix(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.chrome_style())
+            .title(Span::styled(
+                format!(
+                    "Matrix · {} in x {} out",
+                    self.ctx.num_inputs, self.ctx.num_outputs
+                ),
+                self.theme.label(),
+            ));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if self.matrix.is_empty() || inner.height < 4 {
+            f.render_widget(
+                Paragraph::new("No routing read yet.").style(self.theme.label()),
+                inner,
+            );
+            return;
+        }
+
+        const LABEL_W: u16 = 8;
+        const CELL_W: u16 = 7;
+        let fit = ((inner.width.saturating_sub(LABEL_W)) / CELL_W).max(1) as usize;
+        let n_out = self.matrix[0].len();
+        // Scroll so the focused output stays on screen.
+        let first = self
+            .matrix_focus
+            .1
+            .saturating_sub(fit.saturating_sub(1))
+            .min(n_out.saturating_sub(1));
+        let shown = (first..n_out).take(fit);
+
+        let mut header = vec![Span::styled(
+            " ".repeat(LABEL_W as usize),
+            self.theme.label(),
+        )];
+        for o in shown.clone() {
+            let name = self
+                .channels
+                .get(self.ctx.num_inputs as usize + o)
+                .map(|c| c.slug.clone())
+                .unwrap_or_else(|| format!("out{o}"));
+            // Keep the tail segments rather than the last six characters:
+            // "spdif.1.l" truncated blindly becomes "if.1.l", which reads as a
+            // different name entirely. The row labels carry the full name.
+            header.push(Span::styled(
+                format!("{:>6} ", abbreviate(&name, 6)),
+                self.theme.label(),
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(header)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+
+        let rows = (inner.height.saturating_sub(2)) as usize;
+        for (r, (i, row)) in self.matrix.iter().enumerate().take(rows).enumerate() {
+            let label = self
+                .channels
+                .get(i)
+                .map(|c| c.slug.clone())
+                .unwrap_or_else(|| format!("in{i}"));
+            let mut spans = vec![Span::styled(
+                format!("{label:<8}"),
+                if i == self.matrix_focus.0 {
+                    self.theme.focused()
+                } else {
+                    self.theme.label()
+                },
+            )];
+
+            for o in shown.clone() {
+                let cell = row.get(o).copied().unwrap_or_default();
+                let focused = (i, o) == self.matrix_focus;
+                // Off is a dot rather than a zero, so an active route stands out
+                // at a glance across a grid this size.
+                let text = if !cell.enabled {
+                    "    ·  ".to_string()
+                } else if cell.phase_invert {
+                    format!("{:>5.1}ø ", cell.gain_db)
+                } else {
+                    format!("{:>5.1}  ", cell.gain_db)
+                };
+                spans.push(Span::styled(
+                    text,
+                    if focused {
+                        self.theme.focused()
+                    } else if cell.enabled {
+                        Style::default().fg(self.theme.channel(i as u8))
+                    } else {
+                        Style::default().fg(self.theme.chrome)
+                    },
+                ));
+            }
+            f.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect::new(inner.x, inner.y + 1 + r as u16, inner.width, 1),
+            );
+        }
+
+        // The focused crosspoint, spelled out, plus its output's strip.
+        let (i, o) = self.matrix_focus;
+        let cell = self
+            .matrix
+            .get(i)
+            .and_then(|r| r.get(o))
+            .copied()
+            .unwrap_or_default();
+        let strip = self.outputs.get(o).copied().unwrap_or_default();
+        // Kept short enough to survive the meter rail taking a quarter of the
+        // width; a detail line that truncates is worse than a terser one.
+        let detail = format!(
+            "{}→{} {} {:+.1}dB{} · out {} {:+.1}dB {:.1}ms",
+            self.channels.get(i).map(|c| c.slug.as_str()).unwrap_or("?"),
+            self.channels
+                .get(self.ctx.num_inputs as usize + o)
+                .map(|c| c.slug.as_str())
+                .unwrap_or("?"),
+            if cell.enabled { "on" } else { "off" },
+            cell.gain_db,
+            if cell.phase_invert { " inv" } else { "" },
+            if strip.enabled { "on" } else { "off" },
+            strip.gain_db,
+            strip.delay_ms,
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(detail, self.theme.label()))),
+            Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+        );
+    }
+
+    /// Draw a field list: one row per registry parameter.
+    fn draw_fields(&self, f: &mut Frame, area: Rect, title: &str) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.chrome_style())
+            .title(Span::styled(title.to_string(), self.theme.label()));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if self.fields.is_empty() {
+            f.render_widget(
+                Paragraph::new(
+                    "Nothing adjustable here yet.\n\n\
+                     Structured views for this panel are still to come; the \
+                     parameters are reachable now through the command line \
+                     and the palette.",
+                )
+                .style(self.theme.label()),
+                inner,
+            );
+            return;
+        }
+
+        // The last row explains whatever is focused, so the meaning of a control
+        // is never something the user has to already know.
+        let list_h = inner.height.saturating_sub(2);
+
+        for (i, field) in self.fields.iter().take(list_h as usize).enumerate() {
+            let Some(d) = field.desc() else { continue };
+            let focused = i == self.selected_field;
+
+            let name_style = if focused {
+                self.theme.focused()
+            } else if field.unavailable.is_some() {
+                Style::default().fg(self.theme.chrome)
+            } else {
+                self.theme.label()
+            };
+
+            let (value_text, value_style) = match (&field.unavailable, &field.state) {
+                (Some(_), _) => (
+                    "unavailable".to_string(),
+                    Style::default().fg(self.theme.chrome),
+                ),
+                (None, FieldState::Pending) => (
+                    format!("{} ·", field.display()),
+                    Style::default().fg(self.theme.pending),
+                ),
+                // A rejection has to be impossible to miss: the device took the
+                // write and kept something else.
+                (None, FieldState::Rejected(actual)) => (
+                    format!(
+                        "{}  ⚠ {}",
+                        field.display(),
+                        crate::fields::display_value(d, actual)
+                    ),
+                    Style::default().fg(self.theme.danger),
+                ),
+                _ => (field.display(), self.theme.value()),
+            };
+
+            let row = Line::from(vec![
+                Span::styled(
+                    format!("{}{:<22}", if focused { "▸" } else { " " }, d.label),
+                    name_style,
+                ),
+                Span::styled(value_text, value_style),
+            ]);
+            f.render_widget(
+                Paragraph::new(row),
+                Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            );
+        }
+
+        if let Some(field) = self.focused_field()
+            && let Some(d) = field.desc()
+            && inner.height >= 2
+        {
+            let help = match &field.unavailable {
+                Some(why) => format!("{} — {why}", d.plain),
+                None => match d.kind {
+                    dspi_proto::registry::Kind::Float { unit, min, max } => {
+                        format!("{}  ({min} to {max}{})", d.plain, unit.suffix())
+                    }
+                    _ => d.plain.to_string(),
+                },
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(help, self.theme.label()))),
+                Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+            );
+        }
+    }
+
     fn draw_bands(&self, f: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1192,6 +1595,24 @@ impl App {
     }
 }
 
+/// Shorten a channel name for a narrow column, keeping the parts that identify
+/// it. Dropping characters off the front turns "spdif.1.l" into "if.1.l", which
+/// looks like a name of its own.
+pub fn abbreviate(name: &str, width: usize) -> String {
+    if name.chars().count() <= width {
+        return name.to_string();
+    }
+    let parts: Vec<&str> = name.split('.').collect();
+    // Prefer the trailing segments, which are the index and side.
+    for take in (1..parts.len()).rev() {
+        let candidate = parts[parts.len() - take..].join(".");
+        if candidate.chars().count() <= width {
+            return candidate;
+        }
+    }
+    parts.last().map(|s| s.to_string()).unwrap_or_default()
+}
+
 /// Run the interface until the user quits.
 ///
 /// Meters are polled rather than pushed, because the combined status read is one
@@ -1217,7 +1638,25 @@ pub fn run(mut app: App, session: &mut Session) -> io::Result<()> {
                 && let Event::Key(key) = event::read()?
                 && key.kind == event::KeyEventKind::Press
             {
-                app.on_key(key);
+                let before = app.panel;
+                let level_before = app.level;
+
+                // Editing needs the device, so it is routed here rather than
+                // buried in the key handler, which stays free of I/O.
+                match key.code {
+                    KeyCode::Left | KeyCode::Right if !app.fields.is_empty() => {
+                        app.edit_focused(
+                            session,
+                            key.code == KeyCode::Right,
+                            key.modifiers.contains(KeyModifiers::SHIFT),
+                        );
+                    }
+                    _ => app.on_key(key),
+                }
+
+                if app.panel != before || app.level != level_before {
+                    app.load_fields(session);
+                }
             }
             if app.should_quit {
                 return Ok(());
@@ -1863,5 +2302,139 @@ mod performance_tests {
     fn detection_returns_one_of_the_two_profiles() {
         let p = Performance::detect();
         assert!(p == Performance::default() || p == Performance::lite());
+    }
+}
+
+#[cfg(test)]
+mod matrix_panel_tests {
+    use super::*;
+    use crate::theme::ColorDepth;
+    use dspi_session::{Crosspoint, OutputStrip};
+
+    fn app() -> App {
+        let mut a = App::new(Theme::dark(ColorDepth::TrueColor, Glyphs::Braille));
+        a.ctx.num_inputs = 8;
+        a.ctx.num_outputs = 9;
+        a.channels = (0..17)
+            .map(|i| ChannelView {
+                name: format!("Ch {i}"),
+                slug: if i < 8 {
+                    format!("usb.{}", i + 1)
+                } else {
+                    format!(
+                        "spdif.{}.{}",
+                        (i - 8) / 2 + 1,
+                        if i % 2 == 0 { "l" } else { "r" }
+                    )
+                },
+                is_output: i >= 8,
+                ..Default::default()
+            })
+            .collect();
+        a.matrix = (0..8)
+            .map(|i| {
+                (0..9)
+                    .map(|o| Crosspoint {
+                        enabled: i == o,
+                        phase_invert: i == 1 && o == 1,
+                        gain_db: if i == o { -3.0 } else { 0.0 },
+                    })
+                    .collect()
+            })
+            .collect();
+        a.outputs = vec![
+            OutputStrip {
+                enabled: true,
+                mute: false,
+                gain_db: -6.0,
+                delay_ms: 4.2,
+            };
+            9
+        ];
+        a
+    }
+
+    /// Blind truncation turns "spdif.1.l" into "if.1.l", which reads as a name
+    /// of its own rather than an abbreviation.
+    #[test]
+    fn abbreviation_keeps_the_identifying_parts() {
+        assert_eq!(abbreviate("spdif.1.l", 6), "1.l");
+        assert_eq!(abbreviate("usb.1", 6), "usb.1");
+        assert_eq!(abbreviate("pdm", 6), "pdm");
+        assert!(!abbreviate("spdif.1.l", 6).starts_with("if"));
+    }
+
+    #[test]
+    fn the_grid_is_sized_and_labelled_from_the_device() {
+        let mut a = app();
+        a.panel = Panel::Matrix;
+        let out = crate::render_to_string(&a, 90, 18);
+        assert!(out.contains("8 in x 9 out"));
+        assert!(out.contains("usb.1"));
+        assert!(out.contains("usb.8"));
+    }
+
+    /// An inactive crosspoint is a dot, so a live route stands out across a grid
+    /// this size.
+    #[test]
+    fn routes_are_distinguishable_from_silence() {
+        let mut a = app();
+        a.panel = Panel::Matrix;
+        let out = crate::render_to_string(&a, 90, 18);
+        assert!(out.contains('·'), "inactive crosspoints should be dots");
+        assert!(out.contains("-3.0"), "active crosspoints should show gain");
+    }
+
+    #[test]
+    fn the_focused_crosspoint_is_spelled_out_in_full() {
+        let mut a = app();
+        a.panel = Panel::Matrix;
+        a.matrix_focus = (1, 1);
+        let out = crate::render_to_string(&a, 90, 18);
+        assert!(
+            out.contains("usb.2→spdif.1.r"),
+            "detail line missing:\n{out}"
+        );
+        assert!(out.contains("inv"), "polarity should be stated");
+        assert!(out.contains("4.2ms"), "the output strip should be shown");
+    }
+
+    #[test]
+    fn navigation_moves_around_the_grid_and_wraps() {
+        let mut a = app();
+        a.panel = Panel::Matrix;
+        a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(a.matrix_focus, (0, 1));
+        a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(a.matrix_focus, (1, 1));
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(a.matrix_focus, (1, 0));
+        // Wrapping rather than sticking, matching the rest of the interface.
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(a.matrix_focus, (1, 8));
+    }
+
+    /// Nine outputs do not fit a narrow terminal, so the grid scrolls to keep
+    /// the focus visible rather than silently clipping it.
+    #[test]
+    fn the_grid_scrolls_to_follow_the_focus() {
+        let mut a = app();
+        a.panel = Panel::Matrix;
+        a.matrix_focus = (0, 8);
+        let out = crate::render_to_string(&a, 70, 18);
+        // The last output's short name must be on screen.
+        assert!(
+            out.contains("5.l"),
+            "focused column scrolled out of view:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_unread_matrix_says_so_rather_than_showing_an_empty_grid() {
+        let mut a = app();
+        a.panel = Panel::Matrix;
+        a.matrix.clear();
+        let out = crate::render_to_string(&a, 90, 18);
+        assert!(out.contains("No routing read yet"));
     }
 }
