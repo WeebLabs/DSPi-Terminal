@@ -4,6 +4,7 @@
 //! share every behaviour rather than reimplementing it.
 
 pub mod filterfile;
+pub mod preset_file;
 pub mod probe;
 pub mod write;
 

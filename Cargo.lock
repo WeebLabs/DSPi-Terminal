@@ -147,6 +147,7 @@ dependencies = [
  "dspi-proto",
  "dspi-transport",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

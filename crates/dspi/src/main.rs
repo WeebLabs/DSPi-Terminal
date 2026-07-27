@@ -353,6 +353,13 @@ fn cmd_import(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
             return exit::USAGE;
         }
     };
+    // A .dspipreset is a whole-device document rather than a filter bank, so it
+    // takes a different path; the extension picks, and a mis-typed name gets a
+    // clear answer rather than a confusing parse error.
+    if path.ends_with(dspi_session::preset_file::FILE_EXTENSION) {
+        return import_preset(&text, path, flags);
+    }
+
     let file = match dspi_session::filterfile::parse(&text) {
         Ok(f) => f,
         Err(e) => {
@@ -443,6 +450,74 @@ fn cmd_import(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
             );
         }
     }
+    exit::OK
+}
+
+/// Inspect a whole-device document and report what it would do.
+///
+/// Applying every block is still to come; reading, validating and reporting is
+/// what makes a file trustworthy before anyone acts on it, so that lands first.
+fn import_preset(text: &str, path: &str, flags: &[&str]) -> u8 {
+    use dspi_session::preset_file;
+
+    let doc = match preset_file::parse(text) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("dspi: {e}");
+            return exit::USAGE;
+        }
+    };
+
+    println!(
+        "{path}: {}{}, {} channels",
+        doc.meta.name.as_deref().unwrap_or("unnamed"),
+        doc.meta
+            .platform
+            .as_deref()
+            .map(|p| format!(" from {p}"))
+            .unwrap_or_default(),
+        doc.channels.len()
+    );
+
+    let features: Vec<&str> = [
+        doc.psybass.is_some().then_some("psychoacoustic bass"),
+        doc.upmix.is_some().then_some("upmixer"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !features.is_empty() {
+        println!("Carries: {}", features.join(", "));
+    }
+
+    // Compare against the device before promising anything.
+    match connect(flag_value(flags, "--device")) {
+        Ok(session) => {
+            let caps = session.capabilities();
+            let ids: Vec<i32> = caps.channels.iter().map(|c| c.index as i32).collect();
+            let (usable, missing) = preset_file::resolve_channels(&doc, &ids);
+
+            println!(
+                "This device can take {} of {} channels.",
+                usable.len(),
+                doc.channels.len()
+            );
+            if !missing.is_empty() {
+                println!("Not on this device: {}", missing.join(", "));
+            }
+            if doc.meta.wire_format_version != 0
+                && doc.meta.wire_format_version != caps.wire_format as i32
+            {
+                println!(
+                    "Note: written for wire format V{}, this device is V{}.",
+                    doc.meta.wire_format_version, caps.wire_format
+                );
+            }
+        }
+        Err(_) => println!("No device connected, so this is a file check only."),
+    }
+
+    println!("\nApplying .dspipreset files is not implemented yet; use a filter file for now.");
     exit::OK
 }
 
