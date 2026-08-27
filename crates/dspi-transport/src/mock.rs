@@ -22,6 +22,14 @@ pub enum Reply {
     /// mock would hand back the same prefix every time and a chunking bug would
     /// sail through the tests.
     Window(Vec<u8>),
+    /// Answer each of these in turn, then repeat the last one forever.
+    ///
+    /// Models a value that changes between polls, which is what a deferred
+    /// apply looks like from the host: `PENDING`, then the real outcome. A
+    /// single fixed answer cannot express the sequence the wait is watching
+    /// for, so without this a polling loop would be tested against a device
+    /// that had already finished before it started.
+    Sequence(Vec<Vec<u8>>),
     /// Refuse, as the firmware does for an unknown opcode or a bad index.
     Stall,
     /// Stall `n` more times, then fall through to the next reply. Models the
@@ -115,6 +123,18 @@ impl MockTransport {
             Some(Reply::Stall) => Err(TransportError::Stalled { opcode }),
             Some(Reply::Disconnect) => Err(TransportError::Disconnected),
             Some(Reply::Data(d)) => Ok(d.clone()),
+            Some(Reply::Sequence(steps)) => {
+                if steps.is_empty() {
+                    return Err(TransportError::Stalled { opcode });
+                }
+                let next = steps.remove(0);
+                // The last answer stands, so a caller that polls once more
+                // than the script expects sees a settled device, not a stall.
+                if steps.is_empty() {
+                    steps.push(next.clone());
+                }
+                Ok(next)
+            }
             Some(Reply::Window(all)) => {
                 let start = (value as usize).min(all.len());
                 Ok(all[start..].to_vec())
