@@ -15,7 +15,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
 use super::{Shared, channel_name, trimmed, type_code};
-use crate::shell::{Screen, ScreenEvent};
+use crate::shell::{Screen, ScreenEvent, Selection};
 use crate::theme::{ChannelRole, Theme};
 use crate::widgets::card::CardTitle;
 use crate::widgets::text::{fit_left, fit_right};
@@ -201,10 +201,13 @@ impl Screen for Overview {
                 ScreenEvent::Handled
             }
             KeyCode::Enter => {
-                // Selecting a channel is the shell's business, and `Screen` has
-                // no way to ask for it yet; say what would happen instead.
                 let ch = specs[self.cursor].channels.first().copied().unwrap_or(0);
-                ScreenEvent::Status(format!("Select {}", channel_name(state, ch)))
+                let ni = state.caps.num_inputs as usize;
+                ScreenEvent::Select(if ch < ni {
+                    Selection::Input(ch)
+                } else {
+                    Selection::Output(ch - ni)
+                })
             }
             _ => ScreenEvent::Unhandled,
         }
@@ -454,7 +457,7 @@ mod tests {
         assert_eq!(s.cursor, 1);
         assert_eq!(
             s.handle(key(KeyCode::Enter), &state),
-            ScreenEvent::Status("Select OUT L".into())
+            ScreenEvent::Select(Selection::Output(0))
         );
         assert_eq!(
             s.handle(key(KeyCode::PageDown), &state),

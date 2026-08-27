@@ -668,6 +668,7 @@ impl App {
                 freq,
                 q,
                 gain,
+                qp,
             } => {
                 let packet = dspi_proto::value::EqParamPacket {
                     channel,
@@ -677,7 +678,7 @@ impl App {
                     freq,
                     q,
                     gain_db: gain,
-                    qp: None,
+                    qp,
                 };
                 match session.write_band(&packet) {
                     Ok(dspi_session::Outcome::Rejected { .. }) => {

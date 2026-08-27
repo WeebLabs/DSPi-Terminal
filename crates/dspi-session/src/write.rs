@@ -31,6 +31,9 @@ pub enum WriteError {
     #[error("no parameter called `{0}`")]
     UnknownParam(String),
 
+    #[error("`{path}` is limited to {max} on this platform")]
+    PlatformRange { path: String, max: String },
+
     #[error("`{path}` cannot be changed; it is read-only")]
     ReadOnly { path: String },
 
@@ -207,6 +210,18 @@ impl Session {
         // Validate before the wire, so the user gets a message naming the limits
         // rather than a bare stall from the device.
         let value = d.kind.validate(&value)?;
+        // The delay buffers are 1024 samples on an RP2040 and 2048 on an
+        // RP2350 (config.h:94-99): 42 ms against 85 ms at 48 kHz. The registry
+        // carries the larger; the smaller is a platform fact, checked here.
+        if matches!(path, "ch.delay" | "out.delay")
+            && self.caps.platform == dspi_proto::Platform::Rp2040
+            && value.as_f32().is_some_and(|v| v > 42.0)
+        {
+            return Err(WriteError::PlatformRange {
+                path: path.into(),
+                max: "42 ms".into(),
+            });
+        }
 
         // PDM and the Core 1 EQ workers cannot both run, and the firmware skips
         // a blocked enable without saying so (survey-firmware 6.8). Ask first,
@@ -412,6 +427,12 @@ impl Session {
     ) -> Result<Outcome, WriteError> {
         if matches!(d.kind, Kind::Trigger) {
             return Ok(Outcome::Triggered);
+        }
+        // A packet has no scalar readback: `read` fetches one byte of it,
+        // which is not evidence either way. The typed helpers (surfaces.rs)
+        // verify packets by their own status protocol.
+        if matches!(d.kind, Kind::Packet) {
+            return Ok(Outcome::Accepted);
         }
         if !d.needs_readback() {
             return Ok(match d.get {

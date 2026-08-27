@@ -47,6 +47,9 @@ pub struct SharedState {
     /// Preset slot names, read back with `preset.name <slot>` and refreshed
     /// after a rename. Empty means the slot has no name.
     pub preset_names: Vec<String>,
+    /// Bit N set means slot N holds a preset, from `REQ_PRESET_GET_DIR`
+    /// (the Console's `isPresetOccupied`).
+    pub occupied: u16,
     /// The slot the device loads at power on, when the startup mode is
     /// "specified".
     pub default_slot: Option<u8>,
@@ -336,13 +339,18 @@ pub fn band_command(
 ) -> Vec<String> {
     let ch = channel_token(state, channel);
     let n = display_band(band);
-    let mut out = vec![format!(
+    let mut line = format!(
         "eq {ch} {n} {} {} {} {}",
         type_token(p.filter_type),
         number(p.freq),
         number(p.q),
         number(p.gain_db),
-    )];
+    );
+    if let Some(qp) = p.qp.filter(|_| p.filter_type.is_linkwitz()) {
+        line.push(' ');
+        line.push_str(&number(qp));
+    }
+    let mut out = vec![line];
     if p.bypass && p.filter_type != FilterType::Flat && supports_bypass(state) {
         out.push(format!("eq.bypass {ch} {n} on"));
     }

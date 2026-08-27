@@ -9,6 +9,7 @@ use dspi_session::DeviceState;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use super::model::Selection;
 use crate::theme::Theme;
 use crate::widgets::{Dialog, KeyHelp, PopupList};
 
@@ -24,8 +25,11 @@ pub enum ScreenEvent {
     Popup(PopupList),
     /// Open a dialog; results come back through `Screen::dialog_result`.
     Dialog(Dialog),
-    /// A command in the shared grammar, to run through the session.
+    /// A command in the shared grammar, to run through the session. Several
+    /// commands may be joined with newlines.
     Command(String),
+    /// Select a channel (or the overview) in the sidebar.
+    Select(Selection),
     /// Something to say on the echo line.
     Status(String),
     /// The screen wants to close (a tool panel or Settings).

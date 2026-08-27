@@ -1595,6 +1595,7 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool, force: bool) -> u
             freq,
             q,
             gain,
+            qp,
         } => {
             // One transfer for the whole band, which is how the firmware stores
             // it; setting fields one at a time would be six round trips.
@@ -1606,7 +1607,7 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool, force: bool) -> u
                 freq,
                 q,
                 gain_db: gain,
-                qp: None,
+                qp,
             };
             match s.write_band(&packet) {
                 Ok(Outcome::Rejected { .. }) => {
@@ -1771,6 +1772,7 @@ fn write_exit(e: &dspi_session::WriteError) -> u8 {
         | W::ReadOnly { .. }
         | W::WrongArity { .. }
         | W::BadTarget(..)
+        | W::PlatformRange { .. }
         | W::Unavailable { .. } => exit::USAGE,
         // Nothing was written and the old value stands, which is the same
         // thing a script needs to know about a silent rejection.

@@ -638,6 +638,7 @@ impl Live {
                 freq,
                 q,
                 gain,
+                qp,
             } => {
                 let packet = dspi_proto::value::EqParamPacket {
                     channel,
@@ -647,7 +648,7 @@ impl Live {
                     freq,
                     q,
                     gain_db: gain,
-                    qp: None,
+                    qp,
                 };
                 match session.write_band(&packet) {
                     Ok(Outcome::Rejected { .. }) => self.note("the band was not applied as sent"),
@@ -1075,7 +1076,26 @@ impl Live {
                 _ => String::new(),
             })
             .collect();
-        self.shared.borrow_mut().preset_names = names;
+        // The directory says which slots hold anything and which one the
+        // device loads at power on (config.h REQ_PRESET_GET_DIR, 7 bytes).
+        let dir = session
+            .with_transport(|t| {
+                t.control_in(
+                    dspi_proto::generated::opcodes::REQ_PRESET_GET_DIR,
+                    0,
+                    dspi_proto::packets::PresetDirectory::SIZE as u16,
+                )
+            })
+            .ok()
+            .and_then(|d| dspi_proto::packets::PresetDirectory::decode(&d).ok());
+        {
+            let mut shared = self.shared.borrow_mut();
+            shared.preset_names = names;
+            if let Some(dir) = dir {
+                shared.occupied = dir.occupied;
+                shared.default_slot = (dir.startup_mode == 0).then_some(dir.default_slot);
+            }
+        }
         self.sync_model();
     }
 

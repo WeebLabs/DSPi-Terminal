@@ -30,9 +30,12 @@ impl PresetMenu {
     /// What a slot is called on its own: its name, or `Empty` when it has
     /// none. The Console's `presetDropdownLabel`.
     pub fn dropdown_label(shared: &SharedState, slot: u8) -> String {
+        if shared.occupied & (1 << slot) == 0 {
+            return "Empty".to_string();
+        }
         match shared.preset_names.get(slot as usize) {
             Some(name) if !name.trim().is_empty() => name.trim().to_string(),
-            _ => "Empty".to_string(),
+            _ => format!("Preset {}", slot + 1),
         }
     }
 
@@ -128,6 +131,8 @@ mod tests {
         names[2] = "Living Room".into();
         SharedState {
             preset_names: names,
+            // Slots 1 and 3 hold presets; the rest are empty.
+            occupied: 0b101,
             ..Default::default()
         }
     }

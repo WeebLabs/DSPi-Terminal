@@ -322,16 +322,25 @@ impl Dialog {
             KeyCode::Char(c) => {
                 // Accelerators: the first letter of a button, when the kind
                 // does not consume letters.
+                // A letter two buttons share is no accelerator at all: `c`
+                // must never pick `Clear All` over `Cancel`.
                 let lc = c.to_ascii_lowercase();
-                self.buttons
+                let matches: Vec<usize> = self
+                    .buttons
                     .iter()
-                    .position(|b| {
+                    .enumerate()
+                    .filter(|(_, b)| {
                         b.label
                             .chars()
                             .next()
                             .is_some_and(|f| f.to_ascii_lowercase() == lc)
                     })
-                    .map(|i| self.finish(i))
+                    .map(|(i, _)| i)
+                    .collect();
+                match matches.as_slice() {
+                    [i] => Some(self.finish(*i)),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -576,6 +585,17 @@ mod tests {
             d.handle(key(KeyCode::Enter)),
             Some(DialogOutcome::Button(1))
         );
+    }
+
+    #[test]
+    fn a_shared_first_letter_is_not_an_accelerator() {
+        let mut d = Dialog::confirm(
+            "Clear All Bands?",
+            "",
+            vec![Button::destructive("Clear All"), Button::new("Cancel")],
+        );
+        assert_eq!(d.handle(key(KeyCode::Char('c'))), None, "ambiguous");
+        assert_eq!(d.handle(key(KeyCode::Esc)), Some(DialogOutcome::Cancelled));
     }
 
     #[test]

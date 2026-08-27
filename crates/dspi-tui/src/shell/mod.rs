@@ -474,6 +474,7 @@ impl Shell {
                 self.dialog_owner = owner;
             }
             ScreenEvent::Command(c) => out.push(ShellEvent::Command(c)),
+            ScreenEvent::Select(sel) => out.push(ShellEvent::Select(sel)),
             ScreenEvent::Status(s) => out.push(ShellEvent::Status(s)),
             ScreenEvent::Close => match owner {
                 Owner::Settings => out.push(ShellEvent::CloseSettings),

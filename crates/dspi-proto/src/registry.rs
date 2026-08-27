@@ -653,7 +653,7 @@ pub static REGISTRY: &[ParamDesc] = &[
         Float {
             unit: Unit::Ms,
             min: 0.0,
-            max: 42.0,
+            max: 85.0,
         },
         Tg::Channel,
         Some(op::REQ_SET_DELAY),
@@ -758,7 +758,7 @@ pub static REGISTRY: &[ParamDesc] = &[
         Float {
             unit: Unit::Ms,
             min: 0.0,
-            max: 42.0,
+            max: 85.0,
         },
         Tg::Output,
         Some(op::REQ_SET_OUTPUT_DELAY),

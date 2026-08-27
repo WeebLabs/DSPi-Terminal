@@ -115,6 +115,8 @@ pub enum Command {
         freq: f32,
         q: f32,
         gain: f32,
+        /// Linkwitz Transform target Q, when the band carries one.
+        qp: Option<f32>,
     },
     /// A non-parameter verb: list, dump, doctor, and so on.
     Verb { name: String, args: Vec<String> },
@@ -457,6 +459,12 @@ fn parse_eq(tokens: &[&str], ctx: &Context) -> Result<Command, ParseError> {
         freq: num(3, 1000.0)?,
         q: num(4, 0.707)?,
         gain: num(5, 0.0)?,
+        // The Linkwitz Transform's target Q rides in the 18-byte band form;
+        // a seventh token carries it and nothing else does.
+        qp: match tokens.get(6) {
+            Some(_) => Some(num(6, 0.707)?),
+            None => None,
+        },
     })
 }
 
@@ -612,6 +620,7 @@ pub fn format(cmd: &Command, ctx: &Context) -> String {
             freq,
             q,
             gain,
+            qp,
         } => {
             let ty = crossover_token(*filter_type).unwrap_or_else(|| {
                 by_path("eq.type")
@@ -625,14 +634,18 @@ pub fn format(cmd: &Command, ctx: &Context) -> String {
                     .unwrap_or("?")
                     .to_string()
             });
-            format!(
+            let mut line = format!(
                 "eq {} {} {ty} {freq} {q} {gain}",
                 ctx.channel_slugs
                     .get(*channel as usize)
                     .cloned()
                     .unwrap_or_else(|| channel.to_string()),
                 display_band(*band),
-            )
+            );
+            if let Some(qp) = qp {
+                line.push_str(&format!(" {qp}"));
+            }
+            line
         }
         Command::Verb { name, args } => {
             if args.is_empty() {
@@ -988,6 +1001,7 @@ mod tests {
                 freq: 2856.0,
                 q: 3.58,
                 gain: -8.6,
+                qp: None,
             }
         );
     }
