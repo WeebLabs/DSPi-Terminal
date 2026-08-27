@@ -129,6 +129,9 @@ pub const VERBS: &[(&str, &str)] = &[
     ("eq", "Set a whole filter band at once"),
     ("doctor", "Diagnose connection problems"),
     ("completions", "Generate shell completions"),
+    ("undo", "Put back the value the last change replaced"),
+    ("redo", "Re-apply the change undo reversed"),
+    ("raw", "Issue any vendor opcode directly"),
 ];
 
 /// Parse a token list into a command.
