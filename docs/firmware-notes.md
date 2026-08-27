@@ -233,3 +233,71 @@ Reading that file also settled an older bug here: `filterfile.rs` mapped `LSC`
 and `HSC` to the *first-order* shelves, while the Console and `autoeq.rs` both
 read them as REW's spelling of the second-order ones. A REW file's shelves were
 being imported at half their slope. They now agree.
+
+---
+
+## 17. Four packets are not the same size in both directions
+
+Most vendor structures are one record used both ways. These four are not, and
+each asymmetry is invisible to a size check that only looks at one direction:
+
+| Opcode | SET takes | GET answers | The difference |
+|---|---|---|---|
+| `REQ_PRESET_SET/GET_STARTUP` (0x96/0x97) | 2 B | 3 B | the third byte is `last_active`, read-only |
+| `REQ_SET/GET_CS_DISPLAY_CFG` (0x27/0x28) | 12 B | 16 B | the read prepends `{max_pages, model_count, rsvd[2]}` |
+| `REQ_SET/GET_CS_MACRO` (0x22/0x23) | 36 B | 132 B | the SET is the header alone; steps go one at a time |
+| `REQ_SET_EQ_PARAM` (0x42) | 16 or 18 B | 16 B | the 18-byte form carries the Linkwitz `qp` sidecar |
+
+The display one is the trap: parsing the config from offset 0 of the *reply*
+reads `max_pages` as the mode and `model_count` as the home page, which is a
+plausible-looking config rather than an error. `CsDisplayCfgReply` exists so
+that offset cannot be got wrong.
+
+`max_pages` is also the only place the display's page count is published: it is
+not in the CS caps header. A host that sizes its page loop by
+`CS_MAX_DISPLAY_PAGES` reads sixteen slots from a device that may have fewer.
+
+## 18. The display's deferred tag collides with its own page 0
+
+`cs_last_slot` tags a display config SET as `0x50` and a page SET as
+`0x50 | page` (control_surfaces.h:780-782), so the config and page 0 are the
+same byte. Every other namespace is disjoint: bare `n` is a binding, `0x80|n`
+an IR sub-slot, `0x40|n` a group, `0x60|n` a macro, `0xFF` a save or revert.
+
+That is only safe because a host never has two display SETs in flight. The
+macOS Console serialises them on a queue for exactly this reason, and
+`surfaces.rs` writes them one at a time and waits for each.
+
+## 19. Two delay scales, ten times apart
+
+`CsBinding.on_delay` / `off_delay` are in **0.1 s** units
+(control_surfaces.h:387-391) and `CsMacroStep.pre_delay` is in **10 ms** units
+(control_surfaces.h:469). Both are `uint16` and both are called a delay, so
+mixing them up is a factor of ten in either direction with nothing to notice it
+by. One second is 10 in a binding and 100 in a macro step.
+
+## 20. `SiggenTypeDesc.name` is NUL-padded, not NUL-terminated
+
+The eight name bytes (siggen.h:166) may be entirely filled, so there is no
+terminator to look for and a reader that insists on one runs into the
+`timing_model` byte. Read it as "up to eight bytes, stop at the first NUL if
+there is one".
+
+The same struct's `SiggenParamDesc` entries are 13 bytes each and start at
+offset 10, so every float in the table is unaligned. That is fine on the wire
+and fatal to a `load::<f32>` on a platform that cares.
+
+## 21. Two bytes of `SpdifRxStatusPacket` are documented as reserved and are not
+
+`survey-firmware.md` 6.6 ends the 16-byte packet at `fifo_fill_pct` and calls
+bytes 14 and 15 reserved. The Console reads them as the receiver library's
+state and its callback count and shows both in Stats. They are decoded here
+under the Console's names rather than dropped, since a reserved byte that
+carries diagnostics is worth keeping.
+
+## 22. The Console sends a 9-byte matrix route packet
+
+`MatrixRoutePacket` is 8 bytes in `config.h:845-851` and the Console builds a
+9-byte `Data` for `REQ_SET_MATRIX_ROUTE`, reading 9 back as well. The trailing
+byte is zero and the firmware ignores the excess, so both work; this app sends
+the 8 the header defines.
