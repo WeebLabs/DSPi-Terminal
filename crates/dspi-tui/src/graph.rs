@@ -285,7 +285,7 @@ impl Widget for Graph<'_> {
             let step = s.db_step();
             // A grid line on every row is no grid at all; below two rows per
             // step only the zero line is drawn.
-            let sparse = rows / (span / step) < 2.0;
+            let sparse = rows / (span / step) < 1.5;
             let mut db = (bottom / step).ceil() * step;
             while db <= top + 1e-9 {
                 if sparse && db != 0.0 {
@@ -320,11 +320,16 @@ impl Widget for Graph<'_> {
         }
         if s.freq_grid {
             let major = [100.0, 1_000.0, 10_000.0];
-            let minor: Vec<f64> = (2..10)
-                .flat_map(|m| [10.0, 100.0, 1_000.0].map(|d| m as f64 * d))
+            // The Console draws every minor decade line at 6 % white, which
+            // is nearly invisible. A terminal cell is not, so only the 2 and
+            // 5 lines are drawn, and only when the plot is wide enough that
+            // they do not crowd the majors.
+            let minor: Vec<f64> = [2.0, 5.0]
+                .iter()
+                .flat_map(|m| [10.0, 100.0, 1_000.0].map(|d| m * d))
                 .chain(std::iter::once(20_000.0))
                 .collect();
-            let wide = plot.width >= 60;
+            let wide = plot.width >= 100;
             for hz in minor.iter().filter(|_| wide).chain(major.iter()) {
                 let Some(x) = x_of(*hz) else { continue };
                 let is_major = major.contains(hz);
@@ -470,7 +475,12 @@ impl Widget for Graph<'_> {
         // dB labels in the left gutter.
         if s.db_labels {
             let g = self.gutter() as usize;
-            let step = s.db_step();
+            // A short plot cannot label every step; double the step until
+            // labels are at least two rows apart.
+            let mut step = s.db_step();
+            while rows / (span / step) < 2.0 && step < span {
+                step *= 2.0;
+            }
             let mut taken = vec![false; plot.height as usize];
             let mut db = (bottom / step).ceil() * step;
             while db <= top + 1e-9 {
@@ -543,11 +553,9 @@ fn draw_curve(
                     continue;
                 }
                 let dy = dy as usize;
-                // A dotted curve keeps every fourth dot column and never joins.
-                if dotted {
-                    if dx % 4 == 0 {
-                        set_dot(&mut cells, plot, dx, dy);
-                    }
+                // The Console's dash for an unselected group is 6 on, 4 off.
+                if dotted && dx % 10 >= 6 {
+                    prev = None;
                     continue;
                 }
                 if let Some((px, py)) = prev
@@ -575,7 +583,7 @@ fn draw_curve(
         _ => {
             let blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
             for x in 0..plot.width {
-                if dotted && x % 2 == 1 {
+                if dotted && x % 5 >= 3 {
                     continue;
                 }
                 let frac = x as f64 / (plot.width - 1).max(1) as f64;
@@ -671,7 +679,8 @@ mod tests {
         let out = render(Graph::new(&curves, &s, &t), 60, 12);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 12);
-        assert!(lines[0].starts_with("+25 "), "{:?}", lines[0]);
+        // Eleven plot rows cannot label every 5 dB; the labels thin to 10.
+        assert!(out.contains("+20 ") && !out.contains("+25 "), "{out}");
         assert!(
             lines[11].contains("100") && lines[11].contains("1k") && lines[11].contains("10k"),
             "{:?}",

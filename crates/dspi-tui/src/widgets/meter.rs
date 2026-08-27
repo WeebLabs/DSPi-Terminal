@@ -134,6 +134,7 @@ impl Widget for LevelMeter<'_> {
         let filled = (fraction(self.level) * bar_w as f32).round() as u16;
         let peak_cell = self
             .peak
+            .filter(|p| *p > 0.0 && fraction(*p) > fraction(self.level))
             .map(|p| ((fraction(p) * bar_w as f32).round() as u16).min(bar_w.saturating_sub(1)));
         let fill_style = if self.inactive {
             t.label()

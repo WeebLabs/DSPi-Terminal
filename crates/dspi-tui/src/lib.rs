@@ -3,6 +3,7 @@
 pub mod app;
 pub mod fields;
 pub mod graph;
+pub mod shell;
 pub mod theme;
 pub mod widgets;
 

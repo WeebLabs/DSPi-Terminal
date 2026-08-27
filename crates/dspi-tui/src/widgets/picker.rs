@@ -209,7 +209,7 @@ impl Widget for Segmented<'_> {
 
 /// A popup list, drawn over whatever is beneath it. The screen owns the
 /// `PopupList` while it is open and forwards keys.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PopupList {
     pub title: String,
     /// Items; an item starting with `#` is a group header and cannot be

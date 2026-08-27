@@ -69,6 +69,16 @@ impl<'a> LegendRow<'a> {
         self
     }
 
+    /// Rows needed to show every pill at `width`: one or two.
+    pub fn rows_needed(pills: &[LegendPill], width: u16, glyphs: Glyphs) -> u16 {
+        let total: u16 = pills
+            .iter()
+            .map(|p| pill_text(p, glyphs).chars().count() as u16 + 2)
+            .sum::<u16>()
+            + 1;
+        if total > width { 2 } else { 1 }
+    }
+
     pub fn handle(&self, key: KeyEvent) -> Option<Action> {
         let n = self.pills.len();
         if n == 0 {
@@ -101,17 +111,24 @@ impl Widget for LegendRow<'_> {
         }
         let t = self.theme;
         let mut x = area.x + 1;
+        let mut y = area.y;
         for (i, p) in self.pills.iter().enumerate() {
             let text = pill_text(p, t.glyphs);
             let w = text.chars().count() as u16;
             if x + w > area.x + area.width {
-                break;
+                // Wrap onto the next row when there is one.
+                if y + 1 < area.y + area.height {
+                    y += 1;
+                    x = area.x + 1;
+                } else {
+                    break;
+                }
             }
             let mut style = pill_style(p, t);
             if self.focused && i == self.cursor {
                 style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
             }
-            buf.set_string(x, area.y, &text, style);
+            buf.set_string(x, y, &text, style);
             x += w + 2;
         }
         if let Some(tr) = self.trailing {
