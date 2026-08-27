@@ -167,7 +167,11 @@ release_ms, rsvd[8]}; 0xEC TEST WAR, pulses ~1 s.
 raw IEC 60958 bytes; 0xE4 SET_SPDIF_RX_PIN WAR wValue (index<<8)|GPIO, index
 0..3 (was 0..2); 0xE5 GET index 0..3; 0xE9 SET_SPDIF_INPUT_ENABLE WAR
 (index<<8)|enable, index 1..3 (was 1..2); 0xEF GET_SPDIF_INPUT_CONFIG 6 bytes
-(was 5): {count, enable_mask bit0 = input2, gpio[0..3]}.
+(was 5): {count, enable_mask, gpio[0..3]}. Correction (Phase 1 review): the
+response mask is `(spdif_rx_enabled_ext << 1) | 1`, so bit 0 is input 1 and
+is always set (config.h:456, vendor_commands.c:3407). The bulk packet's
+`spdif_rx_enabled_ext_p1` is the shifted-down mask whose bit 0 is S/PDIF 2.
+The two masks are one bit apart; see docs/firmware-notes.md section 14.
 
 ### 1.23 I2S input, config.h:462-471
 
