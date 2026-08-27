@@ -47,6 +47,19 @@ pub enum WriteError {
     #[error("`{path}` is not available: {why}")]
     Unavailable { path: String, why: String },
 
+    /// Enabling this output would collide with the other side of Core 1.
+    ///
+    /// The firmware silently skips a blocked enable (survey-firmware 6.8), so
+    /// this is refused before the wire with the reason the Console shows,
+    /// rather than returning success for a write that did nothing.
+    #[error("output {output} cannot be enabled yet: {body}")]
+    Core1Conflict {
+        output: u8,
+        title: String,
+        body: String,
+        confirm: String,
+    },
+
     #[error("{0}")]
     Value(#[from] ValueError),
 
@@ -102,6 +115,26 @@ pub struct Session {
     pub journal: Vec<JournalEntry>,
     /// When set, nothing is written; the intended transfer is recorded instead.
     pub dry_run: bool,
+    /// Changes that can still be stepped back through, oldest first.
+    ///
+    /// Separate from the journal because the journal is a log of everything
+    /// that happened, including the replays undo itself issues; undoing those
+    /// again would just toggle a value back and forth.
+    pub(crate) undo_stack: Vec<JournalEntry>,
+    /// Changes stepped back through and not yet re-applied, oldest first.
+    pub(crate) redo_stack: Vec<JournalEntry>,
+    /// Set while undo or redo is replaying, so the replay neither becomes a new
+    /// undo step nor discards the redo stack it is walking.
+    pub(crate) replaying: bool,
+    /// Set while [`Session::enable_output`] drives the Core 1 interlock itself,
+    /// so the check inside [`Session::write`] does not run it twice.
+    pub(crate) core1_checked: bool,
+    /// The status byte the last write-as-read answered.
+    ///
+    /// Pin and clock setters report `PIN_CONFIG_*` here (config.h:607-613) and
+    /// then quietly keep the old value, so the caller that wants to say *why*
+    /// a step was refused needs the code, not just the readback.
+    last_status: Option<u8>,
 }
 
 impl Session {
@@ -114,11 +147,26 @@ impl Session {
             map,
             journal: Vec::new(),
             dry_run: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            replaying: false,
+            core1_checked: false,
+            last_status: None,
         })
     }
 
     pub fn capabilities(&self) -> &Capabilities {
         &self.caps
+    }
+
+    /// The status byte the last write-as-read answered, if there was one.
+    ///
+    /// Every pin and clock setter is a write-as-read that returns a
+    /// `PIN_CONFIG_*` code (config.h:607-613). A refusal leaves the old value
+    /// in place, so the readback alone says only that nothing changed; this
+    /// says why.
+    pub fn last_write_status(&self) -> Option<u8> {
+        self.last_status
     }
 
     /// Run something against the raw transport.
@@ -149,12 +197,33 @@ impl Session {
             .set
             .ok_or_else(|| WriteError::ReadOnly { path: path.into() })?;
 
+        // Belongs to this write alone; a stale code from the previous one would
+        // be read as this one's refusal.
+        self.last_status = None;
+
         self.check_available(d)?;
         self.check_indices(d, indices)?;
 
         // Validate before the wire, so the user gets a message naming the limits
         // rather than a bare stall from the device.
         let value = d.kind.validate(&value)?;
+
+        // PDM and the Core 1 EQ workers cannot both run, and the firmware skips
+        // a blocked enable without saying so (survey-firmware 6.8). Ask first,
+        // so a plain `out.enable` write fails loudly with the reason instead of
+        // reporting success for nothing.
+        if d.path == "out.enable"
+            && !self.core1_checked
+            && value.as_bool() == Some(true)
+            && let Some(c) = self.core1_conflict_alert(indices[0])
+        {
+            return Err(WriteError::Core1Conflict {
+                output: indices[0],
+                title: c.title,
+                body: c.body,
+                confirm: c.confirm,
+            });
+        }
 
         let before = self.read(path, indices).ok();
 
@@ -185,7 +254,8 @@ impl Session {
             // Mutating commands on the IN path. Not a mistake: they carry their
             // parameters in wValue and answer with a status byte.
             Dir::WriteAsRead | Dir::In => {
-                self.transport.control_in(set, wvalue, 1)?;
+                let reply = self.transport.control_in(set, wvalue, 1)?;
+                self.last_status = reply.first().copied();
             }
         }
 
@@ -378,14 +448,23 @@ impl Session {
         after: Value,
         outcome: Outcome,
     ) {
-        self.journal.push(JournalEntry {
+        let entry = JournalEntry {
             path: d.path,
             indices: indices.to_vec(),
             before,
             after,
             outcome,
             undoable: matches!(d.hazard, Hazard::None | Hazard::Audible),
-        });
+        };
+        self.journal.push(entry.clone());
+
+        // A replay is already accounted for by the stack it came from. A fresh
+        // write is a new branch of history, so anything that had been undone is
+        // no longer reachable.
+        if !self.replaying {
+            self.redo_stack.clear();
+            self.undo_stack.push(entry);
+        }
     }
 
     /// Refuse a parameter this device does not have, with the reason.
@@ -1129,6 +1208,281 @@ impl Session {
             .control_in(op::REQ_GET_CORE1_CONFLICT, output as u16, 1)
             .map(|d| d.first().copied().unwrap_or(0) != 0)
             .unwrap_or(false)
+    }
+
+    /// The PDM sub, which is always the last output
+    /// (`DSPViewModel.swift:2124`).
+    pub fn pdm_output(&self) -> Option<u8> {
+        self.map.num_outputs().checked_sub(1)
+    }
+
+    /// The outputs Core 1 runs EQ for, which is the other half of the
+    /// interlock.
+    ///
+    /// `CORE1_EQ_FIRST_OUTPUT` is 2 on both platforms and
+    /// `CORE1_EQ_LAST_OUTPUT` is the output below PDM (config.h:764-770: 7 of
+    /// nine outputs on RP2350, 3 of five on RP2040), so the range follows the
+    /// discovered output count rather than a compiled-in platform test.
+    pub fn eq_worker_outputs(&self) -> std::ops::RangeInclusive<u8> {
+        const FIRST: u8 = 2;
+        match self.map.num_outputs().checked_sub(2) {
+            Some(last) if last >= FIRST => FIRST..=last,
+            // Nothing to conflict with on a part this small, so an empty range
+            // rather than a made-up one.
+            _ => std::ops::RangeInclusive::new(1, 0),
+        }
+    }
+
+    /// The dialog the Console shows before an enable that would take the other
+    /// side of Core 1 down, or `None` when there is no collision.
+    pub fn core1_conflict_alert(&mut self, output: u8) -> Option<Core1Conflict> {
+        if !self.core1_conflict(output) {
+            return None;
+        }
+        // MatrixMixerView.swift:193-217. Both alerts are titled "Warning"; which
+        // one shows depends on which side of the interlock is being asked for.
+        let pdm = self.pdm_output();
+        Some(if Some(output) == pdm {
+            let eq = self.eq_worker_outputs();
+            Core1Conflict {
+                title: "Warning".into(),
+                // 1-based for display, as the Console counts them.
+                body: format!(
+                    "Outputs {}-{} will be disabled. Are you sure?",
+                    eq.start() + 1,
+                    eq.end() + 1
+                ),
+                confirm: "Enable PDM".into(),
+            }
+        } else {
+            Core1Conflict {
+                title: "Warning".into(),
+                body: "The PDM output will be disabled. Are you sure?".into(),
+                confirm: "Disable PDM".into(),
+            }
+        })
+    }
+
+    /// Turn an output on or off, consulting the Core 1 interlock first.
+    ///
+    /// Disabling always lands. Enabling may need the person to agree to the
+    /// other side being switched off, which is what
+    /// [`EnableOutcome::NeedsConfirm`] carries.
+    pub fn enable_output(&mut self, index: u8, enable: bool) -> Result<EnableOutcome, WriteError> {
+        if enable && let Some(c) = self.core1_conflict_alert(index) {
+            return Ok(EnableOutcome::NeedsConfirm(c));
+        }
+        self.set_enable(index, enable)
+    }
+
+    /// Enable an output after the person has agreed to the conflict.
+    ///
+    /// Frees the other side of Core 1 first, in the order the Console uses
+    /// (`Commands.swift:1453-1474`): enabling PDM disables every EQ-worker
+    /// output; enabling an EQ-worker output disables PDM.
+    pub fn enable_output_confirmed(&mut self, index: u8) -> Result<EnableOutcome, WriteError> {
+        let pdm = self.pdm_output();
+        if Some(index) == pdm {
+            for o in self.eq_worker_outputs() {
+                self.set_enable(o, false)?;
+            }
+        } else if let Some(pdm) = pdm {
+            self.set_enable(pdm, false)?;
+        }
+        self.set_enable(index, true)
+    }
+
+    /// The write itself, with the interlock already decided.
+    fn set_enable(&mut self, index: u8, enable: bool) -> Result<EnableOutcome, WriteError> {
+        self.core1_checked = true;
+        let written = self.write("out.enable", &[index], Value::Bool(enable));
+        self.core1_checked = false;
+
+        // A blocked enable is skipped in silence (survey-firmware 6.8), so the
+        // readback is the only evidence that it took. `write` already compares
+        // it, and reports the mismatch as a rejection.
+        Ok(match written? {
+            Outcome::Rejected { .. } => EnableOutcome::Rejected,
+            _ => EnableOutcome::Done,
+        })
+    }
+}
+
+/// The Console's confirmation dialog for a Core 1 collision, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Core1Conflict {
+    pub title: String,
+    pub body: String,
+    /// The label on the button that goes ahead.
+    pub confirm: String,
+}
+
+/// What happened when an output was asked to turn on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnableOutcome {
+    /// The output is now in the state that was asked for.
+    Done,
+    /// Someone has to agree to the other side of Core 1 being switched off.
+    NeedsConfirm(Core1Conflict),
+    /// The device took the request and kept the old state anyway.
+    Rejected,
+}
+
+#[cfg(test)]
+mod core1_tests {
+    use super::tests::caps;
+    use super::*;
+    use dspi_proto::generated::opcodes as op;
+    use dspi_transport::MockTransport;
+    use dspi_transport::mock::{Direction, LogHandle};
+
+    /// A device that reports a conflict for `output`, and answers the enable
+    /// readback with `enabled`.
+    fn rig(conflict: bool, enabled: bool) -> (Session, LogHandle) {
+        let t = MockTransport::new()
+            .data(op::REQ_GET_CORE1_CONFLICT, vec![conflict as u8])
+            .data(op::REQ_SET_OUTPUT_ENABLE, vec![0])
+            .data(op::REQ_GET_OUTPUT_ENABLE, vec![enabled as u8]);
+        let log = t.log_handle();
+        let s = Session::new(Box::new(t), caps(Platform::Rp2350, &[])).unwrap();
+        (s, log)
+    }
+
+    /// The PDM alert names the outputs it is about to take down, 1-based, from
+    /// the discovered output count rather than a platform test.
+    #[test]
+    fn enabling_pdm_warns_about_the_eq_worker_outputs() {
+        let (mut s, _) = rig(true, false);
+        let pdm = s.pdm_output().unwrap();
+        assert_eq!(pdm, 8, "the last of nine outputs");
+
+        match s.enable_output(pdm, true).unwrap() {
+            EnableOutcome::NeedsConfirm(c) => {
+                assert_eq!(c.title, "Warning");
+                assert_eq!(c.body, "Outputs 3-8 will be disabled. Are you sure?");
+                assert_eq!(c.confirm, "Enable PDM");
+            }
+            other => panic!("expected a confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_eq_worker_range_follows_the_output_count() {
+        let mut small = caps(Platform::Rp2040, &[]);
+        small.num_inputs = 2;
+        small.num_outputs = 5;
+        small.num_channels = 7;
+        small.channels.truncate(7);
+        let t = MockTransport::new().data(op::REQ_GET_CORE1_CONFLICT, vec![1]);
+        let mut s = Session::new(Box::new(t), small).unwrap();
+
+        // config.h:764-770: outputs 2-3 on RP2040, shown 1-based.
+        assert_eq!(s.eq_worker_outputs(), 2..=3);
+        let pdm = s.pdm_output().unwrap();
+        match s.enable_output(pdm, true).unwrap() {
+            EnableOutcome::NeedsConfirm(c) => {
+                assert_eq!(c.body, "Outputs 3-4 will be disabled. Are you sure?");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn enabling_an_eq_worker_output_warns_about_pdm() {
+        let (mut s, _) = rig(true, false);
+        match s.enable_output(3, true).unwrap() {
+            EnableOutcome::NeedsConfirm(c) => {
+                assert_eq!(c.title, "Warning");
+                assert_eq!(c.body, "The PDM output will be disabled. Are you sure?");
+                assert_eq!(c.confirm, "Disable PDM");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Disabling never collides, so it must not stop to ask.
+    #[test]
+    fn disabling_never_asks() {
+        let (mut s, _) = rig(true, false);
+        assert_eq!(s.enable_output(8, false).unwrap(), EnableOutcome::Done);
+    }
+
+    /// The plain write path has to refuse too, or a script gets a success for a
+    /// write the firmware quietly dropped.
+    #[test]
+    fn a_plain_write_is_refused_with_the_reason() {
+        let (mut s, log) = rig(true, false);
+        let e = s.write("out.enable", &[3], Value::Bool(true)).unwrap_err();
+        match &e {
+            WriteError::Core1Conflict {
+                output, confirm, ..
+            } => {
+                assert_eq!(*output, 3);
+                assert_eq!(confirm, "Disable PDM");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(e.to_string().contains("PDM output will be disabled"), "{e}");
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|x| x.direction == Direction::Out),
+            "nothing should have gone out"
+        );
+    }
+
+    /// With no conflict the write goes through as it always did.
+    #[test]
+    fn without_a_conflict_the_write_is_untouched() {
+        let (mut s, _) = rig(false, true);
+        assert!(s.write("out.enable", &[3], Value::Bool(true)).is_ok());
+    }
+
+    /// After confirming, the other side is freed first and in the Console's
+    /// order: every EQ-worker output off, then PDM on.
+    #[test]
+    fn confirming_pdm_frees_the_eq_workers_first() {
+        let (mut s, log) = rig(false, true);
+        assert_eq!(s.enable_output_confirmed(8).unwrap(), EnableOutcome::Done);
+
+        let sent: Vec<(u16, Vec<u8>)> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.direction == Direction::Out && e.opcode == op::REQ_SET_OUTPUT_ENABLE)
+            .map(|e| (e.value, e.payload.clone()))
+            .collect();
+
+        assert_eq!(sent.len(), 7, "six EQ-worker outputs, then PDM");
+        for (i, (target, payload)) in sent.iter().take(6).enumerate() {
+            assert_eq!(*target, 2 + i as u16);
+            assert_eq!(payload[0], 0, "the EQ workers go off first");
+        }
+        assert_eq!(sent[6], (8, vec![1]));
+    }
+
+    #[test]
+    fn confirming_an_eq_worker_output_drops_pdm_first() {
+        let (mut s, log) = rig(false, true);
+        s.enable_output_confirmed(3).unwrap();
+
+        let sent: Vec<(u16, u8)> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.direction == Direction::Out && e.opcode == op::REQ_SET_OUTPUT_ENABLE)
+            .map(|e| (e.value, e.payload[0]))
+            .collect();
+        assert_eq!(sent, vec![(8, 0), (3, 1)]);
+    }
+
+    /// The firmware skips a blocked enable in silence (survey-firmware 6.8), so
+    /// a readback that still says "off" has to be reported as a rejection.
+    #[test]
+    fn a_silently_skipped_enable_comes_back_as_rejected() {
+        let (mut s, _) = rig(false, false);
+        assert_eq!(s.enable_output(3, true).unwrap(), EnableOutcome::Rejected);
     }
 }
 

@@ -8,7 +8,12 @@ pub mod filterfile;
 pub mod preset_file;
 pub mod probe;
 pub mod surfaces;
+pub mod undo;
 pub mod write;
 
 pub use probe::{Capabilities, Meters, probe, read_bulk, read_meters};
-pub use write::{Crosspoint, JournalEntry, Outcome, OutputStrip, Session, WriteError};
+pub use undo::Undone;
+pub use write::{
+    Core1Conflict, Crosspoint, EnableOutcome, JournalEntry, Outcome, OutputStrip, Session,
+    WriteError,
+};
