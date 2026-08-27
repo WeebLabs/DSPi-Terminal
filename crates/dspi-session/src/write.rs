@@ -441,7 +441,24 @@ impl Session {
             }
             Target::PresetSlot => indices[0] < 10,
             Target::CsSlot => indices[0] < self.caps.cs.as_ref().map_or(0, |c| c.max_bindings),
+            // `CS_MAX_IR_COMMANDS` doubled from 8 to 16 at caps v6, so this must
+            // come from the caps header rather than a constant.
             Target::CsIrSlot => indices[0] < self.caps.cs.as_ref().map_or(0, |c| c.max_ir_commands),
+            Target::CsGroup => indices[0] < self.caps.cs.as_ref().map_or(0, |c| c.max_groups),
+            Target::CsMacro => indices[0] < self.caps.cs.as_ref().map_or(0, |c| c.max_macros),
+            Target::CsMacroStep => {
+                let cs = self.caps.cs.as_ref();
+                indices[0] < cs.map_or(0, |c| c.max_macros)
+                    && indices[1] < cs.map_or(0, |c| c.max_macro_steps)
+            }
+            // `CS_MAX_DISPLAY_PAGES` is 16 and is not reported by the caps
+            // header; `REQ_GET_CS_DISPLAY_CFG` answers it as `max_pages`, which
+            // no probe reads yet, so the firmware's own range check applies.
+            Target::CsDisplayPage => true,
+            // config.h:448-453: four S/PDIF inputs, indexed 0..3.
+            Target::SpdifInput => indices[0] < 4,
+            // config.h:454: only the optional inputs can be switched.
+            Target::SpdifExtraInput => (1..4).contains(&indices[0]),
             Target::LegacyChannel => indices[0] < 3,
             // Bounded by the device but not separately reported; the firmware
             // range-checks these and answers with a status code.
@@ -482,6 +499,9 @@ pub(crate) fn wvalue_for(d: &ParamDesc, indices: &[u8], value: &Value) -> u16 {
             WValue::Target => indices.first().copied().unwrap_or(0) as u16,
             WValue::ChannelBand => ((indices[0] as u16) << 8) | indices[1] as u16,
             WValue::Crosspoint => ((indices[0] as u16) << 8) | indices[1] as u16,
+            // `(step << 8) | macro`: the only command that puts the second
+            // index in the high byte (config.h:141).
+            WValue::MacroStep => ((indices[1] as u16) << 8) | indices[0] as u16,
             // The band field is five bits wide, so crossover bands 20-23 fit.
             WValue::EqScalar(param) => {
                 ((indices[0] as u16) << 8) | ((indices[1] as u16) << 3) | param as u16
@@ -509,7 +529,9 @@ pub(crate) fn read_wvalue_for(d: &ParamDesc, indices: &[u8]) -> u16 {
             WValue::EqScalar(param) => {
                 ((indices[0] as u16) << 8) | ((indices[1] as u16) << 3) | param as u16
             }
-            WValue::Target | WValue::ValueSlot | WValue::ValueIndex => {
+            // A macro step reads back inside the whole macro, addressed by the
+            // macro index alone; the step number has no place in that wValue.
+            WValue::Target | WValue::ValueSlot | WValue::ValueIndex | WValue::MacroStep => {
                 indices.first().copied().unwrap_or(0) as u16
             }
             _ => 0,
@@ -533,6 +555,12 @@ fn target_name(t: Target) -> &'static str {
         Target::PresetSlot => "preset slot",
         Target::CsSlot => "binding slot",
         Target::CsIrSlot => "IR command slot",
+        Target::CsGroup => "channel group",
+        Target::CsMacro => "macro",
+        Target::CsMacroStep => "macro or step",
+        Target::CsDisplayPage => "display page",
+        Target::SpdifInput => "S/PDIF input",
+        Target::SpdifExtraInput => "optional S/PDIF input",
         Target::LegacyChannel => "legacy channel",
         _ => "index",
     }
@@ -634,11 +662,14 @@ mod tests {
                 })
                 .collect(),
             cs: Some(ControlSurfaceCaps {
-                caps_version: 4,
+                caps_version: 13,
                 max_bindings: 16,
-                type_count: 8,
-                noun_count: 49,
-                max_ir_commands: 8,
+                type_count: 9,
+                noun_count: 57,
+                max_ir_commands: 16,
+                max_groups: 8,
+                max_macros: 8,
+                max_macro_steps: 8,
             }),
             siggen: None,
             active_preset: Some(0),
@@ -1110,7 +1141,7 @@ mod matrix_tests {
 
     fn bulk_with_matrix() -> Vec<u8> {
         let mut b = vec![0u8; generated::BULK_SIZE];
-        b[0] = 26;
+        b[0] = generated::wire::WIRE_FORMAT_VERSION as u8;
         b[1] = 1;
         b[2] = 17;
         b[3] = 9;
