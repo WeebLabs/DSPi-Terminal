@@ -20,6 +20,7 @@ pub mod input;
 pub mod linkwitz;
 pub mod output;
 pub mod overview;
+pub mod presets;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -35,6 +36,7 @@ pub use input::InputPage;
 pub use linkwitz::LinkwitzPanel;
 pub use output::OutputPage;
 pub use overview::Overview;
+pub use presets::{PresetChoice, PresetMenu};
 
 /// The application-side state the screens share.
 #[derive(Debug, Default, Clone)]

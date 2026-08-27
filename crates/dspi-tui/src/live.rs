@@ -25,6 +25,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Widget};
 
 use crate::app::Performance;
 use crate::graph::GraphCurve;
+use crate::screens::{
+    self, InputPage, OutputPage, Overview, PresetChoice, PresetMenu, Shared, clipboard, presets,
+};
 use crate::shell::{
     ChannelItem, Placeholder, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
 };
@@ -38,6 +41,14 @@ pub trait Screens {
     fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen>;
     fn tool(&self, state: &DeviceState, tool: Tool) -> Box<dyn Screen>;
     fn settings(&self, state: &DeviceState) -> Box<dyn Screen>;
+
+    /// The application-side state the screens share, when the factory keeps
+    /// one. The runner needs it for the sidebar actions that are not a screen:
+    /// the preset menu, the channel clipboard, and mirroring onto a linked
+    /// input pair.
+    fn shared(&self) -> Option<Shared> {
+        None
+    }
 }
 
 pub struct PlaceholderScreens;
@@ -70,6 +81,55 @@ impl Screens for PlaceholderScreens {
 
     fn settings(&self, _state: &DeviceState) -> Box<dyn Screen> {
         Box::new(Placeholder::new("Settings", "Settings arrive in Phase 7."))
+    }
+}
+
+/// The Console's screens: the dashboard, the input page and the output page.
+///
+/// Tool panels and Settings are still placeholders; the phases that build them
+/// replace those two methods. Every screen it makes shares one [`Shared`]
+/// handle, which is where the linked pairs, the preset names and the channel
+/// clipboard live.
+pub struct ConsoleScreens {
+    pub shared: Shared,
+}
+
+impl Default for ConsoleScreens {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConsoleScreens {
+    pub fn new() -> Self {
+        Self {
+            shared: screens::shared(),
+        }
+    }
+}
+
+impl Screens for ConsoleScreens {
+    fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen> {
+        match selection {
+            Selection::Overview => Box::new(Overview::new(self.shared.clone())),
+            Selection::Input(i) => Box::new(InputPage::new(i, self.shared.clone(), state)),
+            Selection::Output(o) => Box::new(OutputPage::new(o, self.shared.clone(), state)),
+        }
+    }
+
+    fn tool(&self, _state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
+        Box::new(Placeholder::new(
+            tool.title(),
+            "This panel arrives in a later phase.",
+        ))
+    }
+
+    fn settings(&self, _state: &DeviceState) -> Box<dyn Screen> {
+        Box::new(Placeholder::new("Settings", "Settings arrive in Phase 7."))
+    }
+
+    fn shared(&self) -> Option<Shared> {
+        Some(self.shared.clone())
     }
 }
 
@@ -249,6 +309,11 @@ enum AppDialog {
         channel: usize,
     },
     PresetList,
+    /// The `Copy to...` submenu, with the slot each row stands for.
+    PresetCopyTo(Vec<u8>),
+    PresetRename(u8),
+    PresetClear(u8),
+    PresetClearAll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -269,6 +334,8 @@ pub struct Live {
     peaks: Vec<PeakHold>,
     visible: Vec<bool>,
     screens: Box<dyn Screens>,
+    /// The state the screens share, when the factory keeps one.
+    shared: Shared,
     pub should_quit: bool,
     last_tick: Instant,
 }
@@ -291,6 +358,7 @@ impl Live {
         let mut model = ShellModel::empty();
         model.selection = Selection::Overview;
         let detail = screens.detail(&state, Selection::Overview);
+        let shared = screens.shared().unwrap_or_else(screens::shared);
         let shell = Shell::new(model, theme, detail);
         let mut live = Self {
             shell,
@@ -304,6 +372,7 @@ impl Live {
             peaks: vec![PeakHold::default(); n],
             visible: vec![true; n],
             screens,
+            shared,
             should_quit: false,
             last_tick: Instant::now(),
         };
@@ -327,7 +396,7 @@ impl Live {
         };
         m.connected = true;
         m.preset_label = match caps.active_preset {
-            Some(p) => format!("Preset {}", p + 1),
+            Some(p) => PresetMenu::slot_label(&self.shared.borrow(), p),
             None => "Empty".into(),
         };
         m.preset_dirty = s.has_unsaved_changes();
@@ -497,6 +566,15 @@ impl Live {
             value: value.clone(),
         };
         match session.write(path, indices, value) {
+            // A packet parameter has no scalar readback: the confirming read
+            // asks for one byte of a structure, so a byte-for-byte comparison
+            // is not evidence of anything. Take the device's word for it.
+            Ok(Outcome::Rejected { .. })
+                if matches!(desc.kind, dspi_proto::registry::Kind::Packet) =>
+            {
+                self.echo(dspi_cmd::format(&cmd, &self.ctx));
+                self.refresh(session);
+            }
             Ok(Outcome::Rejected { actual, .. }) => {
                 let shown = dspi_proto::registry::by_path(path)
                     .map(|d| crate::fields::display_value(d, &actual))
@@ -508,6 +586,20 @@ impl Live {
                 self.refresh(session);
             }
             Err(e) => self.note(e.to_string()),
+        }
+    }
+
+    /// Run one or more commands, one per line.
+    ///
+    /// A screen asks for several at once when one gesture is several writes:
+    /// an edit mirrored onto a linked input pair, Clear All over a whole bank,
+    /// a channel paste. The echo line ends up showing the last of them, which
+    /// is the one the person's finger was on.
+    pub fn run_commands(&mut self, session: &mut Session, lines: &str) {
+        for line in lines.lines() {
+            if !line.trim().is_empty() {
+                self.run_command(session, line);
+            }
         }
     }
 
@@ -688,9 +780,10 @@ impl Live {
                 }
             }
             ShellEvent::Preset(None) => {
-                let items: Vec<String> = (1..=10).map(|n| format!("Preset {n}")).collect();
-                let cur = self.state.caps.active_preset.unwrap_or(0) as usize;
-                self.popup = Some((AppDialog::PresetList, PopupList::new("Preset", items, cur)));
+                let active = self.state.caps.active_preset.unwrap_or(0);
+                let dirty = self.state.has_unsaved_changes();
+                let popup = PresetMenu::popup(&self.shared.borrow(), active, dirty);
+                self.popup = Some((AppDialog::PresetList, popup));
             }
             ShellEvent::Source(Some(delta)) => {
                 if let Some((choices, idx)) = &self.shell.model.source {
@@ -726,7 +819,7 @@ impl Live {
                 };
                 self.sync_model();
             }
-            ShellEvent::Command(c) => self.run_command(session, &c),
+            ShellEvent::Command(c) => self.run_commands(session, &c),
             ShellEvent::Status(s) => self.note(s),
             ShellEvent::Palette => self.prompt = Some(Prompt::new(true, &self.ctx)),
             ShellEvent::CommandLine => self.prompt = Some(Prompt::new(false, &self.ctx)),
@@ -795,8 +888,27 @@ impl Live {
                     Dialog::text("Rename", "", name, "Name"),
                 ));
             }
-            ShellEvent::CopyParams(_) | ShellEvent::PasteParams(_) => {
-                self.note("Copy and paste arrive with Phase 4")
+            ShellEvent::CopyParams(row) => {
+                let clip = clipboard::copy(&self.state, row);
+                self.note(clipboard::copied_message(&clip));
+                self.shared.borrow_mut().clipboard = Some(clip);
+            }
+            ShellEvent::PasteParams(row) => {
+                let clip = self.shared.borrow().clipboard.clone();
+                let Some(clip) = clip else {
+                    self.note("Nothing to paste");
+                    return;
+                };
+                // A linked pair mirrors every other edit, so a paste has to
+                // mirror too or the two halves drift apart.
+                let mirror = self
+                    .shared
+                    .borrow()
+                    .linked_partner(row, self.state.caps.num_inputs as usize);
+                let cmds = clipboard::paste_commands(&clip, &self.state, row, mirror);
+                self.run_commands(session, &cmds.join("\n"));
+                let name = screens::channel_name(&self.state, row);
+                self.note(format!("Pasted {} onto {name}", clip.source));
             }
             ShellEvent::Identify(_) => self.note("Identify arrives with Phase 6"),
         }
@@ -840,12 +952,131 @@ impl Live {
             }
             (AppDialog::Rename { channel }, DialogOutcome::Text(name)) => {
                 self.set(session, "ch.name", &[channel as u8], Value::Text(name));
+                // The detail region names the channel in its title, so it has
+                // to be rebuilt for the new name to show.
+                let sel = self.shell.model.selection;
+                self.shell.detail = self.screens.detail(&self.state, sel);
             }
             (AppDialog::PresetList, DialogOutcome::Picked(i)) => {
-                self.request_preset(session, i as u8)
+                self.preset_action(session, PresetMenu::choice(i))
+            }
+            (AppDialog::PresetCopyTo(slots), DialogOutcome::Picked(i)) => {
+                if let Some(dest) = slots.get(i).copied() {
+                    self.copy_preset_to(session, dest);
+                }
+            }
+            (AppDialog::PresetRename(slot), DialogOutcome::Text(name)) => {
+                self.set(session, "preset.name", &[slot], Value::Text(name));
+                self.refresh_presets(session);
+            }
+            (AppDialog::PresetClear(slot), DialogOutcome::Button(0)) => {
+                self.clear_preset(session, slot);
+                self.refresh_presets(session);
+            }
+            (AppDialog::PresetClearAll, DialogOutcome::Button(0)) => {
+                for slot in 0..presets::SLOTS as u8 {
+                    self.clear_preset(session, slot);
+                }
+                self.refresh_presets(session);
             }
             _ => {}
         }
+    }
+
+    /// One item of the Preset row's menu.
+    fn preset_action(&mut self, session: &mut Session, choice: Option<PresetChoice>) {
+        let active = self.state.caps.active_preset.unwrap_or(0);
+        match choice {
+            Some(PresetChoice::Slot(slot)) => self.request_preset(session, slot),
+            Some(PresetChoice::Save) => {
+                // The Console names an unnamed slot before saving it, so a
+                // saved preset never shows as Empty.
+                if PresetMenu::dropdown_label(&self.shared.borrow(), active) == "Empty" {
+                    self.set(
+                        session,
+                        "preset.name",
+                        &[active],
+                        Value::Text(format!("Preset {}", active + 1)),
+                    );
+                }
+                if self.save_active_preset(session) {
+                    self.refresh_presets(session);
+                }
+            }
+            Some(PresetChoice::Rename) => {
+                let d = PresetMenu::rename_dialog(&self.shared.borrow(), active);
+                self.dialog = Some((AppDialog::PresetRename(active), d));
+            }
+            Some(PresetChoice::SetDefault) => {
+                // `WirePresetStartup`: mode 0 is "a specified slot".
+                self.set(
+                    session,
+                    "preset.startup",
+                    &[],
+                    Value::Bytes(vec![0, active]),
+                );
+                self.shared.borrow_mut().default_slot = Some(active);
+            }
+            Some(PresetChoice::CopyTo) => {
+                let (popup, slots) = PresetMenu::copy_to_popup(&self.shared.borrow(), active);
+                self.popup = Some((AppDialog::PresetCopyTo(slots), popup));
+            }
+            Some(PresetChoice::Clear) => {
+                let label = PresetMenu::slot_label(&self.shared.borrow(), active);
+                self.dialog = Some((
+                    AppDialog::PresetClear(active),
+                    PresetMenu::clear_dialog(&label),
+                ));
+            }
+            Some(PresetChoice::ClearAll) => {
+                self.dialog = Some((AppDialog::PresetClearAll, PresetMenu::clear_all_dialog()));
+            }
+            None => {}
+        }
+    }
+
+    /// Copy the live parameters into another slot.
+    ///
+    /// Saving to the destination makes the firmware treat it as the last
+    /// active slot, so the source is re-saved afterwards to put that back.
+    /// Data-wise the second write is a no-op.
+    fn copy_preset_to(&mut self, session: &mut Session, dest: u8) {
+        let source = self.state.caps.active_preset.unwrap_or(0);
+        if dest == source {
+            return;
+        }
+        match session.write("preset.save", &[dest], Value::Trigger) {
+            Ok(Outcome::Rejected { .. }) | Err(_) => {
+                self.note("Save Failed");
+                return;
+            }
+            Ok(_) => {}
+        }
+        let _ = session.write("preset.save", &[source], Value::Trigger);
+        self.refresh_presets(session);
+        self.echo(format!(":preset.save {}", dest + 1));
+    }
+
+    fn clear_preset(&mut self, session: &mut Session, slot: u8) {
+        if session
+            .write("preset.delete", &[slot], Value::Trigger)
+            .is_err()
+        {
+            self.note("Clear Failed");
+        }
+    }
+
+    /// Read the slot names back, which is where the Preset menu's labels come
+    /// from. Called on connect and after anything that changes them.
+    pub fn refresh_presets(&mut self, session: &mut Session) {
+        let names: Vec<String> = (0..presets::SLOTS as u8)
+            .map(|slot| match session.read("preset.name", &[slot]) {
+                Ok(Value::Text(t)) => t.trim().to_string(),
+                _ => String::new(),
+            })
+            .collect();
+        self.shared.borrow_mut().preset_names = names;
+        self.sync_model();
     }
 
     fn run_pending(&mut self, session: &mut Session, then: PendingAction) {
@@ -977,6 +1208,7 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
         .flatten()
         .map(Notifications::start);
     let perf = live.perf;
+    live.refresh_presets(session);
     let mut terminal = ratatui::init();
     let mut last_poll = Instant::now() - perf.meter_interval;
 
@@ -1056,15 +1288,119 @@ mod tests {
         assert_eq!(m.inputs.len(), 8);
         assert_eq!(m.outputs.len(), 9);
         assert_eq!(m.inputs[0].name, "FL");
-        assert_eq!(
-            m.inputs[1].name, "IN2",
-            "an unnamed channel shows its descriptor"
-        );
+        assert_eq!(m.inputs[1].name, "FR");
         assert_eq!(m.outputs[8].descriptor, "OUT9");
-        assert_eq!(m.preset_label, "Preset 3");
+        // The names have not been read back yet, so the slot reads as Empty.
+        assert_eq!(m.preset_label, "3: Empty");
         assert!(!m.preset_dirty);
         assert_eq!(m.serial_short, "1B8B4E3A");
         assert_eq!(m.curves.len(), 17);
+    }
+
+    /// The same runner, wired to the Console's screens rather than the
+    /// placeholders.
+    fn console() -> (Live, Session, LogHandle) {
+        let mock = MockTransport::new()
+            .window(op::REQ_GET_ALL_PARAMS_CHUNK, packet())
+            .data(op::REQ_GET_USER_VOLUME, (-12.5f32).to_le_bytes().to_vec())
+            .data(op::REQ_GET_STATUS, vec![0; 41]);
+        let log = mock.log_handle();
+        let session = Session::new(Box::new(mock), caps()).unwrap();
+        let state = DeviceState::new(
+            caps(),
+            dspi_proto::wire::BulkPacket::decode(packet()).unwrap(),
+        );
+        let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let live = Live::new(
+            state,
+            theme,
+            Performance::default(),
+            Box::new(ConsoleScreens::new()),
+        );
+        (live, session, log)
+    }
+
+    #[test]
+    fn the_console_screens_are_the_default_detail_region() {
+        let (mut l, mut s, _) = console();
+        // The overview is what the shell opens on.
+        assert_eq!(l.shell.detail.title(), "Overview");
+        l.handle_event(&mut s, ShellEvent::Select(Selection::Input(0)));
+        assert!(
+            l.shell.detail.keys().iter().any(|k| k.does == "Enable All"),
+            "the input page carries the filter list's actions"
+        );
+        l.handle_event(&mut s, ShellEvent::Select(Selection::Output(0)));
+        assert!(l.shell.detail.keys().iter().any(|k| k.key == "x"));
+    }
+
+    #[test]
+    fn the_preset_row_opens_the_consoles_whole_menu() {
+        let (mut l, mut s, _) = console();
+        l.shell.focus = crate::shell::Focus::Footer(crate::shell::FooterRow::Preset);
+        l.handle_key(&mut s, key(KeyCode::Enter));
+        let (_, popup) = l.popup.as_ref().expect("the preset popup");
+        assert_eq!(popup.items[0], "1: Empty");
+        assert_eq!(popup.items[11], "Save");
+        assert_eq!(popup.items[16], "Clear All Slots...");
+        // Picking an action rather than a slot opens its own step.
+        l.handle_key(&mut s, key(KeyCode::End));
+        l.handle_key(&mut s, key(KeyCode::Enter));
+        assert!(matches!(l.dialog, Some((AppDialog::PresetClearAll, _))));
+    }
+
+    #[test]
+    fn copy_and_paste_carry_a_channels_parameters() {
+        let (mut l, mut s, log) = console();
+        l.handle_event(&mut s, ShellEvent::CopyParams(0));
+        assert!(l.shared.borrow().clipboard.is_some());
+        assert_eq!(
+            l.shell.model.status.as_deref(),
+            Some("Copied FL parameters")
+        );
+        l.handle_event(&mut s, ShellEvent::PasteParams(1));
+        let writes = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.opcode == op::REQ_SET_EQ_PARAM)
+            .count();
+        assert_eq!(writes, 10, "every band travels");
+        assert!(
+            l.shell
+                .model
+                .status
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Pasted FL onto")),
+            "{:?}",
+            l.shell.model.status
+        );
+    }
+
+    #[test]
+    fn nothing_to_paste_says_so() {
+        let (mut l, mut s, _) = console();
+        l.handle_event(&mut s, ShellEvent::PasteParams(1));
+        assert_eq!(l.shell.model.status.as_deref(), Some("Nothing to paste"));
+    }
+
+    /// A screen asks for several writes at once when one gesture is several
+    /// writes: a mirrored edit, a Clear All, a paste.
+    #[test]
+    fn a_multi_line_command_runs_every_line() {
+        let (mut l, mut s, log) = console();
+        l.handle_event(
+            &mut s,
+            ShellEvent::Command("eq.bypass in.1 2 on\neq.bypass in.2 2 on".into()),
+        );
+        let writes = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.opcode == op::REQ_SET_BAND_BYPASS)
+            .count();
+        assert_eq!(writes, 2);
+        assert_eq!(l.shell.model.echo, "eq.bypass in.2 2 on");
     }
 
     #[test]
