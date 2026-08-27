@@ -14,3 +14,4 @@ dspi-session.workspace = true
 dspi-cmd.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
+unicode-width = "0.2"

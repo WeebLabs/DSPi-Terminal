@@ -127,47 +127,210 @@ pub struct Theme {
     pub accent: Color,
 
     pub ok: Color,
+    /// Unsaved, phase invert, conflict, and every banner. `pending` is the
+    /// same colour under its older name; both are kept so a screen can say
+    /// which meaning it intends.
     pub pending: Color,
+    pub warning: Color,
     pub danger: Color,
+    /// Minor grid lines and the unfilled part of a meter: below chrome.
+    pub chrome_faint: Color,
 
-    /// One hue per channel, reused everywhere that channel appears.
+    /// One hue per channel in the RP2350 order (eight inputs, eight outputs,
+    /// the sub). Use [`Theme::role_color`] when the topology is known.
     pub channels: Vec<Color>,
+    /// The Console's input, output and sub colours by role, so an RP2040's
+    /// first output gets the first output colour rather than the third
+    /// input's.
+    pub inputs: Vec<Color>,
+    pub outputs: Vec<Color>,
+    pub sub: Color,
+}
+
+/// Which channel a colour is for, in the Console's terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelRole {
+    Input(u8),
+    Output(u8),
+    Sub,
+}
+
+impl ChannelRole {
+    /// The role of a unified-space channel index, given the discovered
+    /// topology. The sub is always the last channel.
+    pub fn of(index: u8, num_inputs: u8, num_outputs: u8) -> Self {
+        let total = num_inputs + num_outputs;
+        if index < num_inputs {
+            Self::Input(index)
+        } else if num_outputs > 0 && index == total - 1 {
+            Self::Sub
+        } else {
+            Self::Output(index - num_inputs)
+        }
+    }
+
+    /// The Console's descriptor: `IN1`..`IN8`, `OUT1`..`OUT9`.
+    pub fn descriptor(self, num_outputs: u8) -> String {
+        match self {
+            Self::Input(i) => format!("IN{}", i + 1),
+            Self::Output(o) => format!("OUT{}", o + 1),
+            Self::Sub => format!("OUT{num_outputs}"),
+        }
+    }
 }
 
 /// Which palette to draw with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Palette {
+    /// The DSPi Console's own colours, so a channel looks the same here as it
+    /// does there. The default.
+    Console,
     /// Amber phosphor, after the monitors this kind of instrument used to be
-    /// driven from. The default.
+    /// driven from.
     Amber,
     /// A conventional dark theme, for anyone who would rather have hues.
     Dark,
+    /// No colour at all, for a monochrome terminal or a captured log.
+    Mono,
 }
 
 impl Palette {
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
+            "console" => Some(Self::Console),
             "amber" => Some(Self::Amber),
             "dark" => Some(Self::Dark),
+            "mono" => Some(Self::Mono),
             _ => None,
         }
     }
 
-    pub const NAMES: &'static [&'static str] = &["amber", "dark"];
+    pub const NAMES: &'static [&'static str] = &["console", "amber", "dark", "mono"];
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::new(Palette::Amber, ColorDepth::detect(), Glyphs::Braille)
+        Self::new(Palette::Console, ColorDepth::detect(), Glyphs::Braille)
     }
 }
+
+/// A truecolor value with its hand-chosen 256-colour and 16-colour stand-ins.
+///
+/// The 256 index is the nearest cube entry unless that would make two
+/// channels that can share a graph indistinguishable, in which case the
+/// design document records the step taken.
+#[derive(Debug, Clone, Copy)]
+struct Swatch {
+    rgb: (u8, u8, u8),
+    indexed: u8,
+    ansi: Color,
+}
+
+impl Swatch {
+    const fn new(rgb: (u8, u8, u8), indexed: u8, ansi: Color) -> Self {
+        Self { rgb, indexed, ansi }
+    }
+
+    fn at(self, depth: ColorDepth) -> Color {
+        match depth {
+            ColorDepth::TrueColor => Color::Rgb(self.rgb.0, self.rgb.1, self.rgb.2),
+            ColorDepth::Ansi256 => Color::Indexed(self.indexed),
+            ColorDepth::Ansi16 => self.ansi,
+            ColorDepth::Mono => Color::Reset,
+        }
+    }
+}
+
+/// `ChannelPalette.inputs` in the Console, FL FR FC LFE BL BR SL SR.
+const CONSOLE_INPUTS: [Swatch; 8] = [
+    Swatch::new((0x4A, 0x8F, 0xE3), 68, Color::Blue),
+    Swatch::new((0xF5, 0x73, 0x73), 203, Color::Red),
+    Swatch::new((0x73, 0xC7, 0x8C), 78, Color::Green),
+    Swatch::new((0xED, 0xB3, 0x4D), 215, Color::Yellow),
+    Swatch::new((0x99, 0x8C, 0xEB), 104, Color::Magenta),
+    Swatch::new((0xE6, 0x8C, 0xC7), 176, Color::LightMagenta),
+    Swatch::new((0x66, 0xC7, 0xD1), 80, Color::Cyan),
+    Swatch::new((0xCC, 0xB8, 0x6B), 179, Color::LightYellow),
+];
+
+/// `ChannelPalette.outputs` in the Console: the four stereo pairs.
+const CONSOLE_OUTPUTS: [Swatch; 8] = [
+    Swatch::new((0x45, 0xC2, 0xA3), 79, Color::Cyan),
+    Swatch::new((0x59, 0xD1, 0x80), 84, Color::LightGreen),
+    Swatch::new((0xF0, 0xC4, 0x59), 221, Color::LightYellow),
+    Swatch::new((0xF2, 0xA6, 0x4D), 209, Color::LightRed),
+    Swatch::new((0x59, 0x8C, 0xF2), 33, Color::LightBlue),
+    Swatch::new((0x8C, 0xB3, 0xF2), 111, Color::LightCyan),
+    Swatch::new((0xD9, 0x73, 0x8C), 168, Color::Magenta),
+    Swatch::new((0xF2, 0x99, 0xA6), 217, Color::LightMagenta),
+];
+
+/// `ChannelPalette.pdm`: the mono subwoofer.
+const CONSOLE_SUB: Swatch = Swatch::new((0xBA, 0x87, 0xF2), 141, Color::Magenta);
+
+const CONSOLE_ACCENT: Swatch = Swatch::new((0x3A, 0x8D, 0xFF), 75, Color::LightBlue);
+const CONSOLE_DANGER: Swatch = Swatch::new((0xF5, 0x45, 0x3C), 203, Color::LightRed);
+const CONSOLE_WARNING: Swatch = Swatch::new((0xF0, 0xA0, 0x30), 214, Color::Yellow);
+const CONSOLE_OK: Swatch = Swatch::new((0x5A, 0xC2, 0x6B), 78, Color::Green);
+const CONSOLE_FG: Swatch = Swatch::new((0xE6, 0xE6, 0xE6), 252, Color::White);
+const CONSOLE_DIM: Swatch = Swatch::new((0x8C, 0x8C, 0x8C), 245, Color::DarkGray);
+const CONSOLE_CHROME: Swatch = Swatch::new((0x4A, 0x4A, 0x4A), 238, Color::DarkGray);
+const CONSOLE_CHROME_FAINT: Swatch = Swatch::new((0x33, 0x33, 0x33), 236, Color::Black);
 
 impl Theme {
     pub fn new(palette: Palette, depth: ColorDepth, glyphs: Glyphs) -> Self {
         match palette {
+            Palette::Console => Self::console(depth, glyphs),
             Palette::Amber => Self::amber(depth, glyphs),
             Palette::Dark => Self::dark(depth, glyphs),
+            Palette::Mono => Self::mono(glyphs),
         }
+    }
+
+    /// The Console's palette, quantised for poorer terminals.
+    ///
+    /// The channel colours are `ChannelPalette.swift` verbatim at truecolor.
+    /// The 256-colour indices are the nearest cube entries except where two
+    /// channels that can share a graph landed on one index (FC with the second
+    /// output, LFE with the fourth), which were moved a step. At sixteen
+    /// colours hues repeat and the graph labels its curves instead.
+    pub fn console(depth: ColorDepth, glyphs: Glyphs) -> Self {
+        let inputs: Vec<Color> = CONSOLE_INPUTS.iter().map(|s| s.at(depth)).collect();
+        let outputs: Vec<Color> = CONSOLE_OUTPUTS.iter().map(|s| s.at(depth)).collect();
+        let sub = CONSOLE_SUB.at(depth);
+        let channels = inputs
+            .iter()
+            .chain(outputs.iter())
+            .copied()
+            .chain(std::iter::once(sub))
+            .collect();
+        Self {
+            depth,
+            glyphs,
+            palette: Palette::Console,
+            bg: Color::Reset,
+            fg: CONSOLE_FG.at(depth),
+            chrome: CONSOLE_CHROME.at(depth),
+            chrome_faint: CONSOLE_CHROME_FAINT.at(depth),
+            dim: CONSOLE_DIM.at(depth),
+            accent: CONSOLE_ACCENT.at(depth),
+            ok: CONSOLE_OK.at(depth),
+            pending: CONSOLE_WARNING.at(depth),
+            warning: CONSOLE_WARNING.at(depth),
+            danger: CONSOLE_DANGER.at(depth),
+            channels,
+            inputs,
+            outputs,
+            sub,
+        }
+    }
+
+    /// No colour, whatever the terminal could do. Everything that colour
+    /// would have said is said with reverse video, bold, and patterns.
+    pub fn mono(glyphs: Glyphs) -> Self {
+        let mut t = Self::console(ColorDepth::Mono, glyphs);
+        t.palette = Palette::Mono;
+        t
     }
 
     /// Amber, in the orange-to-red half of it.
@@ -278,19 +441,46 @@ impl Theme {
             ),
         };
 
+        Self::from_ramp(
+            Palette::Amber,
+            depth,
+            glyphs,
+            [fg, chrome, dim, accent, ok, pending, danger],
+            channels,
+        )
+    }
+
+    /// Build a theme from a flat 17-entry channel ramp, deriving the by-role
+    /// tables from the RP2350 order the ramp is written in.
+    #[allow(clippy::too_many_arguments)]
+    fn from_ramp(
+        palette: Palette,
+        depth: ColorDepth,
+        glyphs: Glyphs,
+        [fg, chrome, dim, accent, ok, pending, danger]: [Color; 7],
+        channels: Vec<Color>,
+    ) -> Self {
+        let inputs = channels[..8].to_vec();
+        let outputs = channels[8..16].to_vec();
+        let sub = channels[16];
         Self {
             depth,
             glyphs,
-            palette: Palette::Amber,
+            palette,
             bg: Color::Reset,
             fg,
             chrome,
+            chrome_faint: chrome,
             dim,
             accent,
             ok,
             pending,
+            warning: pending,
             danger,
             channels,
+            inputs,
+            outputs,
+            sub,
         }
     }
 
@@ -385,24 +575,54 @@ impl Theme {
             ),
         };
 
-        Self {
+        Self::from_ramp(
+            Palette::Dark,
             depth,
             glyphs,
-            palette: Palette::Dark,
-            bg: Color::Reset,
-            fg,
-            chrome,
-            dim,
-            accent,
-            ok,
-            pending,
-            danger,
+            [fg, chrome, dim, accent, ok, pending, danger],
             channels,
+        )
+    }
+
+    /// The colour of a channel by its RP2350-order index. Prefer
+    /// [`Theme::channel_of`] when the topology is known.
+    pub fn channel(&self, index: u8) -> Color {
+        *self.channels.get(index as usize).unwrap_or(&self.fg)
+    }
+
+    /// The colour for a channel role, the way the Console assigns it.
+    pub fn role_color(&self, role: ChannelRole) -> Color {
+        match role {
+            ChannelRole::Input(i) => *self.inputs.get(i as usize).unwrap_or(&self.accent),
+            ChannelRole::Output(o) => *self.outputs.get(o as usize).unwrap_or(&self.accent),
+            ChannelRole::Sub => self.sub,
         }
     }
 
-    pub fn channel(&self, index: u8) -> Color {
-        *self.channels.get(index as usize).unwrap_or(&self.fg)
+    /// The colour of a unified-space channel on a device with this topology.
+    pub fn channel_of(&self, index: u8, num_inputs: u8, num_outputs: u8) -> Color {
+        self.role_color(ChannelRole::of(index, num_inputs, num_outputs))
+    }
+
+    /// Warning text: unsaved, inverted, conflicting.
+    pub fn warning_style(&self) -> Style {
+        Style::default().fg(self.warning)
+    }
+
+    /// A status pill or a selected chip: reverse video in the given colour,
+    /// which survives every depth including none.
+    pub fn pill(&self, color: Color) -> Style {
+        Style::default().fg(color).add_modifier(Modifier::REVERSED)
+    }
+
+    /// A section header: the Console's small uppercase label.
+    pub fn section(&self) -> Style {
+        Style::default().fg(self.dim)
+    }
+
+    /// A panel title.
+    pub fn title(&self) -> Style {
+        Style::default().fg(self.fg).add_modifier(Modifier::BOLD)
     }
 
     pub fn chrome_style(&self) -> Style {
@@ -448,10 +668,10 @@ impl Theme {
     /// it survives every colour depth including none.
     pub fn alarm(&self) -> Style {
         match self.palette {
-            Palette::Amber => Style::default()
+            Palette::Dark => Style::default().fg(self.danger),
+            _ => Style::default()
                 .fg(self.danger)
                 .add_modifier(Modifier::REVERSED),
-            Palette::Dark => Style::default().fg(self.danger),
         }
     }
 }
@@ -740,14 +960,16 @@ mod amber_tests {
     }
 
     #[test]
-    fn amber_is_what_you_get_by_default() {
-        assert_eq!(Theme::default().palette, Palette::Amber);
+    fn the_console_palette_is_what_you_get_by_default() {
+        assert_eq!(Theme::default().palette, Palette::Console);
     }
 
     #[test]
     fn themes_are_selectable_by_name() {
         assert_eq!(Palette::parse("amber"), Some(Palette::Amber));
         assert_eq!(Palette::parse("Dark"), Some(Palette::Dark));
+        assert_eq!(Palette::parse("console"), Some(Palette::Console));
+        assert_eq!(Palette::parse("mono"), Some(Palette::Mono));
         assert_eq!(Palette::parse("chartreuse"), None);
     }
 }
@@ -849,5 +1071,74 @@ mod indexed_palette_tests {
                 "{c:?} is not a warm tone"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn the_channel_colours_are_the_consoles_own() {
+        // ChannelPalette.swift: FL is (0.29, 0.56, 0.89), the sub is
+        // (0.73, 0.53, 0.95). Rounded to bytes.
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        assert_eq!(
+            t.role_color(ChannelRole::Input(0)),
+            Color::Rgb(0x4A, 0x8F, 0xE3)
+        );
+        assert_eq!(t.role_color(ChannelRole::Sub), Color::Rgb(0xBA, 0x87, 0xF2));
+    }
+
+    #[test]
+    fn no_two_channels_share_a_256_colour_index() {
+        let t = Theme::console(ColorDepth::Ansi256, Glyphs::Braille);
+        let mut seen = HashSet::new();
+        for c in &t.channels {
+            assert!(seen.insert(*c), "duplicate indexed colour {c:?}");
+        }
+        assert_eq!(seen.len(), 17);
+    }
+
+    #[test]
+    fn roles_follow_the_discovered_topology() {
+        // An RP2040 has two inputs, four outputs and the sub: seven channels.
+        assert_eq!(ChannelRole::of(0, 2, 5), ChannelRole::Input(0));
+        assert_eq!(ChannelRole::of(2, 2, 5), ChannelRole::Output(0));
+        assert_eq!(ChannelRole::of(6, 2, 5), ChannelRole::Sub);
+        // An RP2350: eight and nine.
+        assert_eq!(ChannelRole::of(8, 8, 9), ChannelRole::Output(0));
+        assert_eq!(ChannelRole::of(16, 8, 9), ChannelRole::Sub);
+        assert_eq!(ChannelRole::Sub.descriptor(5), "OUT5");
+        assert_eq!(ChannelRole::Sub.descriptor(9), "OUT9");
+        assert_eq!(ChannelRole::Input(7).descriptor(9), "IN8");
+    }
+
+    #[test]
+    fn an_rp2040s_first_output_wears_the_first_output_colour() {
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        assert_eq!(t.channel_of(2, 2, 5), t.outputs[0]);
+        assert_ne!(t.channel_of(2, 2, 5), t.channel(2));
+    }
+
+    #[test]
+    fn mono_has_no_colour_anywhere() {
+        let t = Theme::mono(Glyphs::Ascii);
+        assert!(t.channels.iter().all(|c| *c == Color::Reset));
+        assert_eq!(t.accent, Color::Reset);
+        assert!(t.needs_pattern_distinction());
+        assert!(t.pill(t.accent).add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn the_semantic_colours_stay_apart_from_the_channels_at_256() {
+        // Danger shares an index with FR (both the Console's red), which is
+        // acceptable because a clip zone is never adjacent to a curve. The
+        // accent must not collide with any channel, since it marks focus on
+        // rows that also carry channel colour.
+        let t = Theme::console(ColorDepth::Ansi256, Glyphs::Braille);
+        assert!(!t.channels.contains(&t.accent));
+        assert!(!t.channels.contains(&t.warning));
     }
 }
