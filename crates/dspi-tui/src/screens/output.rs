@@ -35,6 +35,10 @@ enum Item {
 
 pub struct OutputPage {
     pub output: usize,
+    /// The channel's name at the time the page was made, for the title row.
+    /// The shell asks for the title before it draws, so this is read once
+    /// rather than every frame; a rename rebuilds the page.
+    name: String,
     #[allow(dead_code)]
     shared: Shared,
     pub list: FilterList,
@@ -66,6 +70,7 @@ impl OutputPage {
         let channel = output_channel(state, output);
         Self {
             output,
+            name: channel_name(state, channel),
             shared,
             list: FilterList::new(channel)
                 .linkwitz(true)
@@ -314,7 +319,7 @@ fn cell_style(theme: &Theme, focused: bool, armed: bool) -> Style {
 
 impl Screen for OutputPage {
     fn title(&self) -> String {
-        String::new()
+        self.name.clone()
     }
 
     fn draw(

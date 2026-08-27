@@ -43,6 +43,10 @@ enum Pending {
 
 pub struct InputPage {
     pub input: usize,
+    /// The channel's name at the time the page was made, for the title row.
+    /// The shell asks for the title before it draws, so this is read once
+    /// rather than every frame; a rename rebuilds the page.
+    name: String,
     shared: Shared,
     pub list: FilterList,
     /// `None` while the filter list has the keyboard.
@@ -71,6 +75,7 @@ impl InputPage {
             .linked_partner(input, state.caps.num_inputs as usize);
         Self {
             input,
+            name: super::channel_name(state, input),
             shared,
             list,
             header: Some(1),
@@ -301,7 +306,7 @@ impl InputPage {
 
 impl Screen for InputPage {
     fn title(&self) -> String {
-        String::new()
+        self.name.clone()
     }
 
     fn draw(
