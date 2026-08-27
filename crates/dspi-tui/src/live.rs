@@ -1056,15 +1056,18 @@ mod tests {
         assert_eq!(m.inputs.len(), 8);
         assert_eq!(m.outputs.len(), 9);
         assert_eq!(m.inputs[0].name, "FL");
-        assert_eq!(
-            m.inputs[1].name, "IN2",
-            "an unnamed channel shows its descriptor"
-        );
+        assert_eq!(m.inputs[1].name, "FR");
         assert_eq!(m.outputs[8].descriptor, "OUT9");
         assert_eq!(m.preset_label, "Preset 3");
         assert!(!m.preset_dirty);
         assert_eq!(m.serial_short, "1B8B4E3A");
         assert_eq!(m.curves.len(), 17);
+        // An unnamed channel shows its descriptor instead of a blank.
+        let (mut l, _, _) = live();
+        let (_, n, _) = dspi_proto::generated::SECTIONS[9];
+        l.state.bulk.patch(n + 32, &[0; 32]);
+        l.sync_model();
+        assert_eq!(l.shell.model.inputs[1].name, "IN2");
     }
 
     #[test]
