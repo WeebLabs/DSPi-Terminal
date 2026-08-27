@@ -182,6 +182,7 @@ dependencies = [
  "dspi-session",
  "dspi-transport",
  "ratatui",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
