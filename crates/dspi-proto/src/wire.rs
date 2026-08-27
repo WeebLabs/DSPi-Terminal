@@ -168,6 +168,21 @@ impl BulkPacket {
         &self.raw
     }
 
+    /// Overwrite bytes at `offset`, as a `PARAM_CHANGED` notification asks.
+    ///
+    /// The header is never patched: a notification carries data, not shape.
+    /// Returns the section the bytes landed in, or `None` if the write would
+    /// have run off the packet or into the header, in which case nothing is
+    /// changed.
+    pub fn patch(&mut self, offset: usize, bytes: &[u8]) -> Option<&'static str> {
+        let end = offset.checked_add(bytes.len())?;
+        if offset < WireHeader::LEN || end > self.raw.len() {
+            return None;
+        }
+        self.raw[offset..end].copy_from_slice(bytes);
+        Self::section_at(offset)
+    }
+
     /// Borrow one section's bytes by its generated offset and length.
     pub fn section(&self, name: &str) -> Option<&[u8]> {
         generated::SECTIONS

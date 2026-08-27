@@ -32,6 +32,7 @@ const HEADERS: &[&str] = &[
 /// Prefixes we lift into generated `u16` constants, with the module they land in.
 const DEFINE_GROUPS: &[(&str, &str)] = &[
     ("REQ_", "opcodes"),
+    ("VENDOR_EP_", "usb"),
     ("WIRE_", "wire"),
     ("CS_", "cs"),
     ("PIN_CONFIG_", "status"),

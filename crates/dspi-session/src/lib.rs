@@ -5,10 +5,14 @@
 
 pub mod autoeq;
 pub mod filterfile;
+pub mod notify;
 pub mod preset_file;
 pub mod probe;
+pub mod state;
 pub mod surfaces;
 pub mod write;
 
+pub use notify::{Event, Notification, Notifications, Source};
 pub use probe::{Capabilities, Meters, probe, read_bulk, read_meters};
+pub use state::{Applied, DeviceState, PresetSnapshot};
 pub use write::{Crosspoint, JournalEntry, Outcome, OutputStrip, Session, WriteError};

@@ -6,10 +6,37 @@
 //! Those are exactly the behaviours that are hard to provoke on demand with real
 //! hardware and expensive to get wrong in the field.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::{DeviceDescriptor, Result, Transport, TransportError};
+use crate::{DeviceDescriptor, NotificationSource, Result, Transport, TransportError};
+
+/// Packets a test has queued for the notification endpoint.
+pub type NotifyQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
+
+/// The mock's notification endpoint: hands out queued packets, and an empty
+/// read (a timeout) when the queue is dry. A `Disconnect` is modelled by
+/// queuing an empty packet followed by nothing; tests that need an error push
+/// the sentinel `MockNotifications::DISCONNECT`.
+pub struct MockNotifications {
+    queue: NotifyQueue,
+}
+
+impl MockNotifications {
+    /// A packet that makes the next read report a disconnect.
+    pub const DISCONNECT: &'static [u8] = &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+}
+
+impl NotificationSource for MockNotifications {
+    fn read(&mut self, _timeout: Duration) -> Result<Vec<u8>> {
+        match self.queue.lock().unwrap().pop_front() {
+            Some(p) if p == Self::DISCONNECT => Err(TransportError::Disconnected),
+            Some(p) => Ok(p),
+            None => Ok(Vec::new()),
+        }
+    }
+}
 
 /// What the mock should do for a given opcode.
 #[derive(Debug, Clone)]
@@ -59,6 +86,7 @@ pub struct MockTransport {
     log: LogHandle,
     descriptor: Option<DeviceDescriptor>,
     max_transfer: Option<usize>,
+    notify: NotifyQueue,
 }
 
 impl MockTransport {
@@ -97,6 +125,16 @@ impl MockTransport {
     /// A handle that keeps working once this transport has been handed away.
     pub fn log_handle(&self) -> LogHandle {
         Arc::clone(&self.log)
+    }
+
+    /// The notification queue, to push packets into from a test.
+    pub fn notify_queue(&self) -> NotifyQueue {
+        Arc::clone(&self.notify)
+    }
+
+    /// Queue a notification packet for the reader to find.
+    pub fn push_notification(&self, packet: impl Into<Vec<u8>>) {
+        self.notify.lock().unwrap().push_back(packet.into());
     }
 
     /// Everything recorded so far.
@@ -183,6 +221,12 @@ impl Transport for MockTransport {
 
     fn max_transfer(&self) -> usize {
         self.max_transfer.unwrap_or(4096)
+    }
+
+    fn notifications(&self) -> Option<Box<dyn NotificationSource>> {
+        Some(Box::new(MockNotifications {
+            queue: Arc::clone(&self.notify),
+        }))
     }
 }
 

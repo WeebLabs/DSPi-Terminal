@@ -126,6 +126,22 @@ pub trait Transport: Send {
     fn max_transfer(&self) -> usize {
         4096
     }
+
+    /// A reader for the device's notification endpoint, if this backend has
+    /// one. It is independent of the control path so it can live on its own
+    /// thread and block without holding the transport.
+    fn notifications(&self) -> Option<Box<dyn NotificationSource>> {
+        None
+    }
+}
+
+/// The firmware's notification stream: bulk IN endpoint `0x83`, 64-byte
+/// packets, always armed. When the device has nothing to say it answers a
+/// one-byte idle packet, so a read returns quickly either way.
+pub trait NotificationSource: Send {
+    /// One packet, sized by what actually arrived. A timeout is `Ok(vec![])`
+    /// rather than an error: silence is normal.
+    fn read(&mut self, timeout: Duration) -> Result<Vec<u8>>;
 }
 
 /// Run a transfer that may land inside a deferred write's busy window.

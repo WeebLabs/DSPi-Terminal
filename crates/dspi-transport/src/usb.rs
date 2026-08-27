@@ -12,11 +12,44 @@
 
 use std::time::Duration;
 
+use dspi_proto::generated::usb as usb_gen;
 use dspi_proto::{REQ_TYPE_IN, REQ_TYPE_OUT, USB_PID, USB_VID, VENDOR_INTERFACE};
 use nusb::MaybeFuture;
-use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient, TransferError};
+use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient, TransferError};
 
-use crate::{DEFAULT_TIMEOUT, DeviceDescriptor, Result, Transport, TransportError};
+use crate::{
+    DEFAULT_TIMEOUT, DeviceDescriptor, NotificationSource, Result, Transport, TransportError,
+};
+
+/// `VENDOR_EP_IN` (config.h): the notification endpoint. It is a bulk
+/// endpoint despite the spec's name; an interrupt endpoint polled alongside
+/// rapid EP0 traffic crashes the RP2xxx device controller.
+const NOTIFY_EP: u8 = usb_gen::VENDOR_EP_IN as u8;
+const NOTIFY_EP_SIZE: usize = usb_gen::VENDOR_EP_SIZE as usize;
+
+/// The notification endpoint, opened on a clone of the claimed interface so
+/// the control path and this reader can live on different threads.
+pub struct UsbNotifications {
+    endpoint: nusb::Endpoint<Bulk, In>,
+}
+
+impl NotificationSource for UsbNotifications {
+    fn read(&mut self, timeout: Duration) -> Result<Vec<u8>> {
+        let buf = self.endpoint.allocate(NOTIFY_EP_SIZE);
+        let done = self.endpoint.transfer_blocking(buf, timeout);
+        match done.status {
+            Ok(()) => {
+                let mut v = done.buffer.into_vec();
+                v.truncate(done.actual_len);
+                Ok(v)
+            }
+            Err(TransferError::Cancelled) => Ok(Vec::new()),
+            Err(TransferError::Disconnected) => Err(TransportError::Disconnected),
+            Err(TransferError::Stall) => Err(TransportError::Stalled { opcode: NOTIFY_EP }),
+            Err(e) => Err(TransportError::Usb(e.to_string())),
+        }
+    }
+}
 
 /// The vendor interface number, as a `u8` for `claim_interface`.
 const IFACE: u8 = VENDOR_INTERFACE as u8;
@@ -162,6 +195,15 @@ impl Transport for UsbTransport {
 
     fn descriptor(&self) -> &DeviceDescriptor {
         &self.descriptor
+    }
+
+    fn notifications(&self) -> Option<Box<dyn NotificationSource>> {
+        let endpoint = self
+            .interface
+            .clone()
+            .endpoint::<Bulk, In>(NOTIFY_EP)
+            .ok()?;
+        Some(Box::new(UsbNotifications { endpoint }))
     }
 
     fn max_transfer(&self) -> usize {
