@@ -377,7 +377,7 @@ pub fn channel_name(state: &DeviceState, channel: usize) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::shell::fixture;
+    use crate::shell::{Shell, fixture};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// Turn a key-line token into the key events it stands for, so a screen
@@ -413,6 +413,155 @@ pub(crate) mod tests {
                 }
             })
             .collect()
+    }
+
+    /// A whole shell with one of the Console's screens in its detail region,
+    /// so the golden frames are what a person actually sees.
+    fn shell(detail: Box<dyn crate::shell::Screen>, selection: crate::shell::Selection) -> Shell {
+        let theme = crate::theme::Theme::console(
+            crate::theme::ColorDepth::TrueColor,
+            crate::theme::Glyphs::Braille,
+        );
+        let mut model = fixture::rp2350(&theme);
+        model.selection = selection;
+        let mut shell = Shell::new(model, theme, detail);
+        shell.focus = crate::shell::Focus::Screen;
+        shell
+    }
+
+    fn frame(shell: &mut Shell, w: u16, h: u16) -> String {
+        let state = fixture::state();
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| shell.draw(f.area(), f.buffer_mut(), &state))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn screens_under_test() -> Vec<(
+        &'static str,
+        Box<dyn crate::shell::Screen>,
+        crate::shell::Selection,
+    )> {
+        let state = fixture::state();
+        vec![
+            (
+                "overview",
+                Box::new(Overview::new(shared())) as Box<dyn crate::shell::Screen>,
+                crate::shell::Selection::Overview,
+            ),
+            (
+                "input",
+                Box::new(InputPage::new(0, shared(), &state)),
+                crate::shell::Selection::Input(0),
+            ),
+            (
+                "output",
+                Box::new(OutputPage::new(0, shared(), &state)),
+                crate::shell::Selection::Output(0),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_screen_fills_the_detail_region_at_both_sizes() {
+        for (name, detail, selection) in screens_under_test() {
+            let mut s = shell(detail, selection);
+            for (w, h) in [(120u16, 40u16), (80, 24)] {
+                let f = frame(&mut s, w, h);
+                assert_eq!(f.lines().count(), h as usize, "{name} at {w}x{h}");
+                assert!(f.contains("INPUTS"), "the sidebar is still there: {name}");
+                assert!(
+                    !f.contains("arrives in Phase"),
+                    "{name} at {w}x{h} is still a placeholder:\n{f}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_overview_draws_the_consoles_card_through_the_shell() {
+        let state = fixture::state();
+        let _ = &state;
+        let mut s = shell(
+            Box::new(Overview::new(shared())),
+            crate::shell::Selection::Overview,
+        );
+        let f = frame(&mut s, 120, 40);
+        assert!(f.contains("STEREO INPUT (USB)"), "{f}");
+        assert!(f.contains("Delay: 0 ms"), "{f}");
+        assert!(f.contains("Move between cards"), "the key line: {f}");
+        let f = frame(&mut s, 80, 24);
+        assert!(f.contains("STEREO INPUT (USB)"), "{f}");
+    }
+
+    #[test]
+    fn the_input_page_draws_its_header_and_list_through_the_shell() {
+        let state = fixture::state();
+        let mut s = shell(
+            Box::new(InputPage::new(0, shared(), &state)),
+            crate::shell::Selection::Input(0),
+        );
+        for (w, h) in [(120u16, 40u16), (80, 24)] {
+            let f = frame(&mut s, w, h);
+            assert!(f.contains("Link 1/2"), "{w}x{h}: {f}");
+            assert!(f.contains("Preamp"), "{w}x{h}: {f}");
+            assert!(f.contains("Clear PEQ"), "{w}x{h}: {f}");
+            assert!(f.contains("TYPE"), "{w}x{h}: {f}");
+        }
+        // The wider frame has room for the type names in full, and for the
+        // whole key line.
+        let f = frame(&mut s, 120, 40);
+        assert!(f.contains("Low Shelf (12dB)"), "{f}");
+        assert!(f.contains("105 Hz"), "{f}");
+        assert!(f.contains("Enable All"), "the key line: {f}");
+    }
+
+    #[test]
+    fn the_output_page_draws_routing_gain_delay_mute_and_the_tabs() {
+        let state = fixture::state();
+        let mut s = shell(
+            Box::new(OutputPage::new(0, shared(), &state)),
+            crate::shell::Selection::Output(0),
+        );
+        for (w, h) in [(120u16, 40u16), (80, 24)] {
+            let f = frame(&mut s, w, h);
+            assert!(f.contains("GAIN"), "{w}x{h}: {f}");
+            assert!(f.contains("DELAY"), "{w}x{h}: {f}");
+            assert!(f.contains("MUTE"), "{w}x{h}: {f}");
+            assert!(f.contains("PEQ") && f.contains("XO"), "{w}x{h}: {f}");
+            assert!(f.contains("INV"), "{w}x{h}: {f}");
+        }
+    }
+
+    /// The shell hands the key to the focused screen before it looks at it
+    /// itself, so a screen's own letters have to survive the trip.
+    #[test]
+    fn a_screens_keys_reach_it_through_the_shell() {
+        let state = fixture::state();
+        let mut s = shell(
+            Box::new(InputPage::new(0, shared(), &state)),
+            crate::shell::Selection::Input(0),
+        );
+        let events = s.handle(
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+            &state,
+        );
+        assert!(
+            events.is_empty(),
+            "D opened the Clear All dialog, not a tool"
+        );
+        assert!(s.dialog.is_some());
     }
 
     #[test]

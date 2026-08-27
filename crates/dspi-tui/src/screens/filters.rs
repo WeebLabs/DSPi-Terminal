@@ -378,12 +378,8 @@ impl FilterList {
     // Keys
     // -----------------------------------------------------------------
 
-    /// Whether the cursor is on the first band, so the page above knows an
-    /// `Up` should leave the list rather than move in it.
-    pub fn at_top(&self) -> bool {
-        self.band == 0 && self.edit.is_none() && self.panel.is_none()
-    }
-
+    /// Handle a key. `Up` on the first band is left unhandled, which is how
+    /// the page above knows to take the focus back into its header.
     pub fn handle(&mut self, key: KeyEvent, state: &DeviceState) -> ScreenEvent {
         if self.panel.is_some() {
             return self.handle_panel(key, state);

@@ -14,7 +14,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use super::filters::FilterList;
-use super::{Shared, channel_token, cleared_band, number};
+use super::{Shared, cleared_band, number};
 use crate::shell::{Screen, ScreenEvent};
 use crate::theme::{Glyphs, Theme};
 use crate::widgets::{
@@ -483,11 +483,6 @@ impl Screen for InputPage {
             None => ScreenEvent::Handled,
         }
     }
-}
-
-/// The command that names this input in the grammar, for the report line.
-pub fn input_token(state: &DeviceState, input: usize) -> String {
-    channel_token(state, input)
 }
 
 #[cfg(test)]
