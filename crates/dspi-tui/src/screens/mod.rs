@@ -15,6 +15,8 @@
 //! hands every screen a handle to it.
 
 pub mod clipboard;
+pub mod filters;
+pub mod linkwitz;
 pub mod overview;
 
 use std::cell::RefCell;
@@ -26,6 +28,8 @@ use dspi_proto::xover;
 use dspi_session::DeviceState;
 
 pub use clipboard::ChannelClipboard;
+pub use filters::{FilterList, FilterMode};
+pub use linkwitz::LinkwitzPanel;
 pub use overview::Overview;
 
 /// The application-side state the screens share.

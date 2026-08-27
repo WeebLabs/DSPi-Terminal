@@ -67,7 +67,7 @@ pub fn paste_commands(
         if let Some(db) = clip.preamp_db
             && target < ni
         {
-            out.push(format!("pre {} {}", target + 1, number(db)));
+            out.push(format!("pre {target} {}", number(db)));
         }
     }
 
@@ -81,13 +81,9 @@ pub fn paste_commands(
             }
         }
         if let Some((gain, delay, mute)) = clip.output {
-            out.push(format!("out.gain {} {}", o + 1, number(gain)));
-            out.push(format!("out.delay {} {}", o + 1, number(delay)));
-            out.push(format!(
-                "out.mute {} {}",
-                o + 1,
-                if mute { "on" } else { "off" }
-            ));
+            out.push(format!("out.gain {o} {}", number(gain)));
+            out.push(format!("out.delay {o} {}", number(delay)));
+            out.push(format!("out.mute {o} {}", if mute { "on" } else { "off" }));
         }
     }
     out
@@ -130,7 +126,7 @@ mod tests {
         // Every band travels, including the ones the source leaves unset, so
         // the destination is the source rather than a merge of the two.
         assert_eq!(cmds[9], "eq in.2 10 flat 0 0 0");
-        assert_eq!(cmds[10], "pre 2 0");
+        assert_eq!(cmds[10], "pre 1 0");
         assert_eq!(cmds.len(), 11);
     }
 
@@ -143,9 +139,9 @@ mod tests {
             cmds.iter().any(|c| c == "eq out.9 20 highpass 80 0.707 0"),
             "{cmds:?}"
         );
-        assert!(cmds.iter().any(|c| c == "out.gain 9 0"), "{cmds:?}");
-        assert!(cmds.iter().any(|c| c == "out.delay 9 0"), "{cmds:?}");
-        assert!(cmds.iter().any(|c| c == "out.mute 9 off"), "{cmds:?}");
+        assert!(cmds.iter().any(|c| c == "out.gain 8 0"), "{cmds:?}");
+        assert!(cmds.iter().any(|c| c == "out.delay 8 0"), "{cmds:?}");
+        assert!(cmds.iter().any(|c| c == "out.mute 8 off"), "{cmds:?}");
     }
 
     #[test]
