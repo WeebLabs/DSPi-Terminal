@@ -26,7 +26,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Widget};
 use crate::app::Performance;
 use crate::graph::GraphCurve;
 use crate::screens::{
-    self, InputPage, OutputPage, Overview, PresetChoice, PresetMenu, Shared, clipboard, presets,
+    self, InputPage, MatrixPanel, OutputPage, Overview, PresetChoice, PresetMenu, Shared,
+    clipboard, presets,
 };
 use crate::shell::{
     ChannelItem, Placeholder, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
@@ -86,10 +87,10 @@ impl Screens for PlaceholderScreens {
 
 /// The Console's screens: the dashboard, the input page and the output page.
 ///
-/// Tool panels and Settings are still placeholders; the phases that build them
-/// replace those two methods. Every screen it makes shares one [`Shared`]
-/// handle, which is where the linked pairs, the preset names and the channel
-/// clipboard live.
+/// The Matrix Mixer is the one tool panel that exists; the rest, and Settings,
+/// are still placeholders that later phases replace. Every screen it makes
+/// shares one [`Shared`] handle, which is where the linked pairs, the preset
+/// names and the channel clipboard live.
 pub struct ConsoleScreens {
     pub shared: Shared,
 }
@@ -118,10 +119,13 @@ impl Screens for ConsoleScreens {
     }
 
     fn tool(&self, _state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
-        Box::new(Placeholder::new(
-            tool.title(),
-            "This panel arrives in a later phase.",
-        ))
+        match tool {
+            Tool::Matrix => Box::new(MatrixPanel::new(self.shared.clone())),
+            other => Box::new(Placeholder::new(
+                other.title(),
+                "This panel arrives in a later phase.",
+            )),
+        }
     }
 
     fn settings(&self, _state: &DeviceState) -> Box<dyn Screen> {

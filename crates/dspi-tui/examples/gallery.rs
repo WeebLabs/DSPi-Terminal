@@ -1,14 +1,15 @@
 //! Render the shell with fixture data, for design review without a device.
 //!
 //!   gallery [width] [height] [console|amber|dark|mono] [rp2350|rp2040]
-//!           [--screen overview|input|output] [--ansi]
+//!           [--screen overview|input|output|matrix] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
 //! can be looked at by piping to a terminal. `--screen` picks which of the
 //! Console's detail screens fills the pane; the default is the input page.
+//! `matrix` opens the Matrix Mixer tool panel over it, as `M` does.
 
-use dspi_tui::screens::{InputPage, OutputPage, Overview, shared};
-use dspi_tui::shell::{Focus, Screen, Selection, Shell, fixture};
+use dspi_tui::screens::{InputPage, MatrixPanel, OutputPage, Overview, shared};
+use dspi_tui::shell::{Focus, Screen, Selection, Shell, Tool, fixture};
 use dspi_tui::theme::{ColorDepth, Glyphs, Palette, Theme};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -56,19 +57,22 @@ fn main() {
     let state = fixture::state();
     let shared = shared();
     let (detail, selection): (Box<dyn Screen>, Selection) = match screen.as_str() {
-        "overview" => (Box::new(Overview::new(shared)), Selection::Overview),
+        "overview" | "matrix" => (Box::new(Overview::new(shared.clone())), Selection::Overview),
         "output" => (
-            Box::new(OutputPage::new(0, shared, &state)),
+            Box::new(OutputPage::new(0, shared.clone(), &state)),
             Selection::Output(0),
         ),
         _ => (
-            Box::new(InputPage::new(0, shared, &state)),
+            Box::new(InputPage::new(0, shared.clone(), &state)),
             Selection::Input(0),
         ),
     };
     model.selection = selection;
     let mut shell = Shell::new(model, theme, detail);
     shell.focus = Focus::Screen;
+    if screen == "matrix" {
+        shell.open_tool(Tool::Matrix, Box::new(MatrixPanel::new(shared)));
+    }
 
     let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
     term.draw(|f| shell.draw(f.area(), f.buffer_mut(), &state))
