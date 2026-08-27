@@ -18,6 +18,7 @@ pub mod clipboard;
 pub mod filters;
 pub mod input;
 pub mod linkwitz;
+pub mod output;
 pub mod overview;
 
 use std::cell::RefCell;
@@ -32,6 +33,7 @@ pub use clipboard::ChannelClipboard;
 pub use filters::{FilterList, FilterMode};
 pub use input::InputPage;
 pub use linkwitz::LinkwitzPanel;
+pub use output::OutputPage;
 pub use overview::Overview;
 
 /// The application-side state the screens share.

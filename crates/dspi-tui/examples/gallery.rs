@@ -1,20 +1,41 @@
 //! Render the shell with fixture data, for design review without a device.
 //!
-//!   gallery [width] [height] [console|amber|dark|mono] [rp2350|rp2040] [--ansi]
+//!   gallery [width] [height] [console|amber|dark|mono] [rp2350|rp2040]
+//!           [--screen overview|input|output] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
-//! can be looked at by piping to a terminal.
+//! can be looked at by piping to a terminal. `--screen` picks which of the
+//! Console's detail screens fills the pane; the default is the input page.
 
-use dspi_tui::shell::{Placeholder, Shell, fixture};
+use dspi_tui::screens::{InputPage, OutputPage, Overview, shared};
+use dspi_tui::shell::{Focus, Screen, Selection, Shell, fixture};
 use dspi_tui::theme::{ColorDepth, Glyphs, Palette, Theme};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let ansi = args.iter().any(|a| a == "--ansi");
-    let args: Vec<&String> = args.iter().filter(|a| *a != "--ansi").collect();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let ansi = raw.iter().any(|a| a == "--ansi");
+    let screen = raw
+        .iter()
+        .position(|a| a == "--screen")
+        .and_then(|i| raw.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "input".into());
+    // Positional arguments, with the flags and their values taken out.
+    let mut args: Vec<&String> = Vec::new();
+    let mut skip = false;
+    for a in &raw {
+        if std::mem::take(&mut skip) || a == "--ansi" {
+            continue;
+        }
+        if a == "--screen" {
+            skip = true;
+            continue;
+        }
+        args.push(a);
+    }
     let num = |i: usize, d: u16| args.get(i).and_then(|a| a.parse().ok()).unwrap_or(d);
     let (w, h) = (num(0, 120), num(1, 40));
     let palette = args
@@ -27,17 +48,28 @@ fn main() {
         ColorDepth::TrueColor
     };
     let theme = Theme::new(palette, depth, Glyphs::Braille);
-    let model = match args.get(3).map(|s| s.as_str()) {
+    let mut model = match args.get(3).map(|s| s.as_str()) {
         Some("rp2040") => fixture::rp2040(&theme),
         _ => fixture::rp2350(&theme),
     };
-    let mut shell = Shell::new(
-        model,
-        theme,
-        Box::new(Placeholder::new("FL", "Input page (Phase 4)")),
-    );
 
     let state = fixture::state();
+    let shared = shared();
+    let (detail, selection): (Box<dyn Screen>, Selection) = match screen.as_str() {
+        "overview" => (Box::new(Overview::new(shared)), Selection::Overview),
+        "output" => (
+            Box::new(OutputPage::new(0, shared, &state)),
+            Selection::Output(0),
+        ),
+        _ => (
+            Box::new(InputPage::new(0, shared, &state)),
+            Selection::Input(0),
+        ),
+    };
+    model.selection = selection;
+    let mut shell = Shell::new(model, theme, detail);
+    shell.focus = Focus::Screen;
+
     let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
     term.draw(|f| shell.draw(f.area(), f.buffer_mut(), &state))
         .expect("draw");
