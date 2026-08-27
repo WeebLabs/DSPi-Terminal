@@ -17,6 +17,7 @@ pub mod generated {
 pub mod channel;
 pub mod dsp;
 pub mod enums;
+pub mod packets;
 pub mod registry;
 pub mod value;
 pub mod wire;

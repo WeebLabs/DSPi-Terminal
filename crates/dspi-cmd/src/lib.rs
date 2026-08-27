@@ -12,6 +12,7 @@
 pub mod complete;
 pub mod shell;
 
+use dspi_proto::packets::{FieldKind, PacketSpec, spec_for_path};
 use dspi_proto::registry::{Kind, ParamDesc, Target, by_path};
 use dspi_proto::value::Value;
 
@@ -193,14 +194,133 @@ fn parse_set(tokens: &[&str], ctx: &Context) -> Result<Command, ParseError> {
     }
 
     let indices = parse_indices(d, &rest[..want], ctx)?;
-    let raw = rest[want..].join(" ");
-    let value = parse_value(d, &raw)?;
+
+    // A packet is built from named fields, so it needs the tokens as tokens:
+    // joining them first would lose a quoted name with a space in it.
+    let value = if matches!(d.kind, Kind::Packet) {
+        parse_packet(d, &indices, &rest[want..])?
+    } else {
+        parse_value(d, &rest[want..].join(" "))?
+    };
 
     Ok(Command::Set {
         path: d.path,
         indices,
         value,
     })
+}
+
+/// Build a structured payload from `key=value` tokens.
+///
+/// Three token shapes are accepted, because all three are how a person writes
+/// this: `gain=-3` names its field, `invert` alone is a flag or a boolean set
+/// to on, and a bare word may fill the next positional field, so
+/// `mix 0 4 on gain=-3 invert` reads the way the Console's own grid does.
+/// The command's indices fill the fields that name them, so the crosspoint in
+/// `mix 0 4` does not have to be typed twice.
+fn parse_packet(d: &ParamDesc, indices: &[u8], tokens: &[&str]) -> Result<Value, ParseError> {
+    let Some(spec) = spec_for_path(d.path) else {
+        return Err(ParseError::BadValue {
+            path: d.path.into(),
+            value: tokens.join(" "),
+            expected: "a packet this build knows how to type".into(),
+        });
+    };
+
+    let mut pairs: Vec<(String, String)> = spec
+        .index_fields
+        .iter()
+        .zip(indices)
+        .map(|(name, index)| ((*name).to_string(), index.to_string()))
+        .collect();
+
+    let mut next_positional = 0usize;
+    for token in tokens {
+        if let Some((key, value)) = token.split_once('=') {
+            pairs.push((
+                key.to_ascii_lowercase(),
+                value.trim_matches('"').to_string(),
+            ));
+            continue;
+        }
+
+        let word = token.to_ascii_lowercase();
+
+        // A bare field name that holds a yes or no means yes.
+        if let Some(f) = spec.field(&word)
+            && f.kind == FieldKind::Bool
+        {
+            pairs.push((word, "on".into()));
+            continue;
+        }
+
+        // A bare flag name goes into whichever field owns that bit.
+        if let Some(field) = flag_field_for(spec, &word) {
+            pairs.push((field.to_string(), word));
+            continue;
+        }
+
+        // Otherwise it fills the next field that may be given without a key.
+        match spec.positional.get(next_positional) {
+            Some(name) => {
+                next_positional += 1;
+                pairs.push(((*name).to_string(), word));
+            }
+            None => {
+                return Err(ParseError::BadValue {
+                    path: d.path.into(),
+                    value: (*token).into(),
+                    expected: format!("one of {}, as key=value", spec.field_names().join(", ")),
+                });
+            }
+        }
+    }
+
+    // Several flag words are separate tokens on the line but one field on the
+    // wire, so they are merged rather than overwriting each other.
+    let merged = merge_flag_fields(spec, pairs);
+    let refs: Vec<(&str, &str)> = merged
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    (spec.encode)(&refs)
+        .map(Value::Bytes)
+        .map_err(|e| ParseError::BadValue {
+            path: d.path.into(),
+            value: tokens.join(" "),
+            expected: e.to_string(),
+        })
+}
+
+/// Which field, if any, owns a bare flag word.
+fn flag_field_for(spec: &'static PacketSpec, word: &str) -> Option<&'static str> {
+    spec.fields.iter().find_map(|f| match f.kind {
+        FieldKind::Flags(table) if table.iter().any(|(n, _)| *n == word) => Some(f.name),
+        _ => None,
+    })
+}
+
+/// Join repeated flag fields with commas, which is how the codec reads a set.
+fn merge_flag_fields(
+    spec: &'static PacketSpec,
+    pairs: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        let is_flags = matches!(spec.field(&key).map(|f| f.kind), Some(FieldKind::Flags(_)));
+        match out.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, existing)) if is_flags => {
+                existing.push(',');
+                existing.push_str(&value);
+            }
+            // A later value of an ordinary field wins, so a mistyped field can
+            // be corrected by typing it again rather than starting over.
+            Some((_, existing)) => *existing = value,
+            None => out.push((key, value)),
+        }
+    }
+    out
 }
 
 /// `eq <channel> <band> <type> [freq] [q] [gain]`
@@ -343,6 +463,13 @@ pub fn parse_value(d: &ParamDesc, raw: &str) -> Result<Value, ParseError> {
             Some(hex) => u32::from_str_radix(hex, 16).map_err(|_| bad("a hex mask"))?,
             None => raw.parse().map_err(|_| bad("a mask"))?,
         }),
+        // A structured payload, built from its named fields. Without this arm
+        // a packet fell through to Float and then failed to encode, so none of
+        // these parameters could be set from the command line at all.
+        Kind::Packet => {
+            let tokens: Vec<&str> = raw.split_whitespace().collect();
+            parse_packet(d, &[], &tokens)?
+        }
         _ => Value::Float(raw.parse().map_err(|_| bad("a number"))?),
     })
 }
@@ -442,6 +569,11 @@ fn format_value(path: &str, v: &Value) -> String {
         return v.display(dspi_proto::value::Unit::None);
     };
     match (d.kind, v) {
+        // A packet reads back as the same `key=value` line it was typed as,
+        // minus the fields the command carries as its own indices.
+        (Kind::Packet, Value::Bytes(bytes)) => spec_for_path(path)
+            .and_then(|spec| spec.format(bytes))
+            .unwrap_or_else(|| format!("{} bytes", bytes.len())),
         (Kind::Choice(variants), _) => match v.as_u8().and_then(|n| {
             variants
                 .iter()
@@ -791,6 +923,180 @@ mod tests {
     fn an_unknown_word_suggests_where_to_look() {
         let e = p("wobble 3").unwrap_err();
         assert!(e.to_string().contains("dspi params"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod packet_tests {
+    use super::tests::ctx;
+    use super::*;
+    use dspi_proto::packets::{CsBinding, GPIO_UNUSED, MatrixRoutePacket};
+
+    fn p(line: &str) -> Result<Command, ParseError> {
+        let toks = tokenize(line);
+        let refs: Vec<&str> = toks.iter().map(String::as_str).collect();
+        parse(&refs, &ctx())
+    }
+
+    fn bytes(line: &str) -> Vec<u8> {
+        match p(line).unwrap() {
+            Command::Set {
+                value: Value::Bytes(b),
+                ..
+            } => b,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Before this, a packet parameter fell through to Float and then failed
+    /// to encode, so none of them could be set from the command line at all.
+    #[test]
+    fn a_binding_is_typed_as_named_fields() {
+        let line =
+            "cs.binding 3 type=encoder noun=user_volume action=step gpio=10,11 step=1 flags=accel";
+        match p(line).unwrap() {
+            Command::Set {
+                path,
+                indices,
+                value: Value::Bytes(b),
+            } => {
+                assert_eq!(path, "cs.binding");
+                assert_eq!(indices, vec![3], "the slot rides in wValue");
+                assert_eq!(
+                    b,
+                    CsBinding {
+                        component: 4,
+                        noun: 0,
+                        action: 1,
+                        flags: 0x08,
+                        gpio: [10, 11],
+                        step: 1,
+                        ..Default::default()
+                    }
+                    .encode()
+                    .to_vec()
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// One GPIO means the second is explicitly unused, which is what the
+    /// firmware expects of a configured one-pin component.
+    #[test]
+    fn a_single_gpio_still_marks_the_second_unused() {
+        let b = bytes("cs.binding 0 type=button noun=user_mute action=toggle gpio=16");
+        assert_eq!(b[4], 16);
+        assert_eq!(b[5], GPIO_UNUSED);
+    }
+
+    /// The crosspoint's own indices fill the packet's input and output, so the
+    /// route is not typed twice, and `on` reads the way the Console's grid does.
+    #[test]
+    fn a_crosspoint_takes_its_indices_and_a_bare_word() {
+        let line = "mix 0 4 on gain=-3 invert";
+        match p(line).unwrap() {
+            Command::Set {
+                indices,
+                value: Value::Bytes(b),
+                ..
+            } => {
+                assert_eq!(indices, vec![0, 4]);
+                assert_eq!(
+                    MatrixRoutePacket::decode(&b).unwrap(),
+                    MatrixRoutePacket {
+                        input: 0,
+                        output: 4,
+                        enabled: true,
+                        phase_invert: true,
+                        gain_db: -3.0,
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Flag words are separate tokens on the line but one byte on the wire, so
+    /// a second flag must not replace the first.
+    #[test]
+    fn several_flag_words_merge_into_one_field() {
+        let b = bytes("cs.binding 1 type=encoder noun=preset action=step wrap accel");
+        assert_eq!(b[3], 0x0C, "wrap | accel");
+        let same = bytes("cs.binding 1 type=encoder noun=preset action=step flags=wrap,accel");
+        assert_eq!(b, same);
+    }
+
+    #[test]
+    fn a_typo_is_refused_with_the_fields_that_would_have_worked() {
+        let e = p("cs.binding 3 type=encoder pin=10").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("pin"), "{msg}");
+        assert!(msg.contains("gpio"), "the valid fields are listed: {msg}");
+    }
+
+    #[test]
+    fn a_bad_field_value_lists_the_alternatives() {
+        let e = p("cs.binding 3 type=banana").unwrap_err();
+        assert!(e.to_string().contains("encoder"), "{e}");
+    }
+
+    #[test]
+    fn a_bare_word_with_nowhere_to_go_is_refused() {
+        let e = p("cs.binding 3 type=encoder nonsense").unwrap_err();
+        assert!(e.to_string().contains("key=value"), "{e}");
+    }
+
+    /// The echo line has to be a line the parser accepts, or copying it out of
+    /// the interface writes something else.
+    #[test]
+    fn packet_lines_round_trip_through_the_formatter() {
+        let ctx = ctx();
+        for line in [
+            "cs.binding 3 type=encoder noun=master_volume action=step gpio=27,28 step=256 flags=accel",
+            "cs.ir 2 noun=user_volume action=inc protocol=nec step=256 code=0x20DF40BF",
+            "cs.group 1 kind=output_ch members=0xA",
+            "cs.macro.step 0 1 noun=output_mute action=set target=2 value=1 pre_delay=150",
+            "cs.display mode=cycle_selected dwell=50 overlay_hold=20 edit_timeout=100",
+            "cs.display.page 4 noun=output_gain target=2 flags=active,large",
+            "mix 0 4 on gain=-3 invert",
+            "dev.dacmute on pin=11 hold_ms=5",
+            "dev.uart on baud=115200",
+            "dev.i2c on address=0x42",
+            "preset.startup specified 3",
+        ] {
+            let cmd = p(line).unwrap_or_else(|e| panic!("`{line}` did not parse: {e}"));
+            let rendered = format(&cmd, &ctx);
+            let toks = tokenize(&rendered);
+            let refs: Vec<&str> = toks.iter().map(String::as_str).collect();
+            let reparsed = parse(&refs, &ctx).unwrap_or_else(|e| {
+                panic!("`{line}` rendered as `{rendered}`, which does not parse: {e}")
+            });
+            assert_eq!(cmd, reparsed, "`{line}` did not survive the round trip");
+        }
+    }
+
+    /// The two fields the command line carries as indices must not be printed
+    /// again in the value, or the echo would set the wrong crosspoint.
+    #[test]
+    fn the_index_fields_are_not_printed_twice() {
+        let cmd = p("mix 3 5 on").unwrap();
+        let rendered = format(&cmd, &ctx());
+        assert!(rendered.starts_with("mix 3 5 "), "{rendered}");
+        assert!(!rendered.contains("input="), "{rendered}");
+        assert!(!rendered.contains("output="), "{rendered}");
+    }
+
+    /// The public value parser has the arm too, for a caller that already has
+    /// the tail as one string.
+    #[test]
+    fn parse_value_builds_a_packet_from_a_joined_line() {
+        let d = by_path("dev.i2c").unwrap();
+        let v = parse_value(d, "on sda_pin=18 scl_pin=19 address=0x42").unwrap();
+        match v {
+            Value::Bytes(b) => assert_eq!(b, vec![1, 18, 19, 0x42, 0, 0, 0, 0]),
+            other => panic!("{other:?}"),
+        }
     }
 }
 
