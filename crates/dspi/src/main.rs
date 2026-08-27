@@ -76,6 +76,7 @@ fn main() -> ExitCode {
         Some("export") => cmd_export(serial, &positional(&flags)),
         Some("import") => cmd_import(serial, &positional(&flags), &flags),
         Some("dump") => cmd_dump(serial, json),
+        Some("watch") => cmd_watch(serial, json),
         // No arguments opens the interface; arguments run one command and exit.
         None => cmd_tui(serial, flags.contains(&"--lite"), palette),
         Some(other) if other.starts_with("--") => {
@@ -119,6 +120,7 @@ dspi - terminal control for DSPi audio processors
 USAGE:
     dspi                     open the interface
     dspi dump                connect and print the full device state
+    dspi watch               print the device's notifications as they arrive
     dspi list                list every connected DSPi
     dspi params              list every parameter this build knows
     dspi get <path> [i..]    read one parameter
@@ -711,7 +713,7 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
 }
 
 fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) -> u8 {
-    let session = match connect(serial) {
+    let mut session = match connect(serial) {
         Ok(s) => s,
         Err(c) => return c,
     };
@@ -721,24 +723,167 @@ fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) 
         dspi_tui::theme::ColorDepth::detect(),
         dspi_tui::app::detect_glyphs(),
     );
-    let mut app = dspi_tui::App::from_session(theme, &session);
-    if lite {
-        app.perf = dspi_tui::app::Performance::lite();
-    }
+    let perf = if lite {
+        dspi_tui::app::Performance::lite()
+    } else {
+        dspi_tui::app::Performance::detect()
+    };
 
-    // Seed everything from what the device is actually doing, so the first
-    // frame shows the user's tuning rather than a flat line and an empty
-    // matrix.
-    let mut session = session;
-    load_everything(&mut session, &mut app);
+    // One chunked read seeds everything the bulk packet covers, so the first
+    // frame shows the person's tuning rather than a flat line.
+    let bulk = match session.snapshot() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("dspi: could not read the device state: {e}");
+            return exit::TRANSPORT;
+        }
+    };
+    let state = dspi_session::DeviceState::new(session.capabilities().clone(), bulk);
+    let live = dspi_tui::live::Live::new(
+        state,
+        theme,
+        perf,
+        Box::new(dspi_tui::live::PlaceholderScreens),
+    );
 
-    match dspi_tui::run(app, &mut session) {
+    match dspi_tui::live::run(live, &mut session) {
         Ok(()) => exit::OK,
         Err(e) => {
             eprintln!("dspi: {e}");
             exit::TRANSPORT
         }
     }
+}
+
+/// Print notifications as the device pushes them, until interrupted.
+///
+/// This is the Console's Interrupt Monitor as a one-shot: turn the OS volume
+/// slider and watch `user_volume` arrive with source `UAC1`. With `--json`,
+/// one object per line.
+fn cmd_watch(serial: Option<&str>, json: bool) -> u8 {
+    let mut session = match connect(serial) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let source = match session.with_transport(|t| Ok(t.notifications())) {
+        Ok(Some(s)) => s,
+        _ => {
+            eprintln!("dspi: this transport has no notification endpoint");
+            return exit::TRANSPORT;
+        }
+    };
+    let notes = dspi_session::Notifications::start(source);
+    if !json {
+        println!(
+            "watching {} (Ctrl-C to stop)",
+            session.capabilities().serial
+        );
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if notes.is_disconnected() {
+            eprintln!("dspi: device disconnected");
+            return exit::TRANSPORT;
+        }
+        let Some(n) = notes.next(std::time::Duration::from_millis(500)) else {
+            continue;
+        };
+        let t = started.elapsed().as_secs_f64();
+        if json {
+            let (name, detail) = describe_event(&n.event);
+            println!(
+                "{{\"t\":{t:.3},\"seq\":{},\"lost\":{},\"event\":\"{name}\",\"detail\":\"{}\"}}",
+                n.seq,
+                n.lost,
+                detail.replace('"', "'")
+            );
+        } else {
+            let (name, detail) = describe_event(&n.event);
+            let lost = if n.lost { "  (packets lost)" } else { "" };
+            println!("{t:8.3}  #{:<3}  {name:<18} {detail}{lost}", n.seq);
+        }
+    }
+}
+
+/// A one-line description of a notification, naming the bulk field it
+/// touched where it can.
+fn describe_event(e: &dspi_session::Event) -> (&'static str, String) {
+    use dspi_session::Event;
+    match e {
+        Event::Idle => ("idle", String::new()),
+        Event::MasterVolume(db) => ("master_volume", format!("{db:.1} dB (legacy)")),
+        Event::ParamChanged {
+            offset,
+            source,
+            bytes,
+        } => {
+            let section = dspi_proto::wire::BulkPacket::section_at(*offset as usize).unwrap_or("?");
+            let value = match bytes.len() {
+                4 => format!(
+                    "{}",
+                    f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                ),
+                1 => format!("{}", bytes[0]),
+                _ => hex_string(bytes),
+            };
+            (
+                "param_changed",
+                format!(
+                    "{section}+{} = {value} [{}]",
+                    *offset as usize - section_offset(section),
+                    source.describe()
+                ),
+            )
+        }
+        Event::BulkInvalidated { source } => ("bulk_invalidated", source.describe().to_string()),
+        Event::PresetLoaded { slot } => ("preset_loaded", format!("slot {}", slot + 1)),
+        Event::InputFormat { channels } => ("input_format", format!("{channels} channels")),
+        Event::SiggenState {
+            state,
+            reason,
+            signal_type,
+            channel,
+        } => (
+            "siggen_state",
+            format!("state {state} reason {reason} type {signal_type} channel {channel}"),
+        ),
+        Event::AdatState {
+            enabled,
+            active,
+            pin,
+        } => (
+            "adat_state",
+            format!("enabled {enabled} active {active} pin {pin}"),
+        ),
+        Event::I2sSlaveState { state, rate_hz } => {
+            ("i2s_slave_state", format!("state {state} {rate_hz} Hz"))
+        }
+        Event::IrLearn {
+            state,
+            protocol,
+            code,
+        } => (
+            "cs_ir_learn",
+            format!("state {state} protocol {protocol} code 0x{code:08X}"),
+        ),
+        Event::AdatInputState {
+            state,
+            rate_hz,
+            clock_mode,
+        } => (
+            "adat_input_state",
+            format!("state {state} {rate_hz} Hz clock {clock_mode}"),
+        ),
+        Event::Unknown { id, bytes } => ("unknown", format!("0x{id:02X} {}", hex_string(bytes))),
+    }
+}
+
+fn section_offset(name: &str) -> usize {
+    dspi_proto::generated::SECTIONS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, o, _)| *o)
+        .unwrap_or(0)
 }
 
 /// Fill the app from the device.
