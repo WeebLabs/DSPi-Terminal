@@ -233,3 +233,62 @@ Reading that file also settled an older bug here: `filterfile.rs` mapped `LSC`
 and `HSC` to the *first-order* shelves, while the Console and `autoeq.rs` both
 read them as REW's spelling of the second-order ones. A REW file's shelves were
 being imported at half their slope. They now agree.
+
+## 17. The Core 1 EQ-worker range is derivable, so nothing needs a platform test
+
+`CORE1_EQ_FIRST_OUTPUT` and `CORE1_EQ_LAST_OUTPUT` (config.h:764-770) are
+platform-conditional, so `build.rs` refuses to emit them and no generated
+constant exists. They do not need one. The first is 2 on both platforms, and the
+last is always the output below the PDM sub: 7 of nine outputs on RP2350, 3 of
+five on RP2040. `num_outputs - 2` gives both, from the topology the probe already
+discovered, which is what the Console computes from `platformName` instead
+(`DSPViewModel.swift:2124-2126`).
+
+The same holds for the pin outputs: `NUM_PIN_OUTPUTS` (config.h:667-673) is one
+per S/PDIF slot plus PDM, and a slot carries a stereo pair, so
+`(num_outputs - 1) / 2` slots and one more for PDM covers 5 on RP2350 and 3 on
+RP2040 without naming either.
+
+## 18. A blocked output enable answers success
+
+`REQ_SET_OUTPUT_ENABLE` reports no failure when Core 1 is already running the
+other side of the PDM / EQ-worker interlock; the firmware skips the enable and
+says nothing (survey-firmware 6.8). The status byte is not evidence, and neither
+is the absence of a stall. Only reading the enable back distinguishes "on" from
+"politely ignored", which is why `enable_output` reports `Rejected` rather than
+trusting the write, and why the plain `out.enable` write path asks
+`REQ_GET_CORE1_CONFLICT` (0x7B) first.
+
+## 19. The Console's own preset apply moves the MCK pin while MCK is running
+
+`PresetDocumentTransfer.swift:618-619` writes the MCK enable and then the MCK
+pin, in that order. When a document asks for MCK enabled on a different pin, the
+enable lands first and the pin move then hits `PIN_CONFIG_OUTPUT_ACTIVE`
+(config.h:611), because the firmware refuses to move a clock output that is
+running (survey-firmware 6.7). The Console records the refusal and carries on, so
+the pin silently stays where it was.
+
+Our apply drops MCK first when the pin has to move, moves the pin, and applies
+the document's enable state last. This is a deliberate departure from the
+reference implementation, and the only one in that sequence.
+
+## 20. Two opcodes cannot be reached through a registry row
+
+`REQ_SET_I2S_BCK_PIN` (0xC2) packs a *role* into wValue's high byte
+(config.h:334-336): 0 is the unified or master pair, 1 the SPLIT-mode slave pair.
+The registry addresses the master pair only, and the GET (0xC3) documents no role
+at all, so the slave pin can be written but not read back scalar-wise; it lives
+in the bulk packet as `bck_pin_slave` (bulk_params.h:165).
+
+`REQ_GET_DAC_HW_MUTE_CONFIG` (0xEB) answers 16 bytes, but the registry types
+`dev.dacmute` as a packet whose `Repr::Raw` reads one. The write path's own
+readback therefore cannot confirm it, and reports a correct write as a
+rejection. Both are read directly from the transport in `preset_file.rs` until
+Phase 2B gives them codecs.
+
+## 21. The `.dspipreset` master-clock field is the multiple, not the wire value
+
+The shared schema stores `mckMultiplier` as 128 or 256
+(`PresetDocument.swift:394`). The wire carries a selector: 0 is 128x and 1 is
+256x (`REQ_SET_MCK_MULTIPLIER`, config.h:342-343). Writing the document's number
+through would be out of range for the choice; the two are mapped explicitly.
