@@ -27,6 +27,13 @@ pub enum Reply {
     /// Stall `n` more times, then fall through to the next reply. Models the
     /// flash blackout: the device is alive but its control IRQ is disabled.
     BusyThen(usize, Box<Reply>),
+    /// Answer each reply in turn, then keep answering the last one.
+    ///
+    /// Models a value that changes between reads, which is what the write
+    /// path's confirming readback actually sees: the old value on the way in,
+    /// the new one on the way out. A single canned answer makes every verified
+    /// write look like a silent rejection.
+    Sequence(Vec<Reply>),
     /// The device went away.
     Disconnect,
 }
@@ -56,6 +63,9 @@ pub type LogHandle = Arc<Mutex<Vec<Exchange>>>;
 #[derive(Default)]
 pub struct MockTransport {
     replies: HashMap<u8, Reply>,
+    /// What an opcode with no script answers. `None` stalls, as the firmware
+    /// does for an opcode it does not implement.
+    fallback: Option<Reply>,
     log: LogHandle,
     descriptor: Option<DeviceDescriptor>,
     max_transfer: Option<usize>,
@@ -80,6 +90,16 @@ impl MockTransport {
     /// the way the chunked bulk opcodes behave.
     pub fn window(self, opcode: u8, bytes: impl Into<Vec<u8>>) -> Self {
         self.reply(opcode, Reply::Window(bytes.into()))
+    }
+
+    /// Answer every unscripted opcode with these bytes.
+    ///
+    /// For a test that cares about one part of a long sequence: without it,
+    /// every unscripted read stalls and the retry backoff turns a millisecond
+    /// of assertions into tens of seconds of sleeping.
+    pub fn answering_everything(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.fallback = Some(Reply::Data(bytes.into()));
+        self
     }
 
     /// Constrain the transfer size, to exercise the chunked path that Windows
@@ -109,7 +129,27 @@ impl MockTransport {
         self.log.lock().unwrap().iter().map(|e| e.opcode).collect()
     }
 
+    /// Resolve a reply that carries no state of its own.
+    fn resolve_one(reply: &Reply, opcode: u8, value: u16) -> Result<Vec<u8>> {
+        match reply {
+            Reply::Data(d) => Ok(d.clone()),
+            Reply::Window(all) => {
+                let start = (value as usize).min(all.len());
+                Ok(all[start..].to_vec())
+            }
+            Reply::Disconnect => Err(TransportError::Disconnected),
+            // A stall, and anything that would need its own bookkeeping to
+            // nest, which nothing needs yet.
+            _ => Err(TransportError::Stalled { opcode }),
+        }
+    }
+
     fn resolve(&mut self, opcode: u8, value: u16) -> Result<Vec<u8>> {
+        if !self.replies.contains_key(&opcode)
+            && let Some(fallback) = self.fallback.clone()
+        {
+            return Self::resolve_one(&fallback, opcode, value);
+        }
         match self.replies.get_mut(&opcode) {
             None => Err(TransportError::Stalled { opcode }),
             Some(Reply::Stall) => Err(TransportError::Stalled { opcode }),
@@ -118,6 +158,16 @@ impl MockTransport {
             Some(Reply::Window(all)) => {
                 let start = (value as usize).min(all.len());
                 Ok(all[start..].to_vec())
+            }
+            Some(Reply::Sequence(items)) => {
+                let next = match items.len() {
+                    0 => return Err(TransportError::Stalled { opcode }),
+                    // The last one persists, so a test only has to script the
+                    // reads it cares about.
+                    1 => items[0].clone(),
+                    _ => items.remove(0),
+                };
+                Self::resolve_one(&next, opcode, value)
             }
             Some(Reply::BusyThen(remaining, inner)) => {
                 if *remaining > 0 {
