@@ -19,7 +19,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
-use super::{Shared, channel_name, max_delay_ms, number, output_channel};
+use super::{Shared, channel_name, clipboard, max_delay_ms, number, output_channel};
 use crate::shell::{Screen, ScreenEvent};
 use crate::theme::{ChannelRole, Glyphs, Theme};
 use crate::widgets::text::{fit_centre, fit_left, fit_right};
@@ -60,6 +60,7 @@ enum Line {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
     Clear,
+    Rename(usize),
     /// Enabling this output needs the other side of Core 1 switched off first.
     Enable(usize),
 }
@@ -73,7 +74,6 @@ struct Paint<'a> {
 }
 
 pub struct MatrixPanel {
-    #[allow(dead_code)]
     shared: Shared,
     /// The reticle: a row, an output column, and whether it sits on the input
     /// trim in the pinned label column instead.
@@ -93,6 +93,9 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("i", "Invert"),
     KeyHelp::new("d", "Direct 1:1"),
     KeyHelp::new("D", "Clear"),
+    KeyHelp::new("r", "Rename"),
+    KeyHelp::new("y Y", "Copy, paste parameters"),
+    KeyHelp::new("I", "Identify"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -833,6 +836,32 @@ impl Screen for MatrixPanel {
                     vec![Button::destructive("Clear"), Button::new("Cancel")],
                 ))
             }
+            KeyCode::Char('r') => {
+                let channel = output_channel(state, self.col);
+                self.pending = Some(Pending::Rename(channel));
+                ScreenEvent::Dialog(Dialog::text(
+                    "Rename",
+                    "",
+                    state.channel_name(channel),
+                    "Name",
+                ))
+            }
+            KeyCode::Char('y') => {
+                let clip = clipboard::copy(state, output_channel(state, self.col));
+                let msg = clipboard::copied_message(&clip);
+                self.shared.borrow_mut().clipboard = Some(clip);
+                ScreenEvent::Status(msg)
+            }
+            KeyCode::Char('Y') => {
+                let clip = self.shared.borrow().clipboard.clone();
+                let Some(clip) = clip else {
+                    return ScreenEvent::Status("Nothing to paste".into());
+                };
+                let channel = output_channel(state, self.col);
+                let cmds = clipboard::paste_commands(&clip, state, channel, None);
+                ScreenEvent::Command(cmds.join("\n"))
+            }
+            KeyCode::Char('I') => ScreenEvent::Status("Identify arrives with Phase 6".into()),
             _ => ScreenEvent::Unhandled,
         }
     }
@@ -852,6 +881,14 @@ impl Screen for MatrixPanel {
                     ScreenEvent::Handled
                 } else {
                     ScreenEvent::Command(cmds.join("\n"))
+                }
+            }
+            (Pending::Rename(channel), DialogOutcome::Text(name)) => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    ScreenEvent::Handled
+                } else {
+                    ScreenEvent::Command(format!("ch.name {channel} {name}"))
                 }
             }
             (Pending::Enable(o), DialogOutcome::Button(0)) => {
@@ -1380,6 +1417,59 @@ mod tests {
         assert_eq!(
             p.handle(key(KeyCode::Char(' ')), &state),
             ScreenEvent::Command("out.enable 3 on".into())
+        );
+    }
+
+    // -- Column actions ----------------------------------------------------
+
+    #[test]
+    fn r_renames_the_columns_output() {
+        let state = fixture::state();
+        let mut p = panel();
+        let ScreenEvent::Dialog(d) = p.handle(key(KeyCode::Char('r')), &state) else {
+            panic!("no rename dialog");
+        };
+        assert_eq!(d.title, "Rename");
+        assert_eq!(
+            p.dialog_result(DialogOutcome::Text("Left ".into()), &state),
+            ScreenEvent::Command("ch.name 8 Left".into())
+        );
+        // An empty name leaves the channel alone, as the Console does.
+        p.handle(key(KeyCode::Char('r')), &state);
+        assert_eq!(
+            p.dialog_result(DialogOutcome::Text("  ".into()), &state),
+            ScreenEvent::Handled
+        );
+    }
+
+    #[test]
+    fn y_and_shift_y_move_a_columns_parameters_through_the_clipboard() {
+        let state = fixture::state();
+        let bench = shared();
+        let mut p = MatrixPanel::new(bench.clone());
+        assert_eq!(
+            p.handle(key(KeyCode::Char('Y')), &state),
+            ScreenEvent::Status("Nothing to paste".into())
+        );
+        assert_eq!(
+            p.handle(key(KeyCode::Char('y')), &state),
+            ScreenEvent::Status("Copied OUT L parameters".into())
+        );
+        assert!(bench.borrow().clipboard.is_some());
+        p.handle(key(KeyCode::Right), &state);
+        let ScreenEvent::Command(c) = p.handle(key(KeyCode::Char('Y')), &state) else {
+            panic!("nothing pasted");
+        };
+        assert!(c.contains("out.gain 1 0"), "{c}");
+        assert!(c.contains("eq out.2 20 highpass 80 0.707 0"), "{c}");
+    }
+
+    #[test]
+    fn identify_waits_for_phase_six() {
+        let mut p = panel();
+        assert_eq!(
+            p.handle(key(KeyCode::Char('I')), &fixture::state()),
+            ScreenEvent::Status("Identify arrives with Phase 6".into())
         );
     }
 
