@@ -66,7 +66,15 @@ pub struct ControlSurfaceCaps {
     pub max_bindings: u8,
     pub type_count: u8,
     pub noun_count: u8,
+    /// `CS_MAX_IR_COMMANDS`, 8 before caps v6 and 16 from it.
     pub max_ir_commands: u8,
+    /// `CS_MAX_GROUPS`, added at caps v9. Zero on older firmware, which is how
+    /// "this device has no groups" is reported.
+    pub max_groups: u8,
+    /// `CS_MAX_MACROS`, added at caps v9.
+    pub max_macros: u8,
+    /// `CS_MAX_MACRO_STEPS`, added at caps v9.
+    pub max_macro_steps: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +251,8 @@ fn probe_features(t: &mut dyn Transport) -> Vec<Feature> {
         ("adat_input", op::REQ_GET_ADAT_INPUT_ENABLE, 1),
         ("i2s_slave_clock", op::REQ_GET_I2S_CLOCK_MODE, 1),
         ("i2s_input_channels", op::REQ_GET_I2S_INPUT_CHANNELS, 1),
-        ("spdif_multi_input", op::REQ_GET_SPDIF_INPUT_CONFIG, 5),
+        // 6 bytes at v1.1.6: {count, enable_mask, gpio[0..3]} (config.h:456-457).
+        ("spdif_multi_input", op::REQ_GET_SPDIF_INPUT_CONFIG, 6),
         ("lg_sound_sync", op::REQ_GET_LG_SOUND_SYNC_ENABLE, 1),
         ("dac_hardware_mute", op::REQ_GET_DAC_HW_MUTE_CONFIG, 16),
         ("uart_control", op::REQ_GET_UART_CONFIG, 8),
@@ -282,20 +291,26 @@ fn probe_cs_caps(t: &mut dyn Transport) -> Option<ControlSurfaceCaps> {
     let noun_count = *d.get(3)?;
 
     // The v3+ additions sit after the variable-length type table, so the header
-    // length depends on type_count. Read again now that we know how long it is.
-    let full_len = 4 + 4 * type_count as usize + 4;
-    let max_ir_commands = t
+    // length depends on type_count: `max_ir_commands`, then the three v9
+    // maxima, at `4 + 4*type_count` (control_surfaces.h:568-576). The table grew
+    // by a row at caps v10 when CS_TYPE_DISPLAY arrived, taking the header from
+    // 40 bytes to 44, so a fixed offset here would read the wrong four bytes.
+    let post_table = 4 + 4 * type_count as usize;
+    let full_len = post_table + 4;
+    let full = t
         .control_in(op::REQ_GET_CS_CAPS, 0xFFFF, full_len as u16)
-        .ok()
-        .and_then(|full| full.get(4 + 4 * type_count as usize).copied())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let at = |i: usize| full.get(post_table + i).copied().unwrap_or(0);
 
     Some(ControlSurfaceCaps {
         caps_version,
         max_bindings,
         type_count,
         noun_count,
-        max_ir_commands,
+        max_ir_commands: at(0),
+        max_groups: at(1),
+        max_macros: at(2),
+        max_macro_steps: at(3),
     })
 }
 
@@ -398,7 +413,7 @@ mod tests {
 
     fn bulk_bytes() -> Vec<u8> {
         let mut b = vec![0u8; generated::BULK_SIZE];
-        b[0] = 26; // wire V26
+        b[0] = 28; // wire V28
         b[1] = 1; // RP2350
         b[2] = 17; // channels
         b[3] = 9; // outputs
@@ -413,15 +428,16 @@ mod tests {
 
     fn device() -> MockTransport {
         MockTransport::new()
-            .data(op::REQ_GET_PLATFORM, vec![1, 1, 0x15, 9])
+            .data(op::REQ_GET_PLATFORM, vec![1, 1, 0x16, 9])
             .data(op::REQ_GET_SERIAL, b"4BA1DDB9D1443D6A".to_vec())
             .window(op::REQ_GET_ALL_PARAMS_CHUNK, bulk_bytes())
             .data(op::REQ_PRESET_GET_ACTIVE, vec![3])
+            // Caps v13: nine component types, so the post-table fields sit at
+            // 4 + 4*9 = 40 and the header is 44 bytes.
             .data(op::REQ_GET_CS_CAPS, {
-                let mut v = vec![4, 16, 8, 49];
-                v.extend(std::iter::repeat_n(0u8, 4 * 8));
-                v.push(8); // max_ir_commands
-                v.extend([0, 0, 0]);
+                let mut v = vec![13, 16, 9, 57];
+                v.extend(std::iter::repeat_n(0u8, 4 * 9));
+                v.extend([16, 8, 8, 8]); // ir commands, groups, macros, steps
                 v
             })
             .data(
@@ -438,8 +454,8 @@ mod tests {
         assert_eq!(caps.num_channels, 17);
         assert_eq!(caps.num_inputs, 8);
         assert_eq!(caps.num_outputs, 9);
-        assert_eq!(caps.firmware, "1.1.5");
-        assert_eq!(caps.wire_format, 26);
+        assert_eq!(caps.firmware, "1.1.6");
+        assert_eq!(caps.wire_format, 28);
         assert_eq!(caps.active_preset, Some(3));
     }
 
@@ -460,14 +476,54 @@ mod tests {
         let mut t = device();
         let caps = probe(&mut t).unwrap();
         let cs = caps.cs.unwrap();
-        assert_eq!(cs.caps_version, 4);
+        assert_eq!(cs.caps_version, 13);
         assert_eq!(cs.max_bindings, 16);
-        assert_eq!(cs.noun_count, 49);
-        assert_eq!(cs.max_ir_commands, 8);
+        assert_eq!(cs.noun_count, 57);
+        assert_eq!(cs.max_ir_commands, 16);
+        assert_eq!(cs.max_groups, 8);
+        assert_eq!(cs.max_macros, 8);
+        assert_eq!(cs.max_macro_steps, 8);
 
         let sg = caps.siggen.unwrap();
         assert_eq!(sg.type_count, 15);
         assert_eq!(sg.multitone_max, 16);
+    }
+
+    /// The post-table fields are found at `4 + 4*type_count`, never at a fixed
+    /// offset: caps v10 added a ninth component type and moved them four bytes
+    /// down. A build that assumed 36 would read the type table's last row as
+    /// `max_ir_commands`.
+    #[test]
+    fn the_caps_maxima_follow_the_type_table_length() {
+        for type_count in [8u8, 9, 12] {
+            let mut v = vec![13, 16, type_count, 57];
+            // A distinctive type table, so reading it as a maximum is obvious.
+            v.extend(std::iter::repeat_n(0xEEu8, 4 * type_count as usize));
+            v.extend([16, 8, 8, 8]);
+
+            let mut t = MockTransport::new().data(op::REQ_GET_CS_CAPS, v);
+            let cs = probe_cs_caps(&mut t).unwrap();
+            assert_eq!(cs.type_count, type_count);
+            assert_eq!(cs.max_ir_commands, 16, "with {type_count} types");
+            assert_eq!(cs.max_macro_steps, 8, "with {type_count} types");
+        }
+    }
+
+    /// Pre-v9 firmware has nothing after `max_ir_commands`; the three maxima
+    /// must read as zero rather than as whatever followed in the buffer.
+    #[test]
+    fn a_firmware_without_groups_reports_none() {
+        let mut v = vec![6, 16, 8, 52];
+        v.extend(std::iter::repeat_n(0u8, 4 * 8));
+        v.extend([16, 0, 0, 0]);
+
+        let mut t = MockTransport::new().data(op::REQ_GET_CS_CAPS, v);
+        let cs = probe_cs_caps(&mut t).unwrap();
+        assert_eq!(cs.max_ir_commands, 16);
+        assert_eq!(
+            (cs.max_groups, cs.max_macros, cs.max_macro_steps),
+            (0, 0, 0)
+        );
     }
 
     /// A stall means "this firmware lacks the feature", which is information we
