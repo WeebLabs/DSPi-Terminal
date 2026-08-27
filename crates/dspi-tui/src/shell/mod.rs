@@ -125,6 +125,8 @@ pub enum ShellEvent {
     VolumeChanged(f64),
     VolumeReset,
     VolumeModeToggle,
+    /// Space on the volume row: toggle the user mute.
+    VolumeMute,
     /// A command in the shared grammar.
     Command(String),
     Status(String),
@@ -204,7 +206,7 @@ const FOOTER_KEYS: &[KeyHelp] = &[
     KeyHelp::new("↑ ↓", "Move between rows"),
     KeyHelp::new("← →", "Change"),
     KeyHelp::new("Enter", "Open"),
-    KeyHelp::new("Space", "Toggle a feature"),
+    KeyHelp::new("Space", "Toggle a feature, or mute"),
     KeyHelp::new("Backspace", "Reset the volume"),
 ];
 
@@ -602,9 +604,11 @@ impl Shell {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let n = row.next(has_source);
-                if n != row {
-                    self.focus = Focus::Footer(n);
-                }
+                self.focus = if n != row {
+                    Focus::Footer(n)
+                } else {
+                    self.next_focus()
+                };
                 return;
             }
             _ => {}
@@ -649,6 +653,7 @@ impl Shell {
                     )),
                     KeyCode::Backspace => out.push(ShellEvent::VolumeReset),
                     KeyCode::Enter => out.push(ShellEvent::VolumeModeToggle),
+                    KeyCode::Char(' ') => out.push(ShellEvent::VolumeMute),
                     _ => {}
                 }
             }
@@ -1331,6 +1336,71 @@ mod tests {
         );
         s.handle(key(KeyCode::Esc));
         assert!(s.dialog.is_none());
+    }
+
+    /// Turn a key-line token into the key events it stands for.
+    fn keys_for(token: &str) -> Vec<KeyEvent> {
+        token
+            .split_whitespace()
+            .map(|k| match k {
+                "↑" => key(KeyCode::Up),
+                "↓" => key(KeyCode::Down),
+                "←" => key(KeyCode::Left),
+                "→" => key(KeyCode::Right),
+                "Enter" => key(KeyCode::Enter),
+                "Space" => key(KeyCode::Char(' ')),
+                "Tab" => key(KeyCode::Tab),
+                "Backspace" => key(KeyCode::Backspace),
+                "Esc" => key(KeyCode::Esc),
+                "Ctrl-P" => KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                "Ctrl-S" => KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                "Ctrl-D" => KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                "Ctrl-Z" => KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+                "Ctrl-Y" => KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                other => {
+                    let c = other.chars().next().unwrap();
+                    assert_eq!(other.chars().count(), 1, "unknown key token {other}");
+                    key(KeyCode::Char(c))
+                }
+            })
+            .collect()
+    }
+
+    /// A key that is advertised must do something: produce an event, move
+    /// focus, or open an overlay. This is the test the old interface lacked,
+    /// where the Surfaces panel advertised four keys it did not bind.
+    #[test]
+    fn every_advertised_key_is_handled() {
+        let regions: Vec<(Focus, &[KeyHelp])> = vec![
+            (Focus::Sidebar, SIDEBAR_KEYS),
+            (Focus::Footer(FooterRow::Volume), FOOTER_KEYS),
+            (Focus::Legend, LEGEND_KEYS),
+            (Focus::Sidebar, GLOBAL_KEYS),
+        ];
+        for (focus, keys) in regions {
+            for help in keys {
+                for k in keys_for(help.key) {
+                    let (mut s, _) = shell(120, 40);
+                    s.focus = focus;
+                    // Start every cursor mid-range so a boundary no-op is not
+                    // mistaken for a missing binding.
+                    s.sidebar_cursor = 10;
+                    s.model.selection = Selection::Output(2);
+                    s.strip_cursor = 1;
+                    s.legend_cursor = 3;
+                    let before = (s.focus, s.help, s.legend_cursor, s.strip_cursor);
+                    let events = s.handle(k);
+                    let after = (s.focus, s.help, s.legend_cursor, s.strip_cursor);
+                    assert!(
+                        !events.is_empty() || before != after,
+                        "{:?} does nothing in {:?} (from {:?})",
+                        k.code,
+                        focus,
+                        help.key
+                    );
+                }
+            }
+        }
     }
 
     #[test]

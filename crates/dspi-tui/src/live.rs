@@ -715,6 +715,10 @@ impl Live {
                 };
                 self.set(session, path, &[], Value::Float(0.0));
             }
+            ShellEvent::VolumeMute => {
+                let muted = self.state.user_volume().1;
+                self.set(session, "vol.mute", &[], Value::Bool(!muted));
+            }
             ShellEvent::VolumeModeToggle => {
                 self.shell.model.volume_mode = match self.shell.model.volume_mode {
                     VolumeMode::User => VolumeMode::Master,
