@@ -283,6 +283,11 @@ producing `docs/plan/audit.md`. Fable then audits: (1) `DeviceState` and
 the notification path, (2) the Control Surfaces pages, (3) the theme, graph
 and legend. Then HW-3.
 
+### Progress (2026-08-28)
+
+Merged on `console-parity`: Phases 0, 1, 2A, 2B, 2C, 3 and 4. Running:
+Phases 5 and 6. Waiting: HW-1 (a device), then 7A, 7B, 8, 9, 10.
+
 ## 3. Hardware checkpoints
 
 The Terminal will pause and ask for a device at these points. Everything
@@ -307,24 +312,24 @@ Tick when merged and golden-tested.
 
 | # | Console | Terminal | Phase | Done |
 |---|---|---|---|---|
-| S1 | Sidebar INPUTS rows: meter, clip, pill, rename, copy/paste | Sidebar | 4 | |
-| S2 | Sidebar OUTPUTS rows + identify + muted dimming | Sidebar | 4 | |
-| S3 | Quick-access strip (8 actions) | Sidebar footer key row | 4 | |
-| S4 | Preset row: pick, `*` dirty, save/rename/default/copy-to/clear/clear-all | Sidebar | 4, 8 | |
-| S5 | Source row | Sidebar | 4 | |
-| S6 | Volume: user (sqrt taper) and master (piecewise taper), mode menu, reset | Sidebar | 4 | |
-| S7 | CPU C0/C1 red > 90 % | Sidebar | 4 | |
-| S8 | Connection dot, "No Devices", device picker, reconnect | Title bar | 4 | |
-| D1 | Overview cards (stereo gradient, delay, 10 rows, type codes) | Detail: Overview | 4 | |
-| I1 | Input page: link pill + mismatch prompt, preamp, clear PEQ | Detail: Input | 4 | |
-| I2 | Filter list: all PEQ types, bypass, ValueField semantics, header/footer | Detail | 4 | |
-| I3 | Linkwitz Transform popover with DC boost warning, staged Apply | Detail | 4 | |
-| O1 | Output page: routing panel, gain, delay (42/85), mute | Detail: Output | 4 | |
-| O2 | PEQ / XO tabs, crossover rows (family / type / slope / freq) | Detail | 4 | |
-| O3 | Enable All / Bypass All (tweeter warning), Clear All | Detail | 4 | |
-| G1 | Graph: grid, labels, adaptive dB step, phase overlay, zoom, height | Graph | 3 | |
-| G2 | Legend pills, identical-curve grouping, dashed unselected | Graph | 3 | |
-| G3 | Graph pop-out with independent visibility | Graph panel `g` | 3 | |
+| S1 | Sidebar INPUTS rows: meter, clip, pill, rename, copy/paste | Sidebar | 4| yes |
+| S2 | Sidebar OUTPUTS rows + identify + muted dimming | Sidebar | 4| yes |
+| S3 | Quick-access strip (8 actions) | Sidebar footer key row | 4| yes |
+| S4 | Preset row: pick, `*` dirty, save/rename/default/copy-to/clear/clear-all | Sidebar | 4, 8| yes |
+| S5 | Source row | Sidebar | 4| yes |
+| S6 | Volume: user (sqrt taper) and master (piecewise taper), mode menu, reset | Sidebar | 4| yes |
+| S7 | CPU C0/C1 red > 90 % | Sidebar | 4| yes |
+| S8 | Connection dot, "No Devices", device picker, reconnect | Title bar | 4| partly: picker pending (Phase 8) |
+| D1 | Overview cards (stereo gradient, delay, 10 rows, type codes) | Detail: Overview | 4| yes |
+| I1 | Input page: link pill + mismatch prompt, preamp, clear PEQ | Detail: Input | 4| yes |
+| I2 | Filter list: all PEQ types, bypass, ValueField semantics, header/footer | Detail | 4| yes |
+| I3 | Linkwitz Transform popover with DC boost warning, staged Apply | Detail | 4| yes |
+| O1 | Output page: routing panel, gain, delay (42/85), mute | Detail: Output | 4| yes |
+| O2 | PEQ / XO tabs, crossover rows (family / type / slope / freq) | Detail | 4| yes |
+| O3 | Enable All / Bypass All (tweeter warning), Clear All | Detail | 4| yes |
+| G1 | Graph: grid, labels, adaptive dB step, phase overlay, zoom, height | Graph | 3| yes |
+| G2 | Legend pills, identical-curve grouping, dashed unselected | Graph | 3| yes |
+| G3 | Graph pop-out with independent visibility | Graph panel `g` | 3| yes |
 | M1 | Matrix: crosspoints, INV, trim, Direct 1:1, Clear | Matrix panel | 5 | |
 | M2 | Matrix output rows ENABLE / GAIN / DELAY / MUTE, conflicts | Matrix panel | 5 | |
 | X1 | Crossfeed panel | Tool panel | 6 | |
@@ -341,8 +346,8 @@ Tick when merged and golden-tested.
 | F2 | Import / Export Device Configuration with options and report | same | 8 | |
 | F3 | Save Master Volume, Save Output Configuration | Tools | 8 | |
 | K1 | Commit, Revert to Saved, Factory Reset, Firmware Update (bootloader) | Tools | 8 | |
-| K2 | Unsaved-changes prompt on preset switch / device switch / quit | Everywhere | 2A, 8 | |
-| K3 | Channel clipboard | Sidebar, Matrix | 4, 5 | |
+| K2 | Unsaved-changes prompt on preset switch / device switch / quit | Everywhere | 2A, 8| partly: quit and preset switch done; device switch pending |
+| K3 | Channel clipboard | Sidebar, Matrix | 4, 5| yes |
 | P1 | Settings shell: groups, gating, back/forward, save bar, revert | Settings | 7A | |
 | P2 | Overview pin map with roles | Settings | 7A | |
 | P3 | About | Settings | 7A | |
@@ -358,10 +363,10 @@ Tick when merged and golden-tested.
 | C3 | Display wiring, config, pages | Settings | 7B | |
 | C4 | Channel Groups | Settings | 7B | |
 | C5 | Macros | Settings | 7B | |
-| L1 | Notifications applied live (EQ, names, volume, source, and all of V28) | Session | 2A | |
-| L2 | Multi-device: list, switch with prompt, generation scoping | Session | 2A, 4 | |
-| V1 | Console palette, channel colour everywhere, semantic colours | Theme | 3 | |
-| V2 | Disabled / unsupported presentation rules | Widgets | 3 | |
+| L1 | Notifications applied live (EQ, names, volume, source, and all of V28) | Session | 2A| yes |
+| L2 | Multi-device: list, switch with prompt, generation scoping | Session | 2A, 4| partly: list done; switch pending |
+| V1 | Console palette, channel colour everywhere, semantic colours | Theme | 3| yes |
+| V2 | Disabled / unsupported presentation rules | Widgets | 3| yes |
 | Q1 | 80x24 and 200x60 layouts, help overlay, animation, `--lite` | Shell | 9 | |
 
 Not carried over, with reasons: the `STM32H723` platform (a separate
