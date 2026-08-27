@@ -314,6 +314,11 @@ enum AppDialog {
     PresetRename(u8),
     PresetClear(u8),
     PresetClearAll,
+    /// The Console's Core 1 collision prompt; `index` is the output to enable
+    /// once the other side has been let go.
+    Core1 {
+        index: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -560,6 +565,14 @@ impl Live {
             self.note(format!("unknown parameter {path}"));
             return;
         };
+        // Enabling an output goes through the Core 1 interlock, which may
+        // need the Console's confirmation before the other side is freed.
+        if path == "out.enable"
+            && let (Some(&index), Some(enable)) = (indices.first(), value.as_bool())
+        {
+            self.enable_output(session, index, enable);
+            return;
+        }
         let cmd = dspi_cmd::Command::Set {
             path: desc.path,
             indices: indices.to_vec(),
@@ -600,6 +613,55 @@ impl Live {
             if !line.trim().is_empty() {
                 self.run_command(session, line);
             }
+        }
+    }
+
+    fn enable_output(&mut self, session: &mut Session, index: u8, enable: bool) {
+        match session.enable_output(index, enable) {
+            Ok(dspi_session::EnableOutcome::Done) => {
+                self.echo(format!(
+                    ":out.enable {} {}",
+                    index + 1,
+                    if enable { "on" } else { "off" }
+                ));
+                self.refresh(session);
+            }
+            Ok(dspi_session::EnableOutcome::NeedsConfirm(c)) => {
+                self.dialog = Some((
+                    AppDialog::Core1 { index },
+                    Dialog::confirm(
+                        c.title,
+                        c.body,
+                        vec![Button::destructive(c.confirm), Button::new("Cancel")],
+                    ),
+                ));
+            }
+            Ok(dspi_session::EnableOutcome::Rejected) => {
+                self.note("The device kept the output as it was")
+            }
+            Err(e) => self.note(e.to_string()),
+        }
+    }
+
+    fn undo(&mut self, session: &mut Session, redo: bool) {
+        let result = if redo { session.redo() } else { session.undo() };
+        match result {
+            Ok(Some(u)) => {
+                match u.command {
+                    Some(c) => self.echo(format!("{} {c}", if redo { "redo:" } else { "undo:" })),
+                    None => self.note("Nothing reversible to undo"),
+                }
+                if !u.skipped.is_empty() {
+                    self.note(format!("Skipped {}", u.skipped.join("; ")));
+                }
+                self.refresh(session);
+            }
+            Ok(None) => self.note(if redo {
+                "Nothing to redo"
+            } else {
+                "Nothing to undo"
+            }),
+            Err(e) => self.note(e.to_string()),
         }
     }
 
@@ -659,9 +721,11 @@ impl Live {
                     Err(e) => self.note(e.to_string()),
                 }
             }
-            dspi_cmd::Command::Verb { name, .. } => {
-                self.note(format!("`{name}` only works from the shell"))
-            }
+            dspi_cmd::Command::Verb { name, .. } => match name.as_str() {
+                "undo" => self.undo(session, false),
+                "redo" => self.undo(session, true),
+                other => self.note(format!("`{other}` only works from the shell")),
+            },
         }
     }
 
@@ -836,7 +900,8 @@ impl Live {
                 ));
             }
             ShellEvent::DevicePicker => self.note("One device connected"),
-            ShellEvent::Undo | ShellEvent::Redo => self.note("Undo arrives with Phase 2C"),
+            ShellEvent::Undo => self.undo(session, false),
+            ShellEvent::Redo => self.undo(session, true),
             ShellEvent::Quit => {
                 if self.state.has_unsaved_changes() {
                     self.dialog = Some((
@@ -973,6 +1038,16 @@ impl Live {
             (AppDialog::PresetClear(slot), DialogOutcome::Button(0)) => {
                 self.clear_preset(session, slot);
                 self.refresh_presets(session);
+            }
+            (AppDialog::Core1 { index }, DialogOutcome::Button(0)) => {
+                match session.enable_output_confirmed(index) {
+                    Ok(dspi_session::EnableOutcome::Done) => {
+                        self.echo(format!(":out.enable {} on", index + 1));
+                        self.refresh(session);
+                    }
+                    Ok(_) => self.note("The device kept the output as it was"),
+                    Err(e) => self.note(e.to_string()),
+                }
             }
             (AppDialog::PresetClearAll, DialogOutcome::Button(0)) => {
                 for slot in 0..presets::SLOTS as u8 {
