@@ -1,12 +1,12 @@
-# `WireBulkParams` V26 wire format
+# `WireBulkParams` V28 wire format
 
 *Derived from `crates/dspi-proto/firmware/bulk_params.h`, vendored from
-`WeebLabs/DSPi` `release/v1.1.5` @ `9776c2f`.*
+`WeebLabs/DSPi` `release/v1.1.6` @ `112f35b`.*
 
 This document exists because **no released documentation describes this layout**.
 `DSPi/Documentation/commands.md` §13 documents wire format **V14 at 3664 bytes**
 with a "Master L / Master R" channel model, which the firmware abandoned at V16.
-It is twelve versions stale. This file is derived from the header and is
+It is fourteen versions stale. This file is derived from the header and is
 regenerated-checked by `dspi-proto`'s offset test, so it cannot silently drift.
 
 Writing style note: this doc avoids em-dashes, per project convention.
@@ -26,7 +26,7 @@ Writing style note: this doc avoids em-dashes, per project convention.
 Consequences for a host, and they are strict:
 
 - **`SET_ALL_PARAMS` (0xA1) is all-or-nothing.** You may only bulk-write a packet
-  that is exactly V26 and exactly 5944 bytes. There is no "send a prefix and let
+  that is exactly V28 and exactly 5944 bytes. There is no "send a prefix and let
   older fields default" path, and no forward compatibility on write.
 - **Never bulk-write to a device whose `format_version` you do not implement.**
   Fall back to individual `SET_*` opcodes, which are version-independent, or
@@ -52,7 +52,7 @@ buy us cross-version bulk writes. Those do not exist.
 | `WIRE_MAX_PIN_OUTPUTS` | 5 | 4 S/PDIF + 1 PDM |
 | `WIRE_MAX_SPDIF_INSTANCES` | 4 | |
 | `WIRE_NAME_LEN` | 32 | channel and preset names |
-| `WIRE_FORMAT_VERSION` | **26** | |
+| `WIRE_FORMAT_VERSION` | **28** | |
 | `sizeof(WireBulkParams)` | **5944** | |
 
 Channel index space is `[inputs 0..7][outputs 8..16]` on RP2350 and
@@ -81,7 +81,7 @@ throughout; floats are IEEE 754 single-precision at 4-byte-aligned offsets.
 | 12 | 4648 | 20 | `leveller` | u8 enabled; u8 speed; u8 lookahead; u8 rsv; f32 amount; f32 max_gain_db; f32 gate_threshold_db; u8 detector_mask (V18+); u8 apply_mask (V18+); u8 rsv2[2] |
 | 13 | 4668 | 32 | `preamp` | f32 preamp_db[8] |
 | 14 | 4700 | 16 | `master_volume` | f32 master_volume_db (-128 = mute); u8 rsv[12] |
-| 15 | 4716 | 16 | `input_config` | see §5.2 |
+| 15 | 4716 | 16 | `input_config` | see §5.2; **shape changed at V28, size did not** |
 | 16 | 4732 | 16 | `lg_sound_sync` | u8 enabled; u8 present (ro); u8 volume (ro); u8 muted (ro); u8 rsv[12] |
 | 17 | 4748 | 16 | `user_volume` | f32 user_volume_db; u8 user_mute; u8 rsv[11] |
 | 18 | 4764 | 16 | `dac_hw_mute` | u8 enabled; u8 active_low; u8 pin (0xFF = none); u8 rsv0; u16 hold_ms; u16 release_ms; u8 rsv[8] |
@@ -113,7 +113,7 @@ Band index is implicit in array position: row = channel, column = band.
 
 | Offset | Type | Field |
 |---:|---|---|
-| 0 | u8 | `format_version` (26) |
+| 0 | u8 | `format_version` (28) |
 | 1 | u8 | `platform_id` (0 = RP2040, 1 = RP2350) |
 | 2 | u8 | `num_channels` (7 or 17) |
 | 3 | u8 | `num_output_channels` (5 or 9) |
@@ -141,8 +141,8 @@ report the wrong thing.** Getting this wrong silently disables inputs.
 | `i2s_config` | `bck_pin_slave` | 0 = absent, keep live |
 | `input_config` | `i2s_input_channels` | 0 = absent; else 2/4/6/8 |
 | `input_config` | `i2s_rx_pin_ext[3]` | 0 = unset (pairs 1..3) |
-| `input_config` | `spdif_rx_pin_ext[2]` | 0 = absent, keep live |
-| `input_config` | `spdif_rx_enabled_ext_p1` | 0 = absent; 1 = both disabled; 2 = S/PDIF 2; 3 = both |
+| `input_config` | `spdif_rx_pin_ext[3]` | 0 = absent, keep live (S/PDIF 2..4; **was `[2]` before V28**) |
+| `input_config` | `spdif_rx_enabled_ext_p1` | 0 = absent; else mask + 1, bit 0 = S/PDIF 2 (1 = all disabled, 2 = S/PDIF 2, 8 = S/PDIF 2+3+4) |
 | `input_config` | `adat_input_pin` | 0 = absent, keep live |
 | `input_config` | `adat_input_enabled_p1` | 0 = absent; 1 = disabled; 2 = enabled |
 | `input_config` | `adat_clock_mode_p1` | 0 = absent; 1 = master; 2 = slave |
@@ -162,12 +162,34 @@ u8 bck_pin_slave; u8 rsv[6].
 Note `mck_multiplier` here is the literal value 128 or 256 truncated into a byte,
 whereas the vendor command `0xC9` returns an encoded 0 or 1. Do not confuse them.
 
-### 5.2 `input_config` (16 B @ 4716)
+### 5.2 `input_config` (16 B @ 4716) - changed at V28
 
-u8 input_source; u8 spdif_rx_pin; u8 i2s_rx_pin (pair 0); u8 i2s_input_rate
-(0 = 44100, 1 = 48000, 2 = 96000); u8 i2s_input_channels; u8 i2s_rx_pin_ext[3];
-u8 spdif_rx_pin_ext[2]; u8 spdif_rx_enabled_ext_p1; u8 i2s_clock_mode;
-u8 adat_input_pin; u8 adat_input_enabled_p1; u8 adat_clock_mode_p1; u8 rsv[1].
+**This is the V28 change, and it is the dangerous kind: the section is still 16
+bytes and the packet is still 5944, so no size check can see it.** V28 added a
+fourth selectable S/PDIF input, growing `spdif_rx_pin_ext` from two entries to
+three. Every field below it moved down one byte and the section's last reserved
+byte was consumed; there are no reserved bytes left.
+
+| Offset | Type | Field | V26 offset |
+|---:|---|---|---:|
+| 0 | u8 | `input_source` | 0 |
+| 1 | u8 | `spdif_rx_pin` | 1 |
+| 2 | u8 | `i2s_rx_pin` (pair 0) | 2 |
+| 3 | u8 | `i2s_input_rate` (0 = 44100, 1 = 48000, 2 = 96000) | 3 |
+| 4 | u8 | `i2s_input_channels` (2/4/6/8; 0 = absent) | 4 |
+| 5 | u8[3] | `i2s_rx_pin_ext` (pairs 1..3) | 5 |
+| 8 | u8[**3**] | `spdif_rx_pin_ext` (S/PDIF 2..4) | 8, but **`[2]`** |
+| 11 | u8 | `spdif_rx_enabled_ext_p1` | 10 |
+| 12 | u8 | `i2s_clock_mode` (0 = master, 1 = slave) | 11 |
+| 13 | u8 | `adat_input_pin` | 12 |
+| 14 | u8 | `adat_input_enabled_p1` | 13 |
+| 15 | u8 | `adat_clock_mode_p1` | 14 |
+| | | *(V26 had one reserved byte at 15)* | 15 |
+
+A pre-V28 decoder run against a V28 packet reads the S/PDIF enable mask as the
+I2S clock mode, the clock mode as the ADAT pin, and so on down the section. The
+offsets are pinned by name in `wire.rs`'s
+`the_v28_input_config_offsets_are_where_the_header_puts_them`.
 
 ### 5.3 `psybass` (24 B @ 5876, V23+)
 
