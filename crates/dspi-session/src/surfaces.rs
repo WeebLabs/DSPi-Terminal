@@ -1107,6 +1107,9 @@ mod tests {
             max_groups: 1,
             max_macros: 1,
             max_macro_steps: 8,
+            max_pages: 16,
+            display_models: 8,
+            types: Vec::new(),
         };
         let mut t = MockTransport::new()
             .data(op::REQ_GET_CS_BINDING, vec![0u8; 24])

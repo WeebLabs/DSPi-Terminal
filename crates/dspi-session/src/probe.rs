@@ -75,6 +75,14 @@ pub struct ControlSurfaceCaps {
     pub max_macros: u8,
     /// `CS_MAX_MACRO_STEPS`, added at caps v9.
     pub max_macro_steps: u8,
+    /// `CS_MAX_DISPLAY_PAGES`, from `REQ_GET_CS_DISPLAY_CFG` (caps v10); it
+    /// is published nowhere else. Zero before v10.
+    pub max_pages: u8,
+    /// How many display models the firmware knows (caps v10).
+    pub display_models: u8,
+    /// The per-type capability rows, in `CsType` order.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub types: Vec<dspi_proto::packets::CsTypeDesc>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +309,22 @@ fn probe_cs_caps(t: &mut dyn Transport) -> Option<ControlSurfaceCaps> {
         .control_in(op::REQ_GET_CS_CAPS, 0xFFFF, full_len as u16)
         .unwrap_or_default();
     let at = |i: usize| full.get(post_table + i).copied().unwrap_or(0);
+    let types = dspi_proto::packets::CsCapsHeader::decode(&full)
+        .map(|h| h.types)
+        .unwrap_or_default();
+
+    // The display page limit lives in the display config reply, not the caps
+    // header (control_surfaces.h, REQ_GET_CS_DISPLAY_CFG: 16 bytes with
+    // `max_pages` and `model_count` ahead of the 12-byte config).
+    let (max_pages, display_models) = if caps_version >= 10 {
+        t.control_in(op::REQ_GET_CS_DISPLAY_CFG, 0, 16)
+            .ok()
+            .and_then(|d| dspi_proto::packets::CsDisplayCfgReply::decode(&d).ok())
+            .map(|r| (r.max_pages, r.model_count))
+            .unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
 
     Some(ControlSurfaceCaps {
         caps_version,
@@ -311,6 +335,9 @@ fn probe_cs_caps(t: &mut dyn Transport) -> Option<ControlSurfaceCaps> {
         max_groups: at(1),
         max_macros: at(2),
         max_macro_steps: at(3),
+        max_pages,
+        display_models,
+        types,
     })
 }
 
