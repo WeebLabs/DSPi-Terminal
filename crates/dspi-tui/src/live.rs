@@ -1,0 +1,1183 @@
+//! The shell, wired to a device.
+//!
+//! `Live` owns the shell, the device state and the session, and runs the
+//! event loop: keys go to the shell, the shell's events become writes, meter
+//! polls and notifications update the state, and the state is projected back
+//! into the shell's model every frame. The command line and the palette live
+//! here too, since they need the device.
+//!
+//! Screens (the detail region, the tool panels, Settings) come from a
+//! [`Screens`] factory so the phases that build them plug in without touching
+//! the loop.
+
+use std::io;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
+use dspi_cmd::{Candidate, Context};
+use dspi_proto::dsp;
+use dspi_proto::value::Value;
+use dspi_session::{Applied, DeviceState, Notifications, Outcome, Session, Source};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Widget};
+
+use crate::app::Performance;
+use crate::graph::GraphCurve;
+use crate::shell::{
+    ChannelItem, Placeholder, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
+};
+use crate::theme::{ChannelRole, Glyphs, Theme};
+use crate::widgets::text::truncate;
+use crate::widgets::{Button, Dialog, DialogOutcome, PeakHold, PopupList};
+
+/// Makes the screens the shell shows. The default makes placeholders; later
+/// phases replace it.
+pub trait Screens {
+    fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen>;
+    fn tool(&self, state: &DeviceState, tool: Tool) -> Box<dyn Screen>;
+    fn settings(&self, state: &DeviceState) -> Box<dyn Screen>;
+}
+
+pub struct PlaceholderScreens;
+
+impl Screens for PlaceholderScreens {
+    fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen> {
+        let (title, body) = match selection {
+            Selection::Overview => (
+                "Overview".to_string(),
+                "The dashboard cards arrive in Phase 4.".to_string(),
+            ),
+            Selection::Input(i) => (
+                state.channel_name(i),
+                "The input page arrives in Phase 4.".into(),
+            ),
+            Selection::Output(o) => (
+                state.channel_name(state.caps.num_inputs as usize + o),
+                "The output page arrives in Phase 4.".into(),
+            ),
+        };
+        Box::new(Placeholder::new(title, body))
+    }
+
+    fn tool(&self, _state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
+        Box::new(Placeholder::new(
+            tool.title(),
+            "This panel arrives in a later phase.",
+        ))
+    }
+
+    fn settings(&self, _state: &DeviceState) -> Box<dyn Screen> {
+        Box::new(Placeholder::new("Settings", "Settings arrive in Phase 7."))
+    }
+}
+
+/// The `:` line and the `Ctrl-P` palette.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Prompt {
+    pub palette: bool,
+    pub input: String,
+    pub candidates: Vec<Candidate>,
+    pub index: usize,
+}
+
+impl Prompt {
+    pub fn new(palette: bool, ctx: &Context) -> Self {
+        let mut p = Self {
+            palette,
+            input: String::new(),
+            candidates: Vec::new(),
+            index: 0,
+        };
+        p.refresh(ctx);
+        p
+    }
+
+    pub fn refresh(&mut self, ctx: &Context) {
+        let ends_with_space = self.input.ends_with(' ');
+        let mut tokens: Vec<&str> = self.input.split_whitespace().collect();
+        let partial = if ends_with_space {
+            ""
+        } else {
+            tokens.pop().unwrap_or("")
+        };
+        self.candidates = dspi_cmd::complete(&tokens, partial, ctx);
+        self.index = 0;
+    }
+
+    /// Returns `Some(line)` on Enter, `Some("")` on Escape.
+    pub fn handle(&mut self, key: KeyEvent, ctx: &Context) -> Option<String> {
+        match key.code {
+            KeyCode::Esc => Some(String::new()),
+            KeyCode::Enter => Some(std::mem::take(&mut self.input)),
+            KeyCode::Tab => {
+                if let Some(c) = self.candidates.get(self.index)
+                    && !c.value.is_empty()
+                {
+                    let mut tokens: Vec<&str> = self.input.split_whitespace().collect();
+                    if !self.input.ends_with(' ') {
+                        tokens.pop();
+                    }
+                    let mut next = tokens.join(" ");
+                    if !next.is_empty() {
+                        next.push(' ');
+                    }
+                    next.push_str(&c.value);
+                    next.push(' ');
+                    self.input = next;
+                    self.refresh(ctx);
+                }
+                None
+            }
+            KeyCode::Down => {
+                if !self.candidates.is_empty() {
+                    self.index = (self.index + 1) % self.candidates.len();
+                }
+                None
+            }
+            KeyCode::Up => {
+                if !self.candidates.is_empty() {
+                    self.index = self
+                        .index
+                        .checked_sub(1)
+                        .unwrap_or(self.candidates.len() - 1);
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+                self.refresh(ctx);
+                None
+            }
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.refresh(ctx);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn draw(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        let height = (self.candidates.len().min(8) as u16 + 3).min(area.height);
+        let rect = Rect::new(
+            area.x + 2,
+            area.y + area.height.saturating_sub(height + 2),
+            area.width.saturating_sub(4),
+            height,
+        );
+        Clear.render(rect, buf);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(if theme.glyphs == Glyphs::Ascii {
+                BorderType::Plain
+            } else {
+                BorderType::Rounded
+            })
+            .border_style(Style::default().fg(theme.accent))
+            .title(if self.palette {
+                " Search "
+            } else {
+                " Command "
+            })
+            .title_style(theme.title());
+        let inner = block.inner(rect);
+        block.render(rect, buf);
+        let prompt = if self.palette { "› " } else { ":" };
+        buf.set_string(inner.x, inner.y, prompt, Style::default().fg(theme.accent));
+        let px = inner.x + prompt.chars().count() as u16;
+        buf.set_string(
+            px,
+            inner.y,
+            &self.input,
+            Style::default().add_modifier(Modifier::BOLD),
+        );
+        buf.set_string(
+            px + self.input.chars().count() as u16,
+            inner.y,
+            "▏",
+            Style::default().fg(theme.accent),
+        );
+        for (i, c) in self
+            .candidates
+            .iter()
+            .take(inner.height as usize - 1)
+            .enumerate()
+        {
+            let y = inner.y + 1 + i as u16;
+            let style = if i == self.index {
+                theme.focused()
+            } else {
+                theme.value()
+            };
+            if c.value.is_empty() {
+                buf.set_string(
+                    inner.x,
+                    y,
+                    truncate(&format!("  {}", c.detail), inner.width as usize),
+                    theme.label(),
+                );
+            } else {
+                buf.set_string(
+                    inner.x,
+                    y,
+                    format!("  {:<24}", truncate(&c.value, 24)),
+                    style,
+                );
+                buf.set_string(
+                    inner.x + 26,
+                    y,
+                    truncate(&c.detail, (inner.width as usize).saturating_sub(26)),
+                    theme.label(),
+                );
+            }
+        }
+    }
+}
+
+/// Which app-level dialog is up, so its outcome is routed here rather than
+/// to a screen.
+#[derive(Debug, Clone, PartialEq)]
+enum AppDialog {
+    /// Quit, or switch to `Some(slot)`, after saving or discarding.
+    Unsaved {
+        then: PendingAction,
+    },
+    SavePreset,
+    Rename {
+        channel: usize,
+    },
+    PresetList,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PendingAction {
+    Quit,
+    LoadPreset(u8),
+}
+
+pub struct Live {
+    pub shell: Shell,
+    pub state: DeviceState,
+    pub perf: Performance,
+    pub ctx: Context,
+    pub prompt: Option<Prompt>,
+    dialog: Option<(AppDialog, Dialog)>,
+    popup: Option<(AppDialog, PopupList)>,
+    status_until: Option<Instant>,
+    peaks: Vec<PeakHold>,
+    visible: Vec<bool>,
+    screens: Box<dyn Screens>,
+    pub should_quit: bool,
+    last_tick: Instant,
+}
+
+impl Live {
+    pub fn new(
+        state: DeviceState,
+        theme: Theme,
+        perf: Performance,
+        screens: Box<dyn Screens>,
+    ) -> Self {
+        let caps = &state.caps;
+        let ctx = Context {
+            channel_slugs: caps.channels.iter().map(|c| c.slug.clone()).collect(),
+            num_inputs: caps.num_inputs,
+            num_outputs: caps.num_outputs,
+            max_bands: caps.max_bands,
+        };
+        let n = caps.num_channels as usize;
+        let mut model = ShellModel::empty();
+        model.selection = Selection::Overview;
+        let detail = screens.detail(&state, Selection::Overview);
+        let shell = Shell::new(model, theme, detail);
+        let mut live = Self {
+            shell,
+            state,
+            perf,
+            ctx,
+            prompt: None,
+            dialog: None,
+            popup: None,
+            status_until: None,
+            peaks: vec![PeakHold::default(); n],
+            visible: vec![true; n],
+            screens,
+            should_quit: false,
+            last_tick: Instant::now(),
+        };
+        live.sync_model();
+        live
+    }
+
+    /// Project the device state into the shell's model.
+    pub fn sync_model(&mut self) {
+        let s = &self.state;
+        let caps = &s.caps;
+        let t = &self.shell.theme;
+        let m = &mut self.shell.model;
+        let (ni, no) = (caps.num_inputs as usize, caps.num_outputs as usize);
+        m.platform = format!("{:?}", caps.platform).to_uppercase();
+        m.firmware = caps.firmware.clone();
+        m.serial_short = if caps.serial.len() > 8 {
+            caps.serial[caps.serial.len() - 8..].to_string()
+        } else {
+            caps.serial.clone()
+        };
+        m.connected = true;
+        m.preset_label = match caps.active_preset {
+            Some(p) => format!("Preset {}", p + 1),
+            None => "Empty".into(),
+        };
+        m.preset_dirty = s.has_unsaved_changes();
+
+        let item =
+            |ch: usize, role: ChannelRole, inactive: bool, peaks: &[PeakHold], visible: &[bool]| {
+                ChannelItem {
+                    name: {
+                        let n = s.channel_name(ch);
+                        if n.is_empty() {
+                            role.descriptor(no as u8)
+                        } else {
+                            n
+                        }
+                    },
+                    descriptor: role.descriptor(no as u8),
+                    role,
+                    color: t.role_color(role),
+                    level: s.meters.peaks.get(ch).copied().unwrap_or(0.0),
+                    peak: peaks.get(ch).map(|p| p.peak).unwrap_or(0.0),
+                    clipped: s.is_clipped(ch),
+                    visible: visible.get(ch).copied().unwrap_or(true),
+                    inactive,
+                    index: ch as u8,
+                }
+            };
+        m.inputs = (0..ni)
+            .map(|i| {
+                item(
+                    i,
+                    ChannelRole::Input(i as u8),
+                    false,
+                    &self.peaks,
+                    &self.visible,
+                )
+            })
+            .collect();
+        m.outputs = (0..no)
+            .map(|o| {
+                let out = s.output(o);
+                let role = ChannelRole::of((ni + o) as u8, ni as u8, no as u8);
+                item(
+                    ni + o,
+                    role,
+                    !out.enabled || out.mute,
+                    &self.peaks,
+                    &self.visible,
+                )
+            })
+            .collect();
+
+        let g = s.global();
+        m.strip[1].state = Some(s.crossfeed().enabled);
+        m.strip[2].state = Some(g.loudness_enabled);
+        m.strip[3].state = Some(s.leveller().enabled);
+        m.strip[4].state = Some(s.psybass().enabled);
+        m.strip[7].state = Some(g.bypass);
+
+        let source_supported = caps
+            .features
+            .iter()
+            .any(|f| f.name == "spdif_multi_input" && f.present)
+            || caps
+                .features
+                .iter()
+                .any(|f| f.name == "i2s_input_channels" && f.present);
+        m.source = if source_supported {
+            let choices: Vec<String> = vec![
+                "USB".into(),
+                "S/PDIF".into(),
+                "I2S".into(),
+                "ADAT".into(),
+                "S/PDIF 2".into(),
+                "S/PDIF 3".into(),
+                "S/PDIF 4".into(),
+            ];
+            let idx = s
+                .input_config()
+                .map(|c| c.input_source as usize)
+                .unwrap_or(0)
+                .min(choices.len() - 1);
+            Some((choices, idx))
+        } else {
+            None
+        };
+        m.volume_db = match m.volume_mode {
+            VolumeMode::User => s.user_volume().0 as f64,
+            VolumeMode::Master => s.master_volume_db() as f64,
+        };
+        m.cpu = (s.meters.cpu0, s.meters.cpu1);
+
+        // Curves: PEQ plus crossover bands, with output gain folded in.
+        let selected_index: Option<usize> = match m.selection {
+            Selection::Overview => None,
+            Selection::Input(i) => Some(i),
+            Selection::Output(o) => Some(ni + o),
+        };
+        let mut curves = Vec::with_capacity(ni + no);
+        for ch in 0..ni + no {
+            let mut bands: Vec<dsp::Band> = s
+                .bands(ch as u8)
+                .iter()
+                .map(|p| dsp::Band {
+                    filter_type: p.filter_type,
+                    freq: p.freq,
+                    q: p.q,
+                    gain_db: p.gain_db,
+                    bypass: p.bypass,
+                })
+                .collect();
+            let gain = if ch >= ni {
+                bands.extend(s.xover_bands(ch as u8).iter().map(|p| dsp::Band {
+                    filter_type: p.filter_type,
+                    freq: p.freq,
+                    q: p.q,
+                    gain_db: p.gain_db,
+                    bypass: p.bypass,
+                }));
+                s.output(ch - ni).gain_db as f64
+            } else {
+                0.0
+            };
+            let role = ChannelRole::of(ch as u8, ni as u8, no as u8);
+            curves.push(GraphCurve {
+                descriptor: role.descriptor(no as u8),
+                color: t.role_color(role),
+                magnitude: dsp::curve(&bands, gain),
+                phase: if selected_index == Some(ch) || m.graph.show_phase {
+                    Some(dsp::phase_curve(&bands))
+                } else {
+                    None
+                },
+                selected: selected_index == Some(ch),
+                visible: self.visible.get(ch).copied().unwrap_or(true),
+            });
+        }
+        m.curves = curves;
+    }
+
+    fn note(&mut self, text: impl Into<String>) {
+        self.shell.model.status = Some(text.into());
+        self.status_until = Some(Instant::now() + Duration::from_secs(3));
+    }
+
+    fn echo(&mut self, text: impl Into<String>) {
+        self.shell.model.echo = text.into();
+    }
+
+    /// Re-read the bulk packet and refresh the model.
+    pub fn refresh(&mut self, session: &mut Session) {
+        match session.snapshot() {
+            Ok(b) => self.state.replace_bulk(b),
+            Err(e) => self.note(e.to_string()),
+        }
+        self.sync_model();
+    }
+
+    /// Write one registry parameter, echoing the canonical command.
+    pub fn set(&mut self, session: &mut Session, path: &str, indices: &[u8], value: Value) {
+        let Some(desc) = dspi_proto::registry::by_path(path) else {
+            self.note(format!("unknown parameter {path}"));
+            return;
+        };
+        let cmd = dspi_cmd::Command::Set {
+            path: desc.path,
+            indices: indices.to_vec(),
+            value: value.clone(),
+        };
+        match session.write(path, indices, value) {
+            Ok(Outcome::Rejected { actual, .. }) => {
+                let shown = dspi_proto::registry::by_path(path)
+                    .map(|d| crate::fields::display_value(d, &actual))
+                    .unwrap_or_default();
+                self.note(format!("{path} was not applied; device kept {shown}"));
+            }
+            Ok(_) => {
+                self.echo(dspi_cmd::format(&cmd, &self.ctx));
+                self.refresh(session);
+            }
+            Err(e) => self.note(e.to_string()),
+        }
+    }
+
+    /// Run a typed command against the device.
+    pub fn run_command(&mut self, session: &mut Session, line: &str) {
+        let tokens = dspi_cmd::tokenize(line);
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let cmd = match dspi_cmd::parse(&refs, &self.ctx) {
+            Ok(c) => c,
+            Err(e) => {
+                self.note(e.to_string());
+                return;
+            }
+        };
+        match cmd {
+            dspi_cmd::Command::Set {
+                path,
+                ref indices,
+                ref value,
+            } => {
+                self.set(session, path, indices, value.clone());
+            }
+            dspi_cmd::Command::Get { path, ref indices } => match session.read(path, indices) {
+                Ok(v) => {
+                    let shown = dspi_proto::registry::by_path(path)
+                        .map(|d| crate::fields::display_value(d, &v))
+                        .unwrap_or_default();
+                    self.note(format!("{path} = {shown}"));
+                }
+                Err(e) => self.note(e.to_string()),
+            },
+            dspi_cmd::Command::SetBand {
+                channel,
+                band,
+                filter_type,
+                freq,
+                q,
+                gain,
+            } => {
+                let packet = dspi_proto::value::EqParamPacket {
+                    channel,
+                    band,
+                    filter_type: dspi_proto::FilterType::from_raw(filter_type),
+                    bypass: false,
+                    freq,
+                    q,
+                    gain_db: gain,
+                    qp: None,
+                };
+                match session.write_band(&packet) {
+                    Ok(Outcome::Rejected { .. }) => self.note("the band was not applied as sent"),
+                    Ok(_) => {
+                        self.echo(dspi_cmd::format(&cmd, &self.ctx));
+                        self.refresh(session);
+                    }
+                    Err(e) => self.note(e.to_string()),
+                }
+            }
+            dspi_cmd::Command::Verb { name, .. } => {
+                self.note(format!("`{name}` only works from the shell"))
+            }
+        }
+    }
+
+    fn select(&mut self, sel: Selection) {
+        self.shell.model.selection = sel;
+        self.shell.detail = self.screens.detail(&self.state, sel);
+        if let Some(row) = self.shell.model.row_of_selection() {
+            self.shell.sidebar_cursor = row;
+        }
+        self.sync_model();
+    }
+
+    /// Ask before losing unsaved changes, in the Console's words.
+    fn unsaved_dialog(&self) -> Dialog {
+        let diff = self.state.unsaved_diff();
+        let summary = dspi_session::PresetSnapshot::summary(&diff, 6);
+        Dialog::confirm(
+            "Unsaved Changes",
+            format!(
+                "The current preset has unsaved changes:\n\n{summary}\n\nSave before continuing?"
+            ),
+            vec![
+                Button::new("Save"),
+                Button::destructive("Discard"),
+                Button::new("Cancel"),
+            ],
+        )
+    }
+
+    fn save_active_preset(&mut self, session: &mut Session) -> bool {
+        let Some(slot) = self.state.caps.active_preset else {
+            self.note("No active preset slot");
+            return false;
+        };
+        match session.write("preset.save", &[slot], Value::Trigger) {
+            Ok(Outcome::Rejected { .. }) | Err(_) => {
+                self.note("Save Failed");
+                false
+            }
+            Ok(_) => {
+                self.state.mark_saved();
+                self.echo(format!(":preset.save {}", slot + 1));
+                self.sync_model();
+                true
+            }
+        }
+    }
+
+    fn load_preset(&mut self, session: &mut Session, slot: u8) {
+        match session.write("preset.load", &[slot], Value::Trigger) {
+            Ok(Outcome::Rejected { .. }) | Err(_) => self.note("Load Failed"),
+            Ok(_) => {
+                self.state.caps.active_preset = Some(slot);
+                self.refresh(session);
+                self.state.mark_saved();
+                self.echo(format!(":preset.load {}", slot + 1));
+                self.sync_model();
+            }
+        }
+    }
+
+    fn strip_path(&self, i: usize) -> Option<&'static str> {
+        match i {
+            1 => Some("cf.on"),
+            2 => Some("loud.on"),
+            3 => Some("lev.on"),
+            4 => Some("bass.on"),
+            7 => Some("bypass"),
+            _ => None,
+        }
+    }
+
+    fn strip_tool(&self, i: usize) -> Option<Tool> {
+        match i {
+            0 => Some(Tool::Matrix),
+            1 => Some(Tool::Crossfeed),
+            2 => Some(Tool::Loudness),
+            3 => Some(Tool::Leveller),
+            4 => Some(Tool::Psybass),
+            5 => Some(Tool::Stats),
+            _ => None,
+        }
+    }
+
+    /// Turn a shell event into device traffic or a state change.
+    pub fn handle_event(&mut self, session: &mut Session, ev: ShellEvent) {
+        match ev {
+            ShellEvent::Select(sel) => self.select(sel),
+            ShellEvent::ToggleVisible(row) => {
+                if let Some(v) = self.visible.get_mut(row) {
+                    *v = !*v;
+                }
+                self.sync_model();
+            }
+            ShellEvent::StripToggle(i) => {
+                if let Some(path) = self.strip_path(i) {
+                    let on = self.shell.model.strip[i].state.unwrap_or(false);
+                    self.set(session, path, &[], Value::Bool(!on));
+                }
+            }
+            ShellEvent::StripOpen(i) => {
+                if i == 6 {
+                    self.open_settings();
+                } else if let Some(tool) = self.strip_tool(i) {
+                    self.open_tool(tool);
+                }
+            }
+            ShellEvent::OpenTool(tool) => self.open_tool(tool),
+            ShellEvent::CloseTool => self.shell.close_tool(),
+            ShellEvent::OpenSettings => self.open_settings(),
+            ShellEvent::CloseSettings => self.shell.close_settings(),
+            ShellEvent::Preset(Some(delta)) => {
+                let cur = self.state.caps.active_preset.unwrap_or(0) as i32;
+                let next = (cur + delta).clamp(0, 9) as u8;
+                if next as i32 != cur {
+                    self.request_preset(session, next);
+                }
+            }
+            ShellEvent::Preset(None) => {
+                let items: Vec<String> = (1..=10).map(|n| format!("Preset {n}")).collect();
+                let cur = self.state.caps.active_preset.unwrap_or(0) as usize;
+                self.popup = Some((AppDialog::PresetList, PopupList::new("Preset", items, cur)));
+            }
+            ShellEvent::Source(Some(delta)) => {
+                if let Some((choices, idx)) = &self.shell.model.source {
+                    let next = (*idx as i32 + delta).clamp(0, choices.len() as i32 - 1) as u8;
+                    if next as usize != *idx {
+                        self.set(session, "in.source", &[], Value::Choice(next));
+                    }
+                }
+            }
+            ShellEvent::Source(None) => {}
+            ShellEvent::VolumeChanged(db) => {
+                let path = match self.shell.model.volume_mode {
+                    VolumeMode::User => "vol.user",
+                    VolumeMode::Master => "vol.master",
+                };
+                self.set(session, path, &[], Value::Float(db as f32));
+            }
+            ShellEvent::VolumeReset => {
+                let path = match self.shell.model.volume_mode {
+                    VolumeMode::User => "vol.user",
+                    VolumeMode::Master => "vol.master",
+                };
+                self.set(session, path, &[], Value::Float(0.0));
+            }
+            ShellEvent::VolumeModeToggle => {
+                self.shell.model.volume_mode = match self.shell.model.volume_mode {
+                    VolumeMode::User => VolumeMode::Master,
+                    VolumeMode::Master => VolumeMode::User,
+                };
+                self.sync_model();
+            }
+            ShellEvent::Command(c) => self.run_command(session, &c),
+            ShellEvent::Status(s) => self.note(s),
+            ShellEvent::Palette => self.prompt = Some(Prompt::new(true, &self.ctx)),
+            ShellEvent::CommandLine => self.prompt = Some(Prompt::new(false, &self.ctx)),
+            ShellEvent::SavePreset => {
+                let slot = self.state.caps.active_preset.map(|p| p + 1).unwrap_or(1);
+                self.dialog = Some((
+                    AppDialog::SavePreset,
+                    Dialog::confirm(
+                        "Save Preset",
+                        format!("Save current parameters to preset slot {slot}?"),
+                        vec![Button::new("Save"), Button::new("Cancel")],
+                    ),
+                ));
+            }
+            ShellEvent::DevicePicker => self.note("One device connected"),
+            ShellEvent::Undo | ShellEvent::Redo => self.note("Undo arrives with Phase 2C"),
+            ShellEvent::Quit => {
+                if self.state.has_unsaved_changes() {
+                    self.dialog = Some((
+                        AppDialog::Unsaved {
+                            then: PendingAction::Quit,
+                        },
+                        self.unsaved_dialog(),
+                    ));
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            ShellEvent::ClearClips => {
+                self.state.clear_clip_latch();
+                let _ = session.write("meters.clear", &[], Value::Trigger);
+                self.sync_model();
+            }
+            ShellEvent::BypassToggle => {
+                let on = self.state.global().bypass;
+                self.set(session, "bypass", &[], Value::Bool(!on));
+            }
+            ShellEvent::GraphCursor(hz) => {
+                self.shell.model.cursor_hz = hz;
+                if let Some(hz) = hz {
+                    let m = &self.shell.model;
+                    let g = crate::graph::Graph::new(&m.curves, &m.graph, &self.shell.theme);
+                    let parts: Vec<String> = g
+                        .readout(hz)
+                        .iter()
+                        .map(|(d, db)| format!("{d} {db:+.1}"))
+                        .collect();
+                    let text = format!("{:.0} Hz  {}", hz, parts.join("  "));
+                    self.shell.model.status = Some(text);
+                    self.status_until = Some(Instant::now() + Duration::from_secs(5));
+                }
+            }
+            ShellEvent::GraphZoom(delta) => self.shell.model.graph.zoom(delta),
+            ShellEvent::GraphPhase => {
+                self.shell.model.graph.show_phase = !self.shell.model.graph.show_phase;
+                self.sync_model();
+            }
+            ShellEvent::GraphHeight => {
+                self.shell.model.graph_height = self.shell.model.graph_height.next();
+            }
+            ShellEvent::GraphPopout => self.shell.graph_popout = !self.shell.graph_popout,
+            ShellEvent::Rename(row) => {
+                let name = self.state.channel_name(row);
+                self.dialog = Some((
+                    AppDialog::Rename { channel: row },
+                    Dialog::text("Rename", "", name, "Name"),
+                ));
+            }
+            ShellEvent::CopyParams(_) | ShellEvent::PasteParams(_) => {
+                self.note("Copy and paste arrive with Phase 4")
+            }
+            ShellEvent::Identify(_) => self.note("Identify arrives with Phase 6"),
+        }
+    }
+
+    fn request_preset(&mut self, session: &mut Session, slot: u8) {
+        if self.state.has_unsaved_changes() {
+            self.dialog = Some((
+                AppDialog::Unsaved {
+                    then: PendingAction::LoadPreset(slot),
+                },
+                self.unsaved_dialog(),
+            ));
+        } else {
+            self.load_preset(session, slot);
+        }
+    }
+
+    fn open_tool(&mut self, tool: Tool) {
+        let screen = self.screens.tool(&self.state, tool);
+        self.shell.open_tool(tool, screen);
+    }
+
+    fn open_settings(&mut self) {
+        let screen = self.screens.settings(&self.state);
+        self.shell.open_settings(screen);
+    }
+
+    fn finish_dialog(&mut self, session: &mut Session, kind: AppDialog, outcome: DialogOutcome) {
+        match (kind, outcome) {
+            (AppDialog::Unsaved { then }, DialogOutcome::Button(0)) => {
+                if self.save_active_preset(session) {
+                    self.run_pending(session, then);
+                }
+            }
+            (AppDialog::Unsaved { then }, DialogOutcome::Button(1)) => {
+                self.run_pending(session, then)
+            }
+            (AppDialog::SavePreset, DialogOutcome::Button(0)) => {
+                self.save_active_preset(session);
+            }
+            (AppDialog::Rename { channel }, DialogOutcome::Text(name)) => {
+                self.set(session, "ch.name", &[channel as u8], Value::Text(name));
+            }
+            (AppDialog::PresetList, DialogOutcome::Picked(i)) => {
+                self.request_preset(session, i as u8)
+            }
+            _ => {}
+        }
+    }
+
+    fn run_pending(&mut self, session: &mut Session, then: PendingAction) {
+        match then {
+            PendingAction::Quit => self.should_quit = true,
+            PendingAction::LoadPreset(slot) => self.load_preset(session, slot),
+        }
+    }
+
+    /// One key, from the top of the overlay stack down.
+    pub fn handle_key(&mut self, session: &mut Session, key: KeyEvent) {
+        if let Some(p) = &mut self.prompt {
+            if let Some(line) = p.handle(key, &self.ctx) {
+                self.prompt = None;
+                if !line.trim().is_empty() {
+                    self.run_command(session, &line);
+                }
+            }
+            return;
+        }
+        if let Some((kind, d)) = &mut self.dialog {
+            if let Some(outcome) = d.handle(key) {
+                let kind = kind.clone();
+                self.dialog = None;
+                self.finish_dialog(session, kind, outcome);
+            }
+            return;
+        }
+        if let Some((kind, p)) = &mut self.popup {
+            match p.handle(key) {
+                Some(crate::widgets::Action::Selected(i)) => {
+                    let kind = kind.clone();
+                    self.popup = None;
+                    self.finish_dialog(session, kind, DialogOutcome::Picked(i));
+                }
+                Some(crate::widgets::Action::Closed) => self.popup = None,
+                _ => {}
+            }
+            return;
+        }
+        let events = self.shell.handle(key);
+        for ev in events {
+            self.handle_event(session, ev);
+        }
+    }
+
+    /// Meters, notifications, status expiry, peak ballistics.
+    pub fn tick(&mut self, session: &mut Session, notifications: Option<&Notifications>) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f32();
+        self.last_tick = now;
+
+        if let Ok(m) = session.meters() {
+            for (i, p) in self.peaks.iter_mut().enumerate() {
+                p.update(m.peaks.get(i).copied().unwrap_or(0.0), dt);
+            }
+            self.state.update_meters(m);
+        }
+
+        let mut reread = false;
+        let mut changed_elsewhere: Option<(&'static str, Source)> = None;
+        if let Some(n) = notifications {
+            for note in n.drain() {
+                match self.state.apply(&note) {
+                    Applied::Section { name, source } => {
+                        if !source.is_ours() {
+                            changed_elsewhere = Some((name, source));
+                        }
+                    }
+                    Applied::NeedsReread { .. } => reread = true,
+                    Applied::PresetLoaded { slot } => {
+                        self.state.caps.active_preset = Some(slot);
+                        reread = true;
+                        self.note(format!("Preset {} loaded", slot + 1));
+                    }
+                    Applied::InputFormat { channels } => {
+                        self.note(format!("{channels} input channels active"));
+                    }
+                    Applied::Status(_) | Applied::Nothing => {}
+                }
+            }
+            if n.is_disconnected() {
+                self.shell.model.connected = false;
+            }
+        }
+        if reread {
+            self.refresh(session);
+        }
+        if let Some((name, source)) = changed_elsewhere {
+            self.note(format!("{} {}", name.replace('_', " "), source.describe()));
+        }
+        if let Some(until) = self.status_until
+            && now >= until
+        {
+            self.shell.model.status = None;
+            self.status_until = None;
+        }
+        self.sync_model();
+    }
+
+    pub fn draw(&mut self, area: Rect, buf: &mut Buffer) {
+        self.shell.draw(area, buf);
+        let theme = self.shell.theme.clone();
+        if let Some((_, p)) = &self.popup {
+            let (w, h) = p.size(area.width.saturating_sub(4), area.height.saturating_sub(4));
+            let r = Rect::new(
+                area.x + (area.width - w) / 2,
+                area.y + (area.height - h) / 2,
+                w,
+                h,
+            );
+            p.draw(r, buf, &theme);
+        }
+        if let Some((_, d)) = &self.dialog {
+            let r = d.size(area);
+            d.draw(r, buf, &theme);
+        }
+        if let Some(p) = &self.prompt {
+            p.draw(area, buf, &theme);
+        }
+    }
+}
+
+/// Run the live interface until the person quits.
+pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
+    let notifications = session
+        .with_transport(|t| Ok(t.notifications()))
+        .ok()
+        .flatten()
+        .map(Notifications::start);
+    let perf = live.perf;
+    let mut terminal = ratatui::init();
+    let mut last_poll = Instant::now() - perf.meter_interval;
+
+    let result = (|| -> io::Result<()> {
+        loop {
+            if last_poll.elapsed() >= perf.meter_interval {
+                live.tick(session, notifications.as_ref());
+                last_poll = Instant::now();
+            }
+            terminal.draw(|f| {
+                let area = f.area();
+                live.draw(area, f.buffer_mut());
+            })?;
+            if event::poll(perf.event_timeout)?
+                && let TermEvent::Key(key) = event::read()?
+                && key.kind == event::KeyEventKind::Press
+            {
+                // Ctrl-C always leaves, even with a dialog up.
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    live.should_quit = true;
+                }
+                live.handle_key(session, key);
+            }
+            if live.should_quit {
+                return Ok(());
+            }
+        }
+    })();
+    ratatui::restore();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{ColorDepth, Glyphs};
+    use crate::widgets::testing::key;
+    use dspi_proto::Platform;
+    use dspi_proto::generated::opcodes as op;
+    use dspi_proto::generated::{BULK_SIZE, wire::WIRE_FORMAT_VERSION};
+    use dspi_session::Capabilities;
+    use dspi_session::probe::ChannelInfo;
+    use dspi_transport::mock::LogHandle;
+    use dspi_transport::{MockTransport, Transport};
+
+    fn packet() -> Vec<u8> {
+        let mut b = vec![0u8; BULK_SIZE];
+        b[0] = WIRE_FORMAT_VERSION as u8;
+        b[1] = 1;
+        b[2] = 17;
+        b[3] = 9;
+        b[4] = 8;
+        b[5] = 12;
+        b[6..8].copy_from_slice(&(BULK_SIZE as u16).to_le_bytes());
+        // Every output enabled so the sidebar lists them.
+        let (_, off, _) = dspi_proto::generated::SECTIONS[6];
+        for o in 0..9 {
+            b[off + o * 12] = 1;
+        }
+        let (_, n, _) = dspi_proto::generated::SECTIONS[9];
+        b[n..n + 2].copy_from_slice(b"FL");
+        let (_, u, _) = dspi_proto::generated::SECTIONS[16];
+        b[u..u + 4].copy_from_slice(&(-12.0f32).to_le_bytes());
+        b
+    }
+
+    fn caps() -> Capabilities {
+        Capabilities {
+            serial: "E6614C311B8B4E3A".into(),
+            platform: Platform::Rp2350,
+            firmware: "1.1.6".into(),
+            wire_format: WIRE_FORMAT_VERSION as u8,
+            num_channels: 17,
+            num_inputs: 8,
+            num_outputs: 9,
+            max_bands: 10,
+            band_storage: 12,
+            channels: (0..17)
+                .map(|i| ChannelInfo {
+                    index: i,
+                    name: format!("ch{i}"),
+                    slug: if i < 8 {
+                        format!("in.{}", i + 1)
+                    } else {
+                        format!("out.{}", i - 7)
+                    },
+                    is_output: i >= 8,
+                })
+                .collect(),
+            features: Vec::new(),
+            cs: None,
+            siggen: None,
+            active_preset: Some(2),
+        }
+    }
+
+    fn live() -> (Live, Session, LogHandle) {
+        let mock = MockTransport::new()
+            .window(op::REQ_GET_ALL_PARAMS_CHUNK, packet())
+            // The readback after a nudge from -12.0 dB must agree with the write.
+            .data(op::REQ_GET_USER_VOLUME, (-12.5f32).to_le_bytes().to_vec())
+            .data(op::REQ_GET_STATUS, vec![0; 41]);
+        let log = mock.log_handle();
+        let session = Session::new(Box::new(mock), caps()).unwrap();
+        let state = DeviceState::new(
+            caps(),
+            dspi_proto::wire::BulkPacket::decode(packet()).unwrap(),
+        );
+        let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let live = Live::new(
+            state,
+            theme,
+            Performance::default(),
+            Box::new(PlaceholderScreens),
+        );
+        (live, session, log)
+    }
+
+    #[test]
+    fn the_model_is_projected_from_the_device_state() {
+        let (l, _, _) = live();
+        let m = &l.shell.model;
+        assert_eq!(m.inputs.len(), 8);
+        assert_eq!(m.outputs.len(), 9);
+        assert_eq!(m.inputs[0].name, "FL");
+        assert_eq!(
+            m.inputs[1].name, "IN2",
+            "an unnamed channel shows its descriptor"
+        );
+        assert_eq!(m.outputs[8].descriptor, "OUT9");
+        assert_eq!(m.preset_label, "Preset 3");
+        assert!(!m.preset_dirty);
+        assert_eq!(m.serial_short, "1B8B4E3A");
+        assert_eq!(m.curves.len(), 17);
+    }
+
+    #[test]
+    fn a_volume_nudge_writes_the_user_volume() {
+        let (mut l, mut s, log) = live();
+        l.shell.focus = crate::shell::Focus::Footer(crate::shell::FooterRow::Volume);
+        l.handle_key(&mut s, key(KeyCode::Left));
+        let wrote = log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.opcode == op::REQ_SET_USER_VOLUME);
+        assert!(wrote, "expected a SET_USER_VOLUME on the wire");
+        assert!(
+            l.shell.model.echo.contains("vol.user"),
+            "{}",
+            l.shell.model.echo
+        );
+    }
+
+    #[test]
+    fn the_command_line_runs_the_shared_grammar() {
+        let (mut l, mut s, log) = live();
+        l.handle_key(&mut s, key(KeyCode::Char(':')));
+        assert!(l.prompt.is_some());
+        for c in "bypass on".chars() {
+            l.handle_key(&mut s, key(KeyCode::Char(c)));
+        }
+        l.handle_key(&mut s, key(KeyCode::Enter));
+        assert!(l.prompt.is_none());
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.opcode == op::REQ_SET_BYPASS)
+        );
+    }
+
+    #[test]
+    fn quitting_with_unsaved_changes_asks_first() {
+        let (mut l, mut s, _) = live();
+        let (_, g, _) = dspi_proto::generated::SECTIONS[1];
+        l.state.bulk.patch(g, &(-6.0f32).to_le_bytes());
+        l.sync_model();
+        assert!(l.shell.model.preset_dirty);
+        l.handle_key(&mut s, key(KeyCode::Char('q')));
+        assert!(!l.should_quit);
+        assert!(matches!(l.dialog, Some((AppDialog::Unsaved { .. }, _))));
+        l.handle_key(&mut s, key(KeyCode::Char('d')));
+        assert!(l.should_quit, "Discard quits");
+    }
+
+    #[test]
+    fn a_notification_from_elsewhere_lands_in_the_model_and_the_echo_line() {
+        let (mut l, mut s, _) = live();
+        let mock = MockTransport::new();
+        let (_, u, _) = dspi_proto::generated::SECTIONS[16];
+        let mut p = vec![2, 2, 0, 1];
+        p.extend((u as u16).to_le_bytes());
+        p.extend(4u16.to_le_bytes());
+        p.extend([7, 0, 0, 0]);
+        p.extend((-30.0f32).to_le_bytes());
+        mock.push_notification(p);
+        let n = Notifications::start(mock.notifications().unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        l.tick(&mut s, Some(&n));
+        assert_eq!(l.state.user_volume().0, -30.0);
+        assert_eq!(l.shell.model.volume_db, -30.0);
+        assert_eq!(
+            l.shell.model.status.as_deref(),
+            Some("user volume changed by the system volume")
+        );
+    }
+}
