@@ -1,7 +1,11 @@
 //! Fixture models for tests, the gallery and `dspi screenshot`.
 
-use dspi_proto::FilterType;
 use dspi_proto::dsp;
+use dspi_proto::generated::{BULK_SIZE, SECTIONS, wire::WIRE_FORMAT_VERSION};
+use dspi_proto::wire::BulkPacket;
+use dspi_proto::{FilterType, Platform};
+use dspi_session::probe::ChannelInfo;
+use dspi_session::{Capabilities, DeviceState};
 
 use super::model::{ChannelItem, Selection, ShellModel, VolumeMode};
 use crate::graph::GraphCurve;
@@ -163,4 +167,110 @@ pub fn rp2040(theme: &Theme) -> ShellModel {
         m.curves.push(curve(it, &flat, 0.0, false));
     }
     m
+}
+
+fn section(name: &str) -> usize {
+    SECTIONS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, o, _)| *o)
+        .expect("section")
+}
+
+/// A V28 bulk packet for an RP2350 with the same tuning as [`rp2350`]: FL
+/// and FR carry the headphone bands, the outputs are enabled, OUT L / OUT R
+/// have an 80 Hz high pass, the sub an 80 Hz low pass at -3 dB.
+pub fn packet() -> Vec<u8> {
+    let mut b = vec![0u8; BULK_SIZE];
+    b[0] = WIRE_FORMAT_VERSION as u8;
+    b[1] = 1;
+    b[2] = 17;
+    b[3] = 9;
+    b[4] = 8;
+    b[5] = 12;
+    b[6..8].copy_from_slice(&(BULK_SIZE as u16).to_le_bytes());
+    let g = section("global");
+    b[g..g + 4].copy_from_slice(&(-5.3f32).to_le_bytes());
+    let u = section("user_volume");
+    b[u..u + 4].copy_from_slice(&(-12.0f32).to_le_bytes());
+    let outs = section("outputs");
+    for o in 0..9 {
+        b[outs + o * 12] = 1;
+    }
+    b[outs + 8 * 12 + 4..outs + 8 * 12 + 8].copy_from_slice(&(-3.0f32).to_le_bytes());
+    let names = section("channel_names");
+    for (i, n) in [
+        "FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR", "OUT L", "OUT R", "OUT 3", "OUT 4",
+        "OUT 5", "OUT 6", "OUT 7", "OUT 8", "Sub",
+    ]
+    .iter()
+    .enumerate()
+    {
+        b[names + i * 32..names + i * 32 + n.len()].copy_from_slice(n.as_bytes());
+    }
+    let eq = section("eq");
+    for ch in 0..2 {
+        for (band, t) in tuning().iter().enumerate() {
+            let off = eq + (ch * 12 + band) * 16;
+            b[off] = t.filter_type.to_raw();
+            b[off + 4..off + 8].copy_from_slice(&t.freq.to_le_bytes());
+            b[off + 8..off + 12].copy_from_slice(&t.q.to_le_bytes());
+            b[off + 12..off + 16].copy_from_slice(&t.gain_db.to_le_bytes());
+        }
+    }
+    let xo = section("crossovers");
+    for (ch, ty) in [
+        (8usize, FilterType::HighPass),
+        (9, FilterType::HighPass),
+        (16, FilterType::LowPass),
+    ] {
+        let off = xo + ch * 4 * 16;
+        b[off] = ty.to_raw();
+        b[off + 4..off + 8].copy_from_slice(&80.0f32.to_le_bytes());
+        b[off + 8..off + 12].copy_from_slice(&0.707f32.to_le_bytes());
+    }
+    let cross = section("crosspoints");
+    for i in 0..8 {
+        let off = cross + (i * 9 + i) * 8;
+        b[off] = 1;
+    }
+    b
+}
+
+pub fn caps() -> Capabilities {
+    Capabilities {
+        serial: "E6614C311B8B4E3A".into(),
+        platform: Platform::Rp2350,
+        firmware: "1.1.6".into(),
+        wire_format: WIRE_FORMAT_VERSION as u8,
+        num_channels: 17,
+        num_inputs: 8,
+        num_outputs: 9,
+        max_bands: 10,
+        band_storage: 12,
+        channels: (0..17u8)
+            .map(|i| ChannelInfo {
+                index: i,
+                name: String::new(),
+                slug: if i < 8 {
+                    format!("in.{}", i + 1)
+                } else {
+                    format!("out.{}", i - 7)
+                },
+                is_output: i >= 8,
+            })
+            .collect(),
+        features: Vec::new(),
+        cs: None,
+        siggen: None,
+        active_preset: Some(2),
+    }
+}
+
+/// A device state built from [`packet`] and [`caps`], for screens' tests.
+pub fn state() -> DeviceState {
+    DeviceState::new(
+        caps(),
+        BulkPacket::decode(packet()).expect("fixture packet"),
+    )
 }

@@ -886,7 +886,7 @@ impl Live {
             }
             return;
         }
-        let events = self.shell.handle(key);
+        let events = self.shell.handle(key, &self.state);
         for ev in events {
             self.handle_event(session, ev);
         }
@@ -947,7 +947,7 @@ impl Live {
     }
 
     pub fn draw(&mut self, area: Rect, buf: &mut Buffer) {
-        self.shell.draw(area, buf);
+        self.shell.draw(area, buf, &self.state);
         let theme = self.shell.theme.clone();
         if let Some((_, p)) = &self.popup {
             let (w, h) = p.size(area.width.saturating_sub(4), area.height.saturating_sub(4));
@@ -1014,63 +1014,17 @@ mod tests {
     use super::*;
     use crate::theme::{ColorDepth, Glyphs};
     use crate::widgets::testing::key;
-    use dspi_proto::Platform;
     use dspi_proto::generated::opcodes as op;
-    use dspi_proto::generated::{BULK_SIZE, wire::WIRE_FORMAT_VERSION};
     use dspi_session::Capabilities;
-    use dspi_session::probe::ChannelInfo;
     use dspi_transport::mock::LogHandle;
     use dspi_transport::{MockTransport, Transport};
 
     fn packet() -> Vec<u8> {
-        let mut b = vec![0u8; BULK_SIZE];
-        b[0] = WIRE_FORMAT_VERSION as u8;
-        b[1] = 1;
-        b[2] = 17;
-        b[3] = 9;
-        b[4] = 8;
-        b[5] = 12;
-        b[6..8].copy_from_slice(&(BULK_SIZE as u16).to_le_bytes());
-        // Every output enabled so the sidebar lists them.
-        let (_, off, _) = dspi_proto::generated::SECTIONS[6];
-        for o in 0..9 {
-            b[off + o * 12] = 1;
-        }
-        let (_, n, _) = dspi_proto::generated::SECTIONS[9];
-        b[n..n + 2].copy_from_slice(b"FL");
-        let (_, u, _) = dspi_proto::generated::SECTIONS[16];
-        b[u..u + 4].copy_from_slice(&(-12.0f32).to_le_bytes());
-        b
+        crate::shell::fixture::packet()
     }
 
     fn caps() -> Capabilities {
-        Capabilities {
-            serial: "E6614C311B8B4E3A".into(),
-            platform: Platform::Rp2350,
-            firmware: "1.1.6".into(),
-            wire_format: WIRE_FORMAT_VERSION as u8,
-            num_channels: 17,
-            num_inputs: 8,
-            num_outputs: 9,
-            max_bands: 10,
-            band_storage: 12,
-            channels: (0..17)
-                .map(|i| ChannelInfo {
-                    index: i,
-                    name: format!("ch{i}"),
-                    slug: if i < 8 {
-                        format!("in.{}", i + 1)
-                    } else {
-                        format!("out.{}", i - 7)
-                    },
-                    is_output: i >= 8,
-                })
-                .collect(),
-            features: Vec::new(),
-            cs: None,
-            siggen: None,
-            active_preset: Some(2),
-        }
+        crate::shell::fixture::caps()
     }
 
     fn live() -> (Live, Session, LogHandle) {

@@ -14,6 +14,7 @@ pub mod screen;
 pub mod sidebar;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use dspi_session::DeviceState;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -282,7 +283,7 @@ impl Shell {
     }
 
     /// Handle one key. Returns what the application should do.
-    pub fn handle(&mut self, key: KeyEvent) -> Vec<ShellEvent> {
+    pub fn handle(&mut self, key: KeyEvent, state: &DeviceState) -> Vec<ShellEvent> {
         let mut out = Vec::new();
 
         if self.help {
@@ -295,7 +296,7 @@ impl Shell {
                 self.dialog = None;
                 let owner = self.dialog_owner;
                 if let Some(s) = self.screen_by(owner) {
-                    let ev = s.dialog_result(outcome);
+                    let ev = s.dialog_result(outcome, state);
                     self.absorb(ev, owner, &mut out);
                 }
             }
@@ -308,7 +309,7 @@ impl Shell {
                     self.popup = None;
                     let owner = self.popup_owner;
                     if let Some(s) = self.screen_by(owner) {
-                        let ev = s.popup_result(Some(i));
+                        let ev = s.popup_result(Some(i), state);
                         self.absorb(ev, owner, &mut out);
                     }
                 }
@@ -316,7 +317,7 @@ impl Shell {
                     self.popup = None;
                     let owner = self.popup_owner;
                     if let Some(s) = self.screen_by(owner) {
-                        let ev = s.popup_result(None);
+                        let ev = s.popup_result(None, state);
                         self.absorb(ev, owner, &mut out);
                     }
                 }
@@ -366,7 +367,7 @@ impl Shell {
                 return out;
             }
             let (s, owner) = self.top();
-            let ev = s.handle(key);
+            let ev = s.handle(key, state);
             if ev == ScreenEvent::Unhandled && key.code == KeyCode::Esc {
                 out.push(ShellEvent::CloseSettings);
                 return out;
@@ -378,7 +379,7 @@ impl Shell {
         // The focused screen gets the key first when it has focus.
         if self.focus == Focus::Screen {
             let (s, owner) = self.top();
-            let ev = s.handle(key);
+            let ev = s.handle(key, state);
             if ev != ScreenEvent::Unhandled {
                 self.absorb(ev, owner, &mut out);
                 return out;
@@ -689,7 +690,7 @@ impl Shell {
         keys
     }
 
-    pub fn draw(&mut self, area: Rect, buf: &mut Buffer) {
+    pub fn draw(&mut self, area: Rect, buf: &mut Buffer, state: &DeviceState) {
         let t = self.theme.clone();
         let pills = legend(&self.model.curves);
         let pane_w = area
@@ -705,11 +706,11 @@ impl Shell {
         };
 
         if self.settings.is_some() {
-            self.draw_settings(&regions, buf, &t);
+            self.draw_settings(&regions, buf, &t, state);
         } else {
             self.draw_title(regions.title, buf, &t);
             self.draw_sidebar(&regions, buf, &t);
-            self.draw_pane(&regions, buf, &t);
+            self.draw_pane(&regions, buf, &t, state);
             self.draw_echo(regions.echo, buf, &t);
         }
         self.draw_keys(regions.keys, buf, &t);
@@ -865,14 +866,14 @@ impl Shell {
         );
     }
 
-    fn draw_pane(&mut self, r: &Regions, buf: &mut Buffer, t: &Theme) {
+    fn draw_pane(&mut self, r: &Regions, buf: &mut Buffer, t: &Theme, state: &DeviceState) {
         let screen_focused = self.focus == Focus::Screen;
         if let Some((tool, screen)) = self.tool.as_mut() {
             let title = format!("{}   {} closes", tool.title(), tool.key());
             let block = Self::block_static(&title, screen_focused, t);
             let inner = block.inner(r.pane);
             block.render(r.pane, buf);
-            screen.draw(inner, buf, t, screen_focused);
+            screen.draw(inner, buf, t, state, screen_focused);
             return;
         }
 
@@ -939,7 +940,7 @@ impl Shell {
             );
             detail = Rect::new(detail.x, detail.y + 1, detail.width, detail.height - 1);
         }
-        self.detail.draw(detail, buf, t, detail_focused);
+        self.detail.draw(detail, buf, t, state, detail_focused);
     }
 
     fn block_static(title: &str, focused: bool, t: &Theme) -> Block<'static> {
@@ -975,7 +976,7 @@ impl Shell {
         row.render(legend_area, buf);
     }
 
-    fn draw_settings(&mut self, r: &Regions, buf: &mut Buffer, t: &Theme) {
+    fn draw_settings(&mut self, r: &Regions, buf: &mut Buffer, t: &Theme, state: &DeviceState) {
         let title = " Settings";
         buf.set_string(r.title.x, r.title.y, title, t.title());
         let back = "Esc back ";
@@ -992,7 +993,7 @@ impl Shell {
             r.echo.y - r.title.y,
         );
         if let Some(s) = self.settings.as_deref_mut() {
-            s.draw(body, buf, t, true);
+            s.draw(body, buf, t, state, true);
         }
     }
 
@@ -1056,7 +1057,9 @@ mod tests {
     }
 
     fn frame(shell: &mut Shell, term: &mut Terminal<TestBackend>) -> String {
-        term.draw(|f| shell.draw(f.area(), f.buffer_mut())).unwrap();
+        let state = fixture::state();
+        term.draw(|f| shell.draw(f.area(), f.buffer_mut(), &state))
+            .unwrap();
         let buf = term.backend().buffer();
         let a = *buf.area();
         (0..a.height)
@@ -1134,24 +1137,24 @@ mod tests {
     fn arrows_in_the_sidebar_select_and_enter_returns_to_the_overview() {
         let (mut s, _) = shell(120, 40);
         assert_eq!(
-            s.handle(key(KeyCode::Down)),
+            s.handle(key(KeyCode::Down), &fixture::state()),
             vec![ShellEvent::Select(Selection::Input(1))]
         );
         s.model.selection = Selection::Input(1);
         assert_eq!(
-            s.handle(key(KeyCode::Enter)),
+            s.handle(key(KeyCode::Enter), &fixture::state()),
             vec![ShellEvent::Select(Selection::Overview)]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Char(' '))),
+            s.handle(key(KeyCode::Char(' ')), &fixture::state()),
             vec![ShellEvent::ToggleVisible(1)]
         );
         for _ in 0..20 {
-            s.handle(key(KeyCode::Down));
+            s.handle(key(KeyCode::Down), &fixture::state());
         }
         assert_eq!(s.sidebar_cursor, 16, "clamped to the last output");
         assert_eq!(
-            s.handle(key(KeyCode::Char('i'))),
+            s.handle(key(KeyCode::Char('i')), &fixture::state()),
             vec![ShellEvent::Identify(16)]
         );
     }
@@ -1159,25 +1162,25 @@ mod tests {
     #[test]
     fn tab_walks_the_regions_and_escape_walks_back() {
         let (mut s, _) = shell(120, 40);
-        s.handle(key(KeyCode::Tab));
+        s.handle(key(KeyCode::Tab), &fixture::state());
         assert_eq!(s.focus, Focus::Footer(FooterRow::Strip));
-        s.handle(key(KeyCode::Tab));
+        s.handle(key(KeyCode::Tab), &fixture::state());
         assert_eq!(s.focus, Focus::Footer(FooterRow::Preset));
-        s.handle(key(KeyCode::Tab));
+        s.handle(key(KeyCode::Tab), &fixture::state());
         assert_eq!(s.focus, Focus::Footer(FooterRow::Source));
-        s.handle(key(KeyCode::Tab));
+        s.handle(key(KeyCode::Tab), &fixture::state());
         assert_eq!(s.focus, Focus::Footer(FooterRow::Volume));
-        s.handle(key(KeyCode::Tab));
+        s.handle(key(KeyCode::Tab), &fixture::state());
         assert_eq!(s.focus, Focus::Legend);
-        s.handle(key(KeyCode::Tab));
+        s.handle(key(KeyCode::Tab), &fixture::state());
         assert_eq!(s.focus, Focus::Screen);
-        s.handle(key(KeyCode::Tab));
+        s.handle(key(KeyCode::Tab), &fixture::state());
         assert_eq!(s.focus, Focus::Sidebar);
         s.focus = Focus::Screen;
-        assert_eq!(s.handle(key(KeyCode::Esc)), vec![]);
+        assert_eq!(s.handle(key(KeyCode::Esc), &fixture::state()), vec![]);
         assert_eq!(s.focus, Focus::Sidebar);
         assert_eq!(
-            s.handle(key(KeyCode::Esc)),
+            s.handle(key(KeyCode::Esc), &fixture::state()),
             vec![ShellEvent::Select(Selection::Overview)]
         );
     }
@@ -1188,33 +1191,33 @@ mod tests {
         s.focus = Focus::Footer(FooterRow::Strip);
         s.strip_cursor = 1;
         assert_eq!(
-            s.handle(key(KeyCode::Char(' '))),
+            s.handle(key(KeyCode::Char(' ')), &fixture::state()),
             vec![ShellEvent::StripToggle(1)]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Enter)),
+            s.handle(key(KeyCode::Enter), &fixture::state()),
             vec![ShellEvent::StripOpen(1)]
         );
         s.focus = Focus::Footer(FooterRow::Preset);
         assert_eq!(
-            s.handle(key(KeyCode::Right)),
+            s.handle(key(KeyCode::Right), &fixture::state()),
             vec![ShellEvent::Preset(Some(1))]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Enter)),
+            s.handle(key(KeyCode::Enter), &fixture::state()),
             vec![ShellEvent::Preset(None)]
         );
         s.focus = Focus::Footer(FooterRow::Volume);
         assert_eq!(
-            s.handle(key(KeyCode::Left)),
+            s.handle(key(KeyCode::Left), &fixture::state()),
             vec![ShellEvent::VolumeChanged(-12.5)]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Backspace)),
+            s.handle(key(KeyCode::Backspace), &fixture::state()),
             vec![ShellEvent::VolumeReset]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Enter)),
+            s.handle(key(KeyCode::Enter), &fixture::state()),
             vec![ShellEvent::VolumeModeToggle]
         );
     }
@@ -1223,7 +1226,7 @@ mod tests {
     fn uppercase_letters_open_the_consoles_tools_and_again_closes_them() {
         let (mut s, mut term) = shell(120, 40);
         assert_eq!(
-            s.handle(key(KeyCode::Char('M'))),
+            s.handle(key(KeyCode::Char('M')), &fixture::state()),
             vec![ShellEvent::OpenTool(Tool::Matrix)]
         );
         s.open_tool(Tool::Matrix, Box::new(Placeholder::new("Matrix Mixer", "")));
@@ -1235,31 +1238,41 @@ mod tests {
             "the graph is gone while a tool is open"
         );
         assert_eq!(
-            s.handle(key(KeyCode::Char('M'))),
+            s.handle(key(KeyCode::Char('M')), &fixture::state()),
             vec![ShellEvent::CloseTool]
         );
-        assert_eq!(s.handle(key(KeyCode::Esc)), vec![ShellEvent::CloseTool]);
         assert_eq!(
-            s.handle(key(KeyCode::Char('L'))),
+            s.handle(key(KeyCode::Esc), &fixture::state()),
+            vec![ShellEvent::CloseTool]
+        );
+        assert_eq!(
+            s.handle(key(KeyCode::Char('L')), &fixture::state()),
             vec![ShellEvent::OpenTool(Tool::Loudness)]
         );
-        assert_eq!(s.handle(key(KeyCode::Char('Q'))), vec![], "not a tool");
+        assert_eq!(
+            s.handle(key(KeyCode::Char('Q')), &fixture::state()),
+            vec![],
+            "not a tool"
+        );
     }
 
     #[test]
     fn settings_takes_the_whole_screen_and_escape_leaves_it() {
         let (mut s, mut term) = shell(120, 40);
         assert_eq!(
-            s.handle(key(KeyCode::Char(','))),
+            s.handle(key(KeyCode::Char(',')), &fixture::state()),
             vec![ShellEvent::OpenSettings]
         );
         s.open_settings(Box::new(Placeholder::new("Global Parameters", "")));
         let f = frame(&mut s, &mut term);
         assert!(f.lines().next().unwrap().starts_with(" Settings"), "{f}");
         assert!(!f.contains("INPUTS"), "{f}");
-        assert_eq!(s.handle(key(KeyCode::Esc)), vec![ShellEvent::CloseSettings]);
         assert_eq!(
-            s.handle(key(KeyCode::Char(','))),
+            s.handle(key(KeyCode::Esc), &fixture::state()),
+            vec![ShellEvent::CloseSettings]
+        );
+        assert_eq!(
+            s.handle(key(KeyCode::Char(',')), &fixture::state()),
             vec![ShellEvent::CloseSettings]
         );
     }
@@ -1268,35 +1281,50 @@ mod tests {
     fn global_keys_work_from_anywhere() {
         let (mut s, _) = shell(120, 40);
         let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-        assert_eq!(s.handle(ctrl('p')), vec![ShellEvent::Palette]);
         assert_eq!(
-            s.handle(key(KeyCode::Char(':'))),
+            s.handle(ctrl('p'), &fixture::state()),
+            vec![ShellEvent::Palette]
+        );
+        assert_eq!(
+            s.handle(key(KeyCode::Char(':')), &fixture::state()),
             vec![ShellEvent::CommandLine]
         );
-        assert_eq!(s.handle(ctrl('s')), vec![ShellEvent::SavePreset]);
-        assert_eq!(s.handle(ctrl('z')), vec![ShellEvent::Undo]);
-        assert_eq!(s.handle(key(KeyCode::Char('q'))), vec![ShellEvent::Quit]);
         assert_eq!(
-            s.handle(key(KeyCode::Char('='))),
+            s.handle(ctrl('s'), &fixture::state()),
+            vec![ShellEvent::SavePreset]
+        );
+        assert_eq!(
+            s.handle(ctrl('z'), &fixture::state()),
+            vec![ShellEvent::Undo]
+        );
+        assert_eq!(
+            s.handle(key(KeyCode::Char('q')), &fixture::state()),
+            vec![ShellEvent::Quit]
+        );
+        assert_eq!(
+            s.handle(key(KeyCode::Char('=')), &fixture::state()),
             vec![ShellEvent::GraphHeight]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Char('p'))),
+            s.handle(key(KeyCode::Char('p')), &fixture::state()),
             vec![ShellEvent::GraphPhase]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Char('b'))),
+            s.handle(key(KeyCode::Char('b')), &fixture::state()),
             vec![ShellEvent::BypassToggle]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Char('c'))),
+            s.handle(key(KeyCode::Char('c')), &fixture::state()),
             vec![ShellEvent::ClearClips]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Char('+'))),
+            s.handle(key(KeyCode::Char('+')), &fixture::state()),
             vec![ShellEvent::GraphZoom(-10.0)]
         );
-        match s.handle(key(KeyCode::Char('l'))).as_slice() {
+        match s
+            .handle(key(KeyCode::Char('l')), &fixture::state())
+            .as_slice()
+        {
             [ShellEvent::GraphCursor(Some(hz))] => assert!(*hz > 1000.0),
             other => panic!("{other:?}"),
         }
@@ -1305,14 +1333,14 @@ mod tests {
     #[test]
     fn help_opens_and_any_key_closes_it() {
         let (mut s, mut term) = shell(120, 40);
-        s.handle(key(KeyCode::Char('?')));
+        s.handle(key(KeyCode::Char('?')), &fixture::state());
         assert!(s.help);
         let f = frame(&mut s, &mut term);
         assert!(
             f.contains("EVERYWHERE") && f.contains("Search everything"),
             "{f}"
         );
-        s.handle(key(KeyCode::Char('x')));
+        s.handle(key(KeyCode::Char('x')), &fixture::state());
         assert!(!s.help);
     }
 
@@ -1330,11 +1358,11 @@ mod tests {
         let f = frame(&mut s, &mut term);
         assert!(f.contains(" Unsaved Changes "), "{f}");
         assert_eq!(
-            s.handle(key(KeyCode::Char('q'))),
+            s.handle(key(KeyCode::Char('q')), &fixture::state()),
             vec![],
             "q goes to the dialog, not quit"
         );
-        s.handle(key(KeyCode::Esc));
+        s.handle(key(KeyCode::Esc), &fixture::state());
         assert!(s.dialog.is_none());
     }
 
@@ -1389,7 +1417,7 @@ mod tests {
                     s.strip_cursor = 1;
                     s.legend_cursor = 3;
                     let before = (s.focus, s.help, s.legend_cursor, s.strip_cursor);
-                    let events = s.handle(k);
+                    let events = s.handle(k, &fixture::state());
                     let after = (s.focus, s.help, s.legend_cursor, s.strip_cursor);
                     assert!(
                         !events.is_empty() || before != after,

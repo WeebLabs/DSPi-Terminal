@@ -37,8 +37,9 @@ fn main() {
         Box::new(Placeholder::new("FL", "Input page (Phase 4)")),
     );
 
+    let state = fixture::state();
     let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
-    term.draw(|f| shell.draw(f.area(), f.buffer_mut()))
+    term.draw(|f| shell.draw(f.area(), f.buffer_mut(), &state))
         .expect("draw");
     let buf = term.backend().buffer();
 

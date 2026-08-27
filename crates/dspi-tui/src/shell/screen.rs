@@ -5,6 +5,7 @@
 //! what is inside its rectangle and reports what the person asked for.
 
 use crossterm::event::KeyEvent;
+use dspi_session::DeviceState;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -35,20 +36,33 @@ pub trait Screen {
     /// The panel title, drawn by the shell when the screen fills the pane.
     fn title(&self) -> String;
 
-    fn draw(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme, focused: bool);
+    /// Draw from the live state; a screen keeps only its own cursor and
+    /// edit state, never a copy of the device's.
+    fn draw(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+        state: &DeviceState,
+        focused: bool,
+    );
 
-    fn handle(&mut self, key: KeyEvent) -> ScreenEvent;
+    fn handle(&mut self, key: KeyEvent, state: &DeviceState) -> ScreenEvent;
 
     /// Keys for the key line and the help overlay.
     fn keys(&self) -> &'static [KeyHelp];
 
     /// A popup this screen opened has closed with a choice (or none).
-    fn popup_result(&mut self, _choice: Option<usize>) -> ScreenEvent {
+    fn popup_result(&mut self, _choice: Option<usize>, _state: &DeviceState) -> ScreenEvent {
         ScreenEvent::Handled
     }
 
     /// A dialog this screen opened has closed.
-    fn dialog_result(&mut self, _outcome: crate::widgets::DialogOutcome) -> ScreenEvent {
+    fn dialog_result(
+        &mut self,
+        _outcome: crate::widgets::DialogOutcome,
+        _state: &DeviceState,
+    ) -> ScreenEvent {
         ScreenEvent::Handled
     }
 
@@ -76,7 +90,14 @@ impl Screen for Placeholder {
         self.title.clone()
     }
 
-    fn draw(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme, _focused: bool) {
+    fn draw(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+        _state: &DeviceState,
+        _focused: bool,
+    ) {
         if area.height == 0 {
             return;
         }
@@ -93,7 +114,7 @@ impl Screen for Placeholder {
         }
     }
 
-    fn handle(&mut self, _key: KeyEvent) -> ScreenEvent {
+    fn handle(&mut self, _key: KeyEvent, _state: &DeviceState) -> ScreenEvent {
         ScreenEvent::Unhandled
     }
 
