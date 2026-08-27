@@ -5,10 +5,12 @@
 
 pub mod autoeq;
 pub mod filterfile;
+pub mod pins;
 pub mod preset_file;
 pub mod probe;
 pub mod surfaces;
 pub mod write;
 
+pub use pins::{PinClaim, PinConstraint, PinMap, PinRole};
 pub use probe::{Capabilities, Meters, probe, read_bulk, read_meters};
 pub use write::{Crosspoint, JournalEntry, Outcome, OutputStrip, Session, WriteError};
