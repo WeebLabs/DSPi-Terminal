@@ -59,6 +59,7 @@ enum Line {
 /// place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
+    Clear,
     /// Enabling this output needs the other side of Core 1 switched off first.
     Enable(usize),
 }
@@ -90,6 +91,8 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("Space", "Connect, enable, mute"),
     KeyHelp::new("Enter", "Edit a gain"),
     KeyHelp::new("i", "Invert"),
+    KeyHelp::new("d", "Direct 1:1"),
+    KeyHelp::new("D", "Clear"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -306,6 +309,51 @@ impl MatrixPanel {
             _ => (0.0, 0.0),
         };
         value + dir * step * mult
+    }
+
+    /// `DSPViewModel.applyDirectRouting`: free Core 1, put every crosspoint on
+    /// the `i` to `i` diagonal, then enable the diagonal outputs.
+    fn direct_routing(&self, state: &DeviceState) -> Vec<String> {
+        let ni = self.inputs(state);
+        let no = self.outputs(state);
+        let n = ni.min(no);
+        let pdm = pdm_output(state);
+        let mut out = Vec::new();
+        if let Some(pdm) = pdm
+            && state.output(pdm).enabled
+        {
+            out.push(format!("out.enable {pdm} off"));
+        }
+        for i in 0..ni {
+            for o in 0..no {
+                let on = i == o && i < n;
+                let c = state.crosspoint(i, o);
+                if c.enabled != on || c.gain_db != 0.0 || c.phase_invert {
+                    out.push(self.mix_command(i, o, on, 0.0, false));
+                }
+            }
+        }
+        for o in 0..n {
+            if Some(o) != pdm && !state.output(o).enabled {
+                out.push(format!("out.enable {o} on"));
+            }
+        }
+        out
+    }
+
+    /// `DSPViewModel.clearAllRoutes`: disconnect every crosspoint, leaving the
+    /// gains and the phase alone.
+    fn clear_routes(&self, state: &DeviceState) -> Vec<String> {
+        let mut out = Vec::new();
+        for i in 0..self.inputs(state) {
+            for o in 0..self.outputs(state) {
+                let c = state.crosspoint(i, o);
+                if c.enabled {
+                    out.push(self.mix_command(i, o, false, c.gain_db, c.phase_invert));
+                }
+            }
+        }
+        out
     }
 
     /// `Session::enable_output_confirmed`'s order, as commands: free the other
@@ -602,9 +650,20 @@ impl MatrixPanel {
         }
     }
 
-    fn draw_routing(&self, p: &mut Paint, y: u16) {
-        let (area, theme) = (p.area, p.theme);
+    fn draw_routing(&self, p: &mut Paint, y: u16, grid_w: u16) {
+        let (area, theme, state) = (p.area, p.theme, p.state);
         p.buf.set_string(area.x + 1, y, "ROUTING", theme.section());
+        if !is_8ch(state) {
+            return;
+        }
+        // The Console puts Direct 1:1 and Clear in the ROUTING band, and only
+        // in 8-channel mode: an 8-channel stream is silent until routes exist.
+        let actions = "Direct 1:1   Clear";
+        let w = actions.chars().count() as u16;
+        if grid_w > LABEL_W + w + 2 {
+            p.buf
+                .set_string(area.x + grid_w - w - 1, y, actions, theme.value());
+        }
     }
 }
 
@@ -635,6 +694,7 @@ impl Screen for MatrixPanel {
             .min(self.col)
             .max((self.col + 1).saturating_sub(per_screen));
         let cols: Vec<usize> = (self.scroll..(self.scroll + per_screen).min(n_out)).collect();
+        let grid_w = LABEL_W + cols.len() as u16 * COL_W;
 
         let here = self.row_at(state);
         let lines = self.lines(state);
@@ -662,9 +722,9 @@ impl Screen for MatrixPanel {
         for (n, line) in lines.iter().skip(first).take(body_h).enumerate() {
             let y = area.y + 2 + n as u16;
             match line {
-                Line::Routing => self.draw_routing(&mut p, y),
+                Line::Routing => self.draw_routing(&mut p, y, grid_w),
                 Line::Divider => {
-                    let w = cols.len() * COL_W as usize;
+                    let w = (grid_w - LABEL_W).min(area.width.saturating_sub(LABEL_W)) as usize;
                     let bar = if theme.glyphs == Glyphs::Ascii {
                         "-".repeat(w)
                     } else {
@@ -750,6 +810,29 @@ impl Screen for MatrixPanel {
                 }
                 _ => ScreenEvent::Handled,
             },
+            KeyCode::Char('d') => {
+                let cmds = if is_8ch(state) {
+                    self.direct_routing(state)
+                } else {
+                    Vec::new()
+                };
+                if cmds.is_empty() {
+                    ScreenEvent::Handled
+                } else {
+                    ScreenEvent::Command(cmds.join("\n"))
+                }
+            }
+            KeyCode::Char('D') => {
+                if !is_8ch(state) {
+                    return ScreenEvent::Handled;
+                }
+                self.pending = Some(Pending::Clear);
+                ScreenEvent::Dialog(Dialog::confirm(
+                    "Clear",
+                    "Disconnect every crosspoint",
+                    vec![Button::destructive("Clear"), Button::new("Cancel")],
+                ))
+            }
             _ => ScreenEvent::Unhandled,
         }
     }
@@ -763,6 +846,14 @@ impl Screen for MatrixPanel {
             return ScreenEvent::Handled;
         };
         match (pending, outcome) {
+            (Pending::Clear, DialogOutcome::Button(0)) => {
+                let cmds = self.clear_routes(state);
+                if cmds.is_empty() {
+                    ScreenEvent::Handled
+                } else {
+                    ScreenEvent::Command(cmds.join("\n"))
+                }
+            }
             (Pending::Enable(o), DialogOutcome::Button(0)) => {
                 ScreenEvent::Command(self.enable_confirmed(state, o).join("\n"))
             }
@@ -941,6 +1032,11 @@ mod tests {
             for want in ["ROUTING", "OUT1", "FL", "ENABLE", "GAIN", "DELAY", "MUTE"] {
                 assert!(f.contains(want), "{w}x{h} has no {want}:\n{f}");
             }
+            // The Console's two routing actions, which only 8-channel mode has.
+            assert!(
+                f.contains("Direct 1:1") && f.contains("Clear"),
+                "{w}x{h}: {f}"
+            );
         }
     }
 
@@ -1051,6 +1147,61 @@ mod tests {
         let s = text(&draw(&mut panel(), &stereo(), 120, 24));
         let dividers = s.lines().filter(|l| l.contains("──")).count();
         assert_eq!(dividers, 1, "one L/R separator:\n{s}");
+    }
+
+    // -- Routing -----------------------------------------------------------
+
+    #[test]
+    fn direct_one_to_one_routes_the_diagonal_and_frees_core_one() {
+        let state = connected(0, 3);
+        let mut p = panel();
+        let ScreenEvent::Command(c) = p.handle(key(KeyCode::Char('d')), &state) else {
+            panic!("Direct 1:1 wrote nothing");
+        };
+        let lines: Vec<&str> = c.lines().collect();
+        // The PDM sub goes first, so the EQ workers are free to come up.
+        assert_eq!(lines[0], "out.enable 8 off");
+        // The stray route is taken down; the diagonal is already right, so
+        // nothing else is written.
+        assert_eq!(lines[1], "mix 0 3 off 0");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+    }
+
+    #[test]
+    fn direct_one_to_one_does_nothing_on_a_two_input_device() {
+        let mut p = panel();
+        assert_eq!(
+            p.handle(key(KeyCode::Char('d')), &stereo()),
+            ScreenEvent::Handled,
+            "the Console only offers it in 8-channel mode"
+        );
+        assert_eq!(
+            p.handle(key(KeyCode::Char('D')), &stereo()),
+            ScreenEvent::Handled
+        );
+    }
+
+    #[test]
+    fn clear_confirms_then_disconnects_every_crosspoint() {
+        let state = fixture::state();
+        let mut p = panel();
+        let ScreenEvent::Dialog(d) = p.handle(key(KeyCode::Char('D')), &state) else {
+            panic!("Clear asks first");
+        };
+        assert_eq!(d.body, "Disconnect every crosspoint");
+        assert!(d.buttons[0].destructive);
+        let ScreenEvent::Command(c) = p.dialog_result(DialogOutcome::Button(0), &state) else {
+            panic!("Clear wrote nothing");
+        };
+        // The fixture's eight diagonal routes, gains and phase left alone.
+        assert_eq!(c.lines().count(), 8, "{c}");
+        assert_eq!(c.lines().next().unwrap(), "mix 0 0 off 0");
+        // Cancel writes nothing.
+        p.handle(key(KeyCode::Char('D')), &state);
+        assert_eq!(
+            p.dialog_result(DialogOutcome::Cancelled, &state),
+            ScreenEvent::Handled
+        );
     }
 
     // -- Crosspoint and strip edits ---------------------------------------
