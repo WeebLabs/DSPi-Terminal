@@ -6,23 +6,23 @@ elsewhere, or where the released documentation disagrees with the source.
 **Kept here deliberately.** The firmware repository is not modified as part of
 this work; these are our working notes.
 
-Baseline: `WeebLabs/DSPi` `release/v1.1.5` @ `9776c2f`.
+Baseline: `WeebLabs/DSPi` `release/v1.1.6` @ `112f35b`.
 
 ---
 
-## 1. `commands.md` is twelve wire versions behind the headers
+## 1. `commands.md` is fourteen wire versions behind the headers
 
-On `release/v1.1.5` itself, the documentation and the source disagree:
+On `release/v1.1.6`, the documentation and the source disagree:
 
-| File | Last commit | States |
-|---|---|---|
-| `Documentation/commands.md` | `f7143dc`, 2026-07-12 | wire **V14**, 3664 bytes, 121 opcodes, "Master L / Master R" |
-| `firmware/DSPi/bulk_params.h` | `1b84765`, 2026-07-19 | wire **V26**, **5944 bytes** |
-| `firmware/DSPi/config.h` | `4ab5922`, 2026-07-19 | **190** opcodes |
+| File | States |
+|---|---|
+| `Documentation/commands.md` | wire **V14**, 3664 bytes, 121 opcodes, "Master L / Master R" |
+| `firmware/DSPi/bulk_params.h` | wire **V28**, **5944 bytes** |
+| `firmware/DSPi/config.h` | **202** opcodes |
 
-The code moved on 19 July; the doc last moved on 12 July. Entirely normal for an
-actively developed firmware, and the reason this project generates its constants
-from the headers rather than transcribing the document.
+Entirely normal for an actively developed firmware, and the reason this project
+generates its constants from the headers rather than transcribing the document.
+The gap widened at v1.1.6 rather than closing.
 
 `commands.md` remains excellent and authoritative for **behaviour**: transport
 conventions, the write-as-read opcode list, deferred writes and the busy window,
@@ -159,3 +159,77 @@ four columns instead of twelve.
 Note the addressing differs between the two paths, which is easy to get wrong:
 crossover bands are wire indices **20-23** for `GET`/`SET_EQ_PARAM`, but columns
 **0-3** of the `crossovers` section in the bulk packet.
+
+---
+
+## 11. V28 changed the wire's shape without changing its size
+
+The change that matters most in the v1.1.5 to v1.1.6 bump is invisible to every
+size check. `WireInputConfig` grew `spdif_rx_pin_ext` from two entries to three
+for the fourth selectable S/PDIF input, so `spdif_rx_enabled_ext_p1`,
+`i2s_clock_mode`, `adat_input_pin`, `adat_input_enabled_p1` and
+`adat_clock_mode_p1` all moved down one byte, and the section's last reserved
+byte was consumed. The section is still 16 bytes, the packet is still 5944, and
+`bulk_size_matches_firmware` passes untouched.
+
+`bulk_params.h:34` says so plainly, which is why the bump procedure's first step
+is to read the `WIRE_FORMAT_VERSION` comment rather than to trust the tests. The
+offsets are now pinned by name in `wire::INPUT_CONFIG_FIELDS` and its test, so
+the next shift of this kind fails the build instead of misparsing a GPIO as a
+clock mode.
+
+## 12. The CS caps header grew because a component type was added
+
+`REQ_GET_CS_CAPS` with `wValue = 0xFFFF` answers `CsCapsHeader`, whose type table
+is `CS_TYPE_COUNT` rows of 4 bytes. Caps v10 added `CS_TYPE_DISPLAY`, taking the
+count from 8 to 9 and the header from 40 bytes to 44. The four post-table maxima
+(`max_ir_commands`, `max_groups`, `max_macros`, `max_macro_steps`) therefore sit
+at `4 + 4*type_count`, which is the offset the header itself documents at line
+568. A host that hardcodes 36 reads the display type's descriptor as
+`max_ir_commands` and gets a plausible small number.
+
+This is the mechanism the firmware calls "the documented self-describing
+mechanism": the table is meant to grow, so nothing may index past it by a
+constant.
+
+## 13. `CsStatusPacket` grew for the same reason, one version earlier
+
+Caps v6 doubled `CS_MAX_IR_COMMANDS` from 8 to 16. `ir_active_mask` widened from
+one byte to two and `ir_cmd_status` from 8 entries to 16, taking the packet from
+22 bytes to 41. Both counts come from the caps header, never from a constant:
+`max_bindings` sizes `slot_status` and `max_ir_commands` sizes `ir_cmd_status`.
+
+## 14. The S/PDIF enable mask's bit 0 is input 1, not input 2
+
+`survey-firmware.md` section 1.22 says `REQ_GET_SPDIF_INPUT_CONFIG` (0xEF)
+returns an enable mask whose "bit0 = input2". Both `config.h:456` and
+`vendor_commands.c:3401-3411` say otherwise: the response is
+`(spdif_rx_enabled_ext << 1) | 1`, so **bit 0 is input 1 and is always set**, and
+bits 1..3 are the optional inputs 2..4.
+
+The bulk packet's `spdif_rx_enabled_ext_p1` is the *other* mask: it carries only
+`spdif_rx_enabled_ext`, so its bit 0 **is** S/PDIF 2. The two are one bit apart
+and both are called "the enable mask".
+
+## 15. The first-order pass filters follow the firmware's one-pole
+
+`FILTER_LOWPASS1` (12) and `FILTER_HIGHPASS1` (13) arrived at v1.1.6. Like the
+first-order shelves before them they are a one-pole TPT state-variable section,
+not a degenerate RBJ biquad: `dsp_pipeline.c` sets `g = tan(pi*f/fs)` with no
+prewarp and takes `lp` for the low pass and `in - lp` for the high pass.
+
+The biquad fallback the same file uses above `fs/7.5` is the identical transfer
+function once `1 + cos(w)` is divided out, so one set of coefficients draws both
+paths. Unlike the shelves, these two need no `A` prewarp, because they have no
+gain; they also read neither `Q` nor `gain_db`, so offering either in a UI would
+show a control that does nothing.
+
+## 16. The Console writes these as `LP1` and `HP1`
+
+`DSPi Console/DSPMath.swift` gives every filter type a `shortLabel` and writes it
+verbatim into exported filter files. The two new types are `LP1` and `HP1`.
+
+Reading that file also settled an older bug here: `filterfile.rs` mapped `LSC`
+and `HSC` to the *first-order* shelves, while the Console and `autoeq.rs` both
+read them as REW's spelling of the second-order ones. A REW file's shelves were
+being imported at half their slope. They now agree.

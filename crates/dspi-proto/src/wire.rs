@@ -189,6 +189,11 @@ impl BulkPacket {
         self.header.channel_map()
     }
 
+    /// Section 15, decoded with its `+1` sentinels resolved.
+    pub fn input_config(&self) -> Option<InputConfig> {
+        InputConfig::decode(self.section("input_config")?)
+    }
+
     /// One EQ band, decoded from the snapshot.
     ///
     /// The `eq` section is the same table `REQ_GET_EQ_PARAM` answers from, so
@@ -241,6 +246,94 @@ impl BulkPacket {
 /// `WireBandParams`: type, bypass, two reserved bytes, then three floats.
 const WIRE_BAND_SIZE: usize = 16;
 
+/// Byte offsets inside section 15, `WireInputConfig`, at wire **V28**.
+///
+/// This section is the one place where the packet changed shape at V28 without
+/// changing size: `spdif_rx_pin_ext` grew from two entries to three, so every
+/// field below it moved down one byte and the section's last reserved byte was
+/// consumed (bulk_params.h:203-233). `BULK_SIZE` is unchanged at 5944, so no
+/// size check can catch this: only these offsets can. A host that version-gates
+/// on packet size alone reads `i2s_clock_mode` where `spdif_rx_enabled_ext_p1`
+/// now lives and silently disables the extra S/PDIF inputs.
+///
+/// `(name, offset from the section start, length)`.
+pub const INPUT_CONFIG_FIELDS: [(&str, usize, usize); 12] = [
+    ("input_source", 0, 1),
+    ("spdif_rx_pin", 1, 1),
+    ("i2s_rx_pin", 2, 1),
+    ("i2s_input_rate", 3, 1),
+    ("i2s_input_channels", 4, 1),
+    ("i2s_rx_pin_ext", 5, 3),
+    // V28: was [2] at offset 8..10.
+    ("spdif_rx_pin_ext", 8, 3),
+    ("spdif_rx_enabled_ext_p1", 11, 1),
+    ("i2s_clock_mode", 12, 1),
+    ("adat_input_pin", 13, 1),
+    ("adat_input_enabled_p1", 14, 1),
+    ("adat_clock_mode_p1", 15, 1),
+];
+
+/// Section 15 decoded, with every `+1` sentinel resolved.
+///
+/// `None` on an optional field means "absent, keep the device's live value", and
+/// is not the same as the value zero: writing a plain `0` into one of the `_p1`
+/// fields reads back as "absent" rather than as "disabled" or "master". See
+/// `docs/wire-format.md` section 5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct InputConfig {
+    pub input_source: u8,
+    pub spdif_rx_pin: u8,
+    pub i2s_rx_pin: u8,
+    pub i2s_input_rate: u8,
+    /// Active I2S input channels: 2, 4, 6 or 8. `None` when absent.
+    pub i2s_input_channels: Option<u8>,
+    /// Data GPIO for I2S stereo pairs 1..3. `None` where unset.
+    pub i2s_rx_pin_ext: [Option<u8>; 3],
+    /// GPIO for S/PDIF inputs 2..4. Three entries from V28; two before it.
+    pub spdif_rx_pin_ext: [Option<u8>; 3],
+    /// Enable mask for S/PDIF inputs 2..4, bit 0 = input 2.
+    pub spdif_rx_enabled_ext: Option<u8>,
+    /// 0 = master, 1 = slave. A plain byte, not a `+1` field: a pre-V21 reader
+    /// sees zero here, which is the correct legacy default.
+    pub i2s_clock_mode: u8,
+    pub adat_input_pin: Option<u8>,
+    pub adat_input_enabled: Option<bool>,
+    /// 0 = master, 1 = slave.
+    pub adat_clock_mode: Option<u8>,
+}
+
+impl InputConfig {
+    pub const LEN: usize = 16;
+
+    /// Decode the section's 16 bytes. `None` if the slice is short.
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        let b: &[u8; Self::LEN] = b.get(..Self::LEN)?.try_into().ok()?;
+        Some(Self {
+            input_source: b[0],
+            spdif_rx_pin: b[1],
+            i2s_rx_pin: b[2],
+            i2s_input_rate: b[3],
+            i2s_input_channels: decode_absent_zero(b[4]),
+            i2s_rx_pin_ext: [
+                decode_absent_zero(b[5]),
+                decode_absent_zero(b[6]),
+                decode_absent_zero(b[7]),
+            ],
+            spdif_rx_pin_ext: [
+                decode_absent_zero(b[8]),
+                decode_absent_zero(b[9]),
+                decode_absent_zero(b[10]),
+            ],
+            spdif_rx_enabled_ext: decode_p1(b[11]),
+            i2s_clock_mode: b[12],
+            adat_input_pin: decode_absent_zero(b[13]),
+            adat_input_enabled: decode_p1(b[14]).map(|v| v != 0),
+            adat_clock_mode: decode_p1(b[15]),
+        })
+    }
+}
+
 /// Decode a `+1`-encoded optional byte.
 ///
 /// Several V21-V24 fields were added by claiming reserved bytes, using
@@ -289,7 +382,7 @@ mod tests {
     }
 
     fn valid() -> Vec<u8> {
-        header_bytes(26, 8, 9, 17, generated::BULK_SIZE as u16)
+        header_bytes(28, 8, 9, 17, generated::BULK_SIZE as u16)
     }
 
     /// One `WireBandParams`: type, bypass, the reserved pair, then the floats.
@@ -423,14 +516,14 @@ mod tests {
             BulkPacket::decode(older),
             Err(WireError::UnsupportedVersion {
                 got: 14,
-                expected: 26
+                expected: 28
             })
         );
 
-        let newer = header_bytes(27, 8, 9, 17, generated::BULK_SIZE as u16);
+        let newer = header_bytes(29, 8, 9, 17, generated::BULK_SIZE as u16);
         assert!(matches!(
             BulkPacket::decode(newer),
-            Err(WireError::UnsupportedVersion { got: 27, .. })
+            Err(WireError::UnsupportedVersion { got: 29, .. })
         ));
     }
 
@@ -446,7 +539,7 @@ mod tests {
 
     #[test]
     fn rejects_an_inconsistent_header() {
-        let bad = header_bytes(26, 8, 9, 11, generated::BULK_SIZE as u16);
+        let bad = header_bytes(28, 8, 9, 11, generated::BULK_SIZE as u16);
         assert_eq!(
             BulkPacket::decode(bad),
             Err(WireError::InconsistentHeader {
@@ -459,7 +552,7 @@ mod tests {
 
     #[test]
     fn detects_a_torn_read_via_payload_length() {
-        let bad = header_bytes(26, 8, 9, 17, 3664);
+        let bad = header_bytes(28, 8, 9, 17, 3664);
         assert_eq!(
             BulkPacket::decode(bad),
             Err(WireError::LengthMismatch {
@@ -514,5 +607,108 @@ mod tests {
     fn absent_zero_fields_have_no_offset() {
         assert_eq!(decode_absent_zero(0), None);
         assert_eq!(decode_absent_zero(6), Some(6));
+    }
+
+    /// V28 is the change no size check can catch: the section is still 16 bytes
+    /// and `BULK_SIZE` is still 5944, but `spdif_rx_pin_ext` grew from two
+    /// entries to three and pushed the five fields below it down one byte
+    /// (bulk_params.h:203-233). Every offset is pinned by name here, because
+    /// getting one wrong reads a GPIO as a clock mode and looks plausible.
+    #[test]
+    fn the_v28_input_config_offsets_are_where_the_header_puts_them() {
+        let expect: &[(&str, usize, usize)] = &[
+            ("input_source", 0, 1),
+            ("spdif_rx_pin", 1, 1),
+            ("i2s_rx_pin", 2, 1),
+            ("i2s_input_rate", 3, 1),
+            ("i2s_input_channels", 4, 1),
+            ("i2s_rx_pin_ext", 5, 3),
+            ("spdif_rx_pin_ext", 8, 3),
+            ("spdif_rx_enabled_ext_p1", 11, 1),
+            ("i2s_clock_mode", 12, 1),
+            ("adat_input_pin", 13, 1),
+            ("adat_input_enabled_p1", 14, 1),
+            ("adat_clock_mode_p1", 15, 1),
+        ];
+        assert_eq!(INPUT_CONFIG_FIELDS.as_slice(), expect);
+
+        // The section is exactly full: no reserved byte is left at V28.
+        let (_, last_off, last_len) = INPUT_CONFIG_FIELDS[INPUT_CONFIG_FIELDS.len() - 1];
+        assert_eq!(last_off + last_len, InputConfig::LEN);
+        assert_eq!(InputConfig::LEN, generated::LEN_INPUT_CONFIG);
+    }
+
+    /// Each field is decoded from its own byte. A distinctive value per offset
+    /// means a one-byte slip shows up as the wrong field, not as a near miss.
+    #[test]
+    fn every_input_config_field_decodes_from_its_own_byte() {
+        let mut raw = valid();
+        let off = generated::OFF_INPUT_CONFIG;
+        let bytes: [u8; 16] = [
+            2, // input_source = I2S
+            5, // spdif_rx_pin
+            1, // i2s_rx_pin
+            2, // i2s_input_rate = 96 kHz
+            8, // i2s_input_channels
+            2, 3, 4, // i2s_rx_pin_ext[3]
+            20, 21, 22, // spdif_rx_pin_ext[3], three entries from V28
+            8,  // spdif_rx_enabled_ext_p1: +1, so the mask is 7
+            1,  // i2s_clock_mode = slave, a plain byte with no +1
+            9,  // adat_input_pin
+            2,  // adat_input_enabled_p1: +1, so enabled
+            2,  // adat_clock_mode_p1: +1, so slave
+        ];
+        raw[off..off + 16].copy_from_slice(&bytes);
+
+        let c = BulkPacket::decode(raw).unwrap().input_config().unwrap();
+        assert_eq!(c.input_source, 2);
+        assert_eq!(c.spdif_rx_pin, 5);
+        assert_eq!(c.i2s_rx_pin, 1);
+        assert_eq!(c.i2s_input_rate, 2);
+        assert_eq!(c.i2s_input_channels, Some(8));
+        assert_eq!(c.i2s_rx_pin_ext, [Some(2), Some(3), Some(4)]);
+        assert_eq!(
+            c.spdif_rx_pin_ext,
+            [Some(20), Some(21), Some(22)],
+            "V28 carries a pin for S/PDIF 4"
+        );
+        assert_eq!(c.spdif_rx_enabled_ext, Some(7));
+        assert_eq!(c.i2s_clock_mode, 1);
+        assert_eq!(c.adat_input_pin, Some(9));
+        assert_eq!(c.adat_input_enabled, Some(true));
+        assert_eq!(c.adat_clock_mode, Some(1));
+    }
+
+    /// An all-zero section means "absent everywhere", not "disabled and
+    /// master": the `+1` fields must not read their sentinel as a value.
+    #[test]
+    fn an_untouched_input_config_is_absent_not_zero() {
+        let c = BulkPacket::decode(valid()).unwrap().input_config().unwrap();
+        assert_eq!(c.spdif_rx_enabled_ext, None);
+        assert_eq!(c.adat_input_enabled, None);
+        assert_eq!(c.adat_clock_mode, None);
+        assert_eq!(c.i2s_input_channels, None);
+        assert_eq!(c.spdif_rx_pin_ext, [None, None, None]);
+        // i2s_clock_mode has no sentinel, and zero is master.
+        assert_eq!(c.i2s_clock_mode, 0);
+    }
+
+    /// The pre-V28 reading of the same bytes, to show what the shift costs:
+    /// byte 11 used to be `i2s_clock_mode`, so a stale decoder reports the
+    /// S/PDIF enable mask as a clock mode and vice versa.
+    #[test]
+    fn the_v28_shift_would_be_invisible_to_a_size_check() {
+        assert_eq!(generated::BULK_SIZE, 5944, "unchanged from V26");
+        assert_eq!(generated::LEN_INPUT_CONFIG, 16, "unchanged from V26");
+
+        let field = |name: &str| {
+            INPUT_CONFIG_FIELDS
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .unwrap()
+        };
+        assert_eq!(field("spdif_rx_enabled_ext_p1").1, 11, "was 10 at V26");
+        assert_eq!(field("i2s_clock_mode").1, 12, "was 11 at V26");
+        assert_eq!(field("adat_clock_mode_p1").1, 15, "was 14 at V26");
     }
 }

@@ -95,10 +95,14 @@ struct offset. Nothing is transcribed by hand.
 
 This matters: the firmware's released `commands.md` documents wire format **V14
 at 3664 bytes** with a channel model that was removed at V16, while the headers
-on the same branch are at **V26, 5944 bytes**. Building from the documentation
+on the same branch are at **V28, 5944 bytes**. Building from the documentation
 would produce an app that is wrong on day one. See
 [`docs/wire-format.md`](docs/wire-format.md), which is derived from the headers
 and checked by tests.
+
+Pinned at `WeebLabs/DSPi` `release/v1.1.6` @ `112f35b`: 202 vendor opcodes,
+wire format V28, Control Surfaces caps v13, firmware 1.1.6. `dspi --version`
+prints the pin the binary was built from.
 
 To move to a newer firmware, follow `docs/firmware-bump.md`: copy the headers,
 rebuild, and the tests report exactly what changed.

@@ -64,12 +64,23 @@ pub enum Target {
     CsSlot,
     /// Learned IR command sub-slot.
     CsIrSlot,
+    /// Control-surface target group, `CS_MAX_GROUPS` 8.
+    CsGroup,
+    /// Control-surface macro, `CS_MAX_MACROS` 8.
+    CsMacro,
+    /// A macro plus one of its steps, `CS_MAX_MACRO_STEPS` 8.
+    CsMacroStep,
+    /// Display page slot, `CS_MAX_DISPLAY_PAGES` 16.
+    CsDisplayPage,
     /// Legacy 3-channel gain/mute space, superseded by the matrix mixer.
     LegacyChannel,
     /// One of the upmixer's parameter ids.
     UpmixParam,
-    /// Optional S/PDIF input index.
+    /// S/PDIF input index, `0..=3` (config.h:448-453).
     SpdifInput,
+    /// One of the *optional* S/PDIF inputs, `1..=3`: input 0 is always on and
+    /// `REQ_SET_SPDIF_INPUT_ENABLE` rejects it (config.h:454).
+    SpdifExtraInput,
     /// I2S RX stereo pair.
     I2sPair,
 }
@@ -79,7 +90,7 @@ impl Target {
     pub fn arity(self) -> usize {
         match self {
             Target::None => 0,
-            Target::ChannelBand | Target::Crosspoint => 2,
+            Target::ChannelBand | Target::Crosspoint | Target::CsMacroStep => 2,
             _ => 1,
         }
     }
@@ -107,6 +118,9 @@ pub enum WValue {
     /// The value itself rides in `wValue`; there is no data stage. This is how
     /// the write-as-read opcodes carry their parameters.
     ValueOnly,
+    /// `(step << 8) | macro`, used by the macro-step write. Indices are given
+    /// macro first, so the packing is deliberately reversed here.
+    MacroStep,
     /// A fixed constant, e.g. the caps header selector.
     Fixed(u16),
 }
@@ -367,8 +381,14 @@ const FILTER_TYPE: &[(u8, &str)] = &[
     (9, "lowshelf1"),
     (10, "highshelf1"),
     (11, "linkwitz"),
+    // config.h:924-925, new in v1.1.6. The codes match the Console's file codes
+    // LP1 / HP1 so a filter file round-trips between the two apps.
+    (12, "lowpass1"),
+    (13, "highpass1"),
 ];
-const CENTER_MODE: &[(u8, &str)] = &[(0, "passive"), (1, "logic")];
+/// Upmixer centre mode. Wire V27 widened this to three: `UPMIX_CENTER_OFF = 2`
+/// leaves L/R bit-exact and produces surrounds only (bulk_params.h:34).
+const CENTER_MODE: &[(u8, &str)] = &[(0, "passive"), (1, "logic"), (2, "off")];
 const SURROUND_MODE: &[(u8, &str)] = &[(0, "off"), (1, "passive"), (2, "logic")];
 
 use Dir::{In as DIn, Out as DOut, WriteAsRead as DWar};
@@ -1596,7 +1616,7 @@ pub static REGISTRY: &[ParamDesc] = &[
     p(
         "in.spdif.pin",
         "S/PDIF input GPIO",
-        "Which pin the optical or coaxial receiver uses",
+        "Which pin one optical or coaxial receiver uses",
         Input,
         Expert,
         Int {
@@ -1616,12 +1636,17 @@ pub static REGISTRY: &[ParamDesc] = &[
     p(
         "in.spdif.enable",
         "Extra S/PDIF inputs",
-        "Turn on the optional second and third receivers",
+        "Turn on the optional second, third and fourth receivers",
         Input,
         Expert,
         Bool,
-        Tg::SpdifInput,
+        // Index 1..3 only: input 0 is always enabled (config.h:454).
+        Tg::SpdifExtraInput,
         Some(op::REQ_SET_SPDIF_INPUT_ENABLE),
+        // The readback is the whole 6-byte config, {count, enable_mask,
+        // gpio[0..3]}, whose bit 0 is input 1 and is always set. A scalar read
+        // of one byte therefore sees `count`, not this input's state; Phase 2B
+        // gives it a codec that picks the right bit.
         Some(op::REQ_GET_SPDIF_INPUT_CONFIG),
         DWar,
         Wv::ValueIndex,
@@ -2234,6 +2259,10 @@ pub static REGISTRY: &[ParamDesc] = &[
     p(
         "preset.dir",
         "Preset directory",
+        // 7 bytes, not the 6 the old spec claimed: {occupied u16 LE, startup_mode,
+        // default_slot, last_active, output_config_mode, master_volume_mode}
+        // (vendor_commands.c:2391-2411). Nothing decodes it yet; Phase 2B gives
+        // it a codec.
         "Which slots are in use, and the storage policy",
         Presets,
         Advanced,
@@ -2386,6 +2415,146 @@ pub static REGISTRY: &[ParamDesc] = &[
         Tg::None,
         None,
         Some(op::REQ_GET_CS_STATUS),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Always,
+    ),
+    // Groups and macros, caps v9 (config.h:136-146). Availability is reported
+    // by the caps header's max_groups / max_macros / max_macro_steps, not by a
+    // separate probe, which is why these are `Always`: a firmware without them
+    // answers zero and the UI offers nothing.
+    p(
+        "cs.group",
+        "Channel group",
+        "A named set of channels a control drives as one",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::CsGroup,
+        Some(op::REQ_SET_CS_GROUP),
+        Some(op::REQ_GET_CS_GROUP),
+        DOut,
+        Wv::Target,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.macro",
+        "Macro",
+        "A named sequence of steps one control can fire",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::CsMacro,
+        // The SET takes the 36-byte header alone; the GET answers the whole
+        // 132-byte macro, steps included (control_surfaces.h:488-496).
+        Some(op::REQ_SET_CS_MACRO),
+        Some(op::REQ_GET_CS_MACRO),
+        DOut,
+        Wv::Target,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.macro.step",
+        "Macro step",
+        "One action in a macro, with its delay",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::CsMacroStep,
+        Some(op::REQ_SET_CS_MACRO_STEP),
+        // A step has no GET of its own: it reads back inside the whole macro,
+        // whose wValue is the macro index alone. Steps are written before the
+        // header so a concurrent fire never sees a step_count it cannot reach.
+        Some(op::REQ_GET_CS_MACRO),
+        DOut,
+        Wv::MacroStep,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.macro.fire",
+        "Run a macro",
+        "Run one macro now; a running macro is cancelled at its next step",
+        Surfaces,
+        Advanced,
+        Trigger,
+        Tg::CsMacro,
+        Some(op::REQ_CS_MACRO_FIRE),
+        None,
+        DWar,
+        Wv::Target,
+        Hz::Audible,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.ext.status",
+        "Group and macro status",
+        "Which groups and macros are valid, and what is running",
+        Surfaces,
+        Advanced,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_GET_CS_EXT_STATUS),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Always,
+    ),
+    // I2C display, caps v10-v13 (config.h:150-157).
+    p(
+        "cs.display",
+        "Display settings",
+        "How the attached I2C display behaves",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::None,
+        Some(op::REQ_SET_CS_DISPLAY_CFG),
+        // The GET prepends {max_pages, model_count, reserved[2]} to the same
+        // 12-byte record the SET takes, so the read is 16 bytes.
+        Some(op::REQ_GET_CS_DISPLAY_CFG),
+        DOut,
+        Wv::Zero,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.display.page",
+        "Display page",
+        "What one page of the display shows",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::CsDisplayPage,
+        Some(op::REQ_SET_CS_DISPLAY_PAGE),
+        Some(op::REQ_GET_CS_DISPLAY_PAGE),
+        DOut,
+        Wv::Target,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.display.status",
+        "Display status",
+        "Whether the display is live, and what it is showing",
+        Surfaces,
+        Advanced,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_GET_CS_DISPLAY_STATUS),
         DIn,
         Wv::Zero,
         Hz::None,
@@ -2708,6 +2877,64 @@ mod tests {
         assert_eq!(by_path("out.gain").unwrap().target.arity(), 1);
         assert_eq!(by_path("vol.user").unwrap().target.arity(), 0);
         assert_eq!(by_path("mix").unwrap().target.arity(), 2);
+        // A macro step is addressed by macro and by step number.
+        assert_eq!(by_path("cs.macro.step").unwrap().target.arity(), 2);
+    }
+
+    /// The twelve opcodes v1.1.6 added, and the direction each is dispatched
+    /// on. `REQ_CS_MACRO_FIRE` is the only write-as-read of the group.
+    #[test]
+    fn the_v1_1_6_control_surface_opcodes_are_all_reachable() {
+        let rows: &[(&str, Option<u8>, Option<u8>, Dir)] = &[
+            ("cs.group", Some(0x20), Some(0x21), Dir::Out),
+            ("cs.macro", Some(0x22), Some(0x23), Dir::Out),
+            ("cs.macro.step", Some(0x24), Some(0x23), Dir::Out),
+            ("cs.macro.fire", Some(0x25), None, Dir::WriteAsRead),
+            ("cs.ext.status", None, Some(0x26), Dir::In),
+            ("cs.display", Some(0x27), Some(0x28), Dir::Out),
+            ("cs.display.page", Some(0x29), Some(0x2A), Dir::Out),
+            ("cs.display.status", None, Some(0x2B), Dir::In),
+        ];
+        for (path, set, get, dir) in rows {
+            let d = by_path(path).unwrap_or_else(|| panic!("{path} is not registered"));
+            assert_eq!(d.set, *set, "{path} set opcode");
+            assert_eq!(d.get, *get, "{path} get opcode");
+            assert_eq!(d.dir, *dir, "{path} direction");
+            assert_eq!(d.group, Group::Surfaces, "{path} belongs on the CS screen");
+        }
+    }
+
+    /// `REQ_SET_CS_MACRO_STEP` packs `(step << 8) | macro`, the reverse of the
+    /// usual order, so the indices are given macro first and swapped here.
+    #[test]
+    fn a_macro_step_packs_the_step_into_the_high_byte() {
+        let d = by_path("cs.macro.step").unwrap();
+        assert_eq!(d.wvalue, WValue::MacroStep);
+    }
+
+    /// The optional S/PDIF inputs are 1..3; input 0 is always on and cannot be
+    /// disabled, so it must not share the pin command's index space.
+    #[test]
+    fn the_two_spdif_index_spaces_are_distinct() {
+        assert_eq!(by_path("in.spdif.pin").unwrap().target, Target::SpdifInput);
+        assert_eq!(
+            by_path("in.spdif.enable").unwrap().target,
+            Target::SpdifExtraInput
+        );
+    }
+
+    /// V27 widened the upmixer centre mode, and v1.1.6 added two PEQ types.
+    /// A choice list that has not grown rejects a value the device accepts.
+    #[test]
+    fn the_choice_lists_match_the_firmwares_ranges() {
+        let center = by_path("up.center_mode").unwrap();
+        assert!(center.kind.validate(&Value::Choice(2)).is_ok(), "OFF is 2");
+        assert!(center.kind.validate(&Value::Choice(3)).is_err());
+
+        let ty = by_path("eq.type").unwrap();
+        assert!(ty.kind.validate(&Value::Choice(12)).is_ok(), "LOWPASS1");
+        assert!(ty.kind.validate(&Value::Choice(13)).is_ok(), "HIGHPASS1");
+        assert!(ty.kind.validate(&Value::Choice(14)).is_err());
     }
 
     #[test]

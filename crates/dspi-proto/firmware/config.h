@@ -128,6 +128,33 @@ extern volatile uint32_t nominal_feedback_10_14;
 // tud_vendor_control_xfer_cb in vendor_commands.c.
 #define MS_VENDOR_CODE      0x01
 
+// Control Surfaces target groups and macros (caps v9); see control_surfaces.h
+// and Documentation/Features/control_surfaces_groups_macros_spec.md.  The rest
+// of 0x00-0x1F stays unallocated; 0x01 is MS_VENDOR_CODE above, intercepted in
+// tud_vendor_control_xfer_cb before the application dispatcher sees it.
+#define REQ_SET_CS_GROUP            0x20  // wValue = group (0-7), payload = 40-byte CsGroup;
+                                          // all-zero record clears the slot
+#define REQ_GET_CS_GROUP            0x21  // wValue = group (0-7); returns 40-byte CsGroup
+#define REQ_SET_CS_MACRO            0x22  // wValue = macro (0-7), payload = 36-byte
+                                          // CsMacroHeaderWire (name + step_count)
+#define REQ_GET_CS_MACRO            0x23  // wValue = macro (0-7); returns 132-byte CsMacro
+#define REQ_SET_CS_MACRO_STEP       0x24  // wValue = (step << 8) | macro, payload = 12-byte
+                                          // CsMacroStep; all-zero record clears the step
+#define REQ_CS_MACRO_FIRE           0x25  // GET; wValue = macro fires it, 0xFFFF cancels the
+                                          // running one; returns 1 status byte
+#define REQ_GET_CS_EXT_STATUS       0x26  // returns 24-byte CsExtStatusPacket
+
+// Control Surfaces I2C display (caps v10); see control_surfaces.h and
+// Documentation/Features/control_surfaces_display_spec.md section 2.4.
+#define REQ_SET_CS_DISPLAY_CFG      0x27  // payload = 12-byte CsDisplayCfg
+#define REQ_GET_CS_DISPLAY_CFG      0x28  // returns 16 bytes: {max_pages,
+                                          // model_count, reserved[2]} + CsDisplayCfg
+#define REQ_SET_CS_DISPLAY_PAGE     0x29  // wValue = page (0-15), payload = 4-byte
+                                          // CsDisplayPage; all-zero record clears it
+#define REQ_GET_CS_DISPLAY_PAGE     0x2A  // wValue = page (0-15); returns 4-byte
+                                          // CsDisplayPage
+#define REQ_GET_CS_DISPLAY_STATUS   0x2B  // returns 8-byte CsDisplayStatus
+
 // Psychoacoustic bass enhancement (missing-fundamental harmonics; psybass.h)
 #define REQ_SET_PSYBASS             0x30
 #define REQ_GET_PSYBASS             0x31
@@ -241,13 +268,13 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_SET_CS_BINDING          0x84  // wValue = slot (0-15), payload = 24-byte CsBinding
 #define REQ_GET_CS_BINDING          0x85  // wValue = slot, returns 24-byte CsBinding
 #define REQ_GET_CS_CAPS             0x86  // wValue = 0xFFFF: header + type table; wValue = noun: 12-byte noun descriptor
-#define REQ_GET_CS_STATUS           0x87  // returns 22-byte CsStatusPacket
+#define REQ_GET_CS_STATUS           0x87  // returns 41-byte CsStatusPacket
 // 0x88-0x8A reserved (claimed by the I2S slave-mode branch)
 #define REQ_SET_CS_NAME             0x8B  // wValue = slot (0-15), payload = 1-32 byte name (a single
                                           // NUL byte clears it); apply-live-only preview, deferred,
                                           // result via REQ_GET_CS_STATUS
 #define REQ_GET_CS_NAME             0x8C  // wValue = slot, returns 32-byte NUL-terminated live name
-#define REQ_SET_CS_IR_CMD           0x8D  // wValue = sub-slot (0-7), payload = 16-byte IrCommand;
+#define REQ_SET_CS_IR_CMD           0x8D  // wValue = sub-slot (0-15), payload = 16-byte IrCommand;
                                           // apply-live-only preview, deferred to the main loop
 #define REQ_GET_CS_IR_CMD           0x8E  // wValue = sub-slot, returns 16-byte IrCommand
 #define REQ_CS_IR_LEARN             0x8F  // GET; wValue 1 = arm, 0 = cancel (each returns 1 status
@@ -419,15 +446,15 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_INPUT_SOURCE        0xE1  // returns uint8_t
 #define REQ_GET_SPDIF_RX_STATUS     0xE2  // returns 16-byte status struct (Phase 2)
 #define REQ_GET_SPDIF_RX_CH_STATUS  0xE3  // returns 24-byte IEC 60958 channel status (Phase 2)
-#define REQ_SET_SPDIF_RX_PIN        0xE4  // wValue = (index<<8)|GPIO; index 0..2 selects the
+#define REQ_SET_SPDIF_RX_PIN        0xE4  // wValue = (index<<8)|GPIO; index 0..3 selects the
                                           // SPDIF input (old hosts send wValue=pin => index 0).
                                           // GPIO = PIN_RESET_TO_DEFAULT restores that input's
                                           // default. Returns status byte.
-#define REQ_GET_SPDIF_RX_PIN        0xE5  // wValue = index (0..2); returns that input's GPIO
-#define REQ_SET_SPDIF_INPUT_ENABLE  0xE9  // wValue = (index<<8)|enable; index 1..2, enable 0/1.
+#define REQ_GET_SPDIF_RX_PIN        0xE5  // wValue = index (0..3); returns that input's GPIO
+#define REQ_SET_SPDIF_INPUT_ENABLE  0xE9  // wValue = (index<<8)|enable; index 1..3, enable 0/1.
                                           // Enables/disables an optional SPDIF input. Returns status byte.
-#define REQ_GET_SPDIF_INPUT_CONFIG  0xEF  // returns 5 bytes: count, enable mask (bit0=input1),
-                                          // then the GPIO for inputs 0..2
+#define REQ_GET_SPDIF_INPUT_CONFIG  0xEF  // returns 6 bytes: count, enable mask (bit0=input1),
+                                          // then the GPIO for inputs 0..3
 
 // I2S Input Commands. The device is the rate authority while I2S input is
 // active (the external source slaves to our BCK/LRCLK), so the sample rate
@@ -562,7 +589,7 @@ typedef struct __attribute__((packed)) {
 // Firmware version (BCD encoded: major in high byte, minor.patch in low byte)
 #define FW_VERSION_MAJOR            1
 #define FW_VERSION_MINOR            1
-#define FW_VERSION_PATCH            5
+#define FW_VERSION_PATCH            6
 #define FW_VERSION_BCD              ((FW_VERSION_MAJOR << 8) | (FW_VERSION_MINOR << 4) | FW_VERSION_PATCH)
 
 // Universal "reset to default" escape hatch for every single-pin SET command
@@ -833,18 +860,19 @@ typedef struct {
     float sva1, sva2, sva3;                    // integrator coefficients
     float svm0, svm1, svm2;                    // output mix coefficients
     float svic1eq, svic2eq;                    // integrator state
-    uint32_t svf_type;                         // FilterType enum for inner loop specialization
+    float g;                                   // frequency warped cutoff frequency
 
+    uint32_t filter_type;                      // FilterType enum for inner loop specialization
     bool use_svf;                              // true = SVF path, false = biquad path
-    bool svf_first_order;                      // true = one-pole SVF inner loop (1st-order types)
+    bool first_order;                          // true = filter type is first order
     bool bypass;
-} Biquad;
+} Filter;
 #else
 typedef struct {
     int32_t b0, b1, b2, a1, a2;
     int32_t s1, s2;
     bool bypass;
-} Biquad;
+} Filter;
 #endif
 
 // FilterType value-space contract.  These values are persisted in flash
@@ -857,7 +885,8 @@ typedef struct {
 //     8       FILTER_ALLPASS1  first-order all-pass
 //     9..10   FILTER_LOWSHELF1, FILTER_HIGHSHELF1  first-order shelves
 //     11      FILTER_LINKWITZ_TRANSFORM  pole/zero bass-extension biquad
-//     12..31  reserved for future PEQ types (the PEQ block is everything
+//     12..13  FILTER_LOWPASS1, FILTER_HIGHPASS1  first-order low/high pass
+//     14..31  reserved for future PEQ types (the PEQ block is everything
 //             below FILTER_XOVER_FIRST; see filter_is_peq_type())
 //     32..63  crossover types  FILTER_XOVER_FIRST .. FILTER_XOVER_LAST
 //     64..    reserved for future crossover types (they must stay contiguous
@@ -888,7 +917,14 @@ enum FilterType {
     // see peq_qp_x512[] and Documentation/Features/peq_filters.md.
     FILTER_LINKWITZ_TRANSFORM = 11,
 
-    // 12..31 reserved for future PEQ types.
+    // First-order low/high pass: single-pole 6 dB/oct rolloff, -3 dB at the
+    // corner, no resonance.  Single parameter (freq); Q and gain are unused.
+    // Same hybrid rule as the other 1st-order types: one-pole SVF below
+    // Fs/7.5, degenerate biquad above (and always on RP2040).
+    FILTER_LOWPASS1 = 12,
+    FILTER_HIGHPASS1 = 13,
+
+    // 14..31 reserved for future PEQ types.
 
     // Crossover filter types — indices 32..63. See crossover.h /
     // Documentation/Features/crossover_filters_spec.md for semantics.

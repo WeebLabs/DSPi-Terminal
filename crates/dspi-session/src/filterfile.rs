@@ -74,6 +74,9 @@ fn type_code(t: FilterType) -> Option<&'static str> {
         FilterType::AllPass1 => "AP1",
         FilterType::LowShelf1 => "LS1",
         FilterType::HighShelf1 => "HS1",
+        // The Console writes these as its `shortLabel`, DSPMath.swift:178-179.
+        FilterType::LowPass1 => "LP1",
+        FilterType::HighPass1 => "HP1",
         FilterType::LinkwitzTransform => "LT",
         // Crossovers spell out their family and order with the space removed.
         FilterType::Unknown(raw) => {
@@ -106,15 +109,20 @@ fn type_from_code(code: &str) -> Option<FilterType> {
     let upper = code.to_ascii_uppercase();
     let plain = match upper.as_str() {
         "PK" | "PEQ" => Some(FilterType::Peaking),
-        "LS" => Some(FilterType::LowShelf),
-        "HS" => Some(FilterType::HighShelf),
+        // LSC / HSC are REW's spelling of the second-order shelves, which is
+        // how the Console reads them (DSPMath.swift:297-298) and how
+        // `autoeq.rs` already read them. They are not the first-order pair.
+        "LS" | "LSC" => Some(FilterType::LowShelf),
+        "HS" | "HSC" => Some(FilterType::HighShelf),
         "LP" | "LPQ" => Some(FilterType::LowPass),
         "HP" | "HPQ" => Some(FilterType::HighPass),
         "NT" | "NO" | "NOTCH" => Some(FilterType::Notch),
         "AP" => Some(FilterType::AllPass),
         "AP1" => Some(FilterType::AllPass1),
-        "LS1" | "LSC" => Some(FilterType::LowShelf1),
-        "HS1" | "HSC" => Some(FilterType::HighShelf1),
+        "LS1" => Some(FilterType::LowShelf1),
+        "HS1" => Some(FilterType::HighShelf1),
+        "LP1" => Some(FilterType::LowPass1),
+        "HP1" => Some(FilterType::HighPass1),
         "LT" => Some(FilterType::LinkwitzTransform),
         _ => None,
     };
@@ -393,7 +401,9 @@ mod tests {
     /// part of a tuning.
     #[test]
     fn every_peq_type_round_trips() {
-        for raw in 0u8..=11 {
+        // 0..=13 at v1.1.6: config.h:884-891 lists FILTER_FLAT through
+        // FILTER_HIGHPASS1, with the crossovers starting at 32.
+        for raw in 0u8..=13 {
             let t = FilterType::from_raw(raw);
             if t == FilterType::Flat {
                 continue;
@@ -413,6 +423,29 @@ mod tests {
                 assert!((parsed.q - 3.58).abs() < 0.05, "Q lost for {t:?}");
             }
         }
+    }
+
+    /// The codes must be the Console's, or a file written here reads back on
+    /// macOS as an unrecognised type and the band is silently dropped. Taken
+    /// from `DSPi Console/DSPMath.swift:165-180` and its `init?(fileCode:)`.
+    #[test]
+    fn the_type_codes_are_the_ones_the_console_writes() {
+        for (t, code) in [
+            (FilterType::LowPass1, "LP1"),
+            (FilterType::HighPass1, "HP1"),
+            (FilterType::LowShelf1, "LS1"),
+            (FilterType::HighShelf1, "HS1"),
+            (FilterType::AllPass1, "AP1"),
+        ] {
+            assert_eq!(code_for(t).as_deref(), Some(code));
+            assert_eq!(type_from_code(code), Some(t));
+        }
+
+        // REW's aliases for the second-order shelves. The Console reads them as
+        // LS / HS, and so does `autoeq.rs`; reading them as the first-order
+        // pair would halve the slope of every imported REW shelf.
+        assert_eq!(type_from_code("LSC"), Some(FilterType::LowShelf));
+        assert_eq!(type_from_code("HSC"), Some(FilterType::HighShelf));
     }
 
     #[test]

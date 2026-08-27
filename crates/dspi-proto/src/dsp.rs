@@ -159,7 +159,24 @@ pub fn coefficients(b: &Band) -> Coeffs {
         // as the shelf's linear gain.
         //
         // The one-pole TPT low pass is `g(1 + z^-1) / ((1+g) + (g-1)z^-1)`, and
-        // each type is a fixed mix of that low pass with the input.
+        // each type is a fixed mix of that low pass with the input: `lp` for
+        // LOWPASS1, `in - lp` for HIGHPASS1, `2*lp - in` for ALLPASS1, and the
+        // shelves adding `(A^2 - 1)` times one of the two.
+        FilterType::LowPass1 => {
+            // out = lp. `dsp_pipeline.c` sets svm1 = 1 with no prewarp, and its
+            // biquad fallback for the same type is `b = (sn, sn, 0)`,
+            // `a = (sn + 1 + cs, sn - 1 - cs, 0)`; dividing that through by
+            // `1 + cs` gives exactly `g(1 + z^-1) / ((1+g) + (g-1)z^-1)`.
+            let g = w_over_two_tan(w);
+            (g, g, 0.0, 1.0 + g, g - 1.0, 0.0)
+        }
+        FilterType::HighPass1 => {
+            // out = in - lp, which is `(1 - z^-1)` over the same denominator.
+            // The firmware's fallback `b = (1 + cs, -1 - cs, 0)` over the same
+            // `a` reduces to this once `1 + cs` is divided out.
+            let g = w_over_two_tan(w);
+            (1.0, -1.0, 0.0, 1.0 + g, g - 1.0, 0.0)
+        }
         FilterType::AllPass1 => {
             // out = 2*lp - in
             let g = w_over_two_tan(w);
@@ -569,6 +586,84 @@ mod first_order_tests {
             "corner should sit near half the 12 dB gain, got {mid}"
         );
     }
+
+    fn first_order(t: FilterType, freq: f32) -> [Band; 1] {
+        [Band {
+            filter_type: t,
+            freq,
+            // A first-order section derives its own damping; the firmware never
+            // reads Q or gain for these, so absurd values must not move the
+            // curve.
+            q: 5.0,
+            gain_db: 9.0,
+            bypass: false,
+        }]
+    }
+
+    /// The firmware's one-pole TPT section (`dsp_pipeline.c`, `f->first_order`
+    /// with `g = tan(pi*f/fs)` and no prewarp for the pass types) is the exact
+    /// bilinear image of the analogue one-pole, so its response at `f` is the
+    /// analogue response at `tan(pi*f/fs) / tan(pi*fc/fs)`. That relation is
+    /// computed here from the structure rather than from the biquad the code
+    /// under test builds, so an error in either one shows up.
+    #[test]
+    fn the_first_order_pass_filters_match_the_firmwares_one_pole() {
+        let fc = 1000.0f64;
+        let gc = (std::f64::consts::PI * fc / SAMPLE_RATE).tan();
+
+        for f in [50.0, 250.0, 1000.0, 4000.0, 15_000.0] {
+            let x = (std::f64::consts::PI * f / SAMPLE_RATE).tan() / gc;
+            let lp = -10.0 * (1.0 + x * x).log10();
+            let hp = 20.0 * x.log10() - 10.0 * (1.0 + x * x).log10();
+
+            let got_lp = response_at(f, &first_order(FilterType::LowPass1, fc as f32));
+            let got_hp = response_at(f, &first_order(FilterType::HighPass1, fc as f32));
+            assert!(
+                close(got_lp, lp, 1e-6),
+                "low pass at {f} Hz: expected {lp}, got {got_lp}"
+            );
+            assert!(
+                close(got_hp, hp, 1e-6),
+                "high pass at {f} Hz: expected {hp}, got {got_hp}"
+            );
+        }
+    }
+
+    /// The two hand-checkable anchors: a first-order corner is 3.0103 dB down
+    /// (the analogue `1/sqrt(2)`), and the pair is power-complementary at every
+    /// frequency, so an LP and an HP at the same corner sum to unity.
+    #[test]
+    fn the_first_order_pass_filters_are_three_db_down_and_complementary() {
+        let lp = first_order(FilterType::LowPass1, 1000.0);
+        let hp = first_order(FilterType::HighPass1, 1000.0);
+        assert!(close(response_at(1000.0, &lp), -3.010_299_96, 1e-6));
+        assert!(close(response_at(1000.0, &hp), -3.010_299_96, 1e-6));
+
+        for f in [20.0, 300.0, 1000.0, 7000.0, 19_000.0] {
+            let sum =
+                10f64.powf(response_at(f, &lp) / 10.0) + 10f64.powf(response_at(f, &hp) / 10.0);
+            assert!(close(sum, 1.0, 1e-9), "power sum at {f} Hz was {sum}");
+        }
+    }
+
+    /// Q and gain are not parameters of these sections. The firmware reads
+    /// neither, so offering them would show a control that does nothing.
+    #[test]
+    fn the_first_order_pass_filters_ignore_q_and_gain() {
+        let plain = [Band {
+            filter_type: FilterType::LowPass1,
+            freq: 800.0,
+            q: 0.707,
+            gain_db: 0.0,
+            bypass: false,
+        }];
+        let loud = first_order(FilterType::LowPass1, 800.0);
+        assert!(close(
+            response_at(2000.0, &plain),
+            response_at(2000.0, &loud),
+            1e-12
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +815,42 @@ mod phase_tests {
     fn unwrapping_leaves_a_smooth_curve_alone() {
         let smooth = vec![0.0, -10.0, -20.0, -30.0];
         assert_eq!(unwrap_phase(&smooth), smooth);
+    }
+
+    /// The bilinear image of the analogue one-pole has phase `-atan(x)` for the
+    /// low pass and `90 - atan(x)` degrees for the high pass, with
+    /// `x = tan(pi*f/fs) / tan(pi*fc/fs)`. At the corner that is exactly -45 and
+    /// +45 degrees, which is the hand-checkable anchor.
+    #[test]
+    fn the_first_order_pass_filters_have_the_one_poles_phase() {
+        let fc = 1000.0f64;
+        let gc = (std::f64::consts::PI * fc / SAMPLE_RATE).tan();
+        let band = |t| {
+            [Band {
+                filter_type: t,
+                freq: fc as f32,
+                q: 0.707,
+                gain_db: 0.0,
+                bypass: false,
+            }]
+        };
+
+        assert!((phase_at(fc, &band(FilterType::LowPass1)) + 45.0).abs() < 1e-6);
+        assert!((phase_at(fc, &band(FilterType::HighPass1)) - 45.0).abs() < 1e-6);
+
+        for f in [80.0, 400.0, 5000.0, 18_000.0] {
+            let x = (std::f64::consts::PI * f / SAMPLE_RATE).tan() / gc;
+            let lp = -x.atan().to_degrees();
+            let hp = 90.0 - x.atan().to_degrees();
+            assert!(
+                (phase_at(f, &band(FilterType::LowPass1)) - lp).abs() < 1e-6,
+                "low pass phase at {f} Hz"
+            );
+            assert!(
+                (phase_at(f, &band(FilterType::HighPass1)) - hp).abs() < 1e-6,
+                "high pass phase at {f} Hz"
+            );
+        }
     }
 
     #[test]

@@ -179,7 +179,9 @@ pub struct Status {
     pub dirty: bool,
     pub active_mask: u16,
     pub slot_status: Vec<u8>,
-    pub ir_active_mask: u8,
+    /// Bit N = IR command N live. Widened from 8 to 16 bits at caps v6, when
+    /// `CS_MAX_IR_COMMANDS` doubled (control_surfaces.h:601-604).
+    pub ir_active_mask: u16,
     pub ir_learn_state: u8,
     pub ir_status: Vec<u8>,
 }
@@ -228,6 +230,14 @@ pub fn explain_status(code: u8) -> String {
         0x1C => "could not write to flash".into(),
         0x1D => "another slot already holds the IR receiver".into(),
         0x1E => "set up an IR receiver first".into(),
+        // Caps v9 and v10 additions, control_surfaces.h:629-637.
+        0x1F => "that group is empty, out of range, or the wrong kind for this parameter".into(),
+        0x20 => "no such macro, or its step count is wrong".into(),
+        0x21 => "that macro step is not a valid action".into(),
+        0x22 => "another slot already holds the display".into(),
+        0x23 => "those two pins are not a valid I2C pair".into(),
+        0x24 => "the I2C control interface already has that instance".into(),
+        0x25 => "that display page or setting is not valid".into(),
         other => format!("refused with status 0x{other:02X}"),
     }
 }
@@ -276,11 +286,20 @@ pub fn read_noun_caps(t: &mut dyn Transport, noun: u8) -> TResult<NounCaps> {
     }))
 }
 
+/// Read `CsStatusPacket`, whose length follows the caps header.
+///
+/// 41 bytes on v1.1.6 (control_surfaces.h:594-605): `last_status, last_slot,
+/// max_bindings, dirty, active_mask u16, slot_status[16], ir_active_mask u16,
+/// ir_learn_state, ir_cmd_status[16]`. It was 22 before caps v6, when
+/// `ir_active_mask` was one byte and there were eight IR sub-slots, so both
+/// counts must come from the caps header rather than from constants.
 pub fn read_status(t: &mut dyn Transport, max_bindings: u8, max_ir: u8) -> TResult<Status> {
-    let len = 6 + max_bindings as usize + 2 + max_ir as usize;
+    // 6 fixed + slot_status + 2 for the mask + 1 for the learn state + ir status.
+    let slots = 6 + max_bindings as usize;
+    let ir_base = slots + 3;
+    let len = ir_base + max_ir as usize;
     let d = t.control_in(op::REQ_GET_CS_STATUS, 0, len as u16)?;
 
-    let slots = 6 + max_bindings as usize;
     Ok(Status {
         last_status: d[0],
         last_slot: d[1],
@@ -288,9 +307,12 @@ pub fn read_status(t: &mut dyn Transport, max_bindings: u8, max_ir: u8) -> TResu
         dirty: d[3] != 0,
         active_mask: u16::from_le_bytes([d[4], d[5]]),
         slot_status: d[6..slots.min(d.len())].to_vec(),
-        ir_active_mask: d.get(slots).copied().unwrap_or(0),
-        ir_learn_state: d.get(slots + 1).copied().unwrap_or(0),
-        ir_status: d.get(slots + 2..).unwrap_or(&[]).to_vec(),
+        ir_active_mask: u16::from_le_bytes([
+            d.get(slots).copied().unwrap_or(0),
+            d.get(slots + 1).copied().unwrap_or(0),
+        ]),
+        ir_learn_state: d.get(slots + 2).copied().unwrap_or(0),
+        ir_status: d.get(ir_base..).unwrap_or(&[]).to_vec(),
     })
 }
 
@@ -450,30 +472,60 @@ mod tests {
         assert_ne!(learn::DONE, learn::ARMED);
     }
 
+    /// The v1.1.6 packet, laid out byte by byte from control_surfaces.h:594-605.
+    fn status_bytes() -> Vec<u8> {
+        let mut d = vec![0x02, 3, 16, 1, 0x05, 0x00];
+        d.extend([0u8; 16]); // slot_status[16], bytes 6..22
+        d[6 + 3] = 0x1A; // slot 3 refused: pin and gesture already in use
+        d.extend(0x8003u16.to_le_bytes()); // ir_active_mask, bytes 22..24
+        d.push(learn::IDLE); // byte 24
+        let mut ir = [0u8; 16]; // ir_cmd_status[16], bytes 25..41
+        ir[15] = 0x1E;
+        d.extend(ir);
+        d
+    }
+
     #[test]
     fn status_decodes_the_dirty_flag_and_per_slot_results() {
-        let mut d = vec![0x02, 3, 16, 1, 0x05, 0x00];
-        d.extend([0u8; 16]);
-        d[6 + 3] = 0x1A; // slot 3 refused: pin and gesture already in use
-        d.push(0b11); // ir active
-        d.push(learn::IDLE);
-        d.extend([0u8; 8]);
+        let d = status_bytes();
+        assert_eq!(d.len(), 41, "CsStatusPacket is 41 bytes at caps v6+");
 
         let mut t = MockTransport::new().data(op::REQ_GET_CS_STATUS, d);
-        let s = read_status(&mut t, 16, 8).unwrap();
+        let s = read_status(&mut t, 16, 16).unwrap();
 
         assert!(s.dirty, "unsaved changes must be visible");
         assert_eq!(s.max_bindings, 16);
         assert_eq!(s.active_mask, 0b101);
         assert_eq!(s.slot_status[3], 0x1A);
-        assert_eq!(s.ir_active_mask, 0b11);
+        assert_eq!(s.ir_active_mask, 0x8003);
+        assert_eq!(s.ir_learn_state, learn::IDLE);
+        assert_eq!(s.ir_status.len(), 16);
+    }
+
+    /// The IR half doubled at caps v6: the mask became 16 bits and there are
+    /// sixteen sub-slots. Reading the old layout puts the learn state one byte
+    /// early and reports sub-slot 15's result as sub-slot 14's.
+    #[test]
+    fn the_sixteenth_ir_sub_slot_is_reachable() {
+        // The mock refuses a read longer than the device's answer, so asking
+        // for more than 41 bytes fails here rather than passing quietly.
+        let mut t = MockTransport::new().data(op::REQ_GET_CS_STATUS, status_bytes());
+        let s = read_status(&mut t, 16, 16).unwrap();
+
+        assert!(
+            s.ir_active_mask & 0x8000 != 0,
+            "sub-slot 15 has no bit in an 8-bit mask"
+        );
+        assert_eq!(s.ir_status[15], 0x1E, "sub-slot 15's status was lost");
     }
 
     /// Every status code needs a sentence; a bare number sends the user to a
     /// header file.
     #[test]
     fn every_status_code_explains_itself() {
-        for code in [0x00u8, 0x02, 0x13, 0x15, 0x1A, 0x1D, 0x1E] {
+        for code in [
+            0x00u8, 0x02, 0x13, 0x15, 0x1A, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+        ] {
             let msg = explain_status(code);
             // The bar is "reads as English", not a length: "applied" is a
             // perfectly good answer for success.

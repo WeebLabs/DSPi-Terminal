@@ -110,17 +110,21 @@ mod tests {
 
     #[test]
     fn every_opcode_was_generated() {
-        // 190 REQ_* defines in config.h at release/v1.1.5 @ 9776c2f.
+        // 202 REQ_* defines in config.h at release/v1.1.6 @ 112f35b: the 190 of
+        // v1.1.5 plus 0x20-0x26 (CS groups and macros, config.h:136-146) and
+        // 0x27-0x2B (CS I2C display, config.h:150-157).
         assert_eq!(
             generated::ALL_OPCODES.len(),
-            190,
+            202,
             "opcode count changed; run the firmware-bump procedure"
         );
     }
 
     #[test]
     fn wire_format_version_is_known() {
-        assert_eq!(generated::wire::WIRE_FORMAT_VERSION, 26);
+        // bulk_params.h:34 documents V28: `spdif_rx_pin_ext` grows from 2 to 3
+        // entries and shifts every input-config field below it down one byte.
+        assert_eq!(generated::wire::WIRE_FORMAT_VERSION, 28);
     }
 
     /// Topology must never be compiled in. These are platform-conditional in

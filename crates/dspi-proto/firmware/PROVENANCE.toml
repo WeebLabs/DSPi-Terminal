@@ -5,15 +5,15 @@
 # you exactly what changed.
 
 repository = "https://github.com/WeebLabs/DSPi"
-branch     = "release/v1.1.5"
-commit     = "9776c2f9feb5a1f8487180a351f8fbb1ec67e4ff"
-short      = "9776c2f"
-committed  = "2026-07-25 23:32:55 +0100"
-vendored   = "2026-07-27"
+branch     = "release/v1.1.6"
+commit     = "112f35b2db9cda4151ec8063dd3babe8fcfe9ea4"
+short      = "112f35b"
+committed  = "2026-08-24 09:12:38 +0100"
+vendored   = "2026-08-27"
 
 files = [
   "config.h",            # vendor opcodes, channel model, platform constants
-  "bulk_params.h",       # WireBulkParams V26 wire format
+  "bulk_params.h",       # WireBulkParams V28 wire format
   "control_surfaces.h",  # CS types, nouns, actions, status codes, caps
   "psybass.h",           # psychoacoustic bass ranges and defaults
   "upmix.h",             # upmixer config packet and parameter ids
