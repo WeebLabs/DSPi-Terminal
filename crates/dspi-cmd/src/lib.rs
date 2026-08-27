@@ -195,12 +195,24 @@ fn parse_set(tokens: &[&str], ctx: &Context) -> Result<Command, ParseError> {
 
     let indices = parse_indices(d, &rest[..want], ctx)?;
 
+    // A crosspoint has a short positional form the screens emit,
+    // `mix <in> <out> on|off [gain] [inv]`; the general key=value packet
+    // form still applies when a token names its field.
+    let raw_tokens = &rest[want..];
+    if d.path == "mix" && !raw_tokens.iter().any(|t| t.contains('=')) {
+        return Ok(Command::Set {
+            path: d.path,
+            value: parse_crosspoint(&indices, raw_tokens)?,
+            indices,
+        });
+    }
+
     // A packet is built from named fields, so it needs the tokens as tokens:
     // joining them first would lose a quoted name with a space in it.
     let value = if matches!(d.kind, Kind::Packet) {
-        parse_packet(d, &indices, &rest[want..])?
+        parse_packet(d, &indices, raw_tokens)?
     } else {
-        parse_value(d, &rest[want..].join(" "))?
+        parse_value(d, &raw_tokens.join(" "))?
     };
 
     Ok(Command::Set {
@@ -208,6 +220,78 @@ fn parse_set(tokens: &[&str], ctx: &Context) -> Result<Command, ParseError> {
         indices,
         value,
     })
+}
+
+/// A crossover type by its file code: `lr4lp`, `bw2hp`, `bes4lp`. The codes
+/// are regenerated from `dspi_proto::xover` so this table cannot drift from
+/// the one the filter files use.
+fn crossover_from_token(token: &str) -> Option<u8> {
+    let want = token.to_ascii_lowercase();
+    (dspi_proto::xover::XOVER_FIRST..=dspi_proto::xover::XOVER_LAST)
+        .find(|t| crossover_token(*t).as_deref() == Some(want.as_str()))
+}
+
+fn crossover_token(raw: u8) -> Option<String> {
+    dspi_proto::xover::meta(raw).map(|m| {
+        format!(
+            "{}{}{}",
+            m.family.short(),
+            m.order,
+            if m.high_pass { "hp" } else { "lp" }
+        )
+    })
+}
+
+/// `mix <input> <output> on|off [gain dB] [inv]`
+///
+/// The 8-byte `MatrixRoutePacket` (config.h:845-851): input, output, enabled,
+/// phase_invert, then the gain as a little-endian float.
+fn parse_crosspoint(indices: &[u8], tokens: &[&str]) -> Result<Value, ParseError> {
+    let bad = |value: &str, expected: &str| ParseError::BadValue {
+        path: "mix".into(),
+        value: value.into(),
+        expected: expected.into(),
+    };
+    let Some(&on) = tokens.first() else {
+        return Err(ParseError::MissingValue("mix".into()));
+    };
+    let enabled = match on.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => true,
+        "off" | "false" | "no" | "0" => false,
+        other => return Err(bad(other, "on or off")),
+    };
+    let gain: f32 = match tokens.get(1) {
+        None => 0.0,
+        Some(t) => t.parse().map_err(|_| bad(t, "a gain in dB"))?,
+    };
+    let invert = match tokens.get(2) {
+        None => false,
+        Some(t) => match t.to_ascii_lowercase().as_str() {
+            "inv" | "invert" | "inverted" => true,
+            "norm" | "normal" => false,
+            other => return Err(bad(other, "inv or norm")),
+        },
+    };
+    let mut bytes = vec![indices[0], indices[1], enabled as u8, invert as u8];
+    bytes.extend_from_slice(&gain.to_le_bytes());
+    Ok(Value::Bytes(bytes))
+}
+
+/// A crosspoint packet back as the line that would produce it.
+fn format_crosspoint(bytes: &[u8]) -> String {
+    if bytes.len() < 8 {
+        return String::new();
+    }
+    let gain = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let mut s = format!(
+        "{} {}",
+        if bytes[2] != 0 { "on" } else { "off" },
+        format_value("out.gain", &Value::Float(gain))
+    );
+    if bytes[3] != 0 {
+        s.push_str(" inv");
+    }
+    s
 }
 
 /// Build a structured payload from `key=value` tokens.
@@ -342,14 +426,18 @@ fn parse_eq(tokens: &[&str], ctx: &Context) -> Result<Command, ParseError> {
     let band = parse_band(tokens[1], ctx)?;
 
     let type_desc = by_path("eq.type").expect("eq.type is in the registry");
-    let filter_type =
-        parse_value(type_desc, tokens[2])?
+    // The registry's choice list covers the PEQ types; the crossover types
+    // occupy 32 to 63 and are named by family, order and direction instead.
+    let filter_type = match crossover_from_token(tokens[2]) {
+        Some(raw) => raw,
+        None => parse_value(type_desc, tokens[2])?
             .as_u8()
             .ok_or_else(|| ParseError::BadValue {
                 path: "eq.type".into(),
                 value: tokens[2].into(),
                 expected: "a filter type".into(),
-            })?;
+            })?,
+    };
 
     let num = |i: usize, default: f32| -> Result<f32, ParseError> {
         match tokens.get(i) {
@@ -492,6 +580,18 @@ pub fn format(cmd: &Command, ctx: &Context) -> String {
         Command::Set {
             path,
             indices,
+            value: Value::Bytes(bytes),
+        } if *path == "mix" => {
+            format!(
+                "mix {} {} {}",
+                indices.first().copied().unwrap_or(0),
+                indices.get(1).copied().unwrap_or(0),
+                format_crosspoint(bytes)
+            )
+        }
+        Command::Set {
+            path,
+            indices,
             value,
         } => {
             let mut s = (*path).to_string();
@@ -513,15 +613,18 @@ pub fn format(cmd: &Command, ctx: &Context) -> String {
             q,
             gain,
         } => {
-            let ty = by_path("eq.type")
-                .and_then(|d| match d.kind {
-                    Kind::Choice(v) => v
-                        .iter()
-                        .find(|(raw, _)| raw == filter_type)
-                        .map(|(_, n)| *n),
-                    _ => None,
-                })
-                .unwrap_or("?");
+            let ty = crossover_token(*filter_type).unwrap_or_else(|| {
+                by_path("eq.type")
+                    .and_then(|d| match d.kind {
+                        Kind::Choice(v) => v
+                            .iter()
+                            .find(|(raw, _)| raw == filter_type)
+                            .map(|(_, n)| *n),
+                        _ => None,
+                    })
+                    .unwrap_or("?")
+                    .to_string()
+            });
             format!(
                 "eq {} {} {ty} {freq} {q} {gain}",
                 ctx.channel_slugs
@@ -675,6 +778,62 @@ mod tests {
                 value: Value::Float(-18.0)
             }
         );
+    }
+
+    /// A crosspoint is the one packet the interface writes constantly, so it
+    /// has to be typable and it has to round-trip through the echo line.
+    #[test]
+    fn a_crosspoint_takes_its_state_gain_and_polarity() {
+        let cmd = p("mix 0 8 on -6 inv").unwrap();
+        match &cmd {
+            Command::Set {
+                path: "mix",
+                indices,
+                value: Value::Bytes(b),
+            } => {
+                assert_eq!(indices, &vec![0, 8]);
+                assert_eq!(b[..4], [0, 8, 1, 1]);
+                assert_eq!(f32::from_le_bytes([b[4], b[5], b[6], b[7]]), -6.0);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(format(&cmd, &ctx()), "mix 0 8 on -6 inv");
+        // The gain and the polarity are optional.
+        match p("mix 1 2 off").unwrap() {
+            Command::Set {
+                value: Value::Bytes(b),
+                ..
+            } => assert_eq!(b, vec![1, 2, 0, 0, 0, 0, 0, 0]),
+            other => panic!("{other:?}"),
+        }
+        assert!(p("mix 0 1 maybe").is_err());
+        assert!(p("mix 0 1 on 0 sideways").is_err());
+    }
+
+    /// The crossover types live outside the registry's choice list, since the
+    /// UI picks them by family, order and direction rather than by number.
+    #[test]
+    fn a_crossover_band_is_named_by_its_family_and_order() {
+        let cmd = p("eq pdm 20 lr4hp 80").unwrap();
+        match &cmd {
+            Command::SetBand {
+                channel,
+                band,
+                filter_type,
+                freq,
+                ..
+            } => {
+                assert_eq!((*channel, *band, *filter_type, *freq), (16, 20, 35, 80.0));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(format(&cmd, &ctx()), "eq pdm 20 lr4hp 80 0.707 0");
+        assert_eq!(
+            p("eq pdm 21 BES8LP 120").unwrap(),
+            p("eq pdm 21 bes8lp 120").unwrap(),
+            "the codes are case-insensitive"
+        );
+        assert!(p("eq pdm 20 lr3lp 80").is_err(), "LR has no third order");
     }
 
     #[test]
