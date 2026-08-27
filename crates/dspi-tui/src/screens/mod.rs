@@ -16,6 +16,7 @@
 
 pub mod clipboard;
 pub mod filters;
+pub mod input;
 pub mod linkwitz;
 pub mod overview;
 
@@ -29,6 +30,7 @@ use dspi_session::DeviceState;
 
 pub use clipboard::ChannelClipboard;
 pub use filters::{FilterList, FilterMode};
+pub use input::InputPage;
 pub use linkwitz::LinkwitzPanel;
 pub use overview::Overview;
 
