@@ -25,6 +25,7 @@ pub mod output;
 pub mod overview;
 pub mod panel;
 pub mod presets;
+pub mod psybass;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -44,6 +45,7 @@ pub use loudness::LoudnessPanel;
 pub use output::OutputPage;
 pub use overview::Overview;
 pub use presets::{PresetChoice, PresetMenu};
+pub use psybass::PsybassPanel;
 
 /// The application-side state the screens share.
 #[derive(Debug, Default, Clone)]
