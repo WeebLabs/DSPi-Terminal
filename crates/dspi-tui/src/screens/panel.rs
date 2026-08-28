@@ -1230,6 +1230,7 @@ pub(crate) mod testing {
             output_channels: 9,
             multitone_max: 16,
             valid_channel_mask: 0x1FF,
+            types: Vec::new(),
         });
         s
     }

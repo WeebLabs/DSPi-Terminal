@@ -93,6 +93,12 @@ pub struct SiggenCaps {
     pub output_channels: u8,
     pub multitone_max: u8,
     pub valid_channel_mask: u16,
+    /// One descriptor per signal type, from `REQ_SIGGEN_GET_CAPS` with the
+    /// type index in `wValue` (siggen.h): names, timing models, parameter
+    /// ranges and defaults, so a panel follows the device rather than a
+    /// transcribed table.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub types: Vec<dspi_proto::packets::SiggenTypeDesc>,
 }
 
 /// Read the full bulk snapshot, chunked.
@@ -343,12 +349,29 @@ fn probe_cs_caps(t: &mut dyn Transport) -> Option<ControlSurfaceCaps> {
 
 fn probe_siggen_caps(t: &mut dyn Transport) -> Option<SiggenCaps> {
     let d = t.control_in(op::REQ_SIGGEN_GET_CAPS, 0xFFFF, 8).ok()?;
+    let type_count = *d.get(1)?;
+    // Each descriptor is its own transfer, indexed by wValue; a descriptor
+    // that fails to read is skipped rather than failing the probe, so a
+    // device with an odd table still gets a generator panel.
+    let types = (0..type_count as u16)
+        .filter_map(|i| {
+            let b = t
+                .control_in(
+                    op::REQ_SIGGEN_GET_CAPS,
+                    i,
+                    dspi_proto::packets::SiggenTypeDesc::SIZE as u16,
+                )
+                .ok()?;
+            dspi_proto::packets::SiggenTypeDesc::decode(&b).ok()
+        })
+        .collect();
     Some(SiggenCaps {
         version: *d.first()?,
-        type_count: *d.get(1)?,
+        type_count,
         output_channels: *d.get(2)?,
         multitone_max: *d.get(3)?,
         valid_channel_mask: u16::from_le_bytes([*d.get(4)?, *d.get(5)?]),
+        types,
     })
 }
 

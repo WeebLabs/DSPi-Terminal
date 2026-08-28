@@ -121,15 +121,39 @@ impl Widget for ChipRow<'_> {
             return;
         }
         let t = self.theme;
+        let texts: Vec<String> = self
+            .chips
+            .iter()
+            .map(|c| {
+                let mark = match (c.state, t.depth) {
+                    (ChipState::Inverted, _) => "ø",
+                    (ChipState::On, ColorDepth::Mono) => "■",
+                    _ => "",
+                };
+                format!("[{mark}{}]", c.label)
+            })
+            .collect();
+        // When the row overflows, show a window that keeps the cursor chip
+        // in view, with `‹` and `›` marking what is hidden either side.
+        let widths: Vec<u16> = texts.iter().map(|s| s.chars().count() as u16 + 1).collect();
+        let total: u16 = widths.iter().sum();
+        let avail = area.width.saturating_sub(2);
+        let mut start = 0usize;
+        if total > avail && self.focused {
+            let mut span: u16 = widths[..=self.cursor.min(widths.len() - 1)].iter().sum();
+            while span > avail.saturating_sub(2) && start < self.cursor {
+                span -= widths[start];
+                start += 1;
+            }
+        }
         let mut x = area.x + 1;
-        for (i, c) in self.chips.iter().enumerate() {
-            let mark = match (c.state, t.depth) {
-                (ChipState::Inverted, _) => "ø",
-                (ChipState::On, ColorDepth::Mono) => "■",
-                _ => "",
-            };
-            let text = format!("[{mark}{}]", c.label);
-            if x + text.chars().count() as u16 > area.x + area.width {
+        if start > 0 {
+            buf.set_string(area.x, area.y, "‹", t.label());
+        }
+        for (i, c) in self.chips.iter().enumerate().skip(start) {
+            let text = &texts[i];
+            if x + text.chars().count() as u16 > area.x + area.width.saturating_sub(1) {
+                buf.set_string(area.x + area.width - 1, area.y, "›", t.label());
                 break;
             }
             let base = if !c.enabled {
@@ -146,7 +170,7 @@ impl Widget for ChipRow<'_> {
             } else {
                 base
             };
-            buf.set_string(x, area.y, &text, style);
+            buf.set_string(x, area.y, text, style);
             x += text.chars().count() as u16 + 1;
         }
     }
@@ -172,6 +196,25 @@ mod tests {
         assert_eq!(render(row(&t), 30, 1), " [1] [2] [ø3] [4]");
         let m = Theme::mono(Glyphs::Ascii);
         assert_eq!(render(row(&m), 30, 1), " [■1] [2] [ø3] [4]");
+    }
+
+    #[test]
+    fn an_overflowing_row_scrolls_to_keep_the_cursor_in_view() {
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let labels: Vec<String> = (1..=9).map(|n| format!("OUT {n}")).collect();
+        let mut row = ChipRow::new(&t);
+        for l in &labels {
+            row = row.chip(l, ChipState::Off, t.outputs[0]);
+        }
+        let s = render(row.focused(true, 8), 30, 1);
+        assert!(s.starts_with('‹'), "{s}");
+        assert!(s.contains("[OUT 9]"), "the cursor chip is shown: {s}");
+        let mut row = ChipRow::new(&t);
+        for l in &labels {
+            row = row.chip(l, ChipState::Off, t.outputs[0]);
+        }
+        let s = render(row.focused(true, 0), 30, 1);
+        assert!(s.starts_with(" [OUT 1]") && s.ends_with('›'), "{s}");
     }
 
     #[test]

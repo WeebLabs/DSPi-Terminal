@@ -75,6 +75,7 @@ fn main() {
         output_channels: 9,
         multitone_max: 16,
         valid_channel_mask: 0x1FF,
+        types: Vec::new(),
     });
     // The shell fixture leaves every DSP block at zero, which makes a panel a
     // page of flat sliders and an empty graph. Give each one the Console's own
