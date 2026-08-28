@@ -23,12 +23,13 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Widget};
 
+use crate::actions;
 use crate::app::Performance;
 use crate::graph::GraphCurve;
 use crate::screens::{
-    self, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel, OutputPage,
-    Overview, PresetChoice, PresetMenu, PsybassPanel, Shared, SignalsPanel, UpmixerPanel,
-    clipboard, panel, presets,
+    self, AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
+    MonitorPanel, OutputPage, Overview, PresetChoice, PresetMenu, PsybassPanel, Shared,
+    SignalsPanel, StatsPanel, UpmixerPanel, clipboard, panel, presets,
 };
 use crate::shell::{
     ChannelItem, Placeholder, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
@@ -128,10 +129,9 @@ impl Screens for ConsoleScreens {
             Tool::Psybass => Box::new(PsybassPanel::new()),
             Tool::Upmixer => Box::new(UpmixerPanel::new()),
             Tool::Signals => Box::new(SignalsPanel::new()),
-            _ => Box::new(Placeholder::new(
-                tool.title(),
-                "This panel arrives in a later phase.",
-            )),
+            Tool::Stats => Box::new(StatsPanel::new(self.shared.clone())),
+            Tool::Monitor => Box::new(MonitorPanel::new(self.shared.clone())),
+            Tool::AutoEq => Box::new(AutoEqPanel::new(self.shared.clone())),
         }
     }
 
@@ -358,6 +358,12 @@ pub struct Live {
     /// so the only way to move the gauges is to ask, and once a second is
     /// enough for a meter a person is watching.
     last_upmix_poll: Instant,
+    /// When the Stats panel's diagnostics were last read, on the Console's own
+    /// two-second cadence.
+    last_stats_poll: Instant,
+    /// When the notification log started, which is what its time column counts
+    /// from.
+    started: Instant,
 }
 
 impl Live {
@@ -396,6 +402,8 @@ impl Live {
             should_quit: false,
             last_tick: Instant::now(),
             last_upmix_poll: Instant::now() - Duration::from_secs(2),
+            last_stats_poll: Instant::now() - Duration::from_secs(3),
+            started: Instant::now(),
         };
         live.sync_model();
         live
@@ -624,11 +632,23 @@ impl Live {
     /// an edit mirrored onto a linked input pair, Clear All over a whole bank,
     /// a channel paste. The echo line ends up showing the last of them, which
     /// is the one the person's finger was on.
+    /// A `#` line is not a command but the note to leave on the echo line once
+    /// the block has run, which is how a screen that issues a hundred writes
+    /// for one gesture says what it just did.
     pub fn run_commands(&mut self, session: &mut Session, lines: &str) {
+        let mut note = None;
         for line in lines.lines() {
-            if !line.trim().is_empty() {
-                self.run_command(session, line);
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
+            match line.strip_prefix('#') {
+                Some(text) => note = Some(text.trim().to_string()),
+                None => self.run_command(session, line),
+            }
+        }
+        if let Some(note) = note {
+            self.note(note);
         }
     }
 
@@ -1285,6 +1305,24 @@ impl Live {
         }
     }
 
+    /// Refresh the Stats panel's diagnostics, every two seconds and only while
+    /// that panel is on screen.
+    ///
+    /// None of it is in the bulk packet and none of it is notified, so it can
+    /// only be asked for; two dozen control transfers every two seconds is
+    /// worth it for a panel someone is reading and worth nothing otherwise.
+    fn poll_stats(&mut self, session: &mut Session, now: Instant) {
+        if !matches!(self.shell.tool, Some((Tool::Stats, _)))
+            || now.duration_since(self.last_stats_poll) < Duration::from_secs(2)
+        {
+            return;
+        }
+        self.last_stats_poll = now;
+        let previous = self.shared.borrow().stats.clone();
+        let stats = actions::read_stats(session, &self.state, &previous);
+        self.shared.borrow_mut().stats = stats;
+    }
+
     /// Meters, notifications, status expiry, peak ballistics.
     pub fn tick(&mut self, session: &mut Session, notifications: Option<&Notifications>) {
         let now = Instant::now();
@@ -1298,11 +1336,19 @@ impl Live {
             self.state.update_meters(m);
         }
         self.poll_upmix_status(session, now);
+        self.poll_stats(session, now);
 
         let mut reread = false;
         let mut changed_elsewhere: Option<(&'static str, Source)> = None;
         if let Some(n) = notifications {
+            self.shared.borrow_mut().log.active = true;
+            let at = now.duration_since(self.started).as_secs_f64();
             for note in n.drain() {
+                // The monitor is fed from this drain rather than from a reader
+                // of its own: two readers on one endpoint would each see half
+                // the events, and the log has to keep running while the panel
+                // is closed so opening it shows what just happened.
+                self.shared.borrow_mut().log.push(at, &note);
                 match self.state.apply(&note) {
                     Applied::Section { name, source } => {
                         if !source.is_ours() {

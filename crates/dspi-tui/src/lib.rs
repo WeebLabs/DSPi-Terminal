@@ -1,5 +1,6 @@
 //! The DSPi terminal interface.
 
+pub mod actions;
 pub mod app;
 pub mod curves;
 pub mod fields;

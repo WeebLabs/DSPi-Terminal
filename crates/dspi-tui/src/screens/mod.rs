@@ -14,6 +14,7 @@
 //! from the device, and the channel clipboard. The screen factory owns one and
 //! hands every screen a handle to it.
 
+pub mod autoeq;
 pub mod clipboard;
 pub mod crossfeed;
 pub mod filters;
@@ -22,12 +23,14 @@ pub mod leveller;
 pub mod linkwitz;
 pub mod loudness;
 pub mod matrix;
+pub mod monitor;
 pub mod output;
 pub mod overview;
 pub mod panel;
 pub mod presets;
 pub mod psybass;
 pub mod signals;
+pub mod stats;
 pub mod upmixer;
 
 use std::cell::RefCell;
@@ -38,6 +41,7 @@ use dspi_proto::value::EqParamPacket;
 use dspi_proto::xover;
 use dspi_session::DeviceState;
 
+pub use autoeq::AutoEqPanel;
 pub use clipboard::ChannelClipboard;
 pub use crossfeed::CrossfeedPanel;
 pub use filters::{FilterList, FilterMode};
@@ -46,11 +50,13 @@ pub use leveller::LevellerPanel;
 pub use linkwitz::LinkwitzPanel;
 pub use loudness::LoudnessPanel;
 pub use matrix::MatrixPanel;
+pub use monitor::MonitorPanel;
 pub use output::OutputPage;
 pub use overview::Overview;
 pub use presets::{PresetChoice, PresetMenu};
 pub use psybass::PsybassPanel;
 pub use signals::SignalsPanel;
+pub use stats::StatsPanel;
 pub use upmixer::UpmixerPanel;
 
 /// The application-side state the screens share.
@@ -69,6 +75,19 @@ pub struct SharedState {
     /// "specified".
     pub default_slot: Option<u8>,
     pub clipboard: Option<ChannelClipboard>,
+    /// The polled diagnostics behind the Stats panel. The runner refreshes it
+    /// on the Console's two-second cadence while that panel is open; nothing
+    /// in it is notified, so there is no other way for it to move.
+    pub stats: crate::actions::Stats,
+    /// Every notification seen, for the Interrupt Monitor. The runner fills it
+    /// from the same drain that keeps the device state current, so the monitor
+    /// does not need a second reader on the endpoint.
+    pub log: crate::actions::EventLog,
+    /// The AutoEQ database, loaded once and kept: it is several megabytes of
+    /// JSON, and re-reading it every time the browser opens would be felt.
+    pub autoeq: Option<Rc<dspi_session::autoeq::Database>>,
+    /// Favourite profile ids, mirrored from the favourites file.
+    pub favourites: Vec<String>,
 }
 
 impl SharedState {
@@ -420,6 +439,8 @@ pub(crate) mod tests {
                 "Backspace" => plain(KeyCode::Backspace),
                 "Esc" => plain(KeyCode::Esc),
                 "PgUp" => plain(KeyCode::PageUp),
+                "End" => plain(KeyCode::End),
+                "Home" => plain(KeyCode::Home),
                 "PgDn" => plain(KeyCode::PageDown),
                 "1-9,0" => plain(KeyCode::Char('4')),
                 other => {
