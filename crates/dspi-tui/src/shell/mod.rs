@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Widget};
 
 pub use layout::{Density, Regions};
 pub use model::{ChannelItem, GraphHeight, Selection, ShellModel, StripItem, VolumeMode};
-pub use screen::{Placeholder, Screen, ScreenEvent};
+pub use screen::{Placeholder, Screen, ScreenEvent, SessionReply, SessionRequest};
 pub use sidebar::FooterRow;
 
 use crate::graph::{Graph, legend};
@@ -130,6 +130,8 @@ pub enum ShellEvent {
     VolumeMute,
     /// A command in the shared grammar.
     Command(String),
+    /// A screen's session request, to run and answer.
+    Session(SessionRequest, ScreenOwner),
     Status(String),
     Palette,
     CommandLine,
@@ -151,13 +153,15 @@ pub enum ShellEvent {
     Identify(usize),
 }
 
-/// Who opened the popup or dialog on top, so its result goes back there.
+/// Which screen made a request, so its answer goes back there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Owner {
+pub enum ScreenOwner {
     Detail,
     Tool,
     Settings,
 }
+
+type Owner = ScreenOwner;
 
 pub struct Shell {
     pub model: ShellModel,
@@ -485,6 +489,7 @@ impl Shell {
             }
             ScreenEvent::Command(c) => out.push(ShellEvent::Command(c)),
             ScreenEvent::Select(sel) => out.push(ShellEvent::Select(sel)),
+            ScreenEvent::Session(req) => out.push(ShellEvent::Session(req, owner)),
             ScreenEvent::Status(s) => out.push(ShellEvent::Status(s)),
             ScreenEvent::Close => match owner {
                 Owner::Settings => out.push(ShellEvent::CloseSettings),
@@ -492,6 +497,23 @@ impl Shell {
                 Owner::Detail => {}
             },
         }
+    }
+
+    /// Deliver a session reply to the screen that asked, and absorb whatever
+    /// it wants next.
+    pub fn deliver(
+        &mut self,
+        owner: ScreenOwner,
+        tag: u32,
+        reply: SessionReply,
+        state: &DeviceState,
+    ) -> Vec<ShellEvent> {
+        let mut out = Vec::new();
+        if let Some(s) = self.screen_by(owner) {
+            let ev = s.session_result(tag, reply, state);
+            self.absorb(ev, owner, &mut out);
+        }
+        out
     }
 
     /// Open a dialog from the application (for example the unsaved-changes

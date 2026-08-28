@@ -937,6 +937,14 @@ impl Live {
                 self.sync_model();
             }
             ShellEvent::Command(c) => self.run_commands(session, &c),
+            ShellEvent::Session(req, owner) => {
+                let reply = (req.run)(session);
+                self.refresh(session);
+                let follow = self.shell.deliver(owner, req.tag, reply, &self.state);
+                for ev in follow {
+                    self.handle_event(session, ev);
+                }
+            }
             ShellEvent::Status(s) => self.note(s),
             ShellEvent::Palette => self.prompt = Some(Prompt::new(true, &self.ctx)),
             ShellEvent::CommandLine => self.prompt = Some(Prompt::new(false, &self.ctx)),

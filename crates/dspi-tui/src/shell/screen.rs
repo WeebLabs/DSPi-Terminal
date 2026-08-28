@@ -5,13 +5,55 @@
 //! what is inside its rectangle and reports what the person asked for.
 
 use crossterm::event::KeyEvent;
-use dspi_session::DeviceState;
+use dspi_session::{DeviceState, Session};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use super::model::Selection;
 use crate::theme::Theme;
 use crate::widgets::{Dialog, KeyHelp, PopupList};
+
+/// What a session request answered, back to the screen that asked.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionReply {
+    /// Done, with a line for the echo line or a status row.
+    Ok(String),
+    /// Failed, with the reason.
+    Err(String),
+    /// Bytes the request read, for the screen to decode.
+    Bytes(Vec<u8>),
+}
+
+/// Work a screen needs the session for: a typed write with its own status
+/// protocol (control surfaces), a read the bulk packet lacks. The runner
+/// executes it, refreshes the state, and hands the reply back through
+/// [`Screen::session_result`] with the same `tag`.
+#[derive(Clone)]
+pub struct SessionRequest {
+    pub tag: u32,
+    pub run: std::rc::Rc<dyn Fn(&mut Session) -> SessionReply>,
+}
+
+impl SessionRequest {
+    pub fn new(tag: u32, run: impl Fn(&mut Session) -> SessionReply + 'static) -> Self {
+        Self {
+            tag,
+            run: std::rc::Rc::new(run),
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SessionRequest(tag {})", self.tag)
+    }
+}
+
+impl PartialEq for SessionRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.tag == other.tag
+    }
+}
 
 /// What a screen wants after handling a key.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +72,8 @@ pub enum ScreenEvent {
     Command(String),
     /// Select a channel (or the overview) in the sidebar.
     Select(Selection),
+    /// Run something against the session and hear back.
+    Session(SessionRequest),
     /// Something to say on the echo line.
     Status(String),
     /// The screen wants to close (a tool panel or Settings).
@@ -65,6 +109,16 @@ pub trait Screen {
     fn dialog_result(
         &mut self,
         _outcome: crate::widgets::DialogOutcome,
+        _state: &DeviceState,
+    ) -> ScreenEvent {
+        ScreenEvent::Handled
+    }
+
+    /// A session request this screen made has an answer.
+    fn session_result(
+        &mut self,
+        _tag: u32,
+        _reply: SessionReply,
         _state: &DeviceState,
     ) -> ScreenEvent {
         ScreenEvent::Handled
