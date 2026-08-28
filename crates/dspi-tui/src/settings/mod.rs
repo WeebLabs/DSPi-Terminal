@@ -27,6 +27,7 @@ pub mod advanced;
 pub mod config;
 pub mod global;
 pub mod graphing;
+pub mod outputs;
 pub mod overview;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -1034,6 +1035,7 @@ struct Pages {
     advanced: advanced::AdvancedPage,
     graphing: graphing::GraphingPage,
     overview: overview::OverviewPage,
+    outputs: outputs::OutputsPage,
     global: global::GlobalPage,
     /// The three Phase 7B pages share one placeholder.
     later: LaterPage,
@@ -1095,6 +1097,7 @@ impl SettingsScreen {
                 advanced: advanced::AdvancedPage::default(),
                 graphing: graphing::GraphingPage::new(config.clone()),
                 overview: overview::OverviewPage::default(),
+                outputs: outputs::OutputsPage::default(),
                 global: global::GlobalPage::new(state, &data),
                 later: LaterPage { title: "" },
             },
@@ -1197,8 +1200,9 @@ impl SettingsScreen {
             Page::Advanced => &mut self.pages.advanced,
             Page::Graphing => &mut self.pages.graphing,
             Page::Overview => &mut self.pages.overview,
+            Page::Outputs => &mut self.pages.outputs,
             Page::Global => &mut self.pages.global,
-            Page::Surfaces | Page::Groups | Page::Macros | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => {
+            Page::Surfaces | Page::Groups | Page::Macros | Page::Inputs | Page::I2s | Page::Interfaces => {
                 self.pages.later.title = self.page.title();
                 &mut self.pages.later
             }
@@ -1211,8 +1215,9 @@ impl SettingsScreen {
             Page::Advanced => &self.pages.advanced,
             Page::Graphing => &self.pages.graphing,
             Page::Overview => &self.pages.overview,
+            Page::Outputs => &self.pages.outputs,
             Page::Global => &self.pages.global,
-            Page::Surfaces | Page::Groups | Page::Macros | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => &self.pages.later,
+            Page::Surfaces | Page::Groups | Page::Macros | Page::Inputs | Page::I2s | Page::Interfaces => &self.pages.later,
         }
     }
 
@@ -1608,6 +1613,7 @@ impl Screen for SettingsScreen {
                 Page::Advanced => self.pages.advanced.popup_result(choice, &cx),
                 Page::Graphing => self.pages.graphing.popup_result(choice, &cx),
                 Page::Overview => self.pages.overview.popup_result(choice, &cx),
+                Page::Outputs => self.pages.outputs.popup_result(choice, &cx),
                 Page::Global => self.pages.global.popup_result(choice, &cx),
                 _ => PageEvent::Handled,
             }
@@ -1638,6 +1644,7 @@ impl Screen for SettingsScreen {
                         Page::Advanced => self.pages.advanced.dialog_result(outcome, &cx),
                         Page::Graphing => self.pages.graphing.dialog_result(outcome, &cx),
                         Page::Overview => self.pages.overview.dialog_result(outcome, &cx),
+                        Page::Outputs => self.pages.outputs.dialog_result(outcome, &cx),
                         Page::Global => self.pages.global.dialog_result(outcome, &cx),
                         _ => PageEvent::Handled,
                     }
@@ -1779,6 +1786,7 @@ impl SettingsScreen {
                     Page::Advanced => self.pages.advanced.act(cursor, action, &cx),
                     Page::Graphing => self.pages.graphing.act(cursor, action, &cx),
                     Page::Overview => self.pages.overview.act(cursor, action, &cx),
+                    Page::Outputs => self.pages.outputs.act(cursor, action, &cx),
                     Page::Global => self.pages.global.act(cursor, action, &cx),
                     _ => PageEvent::Handled,
                 }
