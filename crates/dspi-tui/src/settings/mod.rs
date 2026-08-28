@@ -47,7 +47,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Widget};
 
 use crate::shell::{Screen, ScreenEvent};
 use crate::theme::{Glyphs, Theme};
-use crate::widgets::text::{fit_left, truncate, wrap};
+use crate::widgets::text::{truncate, wrap};
 use crate::widgets::{
     Action, Banner, BannerKind, Dialog, DialogOutcome, KeyHelp, ParamRow, PickerRow, PinCell,
     PinGrid, PopupList, SaveBar, SectionHeader, StatusPill, StatusTone, ToggleRow,
@@ -1458,10 +1458,13 @@ impl SettingsScreen {
                         marker,
                         ratatui::style::Style::default().fg(theme.accent),
                     );
+                    // `truncate`, not `fit_left`: the padding there counts
+                    // characters where the ellipsis is three bytes, which
+                    // overruns the border by two columns.
                     buf.set_string(
                         inner.x + 2,
                         y,
-                        fit_left(p.short(), inner.width.saturating_sub(2) as usize),
+                        truncate(p.short(), inner.width.saturating_sub(2) as usize),
                         style,
                     );
                 }
@@ -1526,7 +1529,8 @@ impl Screen for SettingsScreen {
         }
         let dirty = self.dirty(state);
         let body_h = area.height.saturating_sub(u16::from(dirty));
-        let side_w = if area.width >= 100 { 20 } else { 18 };
+        // Wide enough for the longest label, "Control Interfaces" shortened.
+        let side_w = if area.width >= 100 { 20 } else { 19 };
         let sidebar = Rect::new(area.x, area.y, side_w, body_h);
         self.draw_sidebar(sidebar, buf, theme, state);
 
