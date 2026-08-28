@@ -28,13 +28,13 @@ pub fn truncate(s: &str, width: usize) -> String {
 /// Pad or cut to exactly `width` columns, left-aligned.
 pub fn fit_left(s: &str, width: usize) -> String {
     let t = truncate(s, width);
-    format!("{t:<w$}", w = width + (t.len() - t.width()))
+    format!("{t:<w$}", w = width + (t.chars().count() - t.width()))
 }
 
 /// Pad or cut to exactly `width` columns, right-aligned.
 pub fn fit_right(s: &str, width: usize) -> String {
     let t = truncate(s, width);
-    format!("{t:>w$}", w = width + (t.len() - t.width()))
+    format!("{t:>w$}", w = width + (t.chars().count() - t.width()))
 }
 
 /// Centre in `width` columns.
@@ -144,6 +144,10 @@ mod tests {
         assert_eq!(truncate("Living Room", 6), "Livin…");
         assert_eq!(truncate("Sub", 6), "Sub");
         assert_eq!(fit_left("Sub", 6), "Sub   ");
+        // A cut string ends in an ellipsis, which is one column and three
+        // bytes; padding must count columns.
+        assert_eq!(fit_left("Living Room", 6).chars().count(), 6);
+        assert_eq!(fit_right("Living Room", 6).chars().count(), 6);
         assert_eq!(fit_right("Sub", 6), "   Sub");
         assert_eq!(fit_centre("ab", 6), "  ab  ");
     }

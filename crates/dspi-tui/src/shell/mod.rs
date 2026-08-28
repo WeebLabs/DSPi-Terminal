@@ -338,6 +338,16 @@ impl Shell {
                 return out;
             }
             (KeyCode::Char('s'), true) => {
+                // Inside Settings, Ctrl-S is the save bar's Save; the screen
+                // gets first refusal and the preset save is the fallback.
+                if self.settings.is_some() {
+                    let (s, owner) = self.top();
+                    let ev = s.handle(key, state);
+                    if ev != ScreenEvent::Unhandled {
+                        self.absorb(ev, owner, &mut out);
+                        return out;
+                    }
+                }
                 out.push(ShellEvent::SavePreset);
                 return out;
             }

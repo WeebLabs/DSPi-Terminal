@@ -2,17 +2,20 @@
 //!
 //!   gallery [width] [height] [console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
-//!                     |leveller|psybass|upmixer|signals] [--ansi]
+//!                     |leveller|psybass|upmixer|signals] [--settings <page>] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
 //! can be looked at by piping to a terminal. `--screen` picks what fills the
 //! pane: one of the Console's detail screens, or one of its tool panels, which
-//! replace the graph as well. The default is the input page.
+//! replace the graph as well. The default is the input page. `--settings`
+//! opens Settings on one of its pages, as `,` does: about, advanced, graphing,
+//! overview, inputs, outputs, i2s, global, surfaces, interfaces, groups, macros.
 
 use dspi_tui::screens::{
     CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel, OutputPage, Overview,
     PsybassPanel, SignalsPanel, UpmixerPanel, shared,
 };
+use dspi_tui::settings::{AppConfig, SettingsScreen};
 use dspi_tui::shell::{Focus, Screen, Selection, Shell, Tool, fixture};
 use dspi_tui::theme::{ColorDepth, Glyphs, Palette, Theme};
 use ratatui::Terminal;
@@ -28,6 +31,11 @@ fn main() {
         .and_then(|i| raw.get(i + 1))
         .cloned()
         .unwrap_or_else(|| "input".into());
+    let settings = raw
+        .iter()
+        .position(|a| a == "--settings")
+        .and_then(|i| raw.get(i + 1))
+        .cloned();
     // Positional arguments, with the flags and their values taken out.
     let mut args: Vec<&String> = Vec::new();
     let mut skip = false;
@@ -35,7 +43,7 @@ fn main() {
         if std::mem::take(&mut skip) || a == "--ansi" {
             continue;
         }
-        if a == "--screen" {
+        if a == "--screen" || a == "--settings" {
             skip = true;
             continue;
         }
@@ -127,6 +135,12 @@ fn main() {
         ls_gain_q15: 9_000,
         rs_gain_q15: 12_000,
     });
+    // The Settings pages show wiring, so they get a device with some.
+    let state = if settings.is_some() {
+        dspi_tui::settings::demo::state()
+    } else {
+        state
+    };
     let shared = shared();
     let tool = match screen.as_str() {
         "matrix" => Some((
@@ -175,6 +189,20 @@ fn main() {
     shell.focus = Focus::Screen;
     if let Some((tool, panel)) = tool {
         shell.open_tool(tool, panel);
+    }
+    if let Some(name) = &settings {
+        let page = SettingsScreen::page_from_name(name).unwrap_or_else(|| {
+            eprintln!("unknown settings page {name}");
+            std::process::exit(2);
+        });
+        shell.open_settings(Box::new(
+            SettingsScreen::new(
+                &state,
+                dspi_tui::settings::demo::data(),
+                AppConfig::default(),
+            )
+            .open(page, &state),
+        ));
     }
 
     let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
