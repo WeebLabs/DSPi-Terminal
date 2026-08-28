@@ -15,11 +15,13 @@
 //! hands every screen a handle to it.
 
 pub mod clipboard;
+pub mod crossfeed;
 pub mod filters;
 pub mod input;
 pub mod linkwitz;
 pub mod output;
 pub mod overview;
+pub mod panel;
 pub mod presets;
 
 use std::cell::RefCell;
@@ -31,6 +33,7 @@ use dspi_proto::xover;
 use dspi_session::DeviceState;
 
 pub use clipboard::ChannelClipboard;
+pub use crossfeed::CrossfeedPanel;
 pub use filters::{FilterList, FilterMode};
 pub use input::InputPage;
 pub use linkwitz::LinkwitzPanel;
