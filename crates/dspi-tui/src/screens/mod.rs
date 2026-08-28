@@ -26,6 +26,7 @@ pub mod overview;
 pub mod panel;
 pub mod presets;
 pub mod psybass;
+pub mod upmixer;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -46,6 +47,7 @@ pub use output::OutputPage;
 pub use overview::Overview;
 pub use presets::{PresetChoice, PresetMenu};
 pub use psybass::PsybassPanel;
+pub use upmixer::UpmixerPanel;
 
 /// The application-side state the screens share.
 #[derive(Debug, Default, Clone)]
