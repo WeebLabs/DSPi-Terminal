@@ -23,6 +23,7 @@
 //!   the device itself reports and Phase 7B fills in.
 
 pub mod about;
+pub mod advanced;
 pub mod config;
 pub mod global;
 pub mod overview;
@@ -1029,6 +1030,7 @@ enum Pending {
 
 struct Pages {
     about: about::AboutPage,
+    advanced: advanced::AdvancedPage,
     overview: overview::OverviewPage,
     global: global::GlobalPage,
     /// The three Phase 7B pages share one placeholder.
@@ -1088,6 +1090,7 @@ impl SettingsScreen {
         let mut s = Self {
             pages: Pages {
                 about: about::AboutPage,
+                advanced: advanced::AdvancedPage::default(),
                 overview: overview::OverviewPage::default(),
                 global: global::GlobalPage::new(state, &data),
                 later: LaterPage { title: "" },
@@ -1188,9 +1191,10 @@ impl SettingsScreen {
     fn current(&mut self) -> &mut dyn SettingsPage {
         match self.page {
             Page::About => &mut self.pages.about,
+            Page::Advanced => &mut self.pages.advanced,
             Page::Overview => &mut self.pages.overview,
             Page::Global => &mut self.pages.global,
-            Page::Surfaces | Page::Groups | Page::Macros | Page::Advanced | Page::Graphing | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => {
+            Page::Surfaces | Page::Groups | Page::Macros | Page::Graphing | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => {
                 self.pages.later.title = self.page.title();
                 &mut self.pages.later
             }
@@ -1200,9 +1204,10 @@ impl SettingsScreen {
     fn current_ref(&self) -> &dyn SettingsPage {
         match self.page {
             Page::About => &self.pages.about,
+            Page::Advanced => &self.pages.advanced,
             Page::Overview => &self.pages.overview,
             Page::Global => &self.pages.global,
-            Page::Surfaces | Page::Groups | Page::Macros | Page::Advanced | Page::Graphing | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => &self.pages.later,
+            Page::Surfaces | Page::Groups | Page::Macros | Page::Graphing | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => &self.pages.later,
         }
     }
 
@@ -1594,6 +1599,7 @@ impl Screen for SettingsScreen {
             // dispatch is written out rather than going through `current`.
             match self.page {
                 Page::About => self.pages.about.popup_result(choice, &cx),
+                Page::Advanced => self.pages.advanced.popup_result(choice, &cx),
                 Page::Overview => self.pages.overview.popup_result(choice, &cx),
                 Page::Global => self.pages.global.popup_result(choice, &cx),
                 _ => PageEvent::Handled,
@@ -1622,6 +1628,7 @@ impl Screen for SettingsScreen {
                     };
                     match self.page {
                         Page::About => self.pages.about.dialog_result(outcome, &cx),
+                        Page::Advanced => self.pages.advanced.dialog_result(outcome, &cx),
                         Page::Overview => self.pages.overview.dialog_result(outcome, &cx),
                         Page::Global => self.pages.global.dialog_result(outcome, &cx),
                         _ => PageEvent::Handled,
@@ -1761,6 +1768,7 @@ impl SettingsScreen {
                 };
                 match self.page {
                     Page::About => self.pages.about.act(cursor, action, &cx),
+                    Page::Advanced => self.pages.advanced.act(cursor, action, &cx),
                     Page::Overview => self.pages.overview.act(cursor, action, &cx),
                     Page::Global => self.pages.global.act(cursor, action, &cx),
                     _ => PageEvent::Handled,
