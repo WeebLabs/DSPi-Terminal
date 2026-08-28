@@ -5,6 +5,7 @@ pub mod fields;
 pub mod graph;
 pub mod live;
 pub mod screens;
+pub mod settings;
 pub mod shell;
 pub mod theme;
 pub mod widgets;

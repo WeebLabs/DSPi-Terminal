@@ -29,6 +29,7 @@ use crate::screens::{
     self, InputPage, MatrixPanel, OutputPage, Overview, PresetChoice, PresetMenu, Shared,
     clipboard, presets,
 };
+use crate::settings::{AppConfig, SettingsData, SettingsScreen};
 use crate::shell::{
     ChannelItem, Placeholder, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
 };
@@ -50,6 +51,16 @@ pub trait Screens {
     fn shared(&self) -> Option<Shared> {
         None
     }
+
+    /// The app-side settings file, which Settings > Graphing writes and the
+    /// graph reads on start.
+    fn config(&self) -> AppConfig {
+        AppConfig::default()
+    }
+
+    /// Read what Settings needs that `DeviceState` does not carry. Called just
+    /// before the page opens, so a change made elsewhere is on screen.
+    fn refresh_settings(&self, _session: &mut Session) {}
 }
 
 pub struct PlaceholderScreens;
@@ -93,6 +104,11 @@ impl Screens for PlaceholderScreens {
 /// names and the channel clipboard live.
 pub struct ConsoleScreens {
     pub shared: Shared,
+    /// What Settings reads that the bulk packet does not carry, refreshed the
+    /// moment before the page opens.
+    pub settings: std::rc::Rc<std::cell::RefCell<SettingsData>>,
+    /// The app-side settings file, read once at start.
+    pub config: AppConfig,
 }
 
 impl Default for ConsoleScreens {
@@ -105,6 +121,8 @@ impl ConsoleScreens {
     pub fn new() -> Self {
         Self {
             shared: screens::shared(),
+            settings: std::rc::Rc::new(std::cell::RefCell::new(SettingsData::default())),
+            config: AppConfig::load(),
         }
     }
 }
@@ -128,12 +146,24 @@ impl Screens for ConsoleScreens {
         }
     }
 
-    fn settings(&self, _state: &DeviceState) -> Box<dyn Screen> {
-        Box::new(Placeholder::new("Settings", "Settings arrive in Phase 7."))
+    fn settings(&self, state: &DeviceState) -> Box<dyn Screen> {
+        Box::new(SettingsScreen::new(
+            state,
+            self.settings.borrow().clone(),
+            self.config.clone(),
+        ))
     }
 
     fn shared(&self) -> Option<Shared> {
         Some(self.shared.clone())
+    }
+
+    fn config(&self) -> AppConfig {
+        self.config.clone()
+    }
+
+    fn refresh_settings(&self, session: &mut Session) {
+        *self.settings.borrow_mut() = SettingsData::read(session);
     }
 }
 
@@ -364,8 +394,14 @@ impl Live {
             max_bands: caps.max_bands,
         };
         let n = caps.num_channels as usize;
+        let config = screens.config();
         let mut model = ShellModel::empty();
         model.selection = Selection::Overview;
+        model.graph = crate::graph::GraphSettings::from_config(&config.graphing);
+        model.volume_mode = match config.volume.mode {
+            crate::settings::config::VolumeChoice::Master => VolumeMode::Master,
+            crate::settings::config::VolumeChoice::User => VolumeMode::User,
+        };
         let detail = screens.detail(&state, Selection::Overview);
         let shared = screens.shared().unwrap_or_else(screens::shared);
         let shell = Shell::new(model, theme, detail);
@@ -832,14 +868,14 @@ impl Live {
             }
             ShellEvent::StripOpen(i) => {
                 if i == 6 {
-                    self.open_settings();
+                    self.open_settings(session);
                 } else if let Some(tool) = self.strip_tool(i) {
                     self.open_tool(tool);
                 }
             }
             ShellEvent::OpenTool(tool) => self.open_tool(tool),
             ShellEvent::CloseTool => self.shell.close_tool(),
-            ShellEvent::OpenSettings => self.open_settings(),
+            ShellEvent::OpenSettings => self.open_settings(session),
             ShellEvent::CloseSettings => self.shell.close_settings(),
             ShellEvent::Preset(Some(delta)) => {
                 let cur = self.state.caps.active_preset.unwrap_or(0) as i32;
@@ -1002,7 +1038,8 @@ impl Live {
         self.shell.open_tool(tool, screen);
     }
 
-    fn open_settings(&mut self) {
+    fn open_settings(&mut self, session: &mut Session) {
+        self.screens.refresh_settings(session);
         let screen = self.screens.settings(&self.state);
         self.shell.open_settings(screen);
     }

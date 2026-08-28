@@ -1,14 +1,18 @@
 //! Render the shell with fixture data, for design review without a device.
 //!
 //!   gallery [width] [height] [console|amber|dark|mono] [rp2350|rp2040]
-//!           [--screen overview|input|output|matrix] [--ansi]
+//!           [--screen overview|input|output|matrix] [--settings <page>] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
 //! can be looked at by piping to a terminal. `--screen` picks which of the
 //! Console's detail screens fills the pane; the default is the input page.
 //! `matrix` opens the Matrix Mixer tool panel over it, as `M` does.
+//! `--settings` opens Settings on one of its pages, as `,` does: about,
+//! advanced, graphing, overview, inputs, outputs, i2s, global, surfaces,
+//! interfaces, groups, macros.
 
 use dspi_tui::screens::{InputPage, MatrixPanel, OutputPage, Overview, shared};
+use dspi_tui::settings::{AppConfig, SettingsScreen};
 use dspi_tui::shell::{Focus, Screen, Selection, Shell, Tool, fixture};
 use dspi_tui::theme::{ColorDepth, Glyphs, Palette, Theme};
 use ratatui::Terminal;
@@ -24,6 +28,11 @@ fn main() {
         .and_then(|i| raw.get(i + 1))
         .cloned()
         .unwrap_or_else(|| "input".into());
+    let settings = raw
+        .iter()
+        .position(|a| a == "--settings")
+        .and_then(|i| raw.get(i + 1))
+        .cloned();
     // Positional arguments, with the flags and their values taken out.
     let mut args: Vec<&String> = Vec::new();
     let mut skip = false;
@@ -31,7 +40,7 @@ fn main() {
         if std::mem::take(&mut skip) || a == "--ansi" {
             continue;
         }
-        if a == "--screen" {
+        if a == "--screen" || a == "--settings" {
             skip = true;
             continue;
         }
@@ -54,7 +63,12 @@ fn main() {
         _ => fixture::rp2350(&theme),
     };
 
-    let state = fixture::state();
+    // The Settings pages show wiring, so they get a device with some.
+    let state = if settings.is_some() {
+        dspi_tui::settings::demo::state()
+    } else {
+        fixture::state()
+    };
     let shared = shared();
     let (detail, selection): (Box<dyn Screen>, Selection) = match screen.as_str() {
         "overview" | "matrix" => (Box::new(Overview::new(shared.clone())), Selection::Overview),
@@ -72,6 +86,20 @@ fn main() {
     shell.focus = Focus::Screen;
     if screen == "matrix" {
         shell.open_tool(Tool::Matrix, Box::new(MatrixPanel::new(shared)));
+    }
+    if let Some(name) = &settings {
+        let page = SettingsScreen::page_from_name(name).unwrap_or_else(|| {
+            eprintln!("unknown settings page {name}");
+            std::process::exit(2);
+        });
+        shell.open_settings(Box::new(
+            SettingsScreen::new(
+                &state,
+                dspi_tui::settings::demo::data(),
+                AppConfig::default(),
+            )
+            .open(page, &state),
+        ));
     }
 
     let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
