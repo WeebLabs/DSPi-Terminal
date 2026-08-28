@@ -579,8 +579,10 @@ impl SignalsPanel {
                 title: "Outputs".into(),
                 action: Some("a All   n None".into()),
             },
+            // The Console says "Click to select, click again to invert"; here
+            // Space belongs to the transport, so Enter is the gesture.
             Row::Caption(
-                "Space selects, Space again inverts polarity (ø). Dimmed outputs are disabled \
+                "Enter selects, Enter again inverts polarity (ø). Dimmed outputs are disabled \
                  in the matrix mixer and stay silent."
                     .into(),
             ),
