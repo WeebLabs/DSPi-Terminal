@@ -697,3 +697,47 @@ truncates. Tables truncate the TYPE column with `…` last.
   data for design review, and `dspi screenshot` uses the same fixture so
   documentation screenshots need no device.
 - A test that every key named on the key line of every screen is handled.
+
+## 11. Decisions made in implementation
+
+Recorded as they were taken, so the document stays the spec.
+
+- **Unselected curves are dashed 6 on, 4 off** (the Console's `[6, 4]`),
+  not dotted every fourth column, which read as noise on a flat curve.
+- **Minor frequency grid lines** are drawn only at 2 and 5 per decade and
+  only when the plot is at least 100 columns wide; the Console's 6 % white
+  has no terminal equivalent that is not a picket fence. dB grid lines are
+  drawn only when there are at least 1.5 rows per step, and dB labels thin
+  by doubling the step until labels are two rows apart.
+- **Curve-end labels** appear at 16 colours and mono, and for any grouped
+  curve on the overview; colliding labels stack on neighbouring rows.
+- **The legend wraps** onto a second row when seventeen pills do not fit;
+  the layout gives it that row.
+- **The quick strip closes up** its toggles when it would overflow at 80
+  columns; the volume row shortens `Volume User` to `Vol User` and then
+  `Vol U`; the CPU row drops its inner space. Each keeps its dots.
+- **The channel list scrolls as one flat list** (headers, blank, rows) with
+  the hints in the border column, so a hint never covers a pill.
+- **`Space` on the volume row is mute** (`vol.mute`). The Console has no
+  sidebar mute; the key was otherwise dead there and the test that every
+  advertised key is bound flagged it.
+- **`Down` on the last footer row moves on** to the legend, as `Tab` does.
+- **A dialog letter two buttons share is no accelerator** (`c` never picks
+  `Clear All` over `Cancel`); `Esc` cancels.
+- **Screens draw from `&DeviceState` every frame** and never cache device
+  values; they keep only cursors and edit state. Several writes at once are
+  one `ScreenEvent::Command` with newline-separated lines.
+- **Screens reach the session only through `ScreenEvent::Session`**, a
+  closure the runner executes, answered through `session_result` with a
+  tag. Control-surface pages use it for typed writes and their status.
+- **Delays carry the Console's 85 ms** in the registry; the RP2040's 42 ms
+  is enforced by platform at write time.
+- **The Linkwitz target Q** is a seventh token of `eq`.
+- **Preset occupancy** comes from the directory packet; a stored preset
+  without a name shows as `Preset N`, an empty slot as `Empty`.
+- **Signal generator types** come from the device's descriptors at connect
+  when it answers them; the Console's fallback table is used otherwise.
+- **The input card on the overview shows no delay**, following the Console
+  (`showDelay: false`), which section 7.3 had wrong. The Console's exact
+  type-menu labels (`Low Shelf 12 dB/oct`) are the ones to use in the
+  filter list's TYPE column, not an abbreviation.
