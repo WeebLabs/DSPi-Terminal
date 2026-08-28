@@ -285,8 +285,8 @@ and legend. Then HW-3.
 
 ### Progress (2026-08-28)
 
-Merged on `console-parity`: Phases 0, 1, 2A, 2B, 2C, 3 and 4. Running:
-Phases 5 and 6. Waiting: HW-1 (a device), then 7A, 7B, 8, 9, 10.
+Merged on `console-parity`: Phases 0, 1, 2A, 2B, 2C, 3, 4, 5, 6 and 7A.
+Running: Phases 7B and 8. Waiting: HW-1 (a device), then 9 and 10.
 
 ## 3. Hardware checkpoints
 
@@ -330,14 +330,14 @@ Tick when merged and golden-tested.
 | G1 | Graph: grid, labels, adaptive dB step, phase overlay, zoom, height | Graph | 3| yes |
 | G2 | Legend pills, identical-curve grouping, dashed unselected | Graph | 3| yes |
 | G3 | Graph pop-out with independent visibility | Graph panel `g` | 3| yes |
-| M1 | Matrix: crosspoints, INV, trim, Direct 1:1, Clear | Matrix panel | 5 | |
-| M2 | Matrix output rows ENABLE / GAIN / DELAY / MUTE, conflicts | Matrix panel | 5 | |
-| X1 | Crossfeed panel | Tool panel | 6 | |
-| X2 | Loudness panel | Tool panel | 6 | |
-| X3 | Leveller panel | Tool panel | 6 | |
-| X4 | Psybass panel with starting points | Tool panel | 6 | |
-| X5 | Upmixer panel with live gauges | Tool panel | 6 | |
-| T1 | Test Signals: tiles, outputs/polarity, level, params, timing, options, transport | Tool panel | 6 | |
+| M1 | Matrix: crosspoints, INV, trim, Direct 1:1, Clear | Matrix panel | 5| yes |
+| M2 | Matrix output rows ENABLE / GAIN / DELAY / MUTE, conflicts | Matrix panel | 5| yes |
+| X1 | Crossfeed panel | Tool panel | 6| yes |
+| X2 | Loudness panel | Tool panel | 6| yes |
+| X3 | Leveller panel | Tool panel | 6| yes |
+| X4 | Psybass panel with starting points | Tool panel | 6| yes |
+| X5 | Upmixer panel with live gauges | Tool panel | 6| yes |
+| T1 | Test Signals: tiles, outputs/polarity, level, params, timing, options, transport | Tool panel | 6| yes |
 | N1 | Stats for Nerbs, every section, 2 s refresh, reset watermarks | Tool panel | 8 | |
 | N2 | Interrupt Monitor: pause, clear, decoded log | Tool panel | 2A, 8 | |
 | A1 | AutoEQ browser: search, source capsule, favourites, apply | Tool panel | 8 | |
@@ -348,16 +348,16 @@ Tick when merged and golden-tested.
 | K1 | Commit, Revert to Saved, Factory Reset, Firmware Update (bootloader) | Tools | 8 | |
 | K2 | Unsaved-changes prompt on preset switch / device switch / quit | Everywhere | 2A, 8| partly: quit and preset switch done; device switch pending |
 | K3 | Channel clipboard | Sidebar, Matrix | 4, 5| yes |
-| P1 | Settings shell: groups, gating, back/forward, save bar, revert | Settings | 7A | |
-| P2 | Overview pin map with roles | Settings | 7A | |
-| P3 | About | Settings | 7A | |
-| P4 | Graphing settings (persisted) | Settings | 7A | |
-| P5 | Advanced: reset names, debug info | Settings | 7A | |
-| P6 | Global Parameters: startup, DAC mute (+test), master mode, hw mode | Settings | 7A | |
-| P7 | Outputs: slots type/pin, Default capsule, ADAT out, reset pins | Settings | 7A | |
-| P8 | Inputs: SPDIF instances/pins, LG sync, I2S clock/channels/pins, ADAT in | Settings | 7A | |
-| P9 | I2S Configuration: BCK, clock pins, slave BCK, MCK, multiplier, rate | Settings | 7A | |
-| P10 | Control Interfaces: UART, I2C, apply/revert, status pills | Settings | 7A | |
+| P1 | Settings shell: groups, gating, back/forward, save bar, revert | Settings | 7A| yes |
+| P2 | Overview pin map with roles | Settings | 7A| yes |
+| P3 | About | Settings | 7A| yes |
+| P4 | Graphing settings (persisted) | Settings | 7A| yes |
+| P5 | Advanced: reset names, debug info | Settings | 7A| yes |
+| P6 | Global Parameters: startup, DAC mute (+test), master mode, hw mode | Settings | 7A| yes |
+| P7 | Outputs: slots type/pin, Default capsule, ADAT out, reset pins | Settings | 7A| yes |
+| P8 | Inputs: SPDIF instances/pins, LG sync, I2S clock/channels/pins, ADAT in | Settings | 7A| yes |
+| P9 | I2S Configuration: BCK, clock pins, slave BCK, MCK, multiplier, rate | Settings | 7A| yes |
+| P10 | Control Interfaces: UART, I2C, apply/revert, status pills | Settings | 7A| yes |
 | C1 | Control Surfaces slots: full caps-driven editor | Settings | 7B | |
 | C2 | IR remote commands with learn | Settings | 7B | |
 | C3 | Display wiring, config, pages | Settings | 7B | |
