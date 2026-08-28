@@ -27,6 +27,7 @@ pub mod advanced;
 pub mod config;
 pub mod global;
 pub mod graphing;
+pub mod i2s;
 pub mod inputs;
 pub mod outputs;
 pub mod overview;
@@ -1038,6 +1039,7 @@ struct Pages {
     overview: overview::OverviewPage,
     inputs: inputs::InputsPage,
     outputs: outputs::OutputsPage,
+    i2s: i2s::I2sPage,
     global: global::GlobalPage,
     /// The three Phase 7B pages share one placeholder.
     later: LaterPage,
@@ -1101,6 +1103,7 @@ impl SettingsScreen {
                 overview: overview::OverviewPage::default(),
                 inputs: inputs::InputsPage::default(),
                 outputs: outputs::OutputsPage::default(),
+                i2s: i2s::I2sPage::default(),
                 global: global::GlobalPage::new(state, &data),
                 later: LaterPage { title: "" },
             },
@@ -1205,8 +1208,9 @@ impl SettingsScreen {
             Page::Overview => &mut self.pages.overview,
             Page::Inputs => &mut self.pages.inputs,
             Page::Outputs => &mut self.pages.outputs,
+            Page::I2s => &mut self.pages.i2s,
             Page::Global => &mut self.pages.global,
-            Page::Surfaces | Page::Groups | Page::Macros | Page::I2s | Page::Interfaces => {
+            Page::Surfaces | Page::Groups | Page::Macros | Page::Interfaces => {
                 self.pages.later.title = self.page.title();
                 &mut self.pages.later
             }
@@ -1221,8 +1225,9 @@ impl SettingsScreen {
             Page::Overview => &self.pages.overview,
             Page::Inputs => &self.pages.inputs,
             Page::Outputs => &self.pages.outputs,
+            Page::I2s => &self.pages.i2s,
             Page::Global => &self.pages.global,
-            Page::Surfaces | Page::Groups | Page::Macros | Page::I2s | Page::Interfaces => &self.pages.later,
+            Page::Surfaces | Page::Groups | Page::Macros | Page::Interfaces => &self.pages.later,
         }
     }
 
@@ -1620,6 +1625,7 @@ impl Screen for SettingsScreen {
                 Page::Overview => self.pages.overview.popup_result(choice, &cx),
                 Page::Inputs => self.pages.inputs.popup_result(choice, &cx),
                 Page::Outputs => self.pages.outputs.popup_result(choice, &cx),
+                Page::I2s => self.pages.i2s.popup_result(choice, &cx),
                 Page::Global => self.pages.global.popup_result(choice, &cx),
                 _ => PageEvent::Handled,
             }
@@ -1652,6 +1658,7 @@ impl Screen for SettingsScreen {
                         Page::Overview => self.pages.overview.dialog_result(outcome, &cx),
                         Page::Inputs => self.pages.inputs.dialog_result(outcome, &cx),
                         Page::Outputs => self.pages.outputs.dialog_result(outcome, &cx),
+                        Page::I2s => self.pages.i2s.dialog_result(outcome, &cx),
                         Page::Global => self.pages.global.dialog_result(outcome, &cx),
                         _ => PageEvent::Handled,
                     }
@@ -1795,6 +1802,7 @@ impl SettingsScreen {
                     Page::Overview => self.pages.overview.act(cursor, action, &cx),
                     Page::Inputs => self.pages.inputs.act(cursor, action, &cx),
                     Page::Outputs => self.pages.outputs.act(cursor, action, &cx),
+                    Page::I2s => self.pages.i2s.act(cursor, action, &cx),
                     Page::Global => self.pages.global.act(cursor, action, &cx),
                     _ => PageEvent::Handled,
                 }
