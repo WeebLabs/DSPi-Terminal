@@ -583,6 +583,13 @@ pub struct DeviceState {
     pub i2s_slave_state: Option<(u8, u32)>,
     pub adat_input_state: Option<(u8, u32, u8)>,
     pub ir_learn: Option<(u8, u8, u32)>,
+    /// The upmixer's telemetry (`REQ_UPMIX_GET_STATUS`, config.h:187-191).
+    ///
+    /// The notification endpoint does not carry it, so unlike the sub-states
+    /// above this one is polled: the runner refreshes it once a second while
+    /// the upmixer panel is showing its gauges, and it stays `None` on a
+    /// device without the feature.
+    pub upmix_status: Option<dspi_proto::packets::UpmixStatus>,
     /// Set when a notification said the shadow can no longer be trusted.
     pub stale: bool,
 }
@@ -607,6 +614,7 @@ impl DeviceState {
             i2s_slave_state: None,
             adat_input_state: None,
             ir_learn: None,
+            upmix_status: None,
             stale: false,
         };
         s.mark_saved();

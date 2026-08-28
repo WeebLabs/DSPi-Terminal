@@ -2668,6 +2668,11 @@ fn parse_mask32_field(field: &'static str, v: &str) -> Result<u32, PacketError> 
     u32::try_from(n).map_err(|_| bad(field, v, "a 32-bit mask"))
 }
 
+fn parse_mask16_field(field: &'static str, v: &str) -> Result<u16, PacketError> {
+    let n = parse_int(field, v)?;
+    u16::try_from(n).map_err(|_| bad(field, v, "a 16-bit mask"))
+}
+
 fn parse_f32_field(field: &'static str, v: &str) -> Result<f32, PacketError> {
     v.trim()
         .parse::<f32>()
@@ -3360,6 +3365,131 @@ impl I2cCtrlConfig {
     }
 }
 
+/// The signal catalogue, `siggen.h:34-53`, as tokens a person would type.
+pub const SIGGEN_TYPES: &[(&str, u8)] = &[
+    ("sine", 0),
+    ("square", 1),
+    ("white", 2),
+    ("pink", 3),
+    ("sweep-log", 4),
+    ("sweep-lin", 5),
+    ("sweep-step", 6),
+    ("impulse", 7),
+    ("clicks", 8),
+    ("polarity", 9),
+    ("burst", 10),
+    ("tone-pair", 11),
+    ("multitone", 12),
+    ("isp", 13),
+    ("channel-id", 14),
+];
+
+/// `SIGGEN_FLAG_*`, siggen.h:56-58.
+pub const SIGGEN_FLAGS: &[(&str, u8)] = &[
+    ("raw", SiggenConfig::FLAG_RAW),
+    ("decorr", SiggenConfig::FLAG_DECORR),
+    ("walk", SiggenConfig::FLAG_WALK),
+];
+
+impl SiggenConfig {
+    pub const FIELDS: &'static [FieldSpec] = &[
+        f(
+            "type",
+            FieldKind::Enum(SIGGEN_TYPES),
+            "which signal the generator produces",
+        ),
+        f(
+            "channels",
+            FieldKind::Mask32,
+            "output-channel select, bit i = output i",
+        ),
+        f(
+            "invert",
+            FieldKind::Mask32,
+            "the polarity-inverted subset of channels",
+        ),
+        f("flags", FieldKind::Flags(SIGGEN_FLAGS), "raw, decorr, walk"),
+        f("level", FieldKind::F32, "peak level dBFS, -120 to 0"),
+        f(
+            "duration",
+            FieldKind::U32,
+            "sweep length or play time, ms; 0 = until stopped",
+        ),
+        f(
+            "repeat",
+            FieldKind::U16,
+            "sweeps, pattern periods or passes; 0 = forever",
+        ),
+        f("gap", FieldKind::U16, "gap between repeats, ms"),
+        f("p1", FieldKind::F32, "the type's first parameter"),
+        f("p2", FieldKind::F32, "the type's second parameter"),
+        f("p3", FieldKind::F32, "the type's third parameter"),
+        f("p4", FieldKind::F32, "the type's fourth parameter"),
+    ];
+
+    pub fn fields() -> &'static [FieldSpec] {
+        Self::FIELDS
+    }
+
+    pub fn from_fields(given: &[(&str, &str)]) -> Result<Self, PacketError> {
+        let mut c = Self::default();
+        for (key, value) in given {
+            match *key {
+                "type" => c.signal_type = parse_choice("type", SIGGEN_TYPES, value)?,
+                "channels" => c.channel_mask = parse_mask16_field("channels", value)?,
+                "invert" => c.invert_mask = parse_mask16_field("invert", value)?,
+                "flags" => c.flags = parse_flag_set("flags", SIGGEN_FLAGS, value)?,
+                "level" => c.level_db = parse_f32_field("level", value)?,
+                "duration" => c.duration_ms = parse_u32_field("duration", value)?,
+                "repeat" => c.repeat_count = parse_u16_field("repeat", value)?,
+                "gap" => c.gap_ms = parse_u16_field("gap", value)?,
+                "p1" => c.p1 = parse_f32_field("p1", value)?,
+                "p2" => c.p2 = parse_f32_field("p2", value)?,
+                "p3" => c.p3 = parse_f32_field("p3", value)?,
+                "p4" => c.p4 = parse_f32_field("p4", value)?,
+                other => return Err(unknown_field("sig.config", other, Self::FIELDS)),
+            }
+        }
+        Ok(c)
+    }
+
+    /// The fields worth echoing: the type, the outputs and the level always,
+    /// then whatever else is not at its zero.
+    pub fn to_fields(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![
+            ("type", format_choice(SIGGEN_TYPES, self.signal_type)),
+            ("channels", format!("0x{:X}", self.channel_mask)),
+            ("level", format_float(self.level_db)),
+        ];
+        if self.invert_mask != 0 {
+            out.push(("invert", format!("0x{:X}", self.invert_mask)));
+        }
+        if self.flags != 0 {
+            out.push(("flags", format_flag_set(SIGGEN_FLAGS, self.flags)));
+        }
+        if self.duration_ms != 0 {
+            out.push(("duration", self.duration_ms.to_string()));
+        }
+        if self.repeat_count != 0 {
+            out.push(("repeat", self.repeat_count.to_string()));
+        }
+        if self.gap_ms != 0 {
+            out.push(("gap", self.gap_ms.to_string()));
+        }
+        for (name, v) in [
+            ("p1", self.p1),
+            ("p2", self.p2),
+            ("p3", self.p3),
+            ("p4", self.p4),
+        ] {
+            if v != 0.0 {
+                out.push((name, format_float(v)));
+            }
+        }
+        out
+    }
+}
+
 impl PresetStartup {
     pub const FIELDS: &'static [FieldSpec] = &[
         f(
@@ -3502,6 +3632,14 @@ pub static PACKET_SPECS: &[PacketSpec] = &[
         I2cCtrlConfig,
         index: &[],
         positional: &["enabled"]
+    ),
+    // The signal type may be given without a key, because the type is the
+    // first thing anyone says: `sig.config sine level=-6`.
+    packet_spec!(
+        "sig.config",
+        SiggenConfig,
+        index: &[],
+        positional: &["type"]
     ),
     // Written as two bytes and read back as three, so it cannot use the macro:
     // what a SET carries has no `last_active` to describe.
@@ -4938,6 +5076,18 @@ mod tests {
                 "dev.uart" => vec![("enabled", "on"), ("baud", "115200")],
                 "dev.i2c" => vec![("enabled", "on"), ("address", "0x42")],
                 "preset.startup" => vec![("mode", "specified"), ("slot", "3")],
+                "sig.config" => vec![
+                    ("type", "sweep-log"),
+                    ("channels", "0x3"),
+                    ("invert", "0x2"),
+                    ("flags", "raw,walk"),
+                    ("level", "-12.5"),
+                    ("duration", "5000"),
+                    ("repeat", "3"),
+                    ("gap", "250"),
+                    ("p1", "20"),
+                    ("p2", "20000"),
+                ],
                 other => panic!("no sample for {other}"),
             };
 

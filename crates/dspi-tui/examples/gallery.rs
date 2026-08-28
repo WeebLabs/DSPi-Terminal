@@ -1,14 +1,18 @@
 //! Render the shell with fixture data, for design review without a device.
 //!
 //!   gallery [width] [height] [console|amber|dark|mono] [rp2350|rp2040]
-//!           [--screen overview|input|output|matrix] [--ansi]
+//!           [--screen overview|input|output|matrix|crossfeed|loudness
+//!                     |leveller|psybass|upmixer|signals] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
-//! can be looked at by piping to a terminal. `--screen` picks which of the
-//! Console's detail screens fills the pane; the default is the input page.
-//! `matrix` opens the Matrix Mixer tool panel over it, as `M` does.
+//! can be looked at by piping to a terminal. `--screen` picks what fills the
+//! pane: one of the Console's detail screens, or one of its tool panels, which
+//! replace the graph as well. The default is the input page.
 
-use dspi_tui::screens::{InputPage, MatrixPanel, OutputPage, Overview, shared};
+use dspi_tui::screens::{
+    CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel, OutputPage, Overview,
+    PsybassPanel, SignalsPanel, UpmixerPanel, shared,
+};
 use dspi_tui::shell::{Focus, Screen, Selection, Shell, Tool, fixture};
 use dspi_tui::theme::{ColorDepth, Glyphs, Palette, Theme};
 use ratatui::Terminal;
@@ -54,8 +58,106 @@ fn main() {
         _ => fixture::rp2350(&theme),
     };
 
-    let state = fixture::state();
+    // The tool panels are gated on device features, so the gallery's fixture
+    // reports them present; without that every panel would draw its "requires
+    // newer firmware" banner and there would be nothing to review.
+    let mut state = fixture::state();
+    for name in ["psychoacoustic_bass", "upmixer", "test_signals"] {
+        state.caps.features.push(dspi_session::probe::Feature {
+            name: name.into(),
+            present: true,
+            evidence: "fixture".into(),
+        });
+    }
+    state.caps.siggen = Some(dspi_session::probe::SiggenCaps {
+        version: 1,
+        type_count: 15,
+        output_channels: 9,
+        multitone_max: 16,
+        valid_channel_mask: 0x1FF,
+    });
+    // The shell fixture leaves every DSP block at zero, which makes a panel a
+    // page of flat sliders and an empty graph. Give each one the Console's own
+    // defaults so a design review sees a working panel.
+    let section = |name: &str| {
+        dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, o, _)| *o)
+            .expect("section")
+    };
+    let g = section("global");
+    state.bulk.patch(g + 5, &[1]);
+    state.bulk.patch(g + 6, &0x01FFu16.to_le_bytes());
+    state.bulk.patch(g + 8, &80.0f32.to_le_bytes());
+    state.bulk.patch(g + 12, &100.0f32.to_le_bytes());
+    let cf = section("crossfeed");
+    state.bulk.patch(cf, &[1, 0, 1, 0x03]);
+    state.bulk.patch(cf + 4, &700.0f32.to_le_bytes());
+    state.bulk.patch(cf + 8, &4.5f32.to_le_bytes());
+    let lev = section("leveller");
+    state.bulk.patch(lev, &[1, 1, 0, 0]);
+    state.bulk.patch(lev + 4, &50.0f32.to_le_bytes());
+    state.bulk.patch(lev + 8, &12.0f32.to_le_bytes());
+    state.bulk.patch(lev + 12, &(-60.0f32).to_le_bytes());
+    state.bulk.patch(lev + 16, &[0x03, 0x03]);
+    let bass = section("psybass");
+    state.bulk.patch(bass, &[1, 0]);
+    state.bulk.patch(bass + 2, &0x00FFu16.to_le_bytes());
+    state.bulk.patch(bass + 4, &80.0f32.to_le_bytes());
+    state.bulk.patch(bass + 12, &6.0f32.to_le_bytes());
+    state.bulk.patch(bass + 16, &50.0f32.to_le_bytes());
+    let up = section("upmix");
+    state.bulk.patch(up, &[1, 1, 1, 0]);
+    state.bulk.patch(up + 4, &70.0f32.to_le_bytes());
+    state.bulk.patch(up + 12, &30.0f32.to_le_bytes());
+    state.bulk.patch(up + 16, &20.0f32.to_le_bytes());
+    state.bulk.patch(up + 20, &200.0f32.to_le_bytes());
+    state.bulk.patch(up + 24, &120.0f32.to_le_bytes());
+    state.bulk.patch(up + 28, &10.0f32.to_le_bytes());
+    state.bulk.patch(up + 32, &100.0f32.to_le_bytes());
+    state.bulk.patch(up + 36, &7000.0f32.to_le_bytes());
+    state.upmix_status = Some(dspi_proto::packets::UpmixStatus {
+        active: true,
+        parked_reason: 0,
+        corr_q14: 11_000,
+        balance_q14: 8_192,
+        center_gain_q15: 20_000,
+        ls_gain_q15: 9_000,
+        rs_gain_q15: 12_000,
+    });
     let shared = shared();
+    let tool = match screen.as_str() {
+        "matrix" => Some((
+            Tool::Matrix,
+            Box::new(MatrixPanel::new(shared.clone())) as Box<dyn Screen>,
+        )),
+        "crossfeed" => Some((
+            Tool::Crossfeed,
+            Box::new(CrossfeedPanel::new()) as Box<dyn Screen>,
+        )),
+        "loudness" => Some((
+            Tool::Loudness,
+            Box::new(LoudnessPanel::new()) as Box<dyn Screen>,
+        )),
+        "leveller" => Some((
+            Tool::Leveller,
+            Box::new(LevellerPanel::new()) as Box<dyn Screen>,
+        )),
+        "psybass" => Some((
+            Tool::Psybass,
+            Box::new(PsybassPanel::new()) as Box<dyn Screen>,
+        )),
+        "upmixer" => Some((
+            Tool::Upmixer,
+            Box::new(UpmixerPanel::new()) as Box<dyn Screen>,
+        )),
+        "signals" => Some((
+            Tool::Signals,
+            Box::new(SignalsPanel::new()) as Box<dyn Screen>,
+        )),
+        _ => None,
+    };
     let (detail, selection): (Box<dyn Screen>, Selection) = match screen.as_str() {
         "overview" | "matrix" => (Box::new(Overview::new(shared.clone())), Selection::Overview),
         "output" => (
@@ -70,8 +172,8 @@ fn main() {
     model.selection = selection;
     let mut shell = Shell::new(model, theme, detail);
     shell.focus = Focus::Screen;
-    if screen == "matrix" {
-        shell.open_tool(Tool::Matrix, Box::new(MatrixPanel::new(shared)));
+    if let Some((tool, panel)) = tool {
+        shell.open_tool(tool, panel);
     }
 
     let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");

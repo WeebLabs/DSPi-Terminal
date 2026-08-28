@@ -15,13 +15,20 @@
 //! hands every screen a handle to it.
 
 pub mod clipboard;
+pub mod crossfeed;
 pub mod filters;
 pub mod input;
+pub mod leveller;
 pub mod linkwitz;
+pub mod loudness;
 pub mod matrix;
 pub mod output;
 pub mod overview;
+pub mod panel;
 pub mod presets;
+pub mod psybass;
+pub mod signals;
+pub mod upmixer;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,13 +39,19 @@ use dspi_proto::xover;
 use dspi_session::DeviceState;
 
 pub use clipboard::ChannelClipboard;
+pub use crossfeed::CrossfeedPanel;
 pub use filters::{FilterList, FilterMode};
 pub use input::InputPage;
+pub use leveller::LevellerPanel;
 pub use linkwitz::LinkwitzPanel;
+pub use loudness::LoudnessPanel;
 pub use matrix::MatrixPanel;
 pub use output::OutputPage;
 pub use overview::Overview;
 pub use presets::{PresetChoice, PresetMenu};
+pub use psybass::PsybassPanel;
+pub use signals::SignalsPanel;
+pub use upmixer::UpmixerPanel;
 
 /// The application-side state the screens share.
 #[derive(Debug, Default, Clone)]

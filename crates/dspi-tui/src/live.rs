@@ -26,8 +26,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Widget};
 use crate::app::Performance;
 use crate::graph::GraphCurve;
 use crate::screens::{
-    self, InputPage, MatrixPanel, OutputPage, Overview, PresetChoice, PresetMenu, Shared,
-    clipboard, presets,
+    self, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel, OutputPage,
+    Overview, PresetChoice, PresetMenu, PsybassPanel, Shared, SignalsPanel, UpmixerPanel,
+    clipboard, panel, presets,
 };
 use crate::shell::{
     ChannelItem, Placeholder, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
@@ -121,8 +122,14 @@ impl Screens for ConsoleScreens {
     fn tool(&self, _state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
         match tool {
             Tool::Matrix => Box::new(MatrixPanel::new(self.shared.clone())),
-            other => Box::new(Placeholder::new(
-                other.title(),
+            Tool::Crossfeed => Box::new(CrossfeedPanel::new()),
+            Tool::Loudness => Box::new(LoudnessPanel::new()),
+            Tool::Leveller => Box::new(LevellerPanel::new()),
+            Tool::Psybass => Box::new(PsybassPanel::new()),
+            Tool::Upmixer => Box::new(UpmixerPanel::new()),
+            Tool::Signals => Box::new(SignalsPanel::new()),
+            _ => Box::new(Placeholder::new(
+                tool.title(),
                 "This panel arrives in a later phase.",
             )),
         }
@@ -347,6 +354,10 @@ pub struct Live {
     shared: Shared,
     pub should_quit: bool,
     last_tick: Instant,
+    /// When the upmixer's telemetry was last read. It is not a notification,
+    /// so the only way to move the gauges is to ask, and once a second is
+    /// enough for a meter a person is watching.
+    last_upmix_poll: Instant,
 }
 
 impl Live {
@@ -384,6 +395,7 @@ impl Live {
             shared,
             should_quit: false,
             last_tick: Instant::now(),
+            last_upmix_poll: Instant::now() - Duration::from_secs(2),
         };
         live.sync_model();
         live
@@ -980,8 +992,30 @@ impl Live {
                 let name = screens::channel_name(&self.state, row);
                 self.note(format!("Pasted {} onto {name}", clip.source));
             }
-            ShellEvent::Identify(_) => self.note("Identify arrives with Phase 6"),
+            ShellEvent::Identify(row) => self.identify(session, row),
         }
+    }
+
+    /// Play the channel-ID tone on one output, which is the Console's
+    /// Identify: a counted blip melody so the listener can tell which speaker
+    /// is which. It is only offered while the generator exists.
+    fn identify(&mut self, session: &mut Session, row: usize) {
+        if !panel::has_feature(&self.state, "test_signals") {
+            self.note("Firmware has no signal generator");
+            return;
+        }
+        let ni = self.state.caps.num_inputs as usize;
+        let output = row.saturating_sub(ni);
+        let name = screens::channel_name(&self.state, row);
+        self.run_commands(
+            session,
+            &format!(
+                "sig.config type=channel-id channels=0x{:X} invert=0x0 level=-20 duration=0 \
+                 repeat=1 gap=0 flags=walk p1=120\nsig.control start",
+                1u16 << output
+            ),
+        );
+        self.note(format!("Identifying {name}"));
     }
 
     fn request_preset(&mut self, session: &mut Session, slot: u8) {
@@ -1222,6 +1256,35 @@ impl Live {
         }
     }
 
+    /// Refresh the upmixer's telemetry, at most once a second and only while
+    /// its panel is the one on screen.
+    ///
+    /// `REQ_UPMIX_GET_STATUS` is a 16-byte structure with no scalar readback,
+    /// so it goes through the transport rather than the registry, the way the
+    /// preset directory does.
+    fn poll_upmix_status(&mut self, session: &mut Session, now: Instant) {
+        let showing = matches!(self.shell.tool, Some((Tool::Upmixer, _)));
+        if !showing || !panel::has_feature(&self.state, "upmixer") {
+            return;
+        }
+        if now.duration_since(self.last_upmix_poll) < Duration::from_secs(1) {
+            return;
+        }
+        self.last_upmix_poll = now;
+        let read = session.with_transport(|t| {
+            t.control_in(
+                dspi_proto::generated::opcodes::REQ_UPMIX_GET_STATUS,
+                0,
+                dspi_proto::packets::UpmixStatus::SIZE as u16,
+            )
+        });
+        if let Ok(bytes) = read
+            && let Ok(status) = dspi_proto::packets::UpmixStatus::decode(&bytes)
+        {
+            self.state.upmix_status = Some(status);
+        }
+    }
+
     /// Meters, notifications, status expiry, peak ballistics.
     pub fn tick(&mut self, session: &mut Session, notifications: Option<&Notifications>) {
         let now = Instant::now();
@@ -1234,6 +1297,7 @@ impl Live {
             }
             self.state.update_meters(m);
         }
+        self.poll_upmix_status(session, now);
 
         let mut reread = false;
         let mut changed_elsewhere: Option<(&'static str, Source)> = None;
