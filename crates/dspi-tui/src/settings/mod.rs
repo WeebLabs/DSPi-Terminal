@@ -26,6 +26,7 @@ pub mod about;
 pub mod advanced;
 pub mod config;
 pub mod global;
+pub mod graphing;
 pub mod overview;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -1031,6 +1032,7 @@ enum Pending {
 struct Pages {
     about: about::AboutPage,
     advanced: advanced::AdvancedPage,
+    graphing: graphing::GraphingPage,
     overview: overview::OverviewPage,
     global: global::GlobalPage,
     /// The three Phase 7B pages share one placeholder.
@@ -1091,6 +1093,7 @@ impl SettingsScreen {
             pages: Pages {
                 about: about::AboutPage,
                 advanced: advanced::AdvancedPage::default(),
+                graphing: graphing::GraphingPage::new(config.clone()),
                 overview: overview::OverviewPage::default(),
                 global: global::GlobalPage::new(state, &data),
                 later: LaterPage { title: "" },
@@ -1192,9 +1195,10 @@ impl SettingsScreen {
         match self.page {
             Page::About => &mut self.pages.about,
             Page::Advanced => &mut self.pages.advanced,
+            Page::Graphing => &mut self.pages.graphing,
             Page::Overview => &mut self.pages.overview,
             Page::Global => &mut self.pages.global,
-            Page::Surfaces | Page::Groups | Page::Macros | Page::Graphing | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => {
+            Page::Surfaces | Page::Groups | Page::Macros | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => {
                 self.pages.later.title = self.page.title();
                 &mut self.pages.later
             }
@@ -1205,9 +1209,10 @@ impl SettingsScreen {
         match self.page {
             Page::About => &self.pages.about,
             Page::Advanced => &self.pages.advanced,
+            Page::Graphing => &self.pages.graphing,
             Page::Overview => &self.pages.overview,
             Page::Global => &self.pages.global,
-            Page::Surfaces | Page::Groups | Page::Macros | Page::Graphing | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => &self.pages.later,
+            Page::Surfaces | Page::Groups | Page::Macros | Page::Inputs | Page::Outputs | Page::I2s | Page::Interfaces => &self.pages.later,
         }
     }
 
@@ -1360,6 +1365,7 @@ impl SettingsScreen {
             }
             PageEvent::Config(c) => {
                 self.config = *c;
+                self.pages.graphing.adopt(self.config.clone());
                 let result = match &self.config_path {
                     Some(p) => self.config.save_to(p).map(|()| p.clone()),
                     None => self.config.save(),
@@ -1600,6 +1606,7 @@ impl Screen for SettingsScreen {
             match self.page {
                 Page::About => self.pages.about.popup_result(choice, &cx),
                 Page::Advanced => self.pages.advanced.popup_result(choice, &cx),
+                Page::Graphing => self.pages.graphing.popup_result(choice, &cx),
                 Page::Overview => self.pages.overview.popup_result(choice, &cx),
                 Page::Global => self.pages.global.popup_result(choice, &cx),
                 _ => PageEvent::Handled,
@@ -1629,6 +1636,7 @@ impl Screen for SettingsScreen {
                     match self.page {
                         Page::About => self.pages.about.dialog_result(outcome, &cx),
                         Page::Advanced => self.pages.advanced.dialog_result(outcome, &cx),
+                        Page::Graphing => self.pages.graphing.dialog_result(outcome, &cx),
                         Page::Overview => self.pages.overview.dialog_result(outcome, &cx),
                         Page::Global => self.pages.global.dialog_result(outcome, &cx),
                         _ => PageEvent::Handled,
@@ -1769,6 +1777,7 @@ impl SettingsScreen {
                 match self.page {
                     Page::About => self.pages.about.act(cursor, action, &cx),
                     Page::Advanced => self.pages.advanced.act(cursor, action, &cx),
+                    Page::Graphing => self.pages.graphing.act(cursor, action, &cx),
                     Page::Overview => self.pages.overview.act(cursor, action, &cx),
                     Page::Global => self.pages.global.act(cursor, action, &cx),
                     _ => PageEvent::Handled,
