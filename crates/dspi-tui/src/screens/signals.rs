@@ -613,6 +613,11 @@ impl SignalsPanel {
                     // A disabled output is still selectable, as it is in the
                     // Console; it just stays silent, which the caption says.
                     enabled: true,
+                    // `TestSignalsView.swift:557`,
+                    // `.opacity(matrixEnabled ? 1.0 : 0.4)`: an output the
+                    // matrix mixer has switched off is the dim one the caption
+                    // is talking about.
+                    dimmed: !state.output(o).enabled,
                 }
             })
             .collect();
@@ -1194,6 +1199,58 @@ mod tests {
     /// D10: `TestSignalsView.swift:294` puts the connection ahead of the other
     /// three blockers. Without it a disconnected device read `Ready · Sine`
     /// with Start enabled, and pressing it wrote into nothing.
+    /// D25: the caption promises "Dimmed outputs are disabled in the matrix
+    /// mixer and stay silent", and `TestSignalsView.swift:557` is where the dim
+    /// comes from. Every chip was built at full strength, so nothing was ever
+    /// dim and the sentence described nothing.
+    #[test]
+    fn an_output_the_matrix_has_switched_off_is_drawn_dim_but_stays_selectable() {
+        let (mut p, mut state) = panel();
+        let theme = panel::key_theme();
+        let dimmed = |p: &SignalsPanel, state: &DeviceState| -> Vec<bool> {
+            p.rows(state, theme)
+                .iter()
+                .find_map(|r| match r {
+                    Row::Chips { chips, .. } => {
+                        Some(chips.iter().map(|c| c.dimmed).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .expect("the outputs row")
+        };
+        assert!(
+            dimmed(&p, &state).iter().all(|d| !d),
+            "the fixture has every output on"
+        );
+
+        // Turn output 2 off in the matrix mixer.
+        let (_, outputs, _) = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "outputs")
+            .copied()
+            .unwrap();
+        state.bulk.patch(outputs + 12, &[0]);
+        assert!(!state.output(1).enabled);
+        let flags = dimmed(&p, &state);
+        assert!(flags[1], "output 2 is dim: {flags:?}");
+        assert!(!flags[0] && !flags[2], "and only output 2: {flags:?}");
+
+        let name = super::super::channel_name(&state, state.caps.num_inputs as usize + 1);
+        assert_eq!(
+            testing::fg_of(&mut p, &state, 100, 60, &name),
+            theme.dim,
+            "a dim chip is drawn in the caption colour"
+        );
+
+        // It is still selectable, exactly as the Console leaves its button live.
+        p.chip = 1;
+        p.body.focus = focus_of(&p, &state, |r| matches!(r, Row::Chips { .. }));
+        assert!(matches!(
+            p.handle(key(KeyCode::Enter), &state),
+            ScreenEvent::Command(_)
+        ));
+    }
+
     #[test]
     fn a_missing_device_blocks_start_before_any_other_reason() {
         let (mut p, mut state) = panel();

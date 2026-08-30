@@ -137,6 +137,7 @@ impl CrossfeedPanel {
                     },
                     color: theme.role_color(crate::theme::ChannelRole::Output(2 * p as u8)),
                     enabled: true,
+                    dimmed: false,
                 })
                 .collect();
             rows.push(Row::Caption(
@@ -169,10 +170,15 @@ impl CrossfeedPanel {
             title: "Parameters".into(),
             action: None,
         });
+        // `CrossfeedView.swift:301`: the whole section is at 0.5 opacity unless
+        // the voicing is Custom, and it stays live, because an edit is what
+        // switches the voicing.
+        let custom = cf.preset == CUSTOM;
         rows.push(Row::Param(
             Param::new("Cutoff Frequency", cf.custom_fc as f64, 500.0, 2000.0, "Hz")
                 .step(10.0)
                 .decimals(0)
+                .dimmed(!custom)
                 .caption(
                     "Simulates head shadow lowpass cutoff. Lower = more bass crossfeed. \
                      Typical: 650-700 Hz.",
@@ -182,6 +188,7 @@ impl CrossfeedPanel {
             Param::new("Feed Level", cf.custom_feed_db as f64, 0.0, 15.0, "dB")
                 .step(0.5)
                 .decimals(1)
+                .dimmed(!custom)
                 .caption(
                     "Crossfeed attenuation below direct signal. Higher = more crossfeed. \
                      Typical: 4.5-9.5 dB.",
@@ -365,6 +372,66 @@ mod tests {
         assert!(f.contains("Jan Meier"), "{f}");
         assert!(f.contains("Cutoff Frequency"), "{f}");
         assert!(f.contains("700 Hz"), "{f}");
+    }
+
+    /// D24: `CrossfeedView.swift:301` draws PARAMETERS at 0.5 opacity outside
+    /// the Custom voicing, and `survey-console.md` 2.14 says the same. The rows
+    /// stay live, because editing one is what switches the voicing.
+    #[test]
+    fn the_parameters_dim_outside_custom_but_still_take_an_edit() {
+        let (mut p, mut state) = panel();
+        let theme = panel::key_theme();
+        let (_, cf, _) = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "crossfeed")
+            .copied()
+            .unwrap();
+
+        let dimmed = |p: &CrossfeedPanel, state: &DeviceState| -> Vec<bool> {
+            p.rows(state, theme)
+                .iter()
+                .filter_map(|r| match r {
+                    Row::Param(param) => Some(param.dimmed),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // The fixture is on the Default voicing.
+        assert_eq!(state.crossfeed().preset, 0);
+        assert_eq!(dimmed(&p, &state), vec![true, true]);
+        assert_eq!(
+            testing::fg_of(&mut p, &state, 100, 40, "Cutoff Frequency"),
+            theme.dim,
+            "a dimmed parameter is drawn in the caption colour"
+        );
+
+        // Custom (wire 3) brings them back up.
+        state.bulk.patch(cf + 1, &[3]);
+        assert_eq!(state.crossfeed().preset, CUSTOM);
+        assert_eq!(dimmed(&p, &state), vec![false, false]);
+        assert_eq!(
+            testing::fg_of(&mut p, &state, 100, 40, "Cutoff Frequency"),
+            theme.fg
+        );
+    }
+
+    /// The dim is presentation only: a nudge on the Default voicing still
+    /// writes, and carries `cf.preset custom` with it.
+    #[test]
+    fn a_dimmed_parameter_is_still_editable_and_switches_the_voicing() {
+        let (mut p, state) = panel();
+        let rows = p.rows(&state, panel::key_theme());
+        let param = panel::focus_rows(&rows)
+            .iter()
+            .position(|r| matches!(rows[*r], Row::Param(_)))
+            .expect("a parameter row")
+            + 1;
+        p.body.focus = param;
+        assert_eq!(
+            p.handle(key(KeyCode::Right), &state),
+            ScreenEvent::Command("cf.preset custom\ncf.freq 710".into())
+        );
     }
 
     #[test]

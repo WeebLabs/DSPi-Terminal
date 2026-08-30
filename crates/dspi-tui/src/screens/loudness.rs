@@ -111,6 +111,9 @@ impl LoudnessPanel {
                         state.caps.num_outputs,
                     )),
                     enabled: true,
+                    // `LoudnessView.swift:331-348` dims a chip only for being
+                    // off, never for the matrix mixer.
+                    dimmed: false,
                 })
                 .collect();
             rows.push(Row::Chips {

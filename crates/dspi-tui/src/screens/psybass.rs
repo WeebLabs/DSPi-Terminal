@@ -158,6 +158,9 @@ impl PsybassPanel {
                     state.caps.num_outputs,
                 )),
                 enabled: true,
+                // `PsychoacousticBassView.swift:282-296` dims a chip only for
+                // being off, never for the matrix mixer.
+                dimmed: false,
             })
             .collect();
         rows.push(Row::Chips {
