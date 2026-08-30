@@ -118,6 +118,67 @@ pub fn rp2350(theme: &Theme) -> ShellModel {
     m
 }
 
+/// Point the model's graph at `selection`, computing the curves from a
+/// device state the way the runner does: the channel's PEQ and crossover
+/// bands with its trim folded in, and for the linked FL/FR pair the partner
+/// underneath in grey. The gallery uses it so `--screen output` graphs the
+/// output it shows.
+pub fn select(m: &mut ShellModel, state: &DeviceState, theme: &Theme, selection: Selection) {
+    m.selection = selection;
+    let ni = state.caps.num_inputs as usize;
+    let no = state.caps.num_outputs as usize;
+    let channel = match selection {
+        Selection::Overview => None,
+        Selection::Input(i) => Some(i),
+        Selection::Output(o) => Some(ni + o),
+    };
+    let bands_of = |ch: usize| -> (Vec<dsp::Band>, f64) {
+        let band = |p: &dspi_proto::value::EqParamPacket| dsp::Band {
+            filter_type: p.filter_type,
+            freq: p.freq,
+            q: p.q,
+            gain_db: p.gain_db,
+            bypass: p.bypass,
+        };
+        let mut bands: Vec<dsp::Band> = state.bands(ch as u8).iter().map(band).collect();
+        if ch >= ni {
+            bands.extend(state.xover_bands(ch as u8).iter().map(band));
+            (bands, state.output(ch - ni).gain_db as f64)
+        } else {
+            (bands, 0.0)
+        }
+    };
+    let mut curves = Vec::new();
+    if let Some(ch) = channel {
+        let partner = m
+            .linked_pairs
+            .iter()
+            .find_map(|(a, b)| (ch == *a).then_some(*b).or((ch == *b).then_some(*a)));
+        if let Some(p) = partner {
+            let (bands, gain) = bands_of(p);
+            let role = ChannelRole::of(p as u8, ni as u8, no as u8);
+            curves.push(GraphCurve {
+                descriptor: role.descriptor(no as u8),
+                color: theme.dim,
+                magnitude: dsp::curve(&bands, gain),
+                phase: None,
+                selected: false,
+            });
+        }
+        let (bands, gain) = bands_of(ch);
+        let role = ChannelRole::of(ch as u8, ni as u8, no as u8);
+        curves.push(GraphCurve {
+            descriptor: role.descriptor(no as u8),
+            color: theme.role_color(role),
+            magnitude: dsp::curve(&bands, gain),
+            phase: Some(dsp::phase_curve(&bands)),
+            selected: true,
+        });
+    }
+    m.curves = curves;
+    m.graph_channel = channel.map(|ch| state.channel_name(ch));
+}
+
 /// An RP2040: two inputs, four outputs and the sub.
 pub fn rp2040(theme: &Theme) -> ShellModel {
     let mut m = rp2350(theme);

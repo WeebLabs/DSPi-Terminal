@@ -365,7 +365,7 @@ fn main() {
             Selection::Input(0),
         ),
     };
-    model.selection = selection;
+    fixture::select(&mut model, &state, &theme, selection);
     let mut shell = Shell::new(model, theme, detail);
     shell.focus = Focus::Screen;
     if let Some((tool, panel)) = tool {
