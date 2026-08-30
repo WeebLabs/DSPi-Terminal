@@ -283,14 +283,16 @@ producing `docs/plan/audit.md`. Fable then audits: (1) `DeviceState` and
 the notification path, (2) the Control Surfaces pages, (3) the theme, graph
 and legend. Then HW-3.
 
-### Progress (2026-08-28)
+### Progress (2026-08-30)
 
 Merged on `console-parity`: every implementation phase, 0 through 9, and
 the Opus audit (`audit.md`, 81 defects). Fixed by Fable: D1, D2, D2b, D5,
 D6, D6b, D8, D11, D12, D14, D15, D16, D17, D18, D20, D32, D33, D34, D39,
-D41, D43, D44, D56, D75, D77, D78. Both Opus fix rounds are merged (Settings; screens and panels), 961
-tests. Waiting: HW-1 and HW-2 (a device), then Fable's three deep audits
-and HW-3.
+D41, D43, D44, D56, D75, D77, D78. Both Opus fix rounds are merged
+(Settings; screens and panels). The quiet redesign of `DESIGN.md` section
+12 landed on 2026-08-30 (calm palette, one curve per graph, the overview
+grid), 959 tests. Waiting: HW-1 and HW-2 (a device), then Fable's three
+deep audits and HW-3.
 
 ## 3. Hardware checkpoints
 
@@ -369,7 +371,7 @@ Tick when merged and golden-tested.
 | C5 | Macros | Settings | 7B| yes |
 | L1 | Notifications applied live (EQ, names, volume, source, and all of V28) | Session | 2A| yes |
 | L2 | Multi-device: list, switch with prompt, generation scoping | Session | 2A, 4| yes |
-| V1 | Console palette, channel colour everywhere, semantic colours | Theme | 3| yes |
+| V1 | Console palette; a hue on the swatch and the selection (DESIGN 12), the Console's full colouring as `--theme console` | Theme | 3, 12| yes |
 | V2 | Disabled / unsupported presentation rules | Widgets | 3| yes |
 | Q1 | 80x24 and 200x60 layouts, help overlay, animation, `--lite` | Shell | 9| yes |
 

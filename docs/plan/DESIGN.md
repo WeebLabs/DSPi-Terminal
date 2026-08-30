@@ -11,9 +11,8 @@ the conventions in sections 4 and 5.
 ## 1. Principles
 
 1. **Same shape as the Console.** A channel sidebar on the left with
-   meters and visibility pills; a response graph on the top right with a
-   legend; a detail region beneath it that shows the overview, an input, or
-   an output. Tool windows become full-pane panels; Settings becomes a
+   swatches and meters; a response graph on the top right; a detail region
+   beneath it that shows the overview, an input, or an output. Tool windows become full-pane panels; Settings becomes a
    full-screen page with its own sidebar. Someone who knows the Console
    should find everything where they expect it.
 2. **Same words as the Console.** Titles, captions, warnings, preset names,
@@ -85,8 +84,8 @@ Regions, top to bottom and left to right:
   device picker when more than one device is present.
 - **Sidebar** (24 columns; 22 at 80 columns): INPUTS and OUTPUTS sections,
   then the footer block.
-- **Graph** (top of the detail pane): the Bode plot with axes, then one
-  legend row of pills.
+- **Graph** (top of the detail pane): the Bode plot with axes, for the
+  selected channel (section 12). In the overview the grid takes its rows.
 - **Detail** (rest of the detail pane): Overview, Input page or Output
   page, switched by the sidebar selection. Tool panels replace the whole
   detail pane including the graph.
@@ -98,7 +97,7 @@ Regions, top to bottom and left to right:
 ### 2.2 At 80x24 (the minimum)
 
 Same two columns. The sidebar is 22 wide, the graph is 7 rows tall and
-`=` collapses it to a single legend row, the detail gets the rest. Below
+`=` hides it, the detail gets the rest. Below
 80x24 the app draws "Terminal too small: needs 80x24" and nothing else.
 
 ### 2.3 The sidebar footer
@@ -132,8 +131,7 @@ resets to 0 dB (Console right-click). The tapers are the Console's.
 
 ### 2.4 Focus model
 
-`Tab` cycles the regions: sidebar list, sidebar footer, graph legend,
-detail. `Shift-Tab` goes back. Within a region, arrows move. The focused
+`Tab` cycles the regions: sidebar list, sidebar footer, detail. `Shift-Tab` goes back. Within a region, arrows move. The focused
 region's border is drawn in the accent colour; unfocused borders are
 chrome. Inside the focused region, the focused row is marked with a `▸`
 and its label is in the accent colour.
@@ -186,8 +184,9 @@ Global keys that work everywhere:
 | `Ctrl-Z` / `Ctrl-Y` | Undo / redo of live parameter writes |
 | `Ctrl-C` / `q` | Quit, with the unsaved-changes prompt |
 | `=` | Cycle graph height: small, medium, large, hidden |
-| `g` | Graph pop-out: the graph fills the detail pane with its own legend |
+| `g` | Graph pop-out: the selected channel's graph fills the detail pane |
 | `p` | Toggle the phase overlay on the graph |
+| `.` | Show or hide a linked partner's curve under the selected one |
 | `+` / `-` | Graph vertical zoom |
 | `h` / `l` | Graph cursor |
 | `b` | Bypass Master EQ |
@@ -396,11 +395,11 @@ when the latch is set. Peak hold: a single `▌` at the 1 s peak, decaying.
 The CPU meter is the same widget, 8 cells, `accent` fill turning `danger`
 above 90 %, with the percentage after.
 
-### 6.10 Pill (channel visibility)
+### 6.10 Descriptor
 
-`● IN1` in the channel colour when visible, `○ IN1` in `dim` when hidden.
-`Space` toggles. In the legend row they are laid out left to right with
-two spaces between.
+`IN1` in `dim` text after the meter. Section 12 retired the visibility
+pill and its toggle; `--theme console` still fills the descriptor in the
+channel's colour.
 
 ### 6.11 Dialogs
 
@@ -455,28 +454,24 @@ beyond the kit's. Strings come from `survey-console.md` section 2.
 - Sections show only what exists: 2, 4, 6 or 8 inputs; enabled outputs
   only.
 
-### 7.2 Graph and legend
+### 7.2 Graph
 
 Ported from the Console's `GraphView.swift` behaviour: log-x
 `min_freq`..`max_freq`, linear-y `center ± range/2`, adaptive dB step
-(1/3/5/10), 0 dB line, axis labels; phase overlay dotted on a ±180 deg axis
-scaled with the range; identical-curve grouping (output gain folded in;
-bit-identical magnitude arrays collapse into one curve drawn in the first
-member's colour with the other members' pills marked `=` after their
-descriptor); curves not containing the selected channel are drawn dotted
-(every other braille column) when a channel is selected, all solid on the
-Overview; the selected channel's curve is drawn last so it is on top.
-Legend pills toggle visibility. The graph's own keys: `h`/`l` cursor with
-a per-visible-channel readout on the echo line, `+`/`-` range, `p` phase,
-`=` height, `g` pop-out. Settings > Graphing values apply.
+(1/3/5/10), 0 dB line, axis labels; phase overlay dashed on a ±180 deg
+axis scaled with the range. What it draws is section 12.2: the selected
+channel's curve in its hue and, for a linked input pair, the partner's
+underneath in grey, `.` toggling it. The pane title names the channel.
+The graph's own keys: `h`/`l` cursor with a readout of each drawn curve on
+the echo line, `+`/`-` range, `p` phase, `=` height, `g` pop-out.
+Settings > Graphing values apply.
 
 ### 7.3 Overview
 
-The Console's dashboard cards, stacked and scrolling: a stereo card for
-IN1/IN2, a stereo card per enabled S/PDIF pair, a single card for PDM.
-Each card: header with dot, name, `Delay: N ms`; ten rows of `#`, type
-code, freq, gain, Q as the Console shows them, `-` for inactive. Cards are
-read-only; `Enter` on a card selects that channel.
+The grid of section 12.2: one cell per group of channels with identical
+curves, each with the member names, a small grey plot and a summary line.
+The main graph is hidden in the overview; the grid is the graphs. Cells
+are read-only; `Enter` or a digit selects a channel.
 
 ### 7.4 Input page
 
@@ -687,12 +682,12 @@ truncates. Tables truncate the TYPE column with `…` last.
   that no two channels that can be shown together share an index.
 - `widgets/`: every widget in section 6 with `handle()` and golden tests at
   truecolor, 256, 16 and mono.
-- The shell: title bar, sidebar with footer, graph with legend, detail
+- The shell: title bar, sidebar with footer, graph, detail
   region switch, tool panel swap, Settings full screen, echo and key
   lines, focus model, `Esc` stack, help overlay; golden tests at 80x24,
   120x40, 200x60.
-- Graph: legend pills, grouping, dotted unselected, cursor readout, phase,
-  height cycling, pop-out.
+- Graph: one curve plus the linked partner, cursor readout, phase, height
+  cycling, pop-out; the overview grid's grouping and summaries.
 - `examples/gallery.rs` renders every widget and the shell with fixture
   data for design review, and `dspi screenshot` uses the same fixture so
   documentation screenshots need no device.
@@ -702,17 +697,14 @@ truncates. Tables truncate the TYPE column with `…` last.
 
 Recorded as they were taken, so the document stays the spec.
 
-- **Unselected curves are dashed 6 on, 4 off** (the Console's `[6, 4]`),
-  not dotted every fourth column, which read as noise on a flat curve.
+- **Unselected curves were dashed 6 on, 4 off** (the Console's `[6, 4]`)
+  until section 12 removed them; the phase overlay keeps the dash.
 - **Minor frequency grid lines** are drawn only at 2 and 5 per decade and
   only when the plot is at least 100 columns wide; the Console's 6 % white
   has no terminal equivalent that is not a picket fence. dB grid lines are
   drawn only when there are at least 1.5 rows per step, and dB labels thin
   by doubling the step until labels are two rows apart.
-- **Curve-end labels** appear at 16 colours and mono, and for any grouped
-  curve on the overview; colliding labels stack on neighbouring rows.
-- **The legend wraps** onto a second row when seventeen pills do not fit;
-  the layout gives it that row.
+- **Curve-end labels and the wrapping legend** went with section 12.
 - **The quick strip closes up** its toggles when it would overflow at 80
   columns; the volume row shortens `Volume User` to `Vol User` and then
   `Vol U`; the CPU row drops its inner space. Each keeps its dots.
@@ -721,7 +713,7 @@ Recorded as they were taken, so the document stays the spec.
 - **`Space` on the volume row is mute** (`vol.mute`). The Console has no
   sidebar mute; the key was otherwise dead there and the test that every
   advertised key is bound flagged it.
-- **`Down` on the last footer row moves on** to the legend, as `Tab` does.
+- **`Down` on the last footer row moves on** to the detail, as `Tab` does.
 - **A dialog letter two buttons share is no accelerator** (`c` never picks
   `Clear All` over `Cancel`); `Esc` cancels.
 - **Screens draw from `&DeviceState` every frame** and never cache device
@@ -917,3 +909,30 @@ behaviour other than colour.
 4. `screens/overview.rs`: the grid.
 5. Re-baseline the golden tests; update sections 2, 3, 7 and 8 to point
    here; README key table.
+
+All five steps landed on 2026-08-30.
+
+### 12.7 Decisions made in implementation
+
+- **Inputs and outputs never share a cell**, even when their curves are
+  identical, because their summary lines say different things. Disabled
+  outputs are left out of the grid, as they were left off the old cards.
+- **A cell is the plot plus three rows** (title border, summary, bottom
+  border): plots of 3, 6, 8 and 10 rows give the 6, 9, 11 and 13 of 12.2.
+  The grid reads its own rectangle: three columns from 80 cells wide, four
+  from 150; nine-row cells from 27 rows tall, eleven from 42, thirteen
+  from 50.
+- **The main graph is hidden in the overview** and the pane takes the
+  detail's title. `=` still cycles the height a channel page will use.
+- **An unfocused cell's curve is `dim`**, its title `section` style, its
+  border chrome; the focused cell draws all three in its first channel's
+  hue. The plot keeps the main graph's window and zoom, which the runner
+  mirrors into the shared state each frame.
+- **A flat cell says `no filters`** and adds the preamp or trim only when
+  it is not zero; an output with both a crossover and PEQ bands lists the
+  crossover, then `N bands`, then the trim.
+- **The pop-out pins to the channel it opened on** when Graphing says it
+  does not follow the selection; the Console's setting kept its meaning
+  without the visibility maps.
+- **The partner toggle `.` is a global key**, so it works from any region;
+  it is a no-op unless the selected input is linked.

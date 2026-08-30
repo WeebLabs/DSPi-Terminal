@@ -12,34 +12,41 @@ that says which Console feature lives where, and what is still open.
 ## The interface
 
 ```
- DSPi  RP2350 · fw 1.1.6 · A1B2C3D4                       ● Connected   Preset 3: Living Room *
-╭──────────────────────╮╭─────────────────────────────────────────────────────────────────────╮
-│ INPUTS               ││+20                     ┆                        ┆         ┆           │
-│▍FL      ▓▓▓▓▓▓▓▌▏ IN1││    ⠉⠉⠓⠒⠒⠒⠦⠤⠤⠤⣄⣀⣀⣀⣀⡀                                 ⢀⣀⣀⡀   ┆       │
-│▍FR      ▓▓▓▓▓▓▓▌▏ IN2││  0 ⠤⠤⠤──⠤⠤⠤──⠤⠤⠤──⠉⠉⠉⠉⠓⠒⠒⠦⠤⢤⣀⣀⡀──⠤⠤⠤──⠤⣀⣀⣀⣀⣀⣀⣠⠤⠤⠤⠤⠤⠤⠴⠒⠒⠚⠉⠉─⠤⠉⠓⢦⡀⠤⠤│
-│ FC      ░░░░░░░░▏ IN3││-20                                                                  │
-│ ...                  ││       20     50    100    200     500   1k    2k     5k   10k  20k  │
-│ OUTPUTS              ││ ● IN1  ● IN2=  ● IN3  ● IN4=  ...  ● OUT1  ● OUT2=  ● OUT9          │
-│ OUT L  ▓▓▓▓▓▓▓▌▏ OUT1││─ ● FL ──────────────────────────────────────────────────────────────│
-│ OUT R  ▓▓▓▓▓▓▓▌▏ OUT2││ Link 1/2   Preamp -5.3 dB ━━━━━━━━━━━━━━━━●━━━━━━━━━━━━   Clear PEQ  │
-│ Sub    ▓▓▓▓▓▓▓▓▏ OUT9││   # TYPE                    FREQ      GAIN   WIDTH                  │
-│──────────────────────││ ● 1 Low Shelf 12 dB/oct   105 Hz   +8.8 dB                          │
-│ M X● L○ V○ P● T , b○ ││ ● 2 Peaking                64 Hz   -6.2 dB     0.3                  │
-│ Preset ‹3: Living …› ││ ● 3 Peaking              2856 Hz   -8.6 dB    3.58                  │
-│ Source ‹USB›         ││   4 Off                                                             │
-│ Volume User -12.0 dB ││                                                                     │
-│ ━━━━━━━━━━━━━━━━━●━━ ││                                                                     │
-│ C0 ▓░░ 31% C1 ▓▓░ 74%││                                                                     │
-╰──────────────────────╯╰─────────────────────────────────────────────────────────────────────╯
- :eq in.1 3 freq 2856
- ↑ ↓ Select a channel · Enter Back to the overview · Space Show or hide its curve · ? help
+ DSPi  RP2350 · fw 1.1.6 · A1B2C3D4                     ● Connected   Preset 3: Living Room *
+╭────────────────────╮╭ Filter Response · FL ─────────────────────────────────────────── ⤢ g ╮
+│ INPUTS             ││+20                  ┆                    ┆        ┆           ┆      │
+│▍▪FL     ▓▓▓▓▓▓▏ IN1││                     ┆                    ┆        ┆           ┆      │
+│▍▪FR     ▓▓▓▓▓▌▏ IN2││    ⠒⠒⠒⠒⠒⠦⠤⠤⠤⠤⠤⢤⣀⣀⣀⣀⡀┆                   ⢀⣀⣀⣀⣀⣀⡤⠤⣄⡀┆     ⣀⣀⡤⢤⣀⣀⣀⣀⣀⣀⣀⣀⣀│
+│ ▪FC     ░░░░░░▏ IN3││  0 ────────────────⠉⠉⠉⠙⠒⠒⠒⠒⠒⠒⠒⠋⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉────────⠙⢦⣠⠖⠋⠉⠉⠁────────────│
+│ ▪LFE    ░░░░░░▏ IN4││                     ┆                    ┆        ┆           ┆      │
+│ ▪BL     ░░░░░░▏ IN5││-20                  ┆                    ┆        ┆           ┆      │
+│ ▪BR     ░░░░░░▏ IN6││      20      50    100   200      500   1k    2k      5k     10k  20k│
+│ ▪SL     ░░░░░░▏ IN7││─ ● FL ───────────────────────────────────────────────────────────────│
+│ ▪SR     ░░░░░░▏ IN8││ Link 1/2   ▸Preamp +0.0 dB ━━━━━━━━━━━━━━━━━━━━━━━━●━━━━   Clear PEQ │
+│                    ││──────────────────────────────────────────────────────────────────────│
+│ OUTPUTS            ││   # TYPE                       FREQ      GAIN   WIDTH                │
+│ ▪OUT L ▓▓▓▓▓▌▏ OUT1▼│ ● 1 Low Shelf 12 dB/oct      105 Hz   +8.8 dB   0.707                │
+│────────────────────││ ● 2 Peaking                   64 Hz   -6.2 dB     0.3                │
+│ M X●L○V○P● T , b○  ││ ● 3 Peaking                 2856 Hz   -8.6 dB    3.58                │
+│ Preset ‹3: Livin…› ││ ● 4 Peaking                 1880 Hz   +3.6 dB    1.69                │
+│ Source ‹USB›       ││ ● 5 Peaking                 6749 Hz   +4.0 dB    4.74                │
+│ Vol User  -12.0 dB ││   6 Off                                                              │
+│ ━━━━━━━━━━━━━━━●━━ ││   7 Off                                                              │
+│ C0 ▓░ 31% C1 ▓░ 74%││   8 Off                                                             ▼│
+╰────────────────────╯╰──────────────────────────────────────────────────────────────────────╯
+ :eq in.1 3 freq 2856                                     Enable All │ Bypass All  Clear All
+ ↑ ↓ Band, or the header · ← → Field · Enter Edit · Space Bypass · 1-9,0 Jump to a band ·
 ```
 
-The shape is the Console's: a channel sidebar with meters, clip cells and
-visibility pills; the response graph with a legend; below it the overview,
-an input page or an output page, switched by the selection. The Console's
+The shape is the Console's: a channel sidebar with a colour swatch, meters
+and clip cells; the response graph for the selected channel, with a linked
+partner's curve underneath in grey; below it the input page or the output
+page. The overview is a grid of small graphs, one per group of channels
+whose curves are identical, each with a one-line summary. The Console's
 tool windows are panels that replace the right pane; Settings replaces the
-screen. Every channel keeps the Console's colour everywhere it appears.
+screen. Colour follows attention: the selected channel's hue, red for clip
+and mute, orange for warnings, greys for the rest. `--theme console` puts
+the Console's colour on every channel instead.
 
 ### Keys
 
@@ -59,14 +66,14 @@ Everywhere:
 
 | Key | Does |
 |---|---|
-| `Tab` | Next region: channels, footer, legend, detail |
+| `Tab` | Next region: channels, footer, detail |
 | `↑ ↓` | Select a channel; `Enter` returns to the overview |
-| `Space` | Toggle: a curve, a bypass, a feature in the quick strip, mute on the volume row |
+| `Space` | Toggle: a bypass, a feature in the quick strip, mute on the volume row |
 | `Ctrl-P` | Search every parameter, tool and action |
 | `:` | Command line, the same grammar as the shell |
 | `Ctrl-S` | Commit Parameters to the active preset |
 | `Ctrl-Z` `Ctrl-Y` | Undo, redo |
-| `= g p + - h l` | Graph height, pop-out, phase, zoom, cursor |
+| `= g p . + - h l` | Graph height, pop-out, phase, linked partner, zoom, cursor |
 | `b` `c` | Bypass Master EQ, clear clip latches |
 | `?` | Help for whatever has focus |
 | `q` | Quit, with the unsaved-changes prompt |
