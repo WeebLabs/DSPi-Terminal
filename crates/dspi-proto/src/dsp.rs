@@ -384,6 +384,72 @@ mod tests {
         );
     }
 
+    /// D3: a 12 dB/oct shelf's Q is a live wire field, not an ignored one.
+    /// `config.h:905-911` says only the *first*-order shelves are monotonic
+    /// with no Q; the second-order pair prewarps by `sqrt(A)` around the RBJ
+    /// `alpha = sin(w)/(2Q)`, so raising Q puts a peak and a dip on the
+    /// transition while the two plateaux stay where they were.
+    #[test]
+    fn a_second_order_shelfs_q_shapes_its_transition() {
+        let shelf = |q: f32| {
+            [Band {
+                filter_type: FilterType::LowShelf,
+                freq: 105.0,
+                q,
+                gain_db: 8.8,
+                bypass: false,
+            }]
+        };
+        let gentle = shelf(0.707);
+        let resonant = shelf(3.0);
+
+        // Both settle at the same two plateaux, so this is a shape change and
+        // not a gain change.
+        for (f, want) in [(5.0, 8.8), (20_000.0, 0.0)] {
+            assert!(close(response_at(f, &gentle), want, 0.3), "{f} Hz gentle");
+            assert!(
+                close(response_at(f, &resonant), want, 0.3),
+                "{f} Hz resonant is {}",
+                response_at(f, &resonant)
+            );
+        }
+        // A high Q overshoots below the corner and undershoots above it.
+        assert!(
+            response_at(60.0, &resonant) > response_at(60.0, &gentle) + 1.0,
+            "{} vs {}",
+            response_at(60.0, &resonant),
+            response_at(60.0, &gentle)
+        );
+        assert!(
+            response_at(190.0, &resonant) < response_at(190.0, &gentle) - 1.0,
+            "{} vs {}",
+            response_at(190.0, &resonant),
+            response_at(190.0, &gentle)
+        );
+
+        // The first-order shelf beside it ignores Q entirely, which is what
+        // keeps it out of `uses_q`.
+        let first = |q: f32| {
+            [Band {
+                filter_type: FilterType::LowShelf1,
+                freq: 105.0,
+                q,
+                gain_db: 8.8,
+                bypass: false,
+            }]
+        };
+        for f in [20.0, 60.0, 105.0, 190.0, 10_000.0] {
+            assert!(
+                close(
+                    response_at(f, &first(0.707)),
+                    response_at(f, &first(3.0)),
+                    1e-9
+                ),
+                "{f} Hz moved on a first-order shelf"
+            );
+        }
+    }
+
     #[test]
     fn a_low_pass_is_minus_three_db_at_its_corner() {
         let b = [Band {
