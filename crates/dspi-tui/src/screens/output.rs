@@ -184,8 +184,8 @@ impl OutputPage {
                 return y;
             }
             let c = state.crosspoint(input, self.output);
-            let color = theme.role_color(ChannelRole::Input(input as u8));
             let selected = here(Item::Route(input));
+            let color = theme.hue_for(ChannelRole::Input(input as u8), selected);
             buf.set_string(area.x, y, if selected { "▸" } else { " " }, theme.focused());
             let dot = match (c.enabled, ascii) {
                 (true, true) => "*",

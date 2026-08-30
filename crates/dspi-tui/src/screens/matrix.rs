@@ -140,12 +140,17 @@ fn is_8ch(state: &DeviceState) -> bool {
     state.caps.num_inputs as usize > BASE_INPUTS
 }
 
-/// The colour of an output column, which is the sub's colour for the last one.
-fn column_color(state: &DeviceState, theme: &Theme, output: usize) -> Color {
-    theme.channel_of(
-        (state.caps.num_inputs as usize + output) as u8,
-        state.caps.num_inputs,
-        state.caps.num_outputs,
+/// The colour of an output column, which is the sub's colour for the last
+/// one: under the colour budget of DESIGN 12.3 only the focused column
+/// takes its hue.
+fn column_color(state: &DeviceState, theme: &Theme, output: usize, focused: bool) -> Color {
+    theme.hue_for(
+        ChannelRole::of(
+            (state.caps.num_inputs as usize + output) as u8,
+            state.caps.num_inputs,
+            state.caps.num_outputs,
+        ),
+        focused,
     )
 }
 
@@ -424,17 +429,18 @@ impl MatrixPanel {
             let name = channel_name(state, output_channel(state, o));
             // `DESIGN.md` 7.7: "Column headers in the output colour". Both
             // header rows name the same column, so both take it.
+            let color = column_color(state, theme, o, o == self.col);
             p.buf.set_string(
                 x,
                 area.y,
                 fit_centre(&name, COL_W as usize - 1),
-                Style::default().fg(column_color(state, theme, o)),
+                Style::default().fg(color),
             );
             p.buf.set_string(
                 x,
                 area.y + 1,
                 fit_centre(&descriptor(state, o), COL_W as usize - 1),
-                Style::default().fg(column_color(state, theme, o)),
+                Style::default().fg(color),
             );
         }
         // Which way the grid still has columns, since the label column is
@@ -494,7 +500,7 @@ impl MatrixPanel {
             (false, false) => "○",
         };
         let dot_style = if live && c.enabled {
-            Style::default().fg(column_color(state, theme, output))
+            Style::default().fg(column_color(state, theme, output, output == self.col))
         } else {
             theme.label()
         };
@@ -626,7 +632,7 @@ impl MatrixPanel {
         let x = area.x;
         match row {
             Row::Input(i) => {
-                let color = theme.role_color(ChannelRole::Input(i as u8));
+                let color = theme.hue_for(ChannelRole::Input(i as u8), here);
                 let name = channel_name(state, i);
                 if !is_8ch(state) {
                     let text = fit_left(&name, LABEL_W as usize - 2);

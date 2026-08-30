@@ -164,7 +164,9 @@ impl Widget for ChipRow<'_> {
             } else {
                 match c.state {
                     ChipState::Off => Style::default().fg(t.dim),
-                    ChipState::On => t.pill(c.color),
+                    // DESIGN 12.3: a chip is reverse video in `fg`; the
+                    // channel hue is the console theme's alone.
+                    ChipState::On => t.pill(if t.quiet() { t.fg } else { c.color }),
                     ChipState::Inverted => t.pill(t.warning),
                 }
             };
