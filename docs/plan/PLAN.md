@@ -285,8 +285,9 @@ and legend. Then HW-3.
 
 ### Progress (2026-08-28)
 
-Merged on `console-parity`: Phases 0, 1, 2A, 2B, 2C, 3, 4, 5, 6, 7A and 8.
-Running: Phase 7B; Phase 9 under way. Waiting: HW-1 (a device), then 10.
+Merged on `console-parity`: every implementation phase, 0 through 9.
+Running: Phase 10 (the Opus audit). Waiting: HW-1 and HW-2 (a device), then
+Fable's three deep audits and HW-3.
 
 ## 3. Hardware checkpoints
 
@@ -358,16 +359,16 @@ Tick when merged and golden-tested.
 | P8 | Inputs: SPDIF instances/pins, LG sync, I2S clock/channels/pins, ADAT in | Settings | 7A| yes |
 | P9 | I2S Configuration: BCK, clock pins, slave BCK, MCK, multiplier, rate | Settings | 7A| yes |
 | P10 | Control Interfaces: UART, I2C, apply/revert, status pills | Settings | 7A| yes |
-| C1 | Control Surfaces slots: full caps-driven editor | Settings | 7B | |
-| C2 | IR remote commands with learn | Settings | 7B | |
-| C3 | Display wiring, config, pages | Settings | 7B | |
-| C4 | Channel Groups | Settings | 7B | |
-| C5 | Macros | Settings | 7B | |
+| C1 | Control Surfaces slots: full caps-driven editor | Settings | 7B| yes |
+| C2 | IR remote commands with learn | Settings | 7B| yes |
+| C3 | Display wiring, config, pages | Settings | 7B| yes |
+| C4 | Channel Groups | Settings | 7B| yes |
+| C5 | Macros | Settings | 7B| yes |
 | L1 | Notifications applied live (EQ, names, volume, source, and all of V28) | Session | 2A| yes |
 | L2 | Multi-device: list, switch with prompt, generation scoping | Session | 2A, 4| yes |
 | V1 | Console palette, channel colour everywhere, semantic colours | Theme | 3| yes |
 | V2 | Disabled / unsupported presentation rules | Widgets | 3| yes |
-| Q1 | 80x24 and 200x60 layouts, help overlay, animation, `--lite` | Shell | 9 | |
+| Q1 | 80x24 and 200x60 layouts, help overlay, animation, `--lite` | Shell | 9| yes |
 
 Not carried over, with reasons: the `STM32H723` platform (a separate
 firmware repository not in scope; the platform id is decoded generically so
