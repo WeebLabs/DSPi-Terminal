@@ -533,19 +533,19 @@ Footer actions (on the echo line's right side while the list is focused):
 Replaces the detail pane:
 
 ```
-                 OUT L        OUT R        OUT 3        Sub
-                 OUT1         OUT2         OUT3 !       OUT9 !
+          OUT L    OUT R    OUT 3     Sub
+           OUT1     OUT2     OUT3 !   OUT9 !
  ROUTING
- FL                ●            ○            ○            ●
-                0.0 dB                                 -6.0 dB INV
- FR                ○            ●            ○            ●
-                             0.0 dB                    -6.0 dB
+ FL          ●        ○        ○        ●
+      dB   0.0                       -6.0 INV
+ FR          ○        ●        ○        ●
+      dB            0.0              -6.0
  ...
-                ───────────────────────────────────────────────
- ENABLE          ⏻ on         ⏻ on         ⏻ off        ⏻ on
- GAIN            0.0 dB       0.0 dB       0.0 dB      -3.0 dB
- DELAY           0.0 ms       0.0 ms       0.0 ms       2.5 ms
- MUTE              ○            ○            ○            ●
+         ──────────────────────────────────
+ ENABLE    ⏻ on     ⏻ on    ⏻ off     ⏻ on
+ GAIN dB   0.0      0.0      0.0     -3.0
+ DELAY ms  0.0      0.0      0.0      2.5
+ MUTE        ○        ○        ○        ●
 ```
 Column headers in the output colour (section 12: the focused column's);
 input labels in the input colour. Every input has two lines of its own:
@@ -554,9 +554,12 @@ crosspoint gains on the second, a gain only under a `●` and `INV` after
 it in `warning`. The Console's stereo pair dividers are not drawn, and
 one rule parts the inputs from the ENABLE, GAIN, DELAY and MUTE rows.
 The Console's per-input trim column is not shown: the preamp belongs to
-the input page. Columns are at least 13 cells and widen to 18 as the
-pane allows, so nine outputs sit uncrowded at 200 columns and scroll at
-120. The reticle brackets both lines of the input it is on. Cells of a
+the input page. The units ride on the labels (`dB` on every gains line,
+`GAIN dB`, `DELAY ms`) so the cells are bare numbers, right-aligned so
+the last digit sits under the dot. That lets a column be nine cells, and
+nine outputs fit the Normal pane at 120 columns beside a nine-cell label
+column; columns widen to 18 and the label column to 16 as the pane
+allows, and only the 80-column pane scrolls. The reticle brackets both lines of the input it is on. Cells of a
 disabled output in `dim`. A column that would conflict with Core 1
 carries a `warning` `!` after its descriptor in the header, once, rather
 than in every cell. The Console's Direct 1:1 and Clear buttons are the
