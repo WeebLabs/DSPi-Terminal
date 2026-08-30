@@ -314,6 +314,105 @@ impl Refresh {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Writes whose answer the row shows
+// ---------------------------------------------------------------------------
+
+/// The outcome codes a pin, clock or interface write answers
+/// (`PIN_CONFIG_*`, config.h:606-612).
+pub mod pin_status {
+    pub const SUCCESS: u8 = 0x00;
+    pub const INVALID_PIN: u8 = 0x01;
+    pub const PIN_IN_USE: u8 = 0x02;
+    pub const INVALID_OUTPUT: u8 = 0x03;
+    pub const OUTPUT_ACTIVE: u8 = 0x04;
+    /// A non-pin field out of range: a baud rate, an I2C address.
+    pub const INVALID_PARAM: u8 = 0x05;
+}
+
+/// What a page makes of one of those codes: the sentence, and whether it is a
+/// failure. Every site words it the way the Console words that row.
+pub(crate) type Explain = dyn Fn(u8) -> (String, bool);
+
+/// A registry write whose device answer the row shows inline.
+///
+/// Every pin and clock setter is a write-as-read (config.h:596-604): the
+/// transfer succeeds, a refusal leaves the old value in place, and only the
+/// status byte says why. Sending the write as a command instead throws that
+/// byte away, which is how a row came to claim success for a move the device
+/// had refused.
+pub(crate) fn device_write(
+    tag: u32,
+    path: &'static str,
+    indices: Vec<u8>,
+    value: dspi_proto::value::Value,
+    explain: std::rc::Rc<Explain>,
+) -> SessionRequest {
+    SessionRequest::new(tag, move |session| {
+        match session.write(path, &indices, value.clone()) {
+            Err(e) => SessionReply::Err(e.to_string()),
+            Ok(out) => {
+                // An opcode with a plain data stage answers no status byte, so
+                // the confirming readback is the only evidence there is.
+                let code = session.last_write_status().unwrap_or({
+                    if out.is_confirmed() {
+                        pin_status::SUCCESS
+                    } else {
+                        pin_status::INVALID_PARAM
+                    }
+                });
+                reply(explain(code))
+            }
+        }
+    })
+}
+
+/// The same for the two control-interface configurations, whose SET is a plain
+/// data stage with no answer: the outcome lands in
+/// `CtrlIfaceStatus.<iface>_last_status` and has to be read back
+/// (config.h:542-545).
+pub(crate) fn iface_write(
+    tag: u32,
+    path: &'static str,
+    value: dspi_proto::value::Value,
+    uart: bool,
+    explain: std::rc::Rc<Explain>,
+) -> SessionRequest {
+    SessionRequest::new(tag, move |session| {
+        match session.write(path, &[], value.clone()) {
+            Err(e) => SessionReply::Err(e.to_string()),
+            Ok(_) => {
+                let status = session
+                    .with_transport(|t| {
+                        t.control_in(
+                            dspi_proto::generated::opcodes::REQ_GET_CTRL_IFACE_STATUS,
+                            0,
+                            CtrlIfaceStatus::SIZE as u16,
+                        )
+                    })
+                    .ok()
+                    .and_then(|d| CtrlIfaceStatus::decode(&d).ok());
+                // A firmware that cannot answer the status opcode leaves the
+                // write's own success as the only evidence there is.
+                let code = match (status, uart) {
+                    (Some(s), true) => s.uart_last_status,
+                    (Some(s), false) => s.i2c_last_status,
+                    (None, _) => pin_status::SUCCESS,
+                };
+                reply(explain(code))
+            }
+        }
+    })
+}
+
+fn reply((text, failed): (String, bool)) -> SessionReply {
+    if failed {
+        SessionReply::Err(text)
+    } else {
+        SessionReply::Ok(text)
+    }
+}
+
 /// Everything a page reads while it builds its rows.
 pub(crate) struct Cx<'a> {
     pub state: &'a DeviceState,
@@ -746,6 +845,10 @@ pub(crate) enum PageEvent {
     /// Work that needs the session itself: a control-surface write, whose
     /// deferred status protocol the shared command grammar does not speak.
     Session(SessionRequest),
+    /// The same for an output-config edit: a pin or clock write whose
+    /// `PIN_CONFIG_*` answer the row shows inline. Marks the second dirty
+    /// category, as [`PageEvent::IoCommand`] does.
+    IoSession(SessionRequest),
     /// The app-side settings file changed and should be written out.
     Config(Box<AppConfig>),
 }
@@ -1532,6 +1635,10 @@ impl SettingsScreen {
                 ScreenEvent::Popup(p)
             }
             PageEvent::Session(r) => ScreenEvent::Session(self.with_refresh(r, true)),
+            PageEvent::IoSession(r) => {
+                self.begin_output_edit(state);
+                ScreenEvent::Session(self.with_refresh(r, false))
+            }
             PageEvent::Config(c) => {
                 self.config = *c;
                 self.pages.graphing.adopt(self.config.clone());

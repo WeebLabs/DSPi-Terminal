@@ -14,7 +14,14 @@ use dspi_proto::packets::{I2cCtrlConfig, UartCtrlConfig};
 
 use crate::widgets::{Action, KeyHelp, PopupList, StatusTone};
 
+use crate::shell::SessionReply;
+use dspi_proto::value::Value;
+
 use super::{Cx, PageEvent, Row, SettingsData, SettingsPage};
+
+/// Tags for the two applies, so a reply reaches the right section.
+const TAG_UART: u32 = 0;
+const TAG_I2C: u32 = 1;
 
 /// The Console's `UART_CTRL_BAUD_CHOICES` (`Constants.swift:549`).
 pub const BAUD_CHOICES: [u32; 9] = [
@@ -228,10 +235,15 @@ impl InterfacesPage {
         cursor: usize,
     ) -> Vec<(Option<Item>, Row)> {
         let mut rows = Vec::new();
+        // A refusal is shown alongside "Unapplied changes": the draft is still
+        // there to be corrected, and the reason is why it is.
+        match status {
+            Some((text, true)) => rows.push((None, Row::Status(text.clone(), true))),
+            Some((text, false)) if !dirty => rows.push((None, Row::Status(text.clone(), false))),
+            _ => {}
+        }
         if dirty {
             rows.push((None, Row::note("Unapplied changes")));
-        } else if let Some((text, err)) = status {
-            rows.push((None, Row::Status(text.clone(), *err)));
         }
         rows.push((
             Some(item),
@@ -468,28 +480,6 @@ impl InterfacesPage {
         }
         PageEvent::Handled
     }
-
-    /// The one write that applies a whole interface configuration.
-    fn uart_command(&self) -> String {
-        format!(
-            "dev.uart enabled={} tx_pin={} rx_pin={} notify_enable={} baud={}",
-            if self.uart.enabled { "on" } else { "off" },
-            self.uart.tx_pin,
-            self.uart.rx_pin,
-            if self.uart.notify_enable { "on" } else { "off" },
-            self.uart.baud
-        )
-    }
-
-    fn i2c_command(&self) -> String {
-        format!(
-            "dev.i2c enabled={} sda_pin={} scl_pin={} address={}",
-            if self.i2c.enabled { "on" } else { "off" },
-            self.i2c.sda_pin,
-            self.i2c.scl_pin,
-            self.i2c.address
-        )
-    }
 }
 
 impl SettingsPage for InterfacesPage {
@@ -538,10 +528,14 @@ impl SettingsPage for InterfacesPage {
                     self.uart_status = None;
                     return PageEvent::Status("UART changes reverted".into());
                 }
-                let cmd = self.uart_command();
-                self.uart_device = self.uart.clone();
-                self.uart_status = Some(status_message(0, "UART"));
-                PageEvent::Command(cmd)
+                self.uart_status = None;
+                PageEvent::Session(super::iface_write(
+                    TAG_UART,
+                    "dev.uart",
+                    Value::Bytes(self.uart.encode().to_vec()),
+                    true,
+                    std::rc::Rc::new(|code| status_message(code, "UART")),
+                ))
             }
             (Item::I2cApply, Action::Open) => {
                 if self.i2c_button == 0 {
@@ -549,10 +543,14 @@ impl SettingsPage for InterfacesPage {
                     self.i2c_status = None;
                     return PageEvent::Status("I2C changes reverted".into());
                 }
-                let cmd = self.i2c_command();
-                self.i2c_device = self.i2c.clone();
-                self.i2c_status = Some(status_message(0, "I2C"));
-                PageEvent::Command(cmd)
+                self.i2c_status = None;
+                PageEvent::Session(super::iface_write(
+                    TAG_I2C,
+                    "dev.i2c",
+                    Value::Bytes(self.i2c.encode().to_vec()),
+                    false,
+                    std::rc::Rc::new(|code| status_message(code, "I2C")),
+                ))
             }
             (_, Action::Selected(i)) => self.apply(item, i, cx),
             (_, Action::Open) => {
@@ -604,6 +602,34 @@ impl SettingsPage for InterfacesPage {
             None => PageEvent::Handled,
         }
     }
+
+    /// The device's own verdict on the configuration this section just sent.
+    ///
+    /// The draft only becomes "what the device holds" when the device says it
+    /// took it; a refusal leaves the old configuration running, so the section
+    /// stays dirty and the row says why.
+    fn session_result(&mut self, tag: u32, reply: SessionReply, _cx: &Cx<'_>) -> PageEvent {
+        let (uart, status) = match (tag, reply) {
+            (TAG_UART, SessionReply::Ok(m)) => {
+                self.uart_device = self.uart.clone();
+                (true, (m, false))
+            }
+            (TAG_UART, SessionReply::Err(m)) => (true, (m, true)),
+            (TAG_I2C, SessionReply::Ok(m)) => {
+                self.i2c_device = self.i2c.clone();
+                (false, (m, false))
+            }
+            (TAG_I2C, SessionReply::Err(m)) => (false, (m, true)),
+            _ => return PageEvent::Handled,
+        };
+        let text = status.0.clone();
+        if uart {
+            self.uart_status = Some(status);
+        } else {
+            self.i2c_status = Some(status);
+        }
+        PageEvent::Status(text)
+    }
 }
 
 #[cfg(test)]
@@ -646,25 +672,119 @@ mod tests {
         assert!(f.contains("Apply"), "{f}");
     }
 
+    /// Apply is one write of the whole 8-byte record, and the row reports what
+    /// the device made of it rather than assuming.
     #[test]
-    fn apply_writes_the_whole_configuration_in_one_command() {
+    fn apply_writes_the_whole_configuration_and_reports_the_devices_answer() {
+        use dspi_proto::generated::opcodes as op;
+        use dspi_proto::packets::CtrlIfaceStatus;
+        use dspi_transport::MockTransport;
+
+        let iface = |last: u8| {
+            CtrlIfaceStatus {
+                uart_last_status: last,
+                uart_live: last == 0,
+                i2c_last_status: 0,
+                i2c_live: false,
+                proto_version: 2,
+            }
+            .encode()
+            .to_vec()
+        };
+        let armed = |s: &mut SettingsScreen, st: &_| {
+            s.handle(key(KeyCode::Tab), st);
+            s.handle(key(KeyCode::Char(' ')), st);
+            for _ in 0..5 {
+                s.handle(key(KeyCode::Down), st);
+            }
+        };
+        let session = |last: u8| {
+            let t = MockTransport::new()
+                .data(op::REQ_SET_UART_CONFIG, vec![])
+                .data(
+                    op::REQ_GET_UART_CONFIG,
+                    UartCtrlConfig {
+                        enabled: true,
+                        ..UartCtrlConfig::default()
+                    }
+                    .encode()
+                    .to_vec(),
+                )
+                .data(op::REQ_GET_CTRL_IFACE_STATUS, iface(last));
+            let log = t.log_handle();
+            let mut caps = crate::shell::fixture::caps();
+            caps.features = vec![dspi_session::probe::Feature {
+                name: "uart_control".into(),
+                present: true,
+                evidence: "0xF6 answered".into(),
+            }];
+            (
+                dspi_session::Session::new(Box::new(t), caps).expect("session"),
+                log,
+            )
+        };
+
+        // Accepted: the record goes out whole and the section stops being dirty.
         let (mut s, st) = screen(Page::Interfaces);
-        s.handle(key(KeyCode::Tab), &st);
-        s.handle(key(KeyCode::Char(' ')), &st);
-        for _ in 0..5 {
-            s.handle(key(KeyCode::Down), &st);
-        }
-        match s.handle(key(KeyCode::Enter), &st) {
-            ScreenEvent::Command(c) => assert_eq!(
-                c,
-                "dev.uart enabled=on tx_pin=16 rx_pin=17 notify_enable=off baud=115200"
-            ),
+        armed(&mut s, &st);
+        let req = match s.handle(key(KeyCode::Enter), &st) {
+            ScreenEvent::Session(r) => r,
             other => panic!("{other:?}"),
-        }
+        };
+        let (mut sess, log) = session(0);
+        let reply = (req.run)(&mut sess);
+        s.session_result(req.tag, reply, &st);
+        let sent = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|&e| e.opcode == op::REQ_SET_UART_CONFIG)
+            .cloned()
+            .expect("one config write");
+        assert_eq!(
+            sent.payload,
+            UartCtrlConfig {
+                enabled: true,
+                tx_pin: 16,
+                rx_pin: 17,
+                notify_enable: false,
+                baud: 115_200,
+            }
+            .encode()
+            .to_vec()
+        );
         let f = frame(&mut s, &st, 120, 40);
         assert!(
             f.contains("UART configuration applied and saved"),
             "the inline status row: {f}"
+        );
+        assert!(!f.contains("Unapplied changes"), "{f}");
+
+        // Refused: the device kept its old configuration, so the draft stays
+        // dirty and the row says which of the five reasons it was.
+        let (mut s, st) = screen(Page::Interfaces);
+        armed(&mut s, &st);
+        let req = match s.handle(key(KeyCode::Enter), &st) {
+            ScreenEvent::Session(r) => r,
+            other => panic!("{other:?}"),
+        };
+        let (mut sess, _) = session(super::super::pin_status::PIN_IN_USE);
+        let reply = (req.run)(&mut sess);
+        assert_eq!(
+            reply,
+            crate::shell::SessionReply::Err(
+                "A pin is already claimed by another output or interface".into()
+            )
+        );
+        s.session_result(req.tag, reply, &st);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(
+            f.contains("A pin is already claimed by another output or interface"),
+            "{f}"
+        );
+        assert!(
+            f.contains("Unapplied changes"),
+            "still to be corrected: {f}"
         );
     }
 
