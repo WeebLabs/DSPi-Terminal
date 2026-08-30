@@ -592,6 +592,9 @@ pub struct DeviceState {
     pub upmix_status: Option<dspi_proto::packets::UpmixStatus>,
     /// Set when a notification said the shadow can no longer be trusted.
     pub stale: bool,
+    /// False once the transport or the notification reader reports the
+    /// device gone. The shell's dot and dimming follow this.
+    pub connected: bool,
 }
 
 impl DeviceState {
@@ -616,6 +619,7 @@ impl DeviceState {
             ir_learn: None,
             upmix_status: None,
             stale: false,
+            connected: true,
         };
         s.mark_saved();
         s
@@ -675,6 +679,19 @@ impl DeviceState {
         if n.lost {
             self.stale = true;
         }
+        let applied = self.apply_event(n);
+        // A lost packet carried something this shadow will never see; the
+        // only recovery is a full re-read, whatever the surviving packet did.
+        match applied {
+            Applied::NeedsReread { .. } | Applied::PresetLoaded { .. } => applied,
+            _ if n.lost => Applied::NeedsReread {
+                source: Source::Unknown,
+            },
+            _ => applied,
+        }
+    }
+
+    fn apply_event(&mut self, n: &Notification) -> Applied {
         match &n.event {
             Event::ParamChanged {
                 offset,

@@ -42,7 +42,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(exit::USAGE);
             }
         },
-        None => dspi_tui::theme::Palette::Amber,
+        None => dspi_tui::theme::Palette::Console,
     };
 
     // A script beats every other reading of the arguments: `-f` is explicit,
@@ -120,6 +120,10 @@ dspi - terminal control for DSPi audio processors
 USAGE:
     dspi                     open the interface
     dspi dump                connect and print the full device state
+    dspi screenshot [w] [h] [screen]
+                             render one frame of the interface as text
+                             (--ansi for colour; --fixture, or no device,
+                             draws the built-in example device)
     dspi watch               print the device's notifications as they arrive
     dspi list                list every connected DSPi
     dspi params              list every parameter this build knows
@@ -161,7 +165,7 @@ OPTIONS:
     --device <serial>        target a specific device
     --json                   machine-readable output
     --lite                   reduce redraw rate, for a Pi or a slow link
-    --theme amber|dark       colour scheme; amber is the default
+    --theme <name>           console (default), amber, dark or mono
     --dry-run                report what would be written, write nothing
     --quiet                  do not echo each change
     --keep-going             in a script, carry on past a failing line
@@ -666,9 +670,35 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
     let screen = args.get(2).copied().unwrap_or("overview");
     let ansi = flags.contains(&"--ansi");
 
-    let mut session = match connect(serial) {
-        Ok(s) => s,
-        Err(c) => return c,
+    // Without a device (or with --fixture) the frame comes from the same
+    // fixture the gallery and the tests use, so documentation needs no
+    // hardware.
+    let fixture = flags.contains(&"--fixture") || open(serial).is_err();
+    let (mut session, state) = if fixture {
+        let state = if screen == "settings" {
+            dspi_tui::settings::demo::state()
+        } else {
+            dspi_tui::shell::fixture::state()
+        };
+        let mock = dspi_transport::MockTransport::new().answering_everything(vec![0u8; 64]);
+        let Some(session) = Session::new(Box::new(mock), state.caps.clone()) else {
+            return exit::TRANSPORT;
+        };
+        (session, state)
+    } else {
+        let mut session = match connect(serial) {
+            Ok(s) => s,
+            Err(c) => return c,
+        };
+        let bulk = match session.snapshot() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("dspi: could not read the device state: {e}");
+                return exit::TRANSPORT;
+            }
+        };
+        let state = dspi_session::DeviceState::new(session.capabilities().clone(), bulk);
+        (session, state)
     };
     let theme = dspi_tui::Theme::new(
         dspi_tui::theme::Palette::Console,
@@ -679,14 +709,6 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
         },
         dspi_tui::perf::detect_glyphs(),
     );
-    let bulk = match session.snapshot() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("dspi: could not read the device state: {e}");
-            return exit::TRANSPORT;
-        }
-    };
-    let state = dspi_session::DeviceState::new(session.capabilities().clone(), bulk);
     let mut live = dspi_tui::live::Live::new(
         state,
         theme,

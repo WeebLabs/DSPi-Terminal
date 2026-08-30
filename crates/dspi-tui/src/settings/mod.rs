@@ -37,7 +37,7 @@ pub mod outputs;
 pub mod overview;
 pub mod surfaces;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dspi_proto::Platform;
 use dspi_proto::packets::{
     CtrlIfaceStatus, I2cCtrlConfig, PresetDirectory, PresetStartup, SpdifInputConfig,
@@ -1593,6 +1593,14 @@ impl Screen for SettingsScreen {
 
     fn handle(&mut self, key: KeyEvent, state: &DeviceState) -> ScreenEvent {
         self.observe_page(state);
+        // Ctrl-S is the save bar's Save from anywhere in Settings.
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return if self.dirty(state) {
+                self.save(state)
+            } else {
+                ScreenEvent::Status("Nothing to save".into())
+            };
+        }
         // History, from anywhere on the page.
         match key.code {
             KeyCode::Char('[') => {

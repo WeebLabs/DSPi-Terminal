@@ -444,6 +444,8 @@ enum FileAction {
 enum PendingAction {
     Quit,
     LoadPreset(u8),
+    /// Copy the active preset to another slot once the live state is clean.
+    CopyTo(u8),
     /// Open another device, by serial.
     SwitchDevice(String),
 }
@@ -470,6 +472,9 @@ pub struct Live {
     ease_from: Option<(Instant, f64)>,
     /// When the clip latch was first set, for the Console's auto-clear.
     clip_since: Option<Instant>,
+    /// The notification reader, re-armed on every device switch.
+    notes: Option<Notifications>,
+    devices_checked: Option<Instant>,
     /// When the upmixer's telemetry was last read. It is not a notification,
     /// so the only way to move the gauges is to ask, and once a second is
     /// enough for a meter a person is watching.
@@ -533,6 +538,8 @@ impl Live {
             shown_volume: None,
             ease_from: None,
             clip_since: None,
+            notes: None,
+            devices_checked: None,
             last_upmix_poll: Instant::now() - Duration::from_secs(2),
             last_stats_poll: Instant::now() - Duration::from_secs(3),
             started: Instant::now(),
@@ -558,7 +565,7 @@ impl Live {
         } else {
             caps.serial.clone()
         };
-        m.connected = true;
+        m.connected = s.connected;
         m.preset_label = match caps.active_preset {
             Some(p) => PresetMenu::slot_label(&self.shared.borrow(), p),
             None => "Empty".into(),
@@ -1452,6 +1459,16 @@ impl Live {
                     self.run_pending(session, then);
                 }
             }
+            (
+                AppDialog::Unsaved {
+                    then: PendingAction::CopyTo(dest),
+                },
+                DialogOutcome::Button(1),
+            ) => {
+                let source = self.state.caps.active_preset.unwrap_or(0);
+                self.load_preset(session, source);
+                self.copy_preset_to(session, dest);
+            }
             (AppDialog::Unsaved { then }, DialogOutcome::Button(1)) => {
                 self.run_pending(session, then)
             }
@@ -1737,6 +1754,18 @@ impl Live {
         if dest == source {
             return;
         }
+        // The second save below writes the live state over the source slot,
+        // so the live state must be the source's saved state first: ask, as
+        // the Console does, and on Discard reload the source before copying.
+        if self.state.has_unsaved_changes() {
+            self.dialog = Some((
+                AppDialog::Unsaved {
+                    then: PendingAction::CopyTo(dest),
+                },
+                self.unsaved_dialog(),
+            ));
+            return;
+        }
         match session.write("preset.save", &[dest], Value::Trigger) {
             Ok(Outcome::Rejected { .. }) | Err(_) => {
                 self.note("Save Failed");
@@ -1795,7 +1824,31 @@ impl Live {
             PendingAction::Quit => self.should_quit = true,
             PendingAction::LoadPreset(slot) => self.load_preset(session, slot),
             PendingAction::SwitchDevice(serial) => self.switch_to = Some(serial),
+            PendingAction::CopyTo(dest) => self.copy_preset_to(session, dest),
         }
+    }
+
+    /// The notification reader for the current session, started or
+    /// restarted; the old one is dropped first so its interface is released.
+    pub fn arm_notifications(&mut self, session: &mut Session) {
+        self.notes = None;
+        self.notes = session
+            .with_transport(|t| Ok(t.notifications()))
+            .ok()
+            .flatten()
+            .map(Notifications::start);
+    }
+
+    /// Every attached device, for the picker and the title bar.
+    pub fn refresh_devices(&mut self) {
+        self.shell.model.devices = dspi_transport::list_devices()
+            .map(|ds| {
+                ds.iter()
+                    .map(|d| format!("DSPi {}", d.short_name()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.devices_checked = Some(Instant::now());
     }
 
     /// One key, from the top of the overlay stack down.
@@ -1893,34 +1946,47 @@ impl Live {
         self.shared.borrow_mut().stats = stats;
     }
 
+    fn on_meters(&mut self, m: dspi_session::Meters, dt: f32, session: &mut Session) {
+        let now = Instant::now();
+        for (i, p) in self.peaks.iter_mut().enumerate() {
+            p.update(m.peaks.get(i).copied().unwrap_or(0.0), dt);
+        }
+        self.state.update_meters(m);
+        match (self.state.clip_latched != 0, self.clip_since) {
+            (true, None) => self.clip_since = Some(now),
+            (true, Some(since)) if now.duration_since(since) >= CLIP_HOLD => {
+                // The Console clears the latch itself after three
+                // seconds and asks the device to forget too.
+                self.state.clear_clip_latch();
+                let _ = session.write("meters.clear", &[], Value::Trigger);
+                self.clip_since = None;
+            }
+            (false, _) => self.clip_since = None,
+            _ => {}
+        }
+    }
+
     /// Meters, notifications, status expiry, peak ballistics.
     pub fn tick(&mut self, session: &mut Session, notifications: Option<&Notifications>) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f32();
         self.last_tick = now;
 
-        if let Ok(m) = session.meters() {
-            for (i, p) in self.peaks.iter_mut().enumerate() {
-                p.update(m.peaks.get(i).copied().unwrap_or(0.0), dt);
+        match session.meters() {
+            Ok(m) => self.on_meters(m, dt, session),
+            // The control path is the other witness to a disconnect.
+            Err(dspi_session::WriteError::Transport(
+                dspi_transport::TransportError::Disconnected,
+            )) => {
+                self.state.connected = false;
             }
-            self.state.update_meters(m);
-            match (self.state.clip_latched != 0, self.clip_since) {
-                (true, None) => self.clip_since = Some(now),
-                (true, Some(since)) if now.duration_since(since) >= CLIP_HOLD => {
-                    // The Console clears the latch itself after three
-                    // seconds and asks the device to forget too.
-                    self.state.clear_clip_latch();
-                    let _ = session.write("meters.clear", &[], Value::Trigger);
-                    self.clip_since = None;
-                }
-                (false, _) => self.clip_since = None,
-                _ => {}
-            }
+            Err(_) => {}
         }
         self.poll_upmix_status(session, now);
         self.poll_stats(session, now);
 
         let mut reread = false;
+        let mut loaded_elsewhere = false;
         let mut changed_elsewhere: Option<(&'static str, Source)> = None;
         if let Some(n) = notifications {
             self.shared.borrow_mut().log.active = true;
@@ -1942,10 +2008,16 @@ impl Live {
                             }
                         }
                     }
-                    Applied::NeedsReread { .. } => reread = true,
+                    Applied::NeedsReread { source } => {
+                        reread = true;
+                        if source == Source::Preset {
+                            loaded_elsewhere = true;
+                        }
+                    }
                     Applied::PresetLoaded { slot } => {
                         self.state.caps.active_preset = Some(slot);
                         reread = true;
+                        loaded_elsewhere = true;
                         self.note(format!("Preset {} loaded", slot + 1));
                     }
                     Applied::InputFormat { channels } => {
@@ -1955,11 +2027,23 @@ impl Live {
                 }
             }
             if n.is_disconnected() {
-                self.shell.model.connected = false;
+                self.state.connected = false;
             }
         }
-        if reread {
+        if reread || self.state.stale {
             self.refresh(session);
+            self.state.stale = false;
+        }
+        // A preset the device loaded is the new baseline, as a preset this
+        // host loaded is; otherwise the marker compares against the old one.
+        if loaded_elsewhere {
+            self.state.mark_saved();
+        }
+        if self
+            .devices_checked
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5))
+        {
+            self.refresh_devices();
         }
         if let Some((name, source)) = changed_elsewhere {
             self.note(format!("{} {}", name.replace('_', " "), source.describe()));
@@ -2057,11 +2141,8 @@ fn open_device(serial: &str) -> Result<(Session, DeviceState), String> {
 
 /// Run the live interface until the person quits.
 pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
-    let notifications = session
-        .with_transport(|t| Ok(t.notifications()))
-        .ok()
-        .flatten()
-        .map(Notifications::start);
+    live.arm_notifications(session);
+    live.refresh_devices();
     let perf = live.perf;
     live.refresh_presets(session);
     let mut terminal = ratatui::init();
@@ -2070,7 +2151,9 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
     let result = (|| -> io::Result<()> {
         loop {
             if last_poll.elapsed() >= perf.meter_interval {
-                live.tick(session, notifications.as_ref());
+                let notes = live.notes.take();
+                live.tick(session, notes.as_ref());
+                live.notes = notes;
                 last_poll = Instant::now();
             }
             terminal.draw(|f| {
@@ -2092,6 +2175,7 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
                     Ok((next, state)) => {
                         *session = next;
                         live.adopt(session, state);
+                        live.arm_notifications(session);
                     }
                     Err(e) => live.note(format!("Could not open {serial}: {e}")),
                 }
