@@ -999,5 +999,10 @@ any unambiguous prefix (`ga` is `gain`, `de` is `delay`).
 | Crossfeed, Loudness, Leveller, Bass, Upmixer | `on` · `off`; everything else falls through |
 | Everywhere else | the `:` grammar as typed |
 
+A line no page grammar reads is predicted by the shared grammar's
+completer: the hint row lists the candidates (`vol.user · vol.master ·
+…`, a single match with its description) and a lone match ghosts inline,
+so prediction never goes dark anywhere the bar opens.
+
 The bar was asked for as a Super-key feature; terminals do not forward
 Cmd/Win, so the key is `;`, unshifted and one step from `:`.

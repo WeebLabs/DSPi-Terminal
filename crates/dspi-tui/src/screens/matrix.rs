@@ -440,6 +440,7 @@ impl MatrixPanel {
         let lower = line.to_ascii_lowercase();
         let tokens: Vec<&str> = lower.split_whitespace().collect();
         let hint = |h: &str| Quick {
+            fallthrough: false,
             hint: h.to_string(),
             ghost: ghost(&lower, VERBS),
             commands: Vec::new(),
@@ -509,10 +510,19 @@ impl MatrixPanel {
                 if connect { "on" } else { "off" }
             ));
             return Quick {
+                fallthrough: false,
                 hint: h,
                 ghost: None,
                 commands,
             };
+        }
+
+        // A line of nothing but channel tokens is a route being typed.
+        if tokens
+            .iter()
+            .all(|t| super::quick::channel_token(t, ni).is_some())
+        {
+            return hint("then > to connect or x to disconnect: 1 2 > 3 4");
         }
 
         match verb(tokens[0], VERBS) {
@@ -560,6 +570,7 @@ impl MatrixPanel {
                             )
                         };
                         Quick {
+                            fallthrough: false,
                             hint: h,
                             ghost: None,
                             commands,
@@ -604,6 +615,7 @@ impl MatrixPanel {
                     });
                 }
                 Quick {
+                    fallthrough: false,
                     hint: format!(
                         "{} {}{}",
                         names("OUT", &outs),
@@ -620,6 +632,7 @@ impl MatrixPanel {
                     hint("direct 1:1 needs the 8-channel matrix")
                 } else {
                     Quick {
+                        fallthrough: false,
                         hint: "Direct 1:1: INn → OUTn, everything else off".into(),
                         ghost: None,
                         commands,
@@ -632,13 +645,19 @@ impl MatrixPanel {
                     hint("nothing to clear")
                 } else {
                     Quick {
+                        fallthrough: false,
                         hint: format!("disconnect every crosspoint ({})", commands.len()),
                         ghost: None,
                         commands,
                     }
                 }
             }
-            _ => hint(SUMMARY),
+            _ => crate::shell::Quick {
+                fallthrough: true,
+                hint: SUMMARY.to_string(),
+                ghost: ghost(&lower, VERBS),
+                commands: Vec::new(),
+            },
         }
     }
 
@@ -1558,6 +1577,8 @@ mod tests {
             assert!(!r.hint.is_empty(), "{partial:?} has no hint");
         }
         assert_eq!(q("g").ghost.as_deref(), Some("ain"));
+        assert!(q("vol.us").fallthrough, "an unknown line falls through");
+        assert!(!q("1 2").fallthrough, "a partial route is the page's own");
     }
 
     #[test]

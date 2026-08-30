@@ -331,6 +331,7 @@ impl OutputPage {
         let lower = line.to_ascii_lowercase();
         let tokens: Vec<&str> = lower.split_whitespace().collect();
         let hint = |h: &str| Quick {
+            fallthrough: false,
             hint: h.to_string(),
             ghost: ghost(&lower, VERBS),
             commands: Vec::new(),
@@ -346,6 +347,7 @@ impl OutputPage {
             return self.quick_band(state, channel, band as u8 - 1, &tokens[1..]);
         }
         let one = |hint: String, command: String| Quick {
+            fallthrough: false,
             hint,
             ghost: None,
             commands: vec![command],
@@ -391,7 +393,12 @@ impl OutputPage {
                     )
                 }
             }
-            _ => hint(SUMMARY),
+            _ => Quick {
+                fallthrough: true,
+                hint: SUMMARY.to_string(),
+                ghost: ghost(&lower, VERBS),
+                commands: Vec::new(),
+            },
         }
     }
 
@@ -420,6 +427,7 @@ impl OutputPage {
             "off",
         ];
         let hint = |h: &str| Quick {
+            fallthrough: false,
             hint: h.to_string(),
             ghost: args.first().and_then(|t| ghost(t, TYPES)),
             commands: Vec::new(),
@@ -429,6 +437,7 @@ impl OutputPage {
         };
         let n = super::display_band(band);
         let write = |p: &dspi_proto::value::EqParamPacket, what: String| Quick {
+            fallthrough: false,
             hint: format!("band {n}: {what}"),
             ghost: None,
             commands: super::band_command(state, channel, band, p),
@@ -482,12 +491,14 @@ impl OutputPage {
         use crate::shell::Quick;
         if !supports_crossover(state) {
             return Quick {
+                fallthrough: false,
                 hint: "this firmware has no crossover bank".into(),
                 ghost: None,
                 commands: Vec::new(),
             };
         }
         let hint = |h: &str| Quick {
+            fallthrough: false,
             hint: h.to_string(),
             ghost: None,
             commands: Vec::new(),
@@ -504,6 +515,7 @@ impl OutputPage {
                     ));
                 }
                 Quick {
+                    fallthrough: false,
                     hint: "crossover off".into(),
                     ghost: None,
                     commands,
@@ -516,6 +528,7 @@ impl OutputPage {
                 let family = args.get(2).copied().unwrap_or("lr4");
                 let token = format!("{family}{side}");
                 Quick {
+                    fallthrough: false,
                     hint: format!(
                         "{} {freq:.0} Hz {}",
                         side.to_uppercase(),

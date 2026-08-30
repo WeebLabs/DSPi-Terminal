@@ -91,6 +91,8 @@ pub fn toggle(line: &str, path: &str, what: &str) -> crate::shell::Quick {
         ),
     };
     crate::shell::Quick {
+        // A line that is not on/off is the shared grammar's to predict.
+        fallthrough: commands.is_empty() && !tok.is_empty(),
         hint,
         ghost: ghost(&tok, &["on", "off"]),
         commands,

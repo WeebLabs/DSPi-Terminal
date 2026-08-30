@@ -563,6 +563,8 @@ impl Shell {
     }
 
     /// Ask the page what the bar's line means, for the hint and the ghost.
+    /// A line the page cannot read is predicted by the shared `:` grammar's
+    /// completer instead, so the bar is never dark.
     fn refresh_quick(&mut self, state: &DeviceState) {
         let Some(input) = self.quick.as_ref().map(|b| b.input.clone()) else {
             return;
@@ -571,17 +573,25 @@ impl Shell {
             let (s, _) = self.top();
             s.quick(&input, state)
         };
-        if let Some(bar) = &mut self.quick {
-            match reply {
-                Some(q) => {
-                    bar.hint = q.hint;
-                    bar.ghost = q.ghost;
-                }
-                None => {
-                    bar.hint = "No page commands here; the : grammar runs as typed".into();
-                    bar.ghost = None;
-                }
+        let (mut hint, mut ghost) = match &reply {
+            Some(q) => (q.hint.clone(), q.ghost.clone()),
+            None => (
+                "No page commands here; the : grammar runs as typed".into(),
+                None,
+            ),
+        };
+        if reply.is_none() || reply.as_ref().is_some_and(|q| q.fallthrough) {
+            let (g_hint, g_ghost) = global_completion(&input, state);
+            if let Some(h) = g_hint {
+                hint = h;
             }
+            if g_ghost.is_some() {
+                ghost = g_ghost;
+            }
+        }
+        if let Some(bar) = &mut self.quick {
+            bar.hint = hint;
+            bar.ghost = ghost;
         }
     }
 
@@ -1234,6 +1244,45 @@ impl Shell {
     }
 }
 
+/// The shared grammar's prediction for a bar line no page grammar reads:
+/// the candidate list as a hint row, and a ghost when one candidate alone
+/// completes the started token.
+fn global_completion(input: &str, state: &DeviceState) -> (Option<String>, Option<String>) {
+    let ctx = dspi_cmd::Context {
+        channel_slugs: state.caps.channels.iter().map(|c| c.slug.clone()).collect(),
+        num_inputs: state.caps.num_inputs,
+        num_outputs: state.caps.num_outputs,
+        max_bands: state.caps.max_bands,
+    };
+    let ends_with_space = input.ends_with(' ');
+    let mut tokens: Vec<&str> = input.split_whitespace().collect();
+    let partial = if ends_with_space {
+        ""
+    } else {
+        tokens.pop().unwrap_or("")
+    };
+    let cands = dspi_cmd::complete(&tokens, partial, &ctx);
+    if cands.is_empty() {
+        return (None, None);
+    }
+    let ghost = match &cands[..] {
+        [one] if !partial.is_empty() && one.value.starts_with(partial) => {
+            one.value.strip_prefix(partial).map(str::to_string)
+        }
+        _ => None,
+    };
+    let hint = match &cands[..] {
+        [one] if !one.detail.is_empty() => format!("{} · {}", one.value, one.detail),
+        _ => cands
+            .iter()
+            .take(6)
+            .map(|c| c.value.as_str())
+            .collect::<Vec<_>>()
+            .join(" · "),
+    };
+    (Some(hint), ghost)
+}
+
 /// The `;` command bar: an input row and a hint row at the foot of the
 /// pane. The page's grammar drives the hint and the ghost; a line the page
 /// does not know runs through the shared `:` grammar.
@@ -1665,6 +1714,22 @@ mod tests {
         s.handle(key(KeyCode::Char(';')), &fixture::state());
         s.handle(key(KeyCode::Up), &fixture::state());
         assert_eq!(s.quick.as_ref().unwrap().input, "vol.user -18");
+        s.handle(key(KeyCode::Esc), &fixture::state());
+    }
+
+    #[test]
+    fn the_bar_predicts_the_shared_grammar_when_the_page_cannot() {
+        let (mut s, _) = shell(120, 40);
+        s.handle(key(KeyCode::Char(';')), &fixture::state());
+        for c in "vol.us".chars() {
+            s.handle(key(KeyCode::Char(c)), &fixture::state());
+        }
+        let bar = s.quick.as_ref().unwrap();
+        assert_eq!(bar.ghost.as_deref(), Some("er"), "{bar:?}");
+        assert!(bar.hint.contains("vol.user"), "{}", bar.hint);
+        // Tab accepts the ghost.
+        s.handle(key(KeyCode::Tab), &fixture::state());
+        assert_eq!(s.quick.as_ref().unwrap().input, "vol.user ");
         s.handle(key(KeyCode::Esc), &fixture::state());
     }
 

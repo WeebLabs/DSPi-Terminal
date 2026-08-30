@@ -158,6 +158,7 @@ impl InputPage {
         let lower = line.to_ascii_lowercase();
         let tokens: Vec<&str> = lower.split_whitespace().collect();
         let hint = |h: &str| Quick {
+            fallthrough: false,
             hint: h.to_string(),
             ghost: ghost(&lower, VERBS),
             commands: Vec::new(),
@@ -178,6 +179,7 @@ impl InputPage {
                 Some(db) => {
                     let db = db.clamp(-60.0, 10.0);
                     Quick {
+                        fallthrough: false,
                         hint: format!("preamp {db:+.1} dB{}", self.mirror_note()),
                         ghost: None,
                         commands: vec![self.preamp_command(db)],
@@ -201,6 +203,7 @@ impl InputPage {
                         ));
                     }
                     Quick {
+                        fallthrough: false,
                         hint: format!("delay {ms:.1} ms{}", self.mirror_note()),
                         ghost: None,
                         commands,
@@ -210,6 +213,7 @@ impl InputPage {
             },
             Some("clear") => match self.clear_peq(state) {
                 ScreenEvent::Command(c) => Quick {
+                    fallthrough: false,
                     hint: format!("every band off{}", self.mirror_note()),
                     ghost: None,
                     commands: vec![c],
@@ -226,13 +230,19 @@ impl InputPage {
                     hint("name <text> · renames this channel")
                 } else {
                     Quick {
+                        fallthrough: false,
                         hint: format!("rename to {name}"),
                         ghost: None,
                         commands: vec![format!("ch.name {} {name}", self.input)],
                     }
                 }
             }
-            _ => hint(SUMMARY),
+            _ => Quick {
+                fallthrough: true,
+                hint: SUMMARY.to_string(),
+                ghost: ghost(&lower, VERBS),
+                commands: Vec::new(),
+            },
         }
     }
 
@@ -256,6 +266,7 @@ impl InputPage {
             "off",
         ];
         let hint = |h: &str| Quick {
+            fallthrough: false,
             hint: h.to_string(),
             ghost: args.first().and_then(|t| ghost(t, TYPES)),
             commands: Vec::new(),
@@ -272,6 +283,7 @@ impl InputPage {
                 commands.extend(super::band_command(state, m, band, &p));
             }
             Quick {
+                fallthrough: false,
                 hint: format!("band {n}: {what}{}", self.mirror_note()),
                 ghost: None,
                 commands,

@@ -26,6 +26,10 @@ pub struct Quick {
     pub ghost: Option<String>,
     /// The shared-grammar commands the line runs, when it is complete.
     pub commands: Vec<String>,
+    /// True when the page did not recognise the line at all: the bar then
+    /// asks the shared `:` grammar's completer for the hint and the ghost,
+    /// so prediction never goes dark (DESIGN 13).
+    pub fallthrough: bool,
 }
 
 /// What a session request answered, back to the screen that asked.
