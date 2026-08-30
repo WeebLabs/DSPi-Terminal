@@ -43,12 +43,15 @@ impl Density {
         }
     }
 
+    /// The sidebar's width, border included. Above Compact it is wider
+    /// than its content needs so the names, the strip and the pickers have
+    /// air around them; Compact spends every column on the pane.
     pub fn sidebar_width(self) -> u16 {
         match self {
             Self::Compact => 22,
-            Self::Normal => 24,
-            Self::Roomy => 26,
-            Self::Wide => 28,
+            Self::Normal => 28,
+            Self::Roomy => 30,
+            Self::Wide => 32,
         }
     }
 
@@ -173,7 +176,7 @@ mod tests {
     fn the_reference_layout_has_a_twelve_row_graph() {
         let r = compute(Rect::new(0, 0, 120, 40), GraphHeight::Medium).unwrap();
         assert_eq!(r.density, Density::Normal);
-        assert_eq!(r.sidebar.width, 24);
+        assert_eq!(r.sidebar.width, 28);
         assert_eq!(r.graph.height, 12);
         assert_eq!(r.detail.y, r.graph.y + 12);
         assert_eq!(r.echo.y, 38);
@@ -199,7 +202,7 @@ mod tests {
     fn wide_terminals_get_a_bigger_sidebar_and_graph() {
         let r = compute(Rect::new(0, 0, 200, 60), GraphHeight::Medium).unwrap();
         assert_eq!(r.density, Density::Wide);
-        assert_eq!(r.sidebar.width, 28);
+        assert_eq!(r.sidebar.width, 32);
         assert_eq!(r.graph.height, 20);
         let r = compute(Rect::new(0, 0, 200, 60), GraphHeight::Large).unwrap();
         assert_eq!(r.graph.height, 30);

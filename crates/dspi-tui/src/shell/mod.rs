@@ -1161,7 +1161,7 @@ mod tests {
         );
         assert!(lines[2].contains("INPUTS"), "{:?}", lines[2]);
         assert!(
-            lines[3].contains("▍▪FL") && lines[3].contains("IN1"),
+            lines[3].contains("▍▪ FL") && lines[3].contains("IN1"),
             "{:?}",
             lines[3]
         );

@@ -70,10 +70,12 @@ fn draw_row(
     let t = theme;
     let pill_w = item.descriptor.len() as u16;
     let meter_w = if area.width >= 22 { 8 } else { 6 };
-    // bar, swatch, name, space, meter + clip, space, descriptor.
+    // A space between the swatch and the name once the sidebar has room.
+    let pad = u16::from(area.width >= 24);
+    // bar, swatch, pad, name, space, meter + clip, space, descriptor.
     let name_w = area
         .width
-        .saturating_sub(1 + 1 + 1 + meter_w + 1 + 1 + pill_w) as usize;
+        .saturating_sub(1 + 1 + pad + 1 + meter_w + 1 + 1 + pill_w) as usize;
     let hue = t.hue_for(item.role, selected);
     // Selection bar.
     let bar = if selected {
@@ -100,8 +102,13 @@ fn draw_row(
     } else {
         Style::default().fg(hue)
     };
-    buf.set_string(area.x + 2, area.y, fit_left(&item.name, name_w), name_style);
-    let mx = area.x + 3 + name_w as u16;
+    buf.set_string(
+        area.x + 2 + pad,
+        area.y,
+        fit_left(&item.name, name_w),
+        name_style,
+    );
+    let mx = area.x + 3 + pad + name_w as u16;
     LevelMeter::new(item.level, hue, t)
         .peak(item.peak)
         .clipped(item.clipped)
@@ -268,7 +275,7 @@ pub fn draw_footer(
     // At 20 columns the dot loses its space so every word still fits whole.
     let roomy = w >= 22;
     let left_w = if roomy { 11 } else { 10 };
-    let gap = w.saturating_sub(1 + left_w + 8).clamp(1, 3) as u16;
+    let gap = w.saturating_sub(1 + left_w + 8).clamp(1, 4) as u16;
     let right_x = area.x + 1 + left_w as u16 + gap;
     for row in STRIP_GRID {
         if y >= area.y + area.height {

@@ -82,7 +82,8 @@ Regions, top to bottom and left to right:
   right the connection indicator and the active preset with the `*` dirty
   marker. The connection indicator is focusable (`Ctrl-D`) and opens the
   device picker when more than one device is present.
-- **Sidebar** (24 columns; 22 at 80 columns): INPUTS and OUTPUTS sections,
+- **Sidebar** (28 columns, 32 at Wide; 22 at 80 columns, where every
+  column is spent on the pane): INPUTS and OUTPUTS sections,
   then the footer block.
 - **Graph** (top of the detail pane): the Bode plot with axes, for the
   selected channel (section 12). In the overview the grid takes its rows.
