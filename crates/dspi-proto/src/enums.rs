@@ -91,12 +91,26 @@ impl FilterType {
         (Self::XOVER_FIRST..=Self::XOVER_LAST).contains(&raw)
     }
 
-    /// Whether this type uses the `q` field. Shelving and pass filters ignore it,
-    /// and showing an editable Q for them misleads the user.
+    /// Whether this type uses the `q` field.
+    ///
+    /// Every second-order PEQ section does, the two 12 dB/oct shelves included:
+    /// `config.h:905-911` says the *first*-order shelves are "monotonic (no Q)"
+    /// and prewarp by `A`, which is exactly the distinction, and the second-order
+    /// pair prewarps by `sqrt(A)` with the RBJ `alpha = sin(w)/(2Q)`. The Console
+    /// draws the same line: `FilterType.usesQ` (`DSPMath.swift:274`) is
+    /// `!(isCrossover || isFirstOrderPEQ)` for everything but `.flat` and the
+    /// Linkwitz Transform, which edits Q0 and Qp in its own panel. A crossover
+    /// derives its Q from the family and order, so it has no user Q either.
     pub fn uses_q(self) -> bool {
         matches!(
             self,
-            Self::Peaking | Self::Notch | Self::AllPass | Self::LowPass | Self::HighPass
+            Self::Peaking
+                | Self::Notch
+                | Self::AllPass
+                | Self::LowPass
+                | Self::HighPass
+                | Self::LowShelf
+                | Self::HighShelf
         )
     }
 
@@ -386,10 +400,47 @@ mod tests {
     #[test]
     fn field_applicability_matches_the_filter_maths() {
         assert!(FilterType::Peaking.uses_q() && FilterType::Peaking.uses_gain());
-        // A shelf has gain but its Q is not a user parameter here.
-        assert!(FilterType::LowShelf.uses_gain() && !FilterType::LowShelf.uses_q());
+        // A 12 dB/oct shelf has both: its Q sets the shelf's slope, and the
+        // Console's own reference row reads `Low Shelf 12 dB/oct 105 Hz +8.8 dB
+        // 0.707`.
+        assert!(FilterType::LowShelf.uses_gain() && FilterType::LowShelf.uses_q());
+        assert!(FilterType::HighShelf.uses_gain() && FilterType::HighShelf.uses_q());
         // A pass filter has neither gain nor a meaningful gain field.
         assert!(FilterType::HighPass.uses_q() && !FilterType::HighPass.uses_gain());
+    }
+
+    /// `FilterType.usesQ` in `DSPMath.swift:274`, and the two lists
+    /// `FilterFileTests.testGainAndQApplicability` pins. A drift here blanks a
+    /// WIDTH cell in the filter list and drops the Q from an exported file.
+    #[test]
+    fn uses_q_is_the_consoles_list_exactly() {
+        for t in [
+            FilterType::Peaking,
+            FilterType::LowShelf,
+            FilterType::HighShelf,
+            FilterType::LowPass,
+            FilterType::HighPass,
+            FilterType::Notch,
+            FilterType::AllPass,
+        ] {
+            assert!(t.uses_q(), "{t:?} should use Q");
+        }
+        for t in [
+            FilterType::AllPass1,
+            FilterType::LowShelf1,
+            FilterType::HighShelf1,
+            FilterType::LowPass1,
+            FilterType::HighPass1,
+            FilterType::LinkwitzTransform,
+            FilterType::Flat,
+        ] {
+            assert!(!t.uses_q(), "{t:?} should not use Q");
+        }
+        // Crossovers derive their Q from the family and the order.
+        for raw in FilterType::XOVER_FIRST..=FilterType::XOVER_LAST {
+            let t = FilterType::from_raw(raw);
+            assert!(!t.uses_q(), "crossover {raw} should not use Q");
+        }
     }
 
     #[test]

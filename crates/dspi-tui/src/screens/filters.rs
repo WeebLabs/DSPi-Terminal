@@ -969,15 +969,16 @@ mod tests {
             lines[0].contains("GAIN") && lines[0].contains("WIDTH"),
             "{f}"
         );
-        // A low shelf has a gain but no Q.
+        // A 12 dB/oct shelf has a gain and a Q, exactly as DESIGN 2.1's
+        // reference row draws it.
         assert!(lines[1].contains("Low Shelf 12 dB/oct"), "{f}");
         assert!(
             lines[1].contains("105 Hz") && lines[1].contains("+8.8 dB"),
             "{f}"
         );
         assert!(
-            !lines[1].trim_end().ends_with("0.707"),
-            "no Q on a shelf: {f}"
+            lines[1].trim_end().ends_with("0.707"),
+            "a 12 dB/oct shelf carries its Q in WIDTH: {f}"
         );
         // A peaking band has both.
         assert!(
@@ -1015,10 +1016,46 @@ mod tests {
         assert_eq!(l.field, 3);
         l.handle(key(KeyCode::Right), &state);
         assert_eq!(l.field, 3, "clamped to the fields this type has");
-        // Band 1 is a low shelf: no Q, so three fields.
+        // Band 1 is a 12 dB/oct low shelf, which has all four.
         l.handle(key(KeyCode::Up), &state);
         assert_eq!(l.band, 0);
         assert_eq!(l.field, 0);
+        for _ in 0..4 {
+            l.handle(key(KeyCode::Right), &state);
+        }
+        assert_eq!(l.field, 3, "type, freq, gain, Q");
+    }
+
+    /// D3: the second-order shelves take a Q, and it has to be reachable from
+    /// the list, not only visible in it.
+    #[test]
+    fn a_twelve_db_per_octave_shelf_offers_an_editable_q() {
+        let state = fixture::state();
+        let mut l = list(0);
+        let shelf = l.bands(&state)[0];
+        assert_eq!(shelf.filter_type, FilterType::LowShelf);
+        assert_eq!(
+            l.fields(&shelf),
+            vec![Field::Type, Field::Freq, Field::Gain, Field::Q]
+        );
+        // The first-order shelf beside it in the menu still has none.
+        let mut first_order = shelf;
+        first_order.filter_type = FilterType::LowShelf1;
+        assert_eq!(
+            l.fields(&first_order),
+            vec![Field::Type, Field::Freq, Field::Gain]
+        );
+
+        l.field = 3;
+        assert_eq!(l.handle(key(KeyCode::Enter), &state), ScreenEvent::Handled);
+        assert_eq!(l.edit.as_ref().unwrap().text, "0.707");
+        for c in "1.2".chars() {
+            l.handle(key(KeyCode::Char(c)), &state);
+        }
+        assert_eq!(
+            l.handle(key(KeyCode::Enter), &state),
+            ScreenEvent::Command("eq in.1 1 lowshelf 105 1.2 8.8".into())
+        );
     }
 
     #[test]

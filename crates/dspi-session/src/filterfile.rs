@@ -579,6 +579,28 @@ mod tests {
         }
     }
 
+    /// D3: `FilterFile.swift:87` writes a Q for every type whose `usesQ` is
+    /// true, and the 12 dB/oct shelves are in that set. Dropping it exports a
+    /// shelf that reads back at the default 0.707, which is a different filter.
+    #[test]
+    fn a_twelve_db_per_octave_shelf_exports_its_q() {
+        for (t, code) in [(FilterType::LowShelf, "LS"), (FilterType::HighShelf, "HS")] {
+            let line = format_band(Bank::Peq, 1, &band(t, 105.0, 8.8, 1.2), None);
+            assert!(line.contains(code), "{line}");
+            assert!(line.contains("Q "), "no Q written for {t:?}: {line}");
+            let (_, parsed) = parse_band(line.trim()).unwrap();
+            assert!((parsed.q - 1.2).abs() < 0.005, "{line}");
+        }
+        // The 6 dB/oct pair is monotonic (config.h:905) and writes none.
+        let line = format_band(
+            Bank::Peq,
+            1,
+            &band(FilterType::LowShelf1, 105.0, 8.8, 1.2),
+            None,
+        );
+        assert!(!line.contains("Q "), "{line}");
+    }
+
     /// The codes must be the Console's, or a file written here reads back on
     /// macOS as an unrecognised type and the band is silently dropped. Taken
     /// from `DSPi Console/DSPMath.swift:165-180` and its `init?(fileCode:)`.
