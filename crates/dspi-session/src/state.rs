@@ -175,6 +175,20 @@ impl PresetSnapshot {
         bytes[loff + 1..loff + 4].fill(0);
     }
 
+    /// Whether a live packet would capture to this snapshot, compared in
+    /// place: this runs every frame, so it must not allocate.
+    pub fn matches(&self, live: &[u8]) -> bool {
+        if live.len() != self.bytes.len() {
+            return false;
+        }
+        let (_, hoff, hlen) = section("header");
+        let (_, loff, _) = section("lg_sound_sync");
+        live.iter().zip(&self.bytes).enumerate().all(|(i, (a, b))| {
+            let blanked = (i >= hoff && i < hoff + hlen) || (i > loff && i < loff + 4);
+            blanked || a == b
+        })
+    }
+
     /// Every difference between two snapshots, described the way the
     /// Console's `PresetSnapshot.diff` describes them.
     pub fn diff(&self, other: &Self, num_inputs: usize, num_outputs: usize) -> Vec<DiffLine> {
@@ -639,7 +653,7 @@ impl DeviceState {
 
     pub fn has_unsaved_changes(&self) -> bool {
         match &self.saved {
-            Some(s) => *s != PresetSnapshot::capture(self),
+            Some(s) => !s.matches(self.bulk.as_bytes()),
             None => false,
         }
     }

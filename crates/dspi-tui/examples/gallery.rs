@@ -3,7 +3,7 @@
 //!   gallery [width] [height] [console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
-//!                     |autoeq] [--settings <page>] [--expand n] [--ansi]
+//!                     |autoeq] [--settings <page>] [--expand n] [--depth truecolor|256|16|mono] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
 //! can be looked at by piping to a terminal. `--screen` picks what fills the
@@ -64,10 +64,19 @@ fn main() {
         .get(2)
         .and_then(|a| Palette::parse(a))
         .unwrap_or(Palette::Console);
-    let depth = if ansi {
-        ColorDepth::detect()
-    } else {
-        ColorDepth::TrueColor
+    let depth = match raw
+        .iter()
+        .position(|a| a == "--depth")
+        .and_then(|i| raw.get(i + 1))
+    {
+        Some(d) => match d.as_str() {
+            "256" => ColorDepth::Ansi256,
+            "16" => ColorDepth::Ansi16,
+            "mono" => ColorDepth::Mono,
+            _ => ColorDepth::TrueColor,
+        },
+        None if ansi => ColorDepth::detect(),
+        None => ColorDepth::TrueColor,
     };
     let glyphs = if ansi {
         dspi_tui::perf::detect_glyphs()

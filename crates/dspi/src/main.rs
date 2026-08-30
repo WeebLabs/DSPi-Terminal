@@ -78,10 +78,18 @@ fn main() -> ExitCode {
         Some("dump") => cmd_dump(serial, json),
         Some("watch") => cmd_watch(serial, json),
         // No arguments opens the interface; arguments run one command and exit.
-        None => cmd_tui(serial, flags.contains(&"--lite"), palette),
-        Some(other) if other.starts_with("--") => {
-            cmd_tui(serial, flags.contains(&"--lite"), palette)
-        }
+        None => cmd_tui(
+            serial,
+            flags.contains(&"--lite"),
+            flags.contains(&"--no-animation"),
+            palette,
+        ),
+        Some(other) if other.starts_with("--") => cmd_tui(
+            serial,
+            flags.contains(&"--lite"),
+            flags.contains(&"--no-animation"),
+            palette,
+        ),
         // Everything else is a command in the shared grammar, so the CLI and the
         // TUI's ':' line accept exactly the same syntax.
         Some(_) => cmd_run(serial, &flags, json),
@@ -164,6 +172,7 @@ EXAMPLES:
 OPTIONS:
     --device <serial>        target a specific device
     --json                   machine-readable output
+    --no-animation           no connect reveal or easing
     --lite                   reduce redraw rate, for a Pi or a slow link
     --theme <name>           console (default), amber, dark or mono
     --dry-run                report what would be written, write nothing
@@ -731,7 +740,12 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
     exit::OK
 }
 
-fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) -> u8 {
+fn cmd_tui(
+    serial: Option<&str>,
+    lite: bool,
+    no_animation: bool,
+    palette: dspi_tui::theme::Palette,
+) -> u8 {
     let mut session = match connect(serial) {
         Ok(s) => s,
         Err(c) => return c,
@@ -742,11 +756,14 @@ fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) 
         dspi_tui::theme::ColorDepth::detect(),
         dspi_tui::perf::detect_glyphs(),
     );
-    let perf = if lite {
+    let mut perf = if lite {
         dspi_tui::perf::Performance::lite()
     } else {
         dspi_tui::perf::Performance::detect()
     };
+    if no_animation {
+        perf.animate = false;
+    }
 
     // One chunked read seeds everything the bulk packet covers, so the first
     // frame shows the person's tuning rather than a flat line.

@@ -33,7 +33,12 @@ impl NotificationSource for MockNotifications {
         match self.queue.lock().unwrap().pop_front() {
             Some(p) if p == Self::DISCONNECT => Err(TransportError::Disconnected),
             Some(p) => Ok(p),
-            None => Ok(Vec::new()),
+            None => {
+                // A real endpoint blocks for the timeout; give the reader
+                // thread the same pause so tests do not spin a core.
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(Vec::new())
+            }
         }
     }
 }

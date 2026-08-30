@@ -910,13 +910,25 @@ impl Shell {
             return;
         }
 
-        let title = if self.graph_popout {
+        let title = if self.graph_popout || r.graph.height > 0 {
             "Filter Response"
         } else {
             ""
         };
         let focused = screen_focused || self.focus == Focus::Legend;
-        let block = self.block(title, focused, t);
+        let mut block = self.block(title, focused, t);
+        if !title.is_empty() {
+            // The Console's pop-out button; `g` here.
+            block = block.title_top(
+                ratatui::text::Line::from(if t.glyphs == Glyphs::Ascii {
+                    " g "
+                } else {
+                    " ⤢ g "
+                })
+                .right_aligned()
+                .style(t.label()),
+            );
+        }
         block.render(r.pane, buf);
 
         let inner = layout::inset(r.pane);

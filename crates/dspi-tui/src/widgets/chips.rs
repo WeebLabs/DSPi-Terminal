@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
 use super::Action;
-use crate::theme::{ColorDepth, Theme};
+use crate::theme::{ColorDepth, Glyphs, Theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChipState {
@@ -125,9 +125,12 @@ impl Widget for ChipRow<'_> {
             .chips
             .iter()
             .map(|c| {
-                let mark = match (c.state, t.depth) {
-                    (ChipState::Inverted, _) => "ø",
-                    (ChipState::On, ColorDepth::Mono) => "■",
+                let mark = match (c.state, t.depth, t.glyphs) {
+                    (ChipState::Inverted, _, Glyphs::Ascii) => "o",
+                    (ChipState::Inverted, _, _) => "ø",
+                    (ChipState::On, ColorDepth::Mono, Glyphs::Ascii) => "x",
+                    (ChipState::On, ColorDepth::Mono, _) => "■",
+                    (ChipState::Off, ColorDepth::Mono, _) => " ",
                     _ => "",
                 };
                 format!("[{mark}{}]", c.label)
@@ -195,7 +198,7 @@ mod tests {
         let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
         assert_eq!(render(row(&t), 30, 1), " [1] [2] [ø3] [4]");
         let m = Theme::mono(Glyphs::Ascii);
-        assert_eq!(render(row(&m), 30, 1), " [■1] [2] [ø3] [4]");
+        assert_eq!(render(row(&m), 30, 1), " [x1] [ 2] [o3] [ 4]");
     }
 
     #[test]

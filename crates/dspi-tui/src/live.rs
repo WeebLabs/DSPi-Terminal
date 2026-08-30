@@ -202,6 +202,8 @@ pub const APP_VERBS: &[(&str, &str)] = &[
     ("factory-reset", "Factory Reset..."),
     ("bootloader", "Firmware Update..."),
     ("device", "Device picker"),
+    ("reconnect", "Reconnect to the device"),
+    ("clear-favourites", "AutoEQ: clear favourites"),
 ];
 
 /// The `:` line and the `Ctrl-P` palette.
@@ -404,6 +406,14 @@ enum AppDialog {
     Core1 {
         index: u8,
     },
+    /// A command that cannot be undone, typed on the `:` line.
+    Hazard {
+        path: String,
+        indices: Vec<u8>,
+        value: Value,
+    },
+    /// The Source row's list.
+    SourceList,
     /// A path to read or write, by what it is for.
     Path(FileAction),
     /// Which channels an import lands on, and what each row stands for.
@@ -474,6 +484,11 @@ pub struct Live {
     clip_since: Option<Instant>,
     /// The notification reader, re-armed on every device switch.
     notes: Option<Notifications>,
+    /// A hazardous command has been confirmed and may go through once.
+    hazard_confirmed: bool,
+    /// The pop-out graph's own visibility map, when it does not follow the
+    /// selection.
+    popout_visible: Option<Vec<bool>>,
     devices_checked: Option<Instant>,
     /// When the upmixer's telemetry was last read. It is not a notification,
     /// so the only way to move the gauges is to ask, and once a second is
@@ -539,6 +554,8 @@ impl Live {
             ease_from: None,
             clip_since: None,
             notes: None,
+            hazard_confirmed: false,
+            popout_visible: None,
             devices_checked: None,
             last_upmix_poll: Instant::now() - Duration::from_secs(2),
             last_stats_poll: Instant::now() - Duration::from_secs(3),
@@ -594,12 +611,13 @@ impl Live {
                     index: ch as u8,
                 }
             };
+        let active_inputs = s.meters.active_inputs as usize;
         m.inputs = (0..ni)
             .map(|i| {
                 item(
                     i,
                     ChannelRole::Input(i as u8),
-                    false,
+                    active_inputs > 0 && i >= active_inputs,
                     &self.peaks,
                     &self.visible,
                 )
@@ -714,7 +732,13 @@ impl Live {
                     None
                 },
                 selected: selected_index == Some(ch),
-                visible: self.visible.get(ch).copied().unwrap_or(true),
+                visible: self
+                    .popout_visible
+                    .as_ref()
+                    .unwrap_or(&self.visible)
+                    .get(ch)
+                    .copied()
+                    .unwrap_or(true),
             });
         }
         m.curves = curves;
@@ -744,6 +768,28 @@ impl Live {
             self.note(format!("unknown parameter {path}"));
             return;
         };
+        // A command that cannot be undone is confirmed first, the way every
+        // destructive button in the Console is.
+        if matches!(
+            desc.hazard,
+            dspi_proto::registry::Hazard::Irreversible | dspi_proto::registry::Hazard::Flash
+        ) && !self.hazard_confirmed
+        {
+            self.dialog = Some((
+                AppDialog::Hazard {
+                    path: path.to_string(),
+                    indices: indices.to_vec(),
+                    value: value.clone(),
+                },
+                Dialog::confirm(
+                    "Are you sure?",
+                    format!("`{path}`: {}. This cannot be undone.", desc.plain),
+                    vec![Button::destructive("Continue"), Button::new("Cancel")],
+                ),
+            ));
+            return;
+        }
+        self.hazard_confirmed = false;
         // Enabling an output goes through the Core 1 interlock, which may
         // need the Console's confirmation before the other side is freed.
         if path == "out.enable"
@@ -922,6 +968,14 @@ impl Live {
             dspi_cmd::Command::Verb { name, .. } => match name.as_str() {
                 "undo" => self.undo(session, false),
                 "redo" => self.undo(session, true),
+                "reconnect" => {
+                    // The Console's right-click on the device name.
+                    self.switch_to = Some(self.state.caps.serial.clone());
+                }
+                "clear-favourites" => match dspi_session::autoeq::save_favourites(&[]) {
+                    Ok(()) => self.note("Favourites cleared"),
+                    Err(e) => self.note(e.to_string()),
+                },
                 other => self.note(format!("`{other}` only works from the shell")),
             },
         }
@@ -1171,15 +1225,26 @@ impl Live {
     }
 
     fn load_preset(&mut self, session: &mut Session, slot: u8) {
-        match session.write("preset.load", &[slot], Value::Trigger) {
-            Ok(Outcome::Rejected { .. }) | Err(_) => self.note("Load Failed"),
-            Ok(_) => {
+        // The status byte tells a corrupt slot from a refused one; the
+        // registry's trigger path keeps only success.
+        let status = session.with_transport(|t| {
+            t.control_in(
+                dspi_proto::generated::opcodes::REQ_PRESET_LOAD,
+                slot as u16,
+                1,
+            )
+        });
+        match status.map(|b| b.first().copied().unwrap_or(0)) {
+            // PRESET_ERR_CRC (config.h): the Console's own words.
+            Ok(3) => self.note("Load Failed: Preset data is corrupted."),
+            Ok(0) => {
                 self.state.caps.active_preset = Some(slot);
                 self.refresh(session);
                 self.state.mark_saved();
                 self.echo(format!(":preset.load {}", slot + 1));
                 self.sync_model();
             }
+            Ok(_) | Err(_) => self.note("Load Failed"),
         }
     }
 
@@ -1211,7 +1276,8 @@ impl Live {
         match ev {
             ShellEvent::Select(sel) => self.select(sel),
             ShellEvent::ToggleVisible(row) => {
-                if let Some(v) = self.visible.get_mut(row) {
+                let target = self.popout_visible.as_mut().unwrap_or(&mut self.visible);
+                if let Some(v) = target.get_mut(row) {
                     *v = !*v;
                 }
                 self.sync_model();
@@ -1220,6 +1286,9 @@ impl Live {
                 if let Some(path) = self.strip_path(i) {
                     let on = self.shell.model.strip[i].state.unwrap_or(false);
                     self.set(session, path, &[], Value::Bool(!on));
+                } else {
+                    // The Console's click on a plain tool button opens it.
+                    self.handle_event(session, ShellEvent::StripOpen(i));
                 }
             }
             ShellEvent::StripOpen(i) => {
@@ -1254,7 +1323,12 @@ impl Live {
                     }
                 }
             }
-            ShellEvent::Source(None) => {}
+            ShellEvent::Source(None) => {
+                if let Some((choices, idx)) = &self.shell.model.source {
+                    let popup = PopupList::new("Source", choices.clone(), *idx);
+                    self.popup = Some((AppDialog::SourceList, popup));
+                }
+            }
             ShellEvent::VolumeChanged(db) => {
                 let path = match self.shell.model.volume_mode {
                     VolumeMode::User => "vol.user",
@@ -1346,7 +1420,19 @@ impl Live {
             ShellEvent::GraphHeight => {
                 self.shell.model.graph_height = self.shell.model.graph_height.next();
             }
-            ShellEvent::GraphPopout => self.shell.graph_popout = !self.shell.graph_popout,
+            ShellEvent::GraphPopout => {
+                self.shell.graph_popout = !self.shell.graph_popout;
+                // The pop-out keeps its own visibility map unless Graphing
+                // says it follows the selection (the Console's setting).
+                self.popout_visible = if self.shell.graph_popout
+                    && !self.screens.config().graphing.popout_follows_selection
+                {
+                    Some(self.visible.clone())
+                } else {
+                    None
+                };
+                self.sync_model();
+            }
             ShellEvent::Rename(row) => {
                 let name = self.state.channel_name(row);
                 self.dialog = Some((
@@ -1494,6 +1580,20 @@ impl Live {
             (AppDialog::PresetClear(slot), DialogOutcome::Button(0)) => {
                 self.clear_preset(session, slot);
                 self.refresh_presets(session);
+            }
+            (
+                AppDialog::Hazard {
+                    path,
+                    indices,
+                    value,
+                },
+                DialogOutcome::Button(0),
+            ) => {
+                self.hazard_confirmed = true;
+                self.set(session, &path, &indices, value);
+            }
+            (AppDialog::SourceList, DialogOutcome::Picked(i)) => {
+                self.set(session, "in.source", &[], Value::Choice(i as u8));
             }
             (AppDialog::Core1 { index }, DialogOutcome::Button(0)) => {
                 match session.enable_output_confirmed(index) {
@@ -1679,6 +1779,9 @@ impl Live {
         self.peaks = vec![PeakHold::default(); n];
         self.visible = vec![true; n];
         self.state = state;
+        // The Console discards Settings drafts and device facts on a different
+        // serial; the pages re-read on their next open.
+        self.screens.refresh_settings(session);
         {
             let mut shared = self.shared.borrow_mut();
             shared.stats = actions::Stats::default();
@@ -2046,7 +2149,7 @@ impl Live {
             self.refresh_devices();
         }
         if let Some((name, source)) = changed_elsewhere {
-            self.note(format!("{} {}", name.replace('_', " "), source.describe()));
+            self.echo(format!("{} {}", name.replace('_', " "), source.describe()));
         }
         if let Some(until) = self.status_until
             && now >= until
@@ -2095,7 +2198,7 @@ impl Live {
         match done {
             Ok(n) => {
                 self.reload_autoeq();
-                self.note(format!("Database rebuilt successfully!  Entries: {n}"));
+                self.note(format!("Database rebuilt successfully! Entries: {n}"));
             }
             Err(e) => self.note(format!("Rebuild failed: {e}")),
         }
@@ -2806,8 +2909,8 @@ mod tests {
         assert_eq!(l.state.user_volume().0, -30.0);
         assert_eq!(l.shell.model.volume_db, -30.0);
         assert_eq!(
-            l.shell.model.status.as_deref(),
-            Some("user volume changed by the system volume")
+            l.shell.model.echo,
+            "user volume changed by the system volume"
         );
     }
 }

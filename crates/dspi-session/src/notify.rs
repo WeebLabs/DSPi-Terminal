@@ -91,7 +91,7 @@ impl Source {
             Self::HostSet | Self::BulkSet => "changed by this host",
             Self::Preset => "changed by a preset load",
             Self::Factory => "reset to factory defaults",
-            Self::Gpio => "changed by a control surface",
+            Self::Gpio => "changed by control surface",
             Self::Internal => "changed by the device",
             Self::Uac1 => "changed by the system volume",
             Self::Uart => "changed over UART",
@@ -576,6 +576,6 @@ mod tests {
         assert_eq!(Source::from_raw(42), Source::Other(42));
         assert!(Source::HostSet.is_ours());
         assert!(!Source::Gpio.is_ours());
-        assert_eq!(Source::Gpio.describe(), "changed by a control surface");
+        assert_eq!(Source::Gpio.describe(), "changed by control surface");
     }
 }

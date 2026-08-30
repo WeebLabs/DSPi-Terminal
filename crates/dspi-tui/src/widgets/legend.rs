@@ -20,13 +20,26 @@ pub struct LegendPill {
 
 /// One pill: `● IN1` in colour when visible, `○ IN1` dim when hidden.
 pub fn pill_text(p: &LegendPill, glyphs: Glyphs) -> String {
+    pill_text_at(p, glyphs, ColorDepth::TrueColor)
+}
+
+/// Without colour a pill is `[*IN1]` when visible and `[ IN1]` when hidden
+/// (DESIGN 4.3); with colour the dot carries it.
+pub fn pill_text_at(p: &LegendPill, glyphs: Glyphs, depth: ColorDepth) -> String {
+    let eq = if p.grouped { "=" } else { "" };
+    if depth == ColorDepth::Mono {
+        return format!(
+            "[{}{}{eq}]",
+            if p.visible { "*" } else { " " },
+            p.descriptor
+        );
+    }
     let dot = match (p.visible, glyphs) {
         (true, Glyphs::Ascii) => "*",
         (false, Glyphs::Ascii) => "o",
         (true, _) => "●",
         (false, _) => "○",
     };
-    let eq = if p.grouped { "=" } else { "" };
     format!("{dot} {}{eq}", p.descriptor)
 }
 
@@ -113,7 +126,7 @@ impl Widget for LegendRow<'_> {
         let mut x = area.x + 1;
         let mut y = area.y;
         for (i, p) in self.pills.iter().enumerate() {
-            let text = pill_text(p, t.glyphs);
+            let text = pill_text_at(p, t.glyphs, t.depth);
             let w = text.chars().count() as u16;
             if x + w > area.x + area.width {
                 // Wrap onto the next row when there is one.
