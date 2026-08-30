@@ -69,6 +69,8 @@ enum Line {
     /// The second line of an input: the crosspoint gains, under the connect
     /// dots of `Row(Row::Input(i))`.
     Gains(usize),
+    /// The blank line after an input's gains, so the inputs sit evenly.
+    Blank,
 }
 
 /// Which dialog the panel put on screen, so its answer comes back to the right
@@ -215,7 +217,7 @@ impl MatrixPanel {
     }
 
     /// Every line the body draws, in order: the ROUTING band, two lines per
-    /// input (the connect dots, then the gains), a rule, then
+    /// input (the connect dots, then the gains, then a blank), a rule, then
     /// the output rows. The Console divides the inputs into stereo pairs and
     /// puts a crosspoint's dot and gain in one cell; here every input stands
     /// on its own and the dots and the gains are rows of their own, so a
@@ -227,6 +229,7 @@ impl MatrixPanel {
         for i in 0..n {
             v.push(Line::Row(Row::Input(i)));
             v.push(Line::Gains(i));
+            v.push(Line::Blank);
         }
         v.push(Line::Divider);
         v.extend([
@@ -755,6 +758,7 @@ impl Screen for MatrixPanel {
             let y = area.y + 2 + n as u16;
             match line {
                 Line::Routing => self.draw_routing(&mut p, y),
+                Line::Blank => {}
                 Line::Divider => {
                     let w = (grid_w - self.label_w).min(area.width.saturating_sub(self.label_w))
                         as usize;
@@ -1154,7 +1158,7 @@ mod tests {
         for _ in 0..8 {
             p.handle(key(KeyCode::Right), &state);
         }
-        let f = text(&draw(&mut p, &state, 56, 20));
+        let f = text(&draw(&mut p, &state, 56, 40));
         assert!(
             f.contains("OUT9"),
             "the reticle's column is on screen:\n{f}"
@@ -1210,12 +1214,12 @@ mod tests {
     fn a_disabled_outputs_cells_draw_dim() {
         let t = theme();
         // The fixture connects input 2 to output 2, so the cell has a colour to
-        // lose. Line order: headers, ROUTING, then two lines per input, so
-        // FC's dots are on line 7.
+        // lose. Line order: headers, ROUTING, then three lines per input, so
+        // FC's dots are on line 9.
         let col_w = col_width(120, 9);
         let label_w = label_width(120);
-        let (x, y) = (label_w + 2 * col_w + (col_w - 1) / 2, 7u16);
-        let live = draw(&mut panel(), &fixture::state(), 120, 30);
+        let (x, y) = (label_w + 2 * col_w + (col_w - 1) / 2, 9u16);
+        let live = draw(&mut panel(), &fixture::state(), 120, 34);
         assert_eq!(live[(x, y)].symbol(), "●");
         assert_eq!(
             live[(x, y)].fg,
@@ -1223,14 +1227,14 @@ mod tests {
             "the output's colour"
         );
 
-        let off = draw(&mut panel(), &outputs_off(&[2]), 120, 30);
+        let off = draw(&mut panel(), &outputs_off(&[2]), 120, 34);
         assert_eq!(off[(x, y)].symbol(), "●", "still connected");
         assert_eq!(off[(x, y)].fg, t.dim, "but the whole column is dim");
         // And so is the output's own strip beneath it: the GAIN row is line
-        // 21, after sixteen input lines and the rule.
+        // 29, after twenty-four input lines and the rule.
         let x = label_w + 2 * col_w;
         let gain: Vec<_> = (0..col_w - 1)
-            .map(|dx| &off[(x + dx, 21)])
+            .map(|dx| &off[(x + dx, 29)])
             .filter(|c| c.symbol() != " ")
             .map(|c| c.fg)
             .collect();
@@ -1273,7 +1277,7 @@ mod tests {
 
     #[test]
     fn inputs_stand_alone_and_one_rule_parts_them_from_the_outputs() {
-        let f = text(&draw(&mut panel(), &fixture::state(), 120, 24));
+        let f = text(&draw(&mut panel(), &fixture::state(), 120, 36));
         let dividers = f.lines().filter(|l| l.contains("──")).count();
         assert_eq!(dividers, 1, "one rule above ENABLE:\n{f}");
         let lines: Vec<&str> = f.lines().collect();
@@ -1282,9 +1286,10 @@ mod tests {
             lines[4].starts_with("      dB"),
             "the gains line's unit: {f}"
         );
-        assert!(lines[5].starts_with(" FR"), "no pair divider:\n{f}");
-        assert!(lines[7].starts_with(" FC"), "{f}");
-        let s = text(&draw(&mut panel(), &stereo(), 120, 24));
+        assert!(lines[5].is_empty(), "a blank line after the gains:\n{f}");
+        assert!(lines[6].starts_with(" FR"), "no pair divider:\n{f}");
+        assert!(lines[9].starts_with(" FC"), "{f}");
+        let s = text(&draw(&mut panel(), &stereo(), 120, 36));
         let dividers = s.lines().filter(|l| l.contains("──")).count();
         assert_eq!(dividers, 1, "the same rule in stereo:\n{s}");
     }

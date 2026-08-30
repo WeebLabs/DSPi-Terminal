@@ -548,10 +548,10 @@ Replaces the detail pane:
  MUTE        ○        ○        ○        ●
 ```
 Column headers in the output colour (section 12: the focused column's);
-input labels in the input colour. Every input has two lines of its own:
-the connect dots (`●`/`○`, centred in the column) on the first, the
-crosspoint gains on the second, a gain only under a `●` and `INV` after
-it in `warning`. The Console's stereo pair dividers are not drawn, and
+input labels in the input colour. Every input has two lines of its own
+and a blank after them, so the inputs sit evenly: the connect dots
+(`●`/`○`, centred in the column) on the first, the crosspoint gains on
+the second, a gain only under a `●` and `INV` after it in `warning`. The Console's stereo pair dividers are not drawn, and
 one rule parts the inputs from the ENABLE, GAIN, DELAY and MUTE rows.
 The Console's per-input trim column is not shown: the preamp belongs to
 the input page. The units ride on the labels (`dB` on every gains line,
