@@ -819,6 +819,16 @@ mod detection_tests {
     }
 
     #[test]
+    fn the_linux_console_gets_sixteen_colours_and_blocks() {
+        let e = TermEnv {
+            term: Some("linux".into()),
+            ..env()
+        };
+        assert_eq!(ColorDepth::from_env(&e), ColorDepth::Ansi16);
+        assert_eq!(glyphs_for(&e), Glyphs::Blocks);
+    }
+
+    #[test]
     fn the_user_can_force_the_coarser_renderer() {
         let e = TermEnv {
             force_no_unicode: true,

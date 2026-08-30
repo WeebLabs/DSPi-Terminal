@@ -60,11 +60,36 @@ pub fn render_frame_ansi(
 
     fn sgr(c: Color, fg: bool) -> String {
         let base = if fg { 38 } else { 48 };
+        // The sixteen named colours are SGR 30-37 and 90-97 (40-47 and
+        // 100-107 for backgrounds), which is all a Linux console understands.
+        let named = |n: u8| -> String {
+            let code = if n < 8 {
+                n + if fg { 30 } else { 40 }
+            } else {
+                n - 8 + if fg { 90 } else { 100 }
+            };
+            format!("\x1b[{code}m")
+        };
         match c {
             Color::Rgb(r, g, b) => format!("\x1b[{base};2;{r};{g};{b}m"),
             Color::Indexed(i) => format!("\x1b[{base};5;{i}m"),
             Color::Reset => format!("\x1b[{}m", if fg { 39 } else { 49 }),
-            _ => String::new(),
+            Color::Black => named(0),
+            Color::Red => named(1),
+            Color::Green => named(2),
+            Color::Yellow => named(3),
+            Color::Blue => named(4),
+            Color::Magenta => named(5),
+            Color::Cyan => named(6),
+            Color::Gray => named(7),
+            Color::DarkGray => named(8),
+            Color::LightRed => named(9),
+            Color::LightGreen => named(10),
+            Color::LightYellow => named(11),
+            Color::LightBlue => named(12),
+            Color::LightMagenta => named(13),
+            Color::LightCyan => named(14),
+            Color::White => named(15),
         }
     }
 

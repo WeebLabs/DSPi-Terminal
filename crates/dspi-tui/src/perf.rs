@@ -69,6 +69,11 @@ pub fn glyphs_for(e: &crate::theme::TermEnv) -> Glyphs {
     if e.force_no_unicode {
         return Glyphs::Blocks;
     }
+    // The Linux virtual console's fonts carry box drawing and the shade
+    // blocks but no braille, which would draw the curve as question marks.
+    if e.term.as_deref() == Some("linux") {
+        return Glyphs::Blocks;
+    }
     if e.windows && !e.wt_session && e.conemu_ansi.as_deref() != Some("ON") {
         return Glyphs::Blocks;
     }

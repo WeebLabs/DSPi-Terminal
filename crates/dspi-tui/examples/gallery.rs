@@ -22,9 +22,6 @@ use dspi_tui::screens::{
 use dspi_tui::settings::{AppConfig, SettingsScreen};
 use dspi_tui::shell::{Focus, Screen, Selection, Shell, Tool, fixture};
 use dspi_tui::theme::{ColorDepth, Glyphs, Palette, Theme};
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
-use ratatui::style::{Color, Modifier};
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -72,7 +69,12 @@ fn main() {
     } else {
         ColorDepth::TrueColor
     };
-    let theme = Theme::new(palette, depth, Glyphs::Braille);
+    let glyphs = if ansi {
+        dspi_tui::perf::detect_glyphs()
+    } else {
+        Glyphs::Braille
+    };
+    let theme = Theme::new(palette, depth, glyphs);
     let mut model = match args.get(3).map(|s| s.as_str()) {
         Some("rp2040") => fixture::rp2040(&theme),
         _ => fixture::rp2350(&theme),
@@ -375,41 +377,15 @@ fn main() {
         shell.open_settings(Box::new(s));
     }
 
-    let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
-    term.draw(|f| shell.draw(f.area(), f.buffer_mut(), &state))
-        .expect("draw");
-    let buf = term.backend().buffer();
-
-    fn sgr(c: Color, fg: bool) -> String {
-        let base = if fg { 38 } else { 48 };
-        match c {
-            Color::Rgb(r, g, b) => format!("\x1b[{base};2;{r};{g};{b}m"),
-            Color::Indexed(i) => format!("\x1b[{base};5;{i}m"),
-            Color::Reset => format!("\x1b[{}m", if fg { 39 } else { 49 }),
-            _ => String::new(),
-        }
-    }
-
-    for y in 0..h {
-        let mut line = String::new();
-        for x in 0..w {
-            let cell = &buf[(x, y)];
-            if ansi {
-                line.push_str("\x1b[0m");
-                line.push_str(&sgr(cell.fg, true));
-                line.push_str(&sgr(cell.bg, false));
-                if cell.modifier.contains(Modifier::REVERSED) {
-                    line.push_str("\x1b[7m");
-                }
-                if cell.modifier.contains(Modifier::BOLD) {
-                    line.push_str("\x1b[1m");
-                }
-            }
-            line.push_str(cell.symbol());
-        }
-        if ansi {
-            line.push_str("\x1b[0m");
-        }
-        println!("{}", line.trim_end());
+    if ansi {
+        print!(
+            "{}",
+            dspi_tui::render_frame_ansi(w, h, |area, buf| shell.draw(area, buf, &state))
+        );
+    } else {
+        println!(
+            "{}",
+            dspi_tui::render_frame(w, h, |area, buf| shell.draw(area, buf, &state))
+        );
     }
 }
