@@ -348,6 +348,45 @@ pub fn busy_packet() -> Vec<u8> {
     b
 }
 
+/// The worst case for the overview grid: all seventeen channels tuned, no
+/// two alike and none flat, so nothing collapses. Each input gets a peaking
+/// band at its own frequency; each output its own crossover corner, with
+/// OUT 5 back on.
+pub fn full_packet() -> Vec<u8> {
+    let mut b = busy_packet();
+    let eq = section("eq");
+    for ch in 0..8 {
+        // Band 10 (index 9) is unused by every busy tuning.
+        let off = eq + (ch * 12 + 9) * 16;
+        b[off] = FilterType::Peaking.to_raw();
+        b[off + 4..off + 8].copy_from_slice(&(300.0f32 + 400.0 * ch as f32).to_le_bytes());
+        b[off + 8..off + 12].copy_from_slice(&1.5f32.to_le_bytes());
+        b[off + 12..off + 16].copy_from_slice(&(2.0f32 + 0.5 * ch as f32).to_le_bytes());
+    }
+    let xo = section("crossovers");
+    for o in 0..9 {
+        let ch = 8 + o;
+        let off = xo + ch * 4 * 16;
+        // LR4 high passes at rising corners; the sub keeps its low pass.
+        if o < 8 {
+            b[off] = 35;
+            b[off + 4..off + 8].copy_from_slice(&(60.0f32 + 20.0 * o as f32).to_le_bytes());
+            b[off + 8..off + 12].copy_from_slice(&0.707f32.to_le_bytes());
+        }
+    }
+    let outs = section("outputs");
+    b[outs + 4 * 12] = 1;
+    b
+}
+
+/// [`full_packet`] as a device state.
+pub fn full_state() -> DeviceState {
+    DeviceState::new(
+        caps(),
+        BulkPacket::decode(full_packet()).expect("fixture packet"),
+    )
+}
+
 /// [`busy_packet`] as a device state.
 pub fn busy_state() -> DeviceState {
     DeviceState::new(

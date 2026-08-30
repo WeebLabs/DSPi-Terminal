@@ -65,6 +65,14 @@ fn channels(state: &DeviceState) -> Vec<usize> {
         .collect()
 }
 
+fn bands_word(n: usize) -> String {
+    if n == 1 {
+        "1 band".into()
+    } else {
+        format!("{n} bands")
+    }
+}
+
 /// The summary line for a channel (DESIGN 12.2): what is set, and nothing
 /// that is not, so a cell does not spend its one line on `+0.0 dB`.
 fn summary(state: &DeviceState, channel: usize, flat: bool) -> String {
@@ -80,7 +88,7 @@ fn summary(state: &DeviceState, channel: usize, flat: bool) -> String {
         if flat {
             parts.push("no filters".into());
         } else {
-            parts.push(format!("{peq} bands"));
+            parts.push(bands_word(peq));
         }
         let preamp = state.preamp_db(channel) as f64;
         if preamp != 0.0 {
@@ -110,7 +118,7 @@ fn summary(state: &DeviceState, channel: usize, flat: bool) -> String {
         } else {
             parts.extend(xover);
             if peq > 0 {
-                parts.push(format!("{peq} bands"));
+                parts.push(bands_word(peq));
             }
         }
         let trim = out.gain_db as f64;
@@ -194,26 +202,43 @@ impl Overview {
         out
     }
 
-    /// Columns of cells for a detail region this wide, and rows per cell for
-    /// one this tall: DESIGN 12.2's Compact, Normal, Roomy and Wide sizes.
-    fn shape(area: Rect) -> (usize, u16) {
-        let cols = if area.width >= 150 {
-            4
-        } else if area.width >= 80 {
-            3
-        } else {
-            2
-        };
-        let rows = if area.height >= 50 {
-            13
-        } else if area.height >= 42 {
-            11
-        } else if area.height >= 27 {
-            9
-        } else {
-            6
-        };
-        (cols, rows)
+    /// The narrowest cell that still reads: a 20-column cell keeps the
+    /// summary (`HP 80 Hz LR4 · 2 bands`) and an 18-column plot.
+    const MIN_W: u16 = 20;
+    /// The shortest cell: three plot rows between the title and the summary.
+    const MIN_H: u16 = 6;
+    /// The tallest cell worth drawing; beyond ten plot rows a cell is a
+    /// graph, and the channel page has one of those.
+    const MAX_H: u16 = 13;
+
+    /// Columns of cells, and rows per cell, for `n` cells in this region:
+    /// the largest cells that let every cell fit, so a full device is seen
+    /// whole wherever the pane has room for it (DESIGN 12.7). When even the
+    /// smallest cells will not fit, the grid takes the most columns it can
+    /// at the smallest height and scrolls.
+    fn shape(area: Rect, n: usize) -> (usize, u16) {
+        let n = n.max(1);
+        let mut best: Option<(usize, u16, u16)> = None;
+        let mut widest_cols = 1;
+        for cols in 1..=8usize {
+            let w = area.width / cols as u16;
+            if w < Self::MIN_W {
+                break;
+            }
+            widest_cols = cols;
+            let rows_needed = n.div_ceil(cols) as u16;
+            let h = (area.height / rows_needed.max(1)).min(Self::MAX_H);
+            if h < Self::MIN_H {
+                continue;
+            }
+            if best.is_none_or(|(_, bh, bw)| (h, w) > (bh, bw)) {
+                best = Some((cols, h, w));
+            }
+        }
+        match best {
+            Some((cols, h, _)) => (cols, h),
+            None => (widest_cols, Self::MIN_H),
+        }
     }
 }
 
@@ -245,7 +270,7 @@ impl Screen for Overview {
             return;
         }
         self.cursor = self.cursor.min(cells.len() - 1);
-        let (cols, step) = Self::shape(area);
+        let (cols, step) = Self::shape(area, cells.len());
         self.cols = cols;
         let rows = cells.len().div_ceil(cols) as u16;
 
@@ -586,11 +611,11 @@ mod tests {
         assert!(f.contains("5 bands"), "{f}");
         assert!(f.contains("flat"), "{f}");
         assert!(f.contains("LP 80 Hz · -3.0 dB"), "{f}");
-        // Three columns of nine-row cells: the second row of cells starts on
-        // row nine.
+        // Five cells in 94x35: three columns of the tallest cells, so the
+        // second row of cells starts on row thirteen.
         let lines: Vec<&str> = f.lines().collect();
         assert!(lines[0].matches('╭').count() == 3, "{:?}", lines[0]);
-        assert!(lines[9].starts_with("╭"), "{:?}", lines[9]);
+        assert!(lines[13].starts_with("╭"), "{:?}", lines[13]);
         // A cell's curve is braille.
         assert!(
             f.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
@@ -613,6 +638,39 @@ mod tests {
         assert!(!f.contains("▼"), "everything fits: {f}");
         let f = draw(54, 10);
         assert!(f.contains("▼"), "more rows below: {f}");
+    }
+
+    #[test]
+    fn the_grid_sizes_its_cells_so_every_channel_fits_where_it_can() {
+        // Seventeen distinct channels at the Normal density's 94x35: four
+        // columns of seven-row cells, five rows, all on one screen.
+        assert_eq!(Overview::shape(Rect::new(0, 0, 94, 35), 17), (4, 7));
+        // At Wide's 170x55: five columns, thirteen-row cells.
+        assert_eq!(Overview::shape(Rect::new(0, 0, 170, 55), 17), (5, 13));
+        // Five cells get the tallest cells three abreast.
+        assert_eq!(Overview::shape(Rect::new(0, 0, 94, 35), 5), (3, 13));
+        // Compact's 54x19 cannot hold seventeen: two columns, the smallest
+        // cells, and the grid scrolls.
+        assert_eq!(Overview::shape(Rect::new(0, 0, 54, 19), 17), (2, 6));
+        let state = fixture::full_state();
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut s = Overview::new(shared());
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(94, 35)).unwrap();
+        term.draw(|f| s.draw(f.area(), f.buffer_mut(), &t, &state, true))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let f: String = (0..35)
+            .map(|y| (0..94).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for name in ["FL", "SR", "OUT 5", "Sub"] {
+            assert!(
+                f.contains(&format!("╭ {name} ")),
+                "{name} is on screen:\n{f}"
+            );
+        }
+        assert!(!f.contains('▼'), "nothing left to scroll to:\n{f}");
+        assert!(f.contains("1 band ·"), "singular: {f}");
     }
 
     #[test]

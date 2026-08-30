@@ -3,7 +3,7 @@
 //!   gallery [width] [height] [calm|console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
-//!                     |autoeq] [--settings <page>] [--expand n] [--busy]
+//!                     |autoeq] [--settings <page>] [--expand n] [--busy|--full]
 //!           [--depth truecolor|256|16|mono] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
@@ -15,7 +15,7 @@
 //! macros. `--expand n` opens the nth card on one of the three Control pages,
 //! whose bodies are otherwise behind a collapsed header. `--busy` swaps in
 //! the fixture with every channel tuned, which is what the overview grid
-//! is for.
+//! is for; `--full` the one where no two channels are alike.
 
 use dspi_tui::screens::{
     AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
@@ -30,6 +30,7 @@ fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let ansi = raw.iter().any(|a| a == "--ansi");
     let busy = raw.iter().any(|a| a == "--busy");
+    let full = raw.iter().any(|a| a == "--full");
     let screen = raw
         .iter()
         .position(|a| a == "--screen")
@@ -53,7 +54,7 @@ fn main() {
     let mut args: Vec<&String> = Vec::new();
     let mut skip = false;
     for a in &raw {
-        if std::mem::take(&mut skip) || a == "--ansi" || a == "--busy" {
+        if std::mem::take(&mut skip) || a == "--ansi" || a == "--busy" || a == "--full" {
             continue;
         }
         if a == "--screen" || a == "--settings" || a == "--expand" {
@@ -103,7 +104,9 @@ fn main() {
             .map(|(_, o, _)| *o)
             .expect("section")
     };
-    let mut state = if busy {
+    let mut state = if full {
+        fixture::full_state()
+    } else if busy {
         fixture::busy_state()
     } else {
         fixture::state()
