@@ -797,3 +797,123 @@ Recorded as they were taken, so the document stays the spec.
   notification stream does not carry; the Console polls the same way.
 - **`theme` in the config file** selects the palette; `--theme` overrides
   it for one run.
+
+## 12. The quiet redesign: one curve per graph, colour on demand
+
+*Revision 2, 2026-08-30. Supersedes 2.1's legend row, 4's use of channel
+colour on meters and pills, 7.1's pill toggle, 7.2's overlay, grouping and
+dashes, and 7.3's dashboard cards. Decided with the owner: the stereo
+partner is shown only for linked pairs; identical curves always collapse.*
+
+### 12.1 Why
+
+The Console draws seventeen saturated hues at once and gets away with it
+on a large canvas with thin, translucent lines. A terminal cannot: every
+coloured cell is a solid block, and we were putting a channel's hue on its
+meter, its pill, its curve and its card at the same time, then overlaying
+every curve on one axis with dashes for the ones that were not selected.
+It read as noise, and worst at sixteen colours where the bright half of
+the palette renders bold.
+
+Two changes fix it. The graph shows one channel's curve; the overview
+becomes a grid of small graphs, one per group of identical curves. And
+colour follows attention: a hue appears where the selection is and
+nowhere else.
+
+### 12.2 The two modes
+
+**Overview**: the detail pane is a grid of cells, one per *group* of
+channels whose curves are bit-identical after output gain is folded in
+(the Console's `groupedChannels` rule). A cell carries the member names
+in its title, a small plot, and one summary line. Members are listed in
+channel order; a cell for one channel shows its name alone.
+
+```
+╭ FL FR ───────────────────╮╭ FC LFE BL BR SL SR ────────╮╭ OUT L OUT R ─────────────╮
+│    ⢀⡠⠤⠤⢄⡀                 ││                            ││              ⢀⡠⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤│
+│ ⠔⠁      ⠈⠢⡀    ⢀⡠⠤⠒⠒⠒⠒⠒⠒││          flat              ││       ⢀⡠⠔⠉             │
+│            ⠈⠑⠒⠒⠊         ││                            ││ ⣀⡠⠔⠉                   │
+│ 5 bands · preamp -5.3 dB ││ no filters                 ││ HP 80 Hz LR4 · 0.0 dB    │
+╰──────────────────────────╯╰────────────────────────────╯╰──────────────────────────╯
+```
+
+- A group whose curve is flat draws the word `flat` centred in the plot
+  rather than a line; its summary is `no filters`.
+- The summary line: inputs `N bands · preamp X dB`; outputs the crossover
+  in the filter-file short form and the trim (`HP 80 Hz LR4 · -3.0 dB`),
+  or `N bands` when there is no crossover; the sub the same as an output.
+  Delay is shown only when non-zero (`· 2.5 ms`).
+- Cell size by density: Compact 2 columns of cells 6 rows high (plot 3
+  rows); Normal 3 columns, 9 rows (plot 5); Roomy 3 columns, 11 rows
+  (plot 7); Wide 4 columns, 13 rows (plot 9). Cells that do not fit scroll
+  as rows, with the `▲`/`▼` hints in the border column.
+- `↑ ↓ ← →` move between cells, `Enter` selects the cell's first channel,
+  digits select the nth cell.
+- The plot in a cell draws one curve, in grey, on a 0 dB rule with no
+  labels; the y-range is the same as the main graph's so cells compare.
+  The focused cell's curve and title take its first channel's colour.
+
+**Individual**: the full-width graph above the filter list, as in 2.1,
+drawing the selected channel's curve in its colour. For a linked input
+pair the partner's curve is drawn first as a thin grey line, so a mismatch
+is visible; `.` toggles it. No other channel is drawn. There is no
+legend row: the graph's title row reads `Filter Response · FL` and the
+detail title beneath names the channel as before.
+
+### 12.3 Colour budget
+
+At most three hues on screen: the selected channel's, red for clip and
+mute, and orange for the dirty marker, `INV` and warnings. Everything
+else is the grey ramp `fg` / `dim` / `chrome` / `chrome_faint` from 4.2.
+
+| Element | Before | Now |
+|---|---|---|
+| Sidebar name | fg | fg; the selected channel's hue when selected |
+| Sidebar swatch | (none) | `▪` in the channel's hue, one cell, always |
+| Sidebar meter | channel hue | `fg` fill; the selected channel's hue when selected |
+| Descriptor pill | reverse video in the hue | `dim` text, no fill |
+| Curve | channel hue, others dashed | the selected channel's hue; partner grey |
+| Grid cell curve | (new) | grey; the focused cell's hue |
+| Card / cell border | channel hue | chrome; the focused cell's hue |
+| Matrix column headers | output hue | dim; the focused column's hue |
+| Chips | reverse in the hue | reverse in `fg`; the channel hue only for the selected channel's chip |
+| Section headers, dividers, grid | dim / chrome | unchanged |
+| Semantic | accent, ok, warning, danger | unchanged |
+
+At 16 colours the same rule applies with the 16-colour column of 4.1 for
+the one hue in use, and the bright set is never used for a resting
+element. Mono is unchanged: reverse video and bold carry focus.
+
+The Console's full colouring survives as `--theme console` (or `theme =
+"console"` in the config file), which applies hues to swatch, meter, pill
+and curve for every channel as sections 4 to 7 describe. The reduced
+scheme is the default and is what `calm` names.
+
+### 12.4 What goes
+
+- The legend row and its focus region; `Space` on a sidebar row (pills no
+  longer toggle anything); the visibility maps, including the pop-out's
+  own map (14 in section 11); curve-end labels, dashes and draw order in
+  `graph.rs`; the grouped `=` marker; the overview's ten-row band tables.
+- The layout gives the legend's row (or two) back to the detail region.
+- The old grid mode (`m`) is subsumed by the overview.
+
+### 12.5 What stays
+
+Identical-curve grouping (now the grid's cell rule), the graph's window,
+grid, phase overlay, cursor and readout, `g` pop-out (the selected
+channel's graph fills the pane), `=` height cycling, and every screen's
+behaviour other than colour.
+
+### 12.6 Order of work
+
+1. `theme.rs`: the `calm` palette as the default, `console` kept; a
+   `Theme::hue_for(selected: bool, role)` that answers the budget rule so
+   widgets do not each decide.
+2. Sidebar and widgets: swatch cell, grey meters and pills, chips.
+3. `graph.rs`: one curve plus optional partner; delete grouping, dashes,
+   end labels, legend; `shell/`: remove the legend region and focus,
+   rebalance layout; `live.rs`: remove visibility, add the partner toggle.
+4. `screens/overview.rs`: the grid.
+5. Re-baseline the golden tests; update sections 2, 3, 7 and 8 to point
+   here; README key table.
