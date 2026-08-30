@@ -524,6 +524,12 @@ impl<'t> Surfaces<'t> {
         (0..pages).map(|i| self.read_display_page(i)).collect()
     }
 
+    /// One noun's descriptor, so a caller can tolerate a single stall rather
+    /// than losing the whole table to it.
+    pub fn read_noun(&mut self, noun: u8) -> Result<CsNounDesc> {
+        Ok(read_noun_caps(self.t, noun)?)
+    }
+
     /// Every noun descriptor. A noun whose `actions` mask is zero is not
     /// available on this platform, which is how the firmware reports a
     /// difference like ADAT on an RP2040; it must not be offered.
