@@ -285,8 +285,8 @@ and legend. Then HW-3.
 
 ### Progress (2026-08-28)
 
-Merged on `console-parity`: Phases 0, 1, 2A, 2B, 2C, 3, 4, 5, 6 and 7A.
-Running: Phases 7B and 8. Waiting: HW-1 (a device), then 9 and 10.
+Merged on `console-parity`: Phases 0, 1, 2A, 2B, 2C, 3, 4, 5, 6, 7A and 8.
+Running: Phase 7B; Phase 9 under way. Waiting: HW-1 (a device), then 10.
 
 ## 3. Hardware checkpoints
 
@@ -319,7 +319,7 @@ Tick when merged and golden-tested.
 | S5 | Source row | Sidebar | 4| yes |
 | S6 | Volume: user (sqrt taper) and master (piecewise taper), mode menu, reset | Sidebar | 4| yes |
 | S7 | CPU C0/C1 red > 90 % | Sidebar | 4| yes |
-| S8 | Connection dot, "No Devices", device picker, reconnect | Title bar | 4| partly: picker pending (Phase 8) |
+| S8 | Connection dot, "No Devices", device picker, reconnect | Title bar | 4| yes |
 | D1 | Overview cards (stereo gradient, delay, 10 rows, type codes) | Detail: Overview | 4| yes |
 | I1 | Input page: link pill + mismatch prompt, preamp, clear PEQ | Detail: Input | 4| yes |
 | I2 | Filter list: all PEQ types, bypass, ValueField semantics, header/footer | Detail | 4| yes |
@@ -338,15 +338,15 @@ Tick when merged and golden-tested.
 | X4 | Psybass panel with starting points | Tool panel | 6| yes |
 | X5 | Upmixer panel with live gauges | Tool panel | 6| yes |
 | T1 | Test Signals: tiles, outputs/polarity, level, params, timing, options, transport | Tool panel | 6| yes |
-| N1 | Stats for Nerbs, every section, 2 s refresh, reset watermarks | Tool panel | 8 | |
-| N2 | Interrupt Monitor: pause, clear, decoded log | Tool panel | 2A, 8 | |
-| A1 | AutoEQ browser: search, source capsule, favourites, apply | Tool panel | 8 | |
-| A2 | AutoEQ favourites menu, Update Database (3 methods) | Palette / panel | 8 | |
-| F1 | Import / Export Filters (REW, DSPi, Windows dialect), channel pickers | `:import` `:export` + dialogs | 8 | |
-| F2 | Import / Export Device Configuration with options and report | same | 8 | |
-| F3 | Save Master Volume, Save Output Configuration | Tools | 8 | |
-| K1 | Commit, Revert to Saved, Factory Reset, Firmware Update (bootloader) | Tools | 8 | |
-| K2 | Unsaved-changes prompt on preset switch / device switch / quit | Everywhere | 2A, 8| partly: quit and preset switch done; device switch pending |
+| N1 | Stats for Nerbs, every section, 2 s refresh, reset watermarks | Tool panel | 8| yes |
+| N2 | Interrupt Monitor: pause, clear, decoded log | Tool panel | 2A, 8| yes |
+| A1 | AutoEQ browser: search, source capsule, favourites, apply | Tool panel | 8| yes |
+| A2 | AutoEQ favourites menu, Update Database (3 methods) | Palette / panel | 8| yes |
+| F1 | Import / Export Filters (REW, DSPi, Windows dialect), channel pickers | `:import` `:export` + dialogs | 8| yes |
+| F2 | Import / Export Device Configuration with options and report | same | 8| yes |
+| F3 | Save Master Volume, Save Output Configuration | Tools | 8| yes |
+| K1 | Commit, Revert to Saved, Factory Reset, Firmware Update (bootloader) | Tools | 8| yes |
+| K2 | Unsaved-changes prompt on preset switch / device switch / quit | Everywhere | 2A, 8| yes |
 | K3 | Channel clipboard | Sidebar, Matrix | 4, 5| yes |
 | P1 | Settings shell: groups, gating, back/forward, save bar, revert | Settings | 7A| yes |
 | P2 | Overview pin map with roles | Settings | 7A| yes |
@@ -364,7 +364,7 @@ Tick when merged and golden-tested.
 | C4 | Channel Groups | Settings | 7B | |
 | C5 | Macros | Settings | 7B | |
 | L1 | Notifications applied live (EQ, names, volume, source, and all of V28) | Session | 2A| yes |
-| L2 | Multi-device: list, switch with prompt, generation scoping | Session | 2A, 4| partly: list done; switch pending |
+| L2 | Multi-device: list, switch with prompt, generation scoping | Session | 2A, 4| yes |
 | V1 | Console palette, channel colour everywhere, semantic colours | Theme | 3| yes |
 | V2 | Disabled / unsupported presentation rules | Widgets | 3| yes |
 | Q1 | 80x24 and 200x60 layouts, help overlay, animation, `--lite` | Shell | 9 | |
