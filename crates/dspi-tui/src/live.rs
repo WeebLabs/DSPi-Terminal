@@ -39,6 +39,13 @@ use crate::theme::{ChannelRole, Glyphs, Theme};
 use crate::widgets::text::truncate;
 use crate::widgets::{Button, Dialog, DialogOutcome, PeakHold, PopupList};
 
+/// The connect animation's length.
+const REVEAL: Duration = Duration::from_millis(400);
+/// How long a remotely changed value takes to reach its new position.
+const EASE: Duration = Duration::from_millis(120);
+/// The Console clears a clip latch this long after it lit.
+const CLIP_HOLD: Duration = Duration::from_secs(3);
+
 /// Makes the screens the shell shows. The default makes placeholders; later
 /// phases replace it.
 pub trait Screens {
@@ -457,6 +464,12 @@ pub struct Live {
     shared: Shared,
     pub should_quit: bool,
     last_tick: Instant,
+    /// The volume the slider is drawn at, easing toward the device's value
+    /// when someone else moved it.
+    shown_volume: Option<f64>,
+    ease_from: Option<(Instant, f64)>,
+    /// When the clip latch was first set, for the Console's auto-clear.
+    clip_since: Option<Instant>,
     /// When the upmixer's telemetry was last read. It is not a notification,
     /// so the only way to move the gauges is to ask, and once a second is
     /// enough for a meter a person is watching.
@@ -517,6 +530,9 @@ impl Live {
             shared,
             should_quit: false,
             last_tick: Instant::now(),
+            shown_volume: None,
+            ease_from: None,
+            clip_since: None,
             last_upmix_poll: Instant::now() - Duration::from_secs(2),
             last_stats_poll: Instant::now() - Duration::from_secs(3),
             started: Instant::now(),
@@ -630,10 +646,23 @@ impl Live {
         } else {
             None
         };
-        m.volume_db = match m.volume_mode {
+        let target = match m.volume_mode {
             VolumeMode::User => s.user_volume().0 as f64,
             VolumeMode::Master => s.master_volume_db() as f64,
         };
+        // A value the device changed eases to its new place, so a knob turn
+        // reads as motion rather than a jump. Our own writes snap.
+        m.volume_db = match (self.ease_from, self.perf.animate) {
+            (Some((since, from)), true) => {
+                let t = (since.elapsed().as_secs_f64() / EASE.as_secs_f64()).min(1.0);
+                if t >= 1.0 {
+                    self.ease_from = None;
+                }
+                from + (target - from) * t
+            }
+            _ => target,
+        };
+        self.shown_volume = Some(target);
         m.cpu = (s.meters.cpu0, s.meters.cpu1);
 
         // Curves: PEQ plus crossover bands, with output gain folded in.
@@ -671,7 +700,7 @@ impl Live {
             curves.push(GraphCurve {
                 descriptor: role.descriptor(no as u8),
                 color: t.role_color(role),
-                magnitude: dsp::curve(&bands, gain),
+                magnitude: reveal(dsp::curve(&bands, gain), self.started, self.perf.animate),
                 phase: if selected_index == Some(ch) || m.graph.show_phase {
                     Some(dsp::phase_curve(&bands))
                 } else {
@@ -1875,6 +1904,18 @@ impl Live {
                 p.update(m.peaks.get(i).copied().unwrap_or(0.0), dt);
             }
             self.state.update_meters(m);
+            match (self.state.clip_latched != 0, self.clip_since) {
+                (true, None) => self.clip_since = Some(now),
+                (true, Some(since)) if now.duration_since(since) >= CLIP_HOLD => {
+                    // The Console clears the latch itself after three
+                    // seconds and asks the device to forget too.
+                    self.state.clear_clip_latch();
+                    let _ = session.write("meters.clear", &[], Value::Trigger);
+                    self.clip_since = None;
+                }
+                (false, _) => self.clip_since = None,
+                _ => {}
+            }
         }
         self.poll_upmix_status(session, now);
         self.poll_stats(session, now);
@@ -1894,6 +1935,11 @@ impl Live {
                     Applied::Section { name, source } => {
                         if !source.is_ours() {
                             changed_elsewhere = Some((name, source));
+                            if matches!(name, "user_volume" | "master_volume")
+                                && let Some(from) = self.shown_volume
+                            {
+                                self.ease_from = Some((now, from));
+                            }
                         }
                     }
                     Applied::NeedsReread { .. } => reread = true,
@@ -2059,6 +2105,23 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
     result
 }
 
+/// The connect animation: the curve draws left to right over `REVEAL`, the
+/// rest of it hidden as non-finite points the graph skips.
+fn reveal(mut points: Vec<f64>, started: Instant, animate: bool) -> Vec<f64> {
+    if !animate {
+        return points;
+    }
+    let t = started.elapsed().as_secs_f64() / REVEAL.as_secs_f64();
+    if t >= 1.0 {
+        return points;
+    }
+    let shown = (t * points.len() as f64) as usize;
+    for p in points.iter_mut().skip(shown) {
+        *p = f64::NAN;
+    }
+    points
+}
+
 /// A value in the words the registry uses for it: a choice by name, a number
 /// with its unit.
 fn display_value(d: &dspi_proto::registry::ParamDesc, v: &Value) -> String {
@@ -2101,10 +2164,12 @@ mod tests {
             dspi_proto::wire::BulkPacket::decode(packet()).unwrap(),
         );
         let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        // Tests run without the reveal and the easing, as --lite does, so a
+        // value asserted right after a change is the value itself.
         let live = Live::new(
             state,
             theme,
-            Performance::default(),
+            Performance::lite(),
             Box::new(PlaceholderScreens),
         );
         (live, session, log)
