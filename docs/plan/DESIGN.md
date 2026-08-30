@@ -536,15 +536,15 @@ Replaces the detail pane:
           OUT L    OUT R    OUT 3     Sub
            OUT1     OUT2     OUT3 !   OUT9 !
  ROUTING
- FL          ●        ○        ○        ●
-      dB   0.0                       -6.0 INV
+ FL     [    ●   ]    ○        ○        ●
+        [  0.0 dB]                  -6.0 INV
  FR          ○        ●        ○        ●
-      dB            0.0              -6.0
+                    0.0              -6.0
  ...
          ──────────────────────────────────
  ENABLE    ⏻ on     ⏻ on    ⏻ off     ⏻ on
- GAIN dB   0.0      0.0      0.0     -3.0
- DELAY ms  0.0      0.0      0.0      2.5
+ GAIN      0.0      0.0      0.0     -3.0
+ DELAY     0.0      0.0      0.0      2.5
  MUTE        ○        ○        ○        ●
 ```
 Column headers in the output colour (section 12: the focused column's);
@@ -554,9 +554,10 @@ and a blank after them, so the inputs sit evenly: the connect dots
 the second, a gain only under a `●` and `INV` after it in `warning`. The Console's stereo pair dividers are not drawn, and
 one rule parts the inputs from the ENABLE, GAIN, DELAY and MUTE rows.
 The Console's per-input trim column is not shown: the preamp belongs to
-the input page. The units ride on the labels (`dB` on every gains line,
-`GAIN dB`, `DELAY ms`) so the cells are bare numbers, right-aligned so
-the last digit sits under the dot. That lets a column be nine cells, and
+the input page. The cells are bare numbers, right-aligned so the last
+digit sits under the dot; the unit follows the value in the focused cell
+alone (`0.0 dB`, `2.5 ms`), where `INV` takes its place on an inverted
+crosspoint. That lets a column be nine cells, and
 nine outputs fit the Normal pane at 120 columns beside a nine-cell label
 column; columns widen to 18 and the label column to 16 as the pane
 allows, and only the 80-column pane scrolls. The reticle brackets both lines of the input it is on. Cells of a

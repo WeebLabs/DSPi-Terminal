@@ -536,15 +536,6 @@ impl MatrixPanel {
         let live = state.output(output).enabled;
         let w = self.col_w as usize - 1;
         let armed = focused && self.edit.is_some();
-        let text = match self.edit.as_ref().filter(|_| focused) {
-            Some(e) => format!("[{}]", e.text),
-            None if c.enabled => format!(
-                "{:.1}{}",
-                c.gain_db,
-                if c.phase_invert { " INV" } else { "" }
-            ),
-            None => String::new(),
-        };
         let style = if armed {
             theme.editing()
         } else if focused {
@@ -554,25 +545,31 @@ impl MatrixPanel {
         } else {
             theme.label()
         };
-        // The number's last digit sits under the dot, so a column of gains
-        // lines up on its decimal point; `INV` follows it.
+        // Cells are bare numbers whose last digit sits under the dot, so a
+        // column of gains lines up on its decimal point. The unit appears
+        // after the value in the focused cell alone; an inverted cell has
+        // `INV` there instead, one cell left so the pair fits the column.
         let dot = (w / 2) as u16;
-        if armed || self.edit.as_ref().filter(|_| focused).is_some() {
+        if let Some(e) = self.edit.as_ref().filter(|_| focused) {
+            let text = format!("[{}]", e.text);
             let len = text.chars().count();
             let start = x + (w.saturating_sub(len) / 2) as u16;
             p.buf.set_string(start, y, &text, style);
         } else if c.enabled {
             let number = format!("{:.1}", c.gain_db);
             let len = number.chars().count() as u16;
+            let end = if c.phase_invert { dot - 1 } else { dot };
             p.buf
-                .set_string(x + dot + 1 - len.min(dot + 1), y, &number, style);
+                .set_string(x + end + 1 - len.min(end + 1), y, &number, style);
             if c.phase_invert {
                 let style = if live {
                     theme.warning_style()
                 } else {
                     theme.label()
                 };
-                p.buf.set_string(x + dot + 2, y, "INV", style);
+                p.buf.set_string(x + dot + 1, y, "INV", style);
+            } else if focused {
+                p.buf.set_string(x + dot + 1, y, " dB", style);
             }
         }
         if focused {
@@ -615,6 +612,7 @@ impl MatrixPanel {
             }
             Row::Gain | Row::Delay => {
                 let armed = focused && self.edit.is_some();
+                let unit = if row == Row::Gain { " dB" } else { " ms" };
                 let text = match (self.edit.as_ref().filter(|_| focused), row) {
                     (Some(e), _) => format!("[{}]", e.text),
                     (None, Row::Gain) => format!("{:.1}", out.gain_db),
@@ -632,11 +630,15 @@ impl MatrixPanel {
                 if armed {
                     p.buf.set_string(x, y, fit_centre(&text, w), style);
                 } else {
-                    // Right-aligned under the dot, like the gains lines.
+                    // Right-aligned under the dot, like the gains lines, with
+                    // the unit after the value in the focused cell alone.
                     let dot = (w / 2) as u16;
                     let len = text.chars().count() as u16;
                     p.buf
                         .set_string(x + dot + 1 - len.min(dot + 1), y, &text, style);
+                    if focused {
+                        p.buf.set_string(x + dot + 1, y, unit, style);
+                    }
                 }
             }
             Row::Mute => {
@@ -676,15 +678,8 @@ impl MatrixPanel {
                 p.buf.set_string(x + 1, y, text, Style::default().fg(color));
             }
             Row::Enable => p.buf.set_string(x + 1, y, "ENABLE", theme.section()),
-            // The unit rides on the label, so the cells are bare numbers.
-            Row::Gain => {
-                p.buf.set_string(x + 1, y, "GAIN", theme.section());
-                p.buf.set_string(x + 6, y, "dB", theme.label());
-            }
-            Row::Delay => {
-                p.buf.set_string(x + 1, y, "DELAY", theme.section());
-                p.buf.set_string(x + 7, y, "ms", theme.label());
-            }
+            Row::Gain => p.buf.set_string(x + 1, y, "GAIN", theme.section()),
+            Row::Delay => p.buf.set_string(x + 1, y, "DELAY", theme.section()),
             Row::Mute => p.buf.set_string(x + 1, y, "MUTE", theme.section()),
         }
     }
@@ -792,11 +787,6 @@ impl Screen for MatrixPanel {
                 }
                 Line::Gains(input) => {
                     let on_row = focused && Row::Input(*input) == here;
-                    // The unit sits in the label column, once per line, so
-                    // the gains themselves are bare numbers that fit a
-                    // nine-cell column.
-                    p.buf
-                        .set_string(area.x + self.label_w - 3, y, "dB", theme.label());
                     for (i, &o) in cols.iter().enumerate() {
                         let x = area.x + self.label_w + i as u16 * self.col_w;
                         let cell = on_row && o == self.col;
@@ -1185,10 +1175,11 @@ mod tests {
         assert!(fl.contains('●') && fl.contains('○'), "{fl}");
         assert!(!fl.contains("0.0"), "gains are on the next line: {fl}");
         let gains = f.lines().nth(4).expect("the FL gains row");
-        assert!(
-            gains.starts_with("      dB") && gains.contains(" 0.0 "),
-            "{gains}"
-        );
+        // The reticle is on FL/OUT1, so that cell alone carries its unit.
+        assert!(gains.contains("0.0 dB") && gains.contains('['), "{gains}");
+        assert_eq!(gains.matches("dB").count(), 1, "{gains}");
+        let fr = f.lines().nth(7).expect("the FR gains row");
+        assert!(fr.contains("0.0") && !fr.contains("dB"), "{fr}");
         assert!(
             !gains.contains("+0.0 dB") && !f.contains("-5.3 dB"),
             "no input trim in the matrix; it lives on the input page: {f}"
@@ -1281,10 +1272,10 @@ mod tests {
         let dividers = f.lines().filter(|l| l.contains("──")).count();
         assert_eq!(dividers, 1, "one rule above ENABLE:\n{f}");
         let lines: Vec<&str> = f.lines().collect();
-        assert!(lines[3].starts_with("▸FL") && lines[4].contains("0.0"));
+        assert!(lines[3].starts_with("▸FL") && lines[4].contains("0.0 dB"));
         assert!(
-            lines[4].starts_with("      dB"),
-            "the gains line's unit: {f}"
+            lines[4].starts_with("        "),
+            "the gains line has no label: {f}"
         );
         assert!(lines[5].is_empty(), "a blank line after the gains:\n{f}");
         assert!(lines[6].starts_with(" FR"), "no pair divider:\n{f}");
