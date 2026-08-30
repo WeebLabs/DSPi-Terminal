@@ -212,17 +212,17 @@ pub fn type_name(t: FilterType) -> String {
     match t {
         FilterType::Flat => "Off".into(),
         FilterType::Peaking => "Peaking".into(),
-        FilterType::LowShelf => "Low Shelf (12dB)".into(),
-        FilterType::HighShelf => "High Shelf (12dB)".into(),
-        FilterType::LowPass => "High Cut (12dB)".into(),
-        FilterType::HighPass => "Low Cut (12dB)".into(),
+        FilterType::LowShelf => "Low Shelf 12 dB/oct".into(),
+        FilterType::HighShelf => "High Shelf 12 dB/oct".into(),
+        FilterType::LowPass => "High Cut 12 dB/oct".into(),
+        FilterType::HighPass => "Low Cut 12 dB/oct".into(),
         FilterType::Notch => "Notch".into(),
         FilterType::AllPass => "All Pass (360°)".into(),
         FilterType::AllPass1 => "All Pass (180°)".into(),
-        FilterType::LowShelf1 => "Low Shelf (6dB)".into(),
-        FilterType::HighShelf1 => "High Shelf (6dB)".into(),
-        FilterType::LowPass1 => "High Cut (6dB)".into(),
-        FilterType::HighPass1 => "Low Cut (6dB)".into(),
+        FilterType::LowShelf1 => "Low Shelf 6 dB/oct".into(),
+        FilterType::HighShelf1 => "High Shelf 6 dB/oct".into(),
+        FilterType::LowPass1 => "High Cut 6 dB/oct".into(),
+        FilterType::HighPass1 => "Low Cut 6 dB/oct".into(),
         FilterType::LinkwitzTransform => "Linkwitz Transform".into(),
         other => match xover::meta(other.to_raw()) {
             Some(m) => format!(
@@ -567,7 +567,7 @@ pub(crate) mod tests {
         // The wider frame has room for the type names in full, and for the
         // whole key line.
         let f = frame(&mut s, 120, 40);
-        assert!(f.contains("Low Shelf (12dB)"), "{f}");
+        assert!(f.contains("Low Shelf 12 dB/oct"), "{f}");
         assert!(f.contains("105 Hz"), "{f}");
         assert!(f.contains("Enable All"), "the key line: {f}");
     }
@@ -638,7 +638,7 @@ pub(crate) mod tests {
 
     #[test]
     fn names_codes_and_tokens_match_the_consoles_tables() {
-        assert_eq!(type_name(FilterType::LowShelf), "Low Shelf (12dB)");
+        assert_eq!(type_name(FilterType::LowShelf), "Low Shelf 12 dB/oct");
         assert_eq!(type_name(FilterType::from_raw(34)), "LR4 Low Pass");
         assert_eq!(type_code(FilterType::Notch), "NO");
         assert_eq!(type_code(FilterType::from_raw(34)), "LR4LP");

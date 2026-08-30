@@ -531,7 +531,10 @@ mod tests {
         assert!(head.contains("Preamp") && head.contains("0.0 dB"), "{head}");
         assert!(head.contains("Clear PEQ"), "{head}");
         // And the filter list is beneath it.
-        assert!(f.contains("TYPE") && f.contains("Low Shelf (12dB)"), "{f}");
+        assert!(
+            f.contains("TYPE") && f.contains("Low Shelf 12 dB/oct"),
+            "{f}"
+        );
         // The Linkwitz Transform is hidden on inputs.
         assert!(!p.list.include_linkwitz);
     }

@@ -78,7 +78,7 @@ enum Pending {
 
 const PEQ_COLUMNS: &[Column] = &[
     Column::right("#", 2),
-    Column::left("Type", 18),
+    Column::left("Type", 21),
     Column::right("Freq", 9),
     Column::right("Gain", 9),
     Column::right("Width", 7),
@@ -970,7 +970,7 @@ mod tests {
             "{f}"
         );
         // A low shelf has a gain but no Q.
-        assert!(lines[1].contains("Low Shelf (12dB)"), "{f}");
+        assert!(lines[1].contains("Low Shelf 12 dB/oct"), "{f}");
         assert!(
             lines[1].contains("105 Hz") && lines[1].contains("+8.8 dB"),
             "{f}"

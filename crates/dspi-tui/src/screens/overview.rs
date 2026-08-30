@@ -244,10 +244,19 @@ fn draw_card(
         return;
     }
 
+    // The Console's input card carries no delay (`showDelay: false`); the
+    // output cards do.
+    let ni = state.caps.num_inputs as usize;
     let details: Vec<String> = spec
         .channels
         .iter()
-        .map(|ch| format!("Delay: {:.0} ms", delay_of(state, *ch)))
+        .map(|ch| {
+            if *ch < ni {
+                String::new()
+            } else {
+                format!("Delay: {:.0} ms", delay_of(state, *ch))
+            }
+        })
         .collect();
     let names: Vec<String> = spec
         .channels
