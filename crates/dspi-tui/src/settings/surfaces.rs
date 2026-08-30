@@ -203,9 +203,12 @@ impl SurfacesPage {
             self.names = cs.names.clone();
             self.ir_drafts = cs.ir.clone();
         }
-        // The display config and pages apply as they are edited, so the live
-        // copy is the draft: follow the device for them.
+        // Everything the device reports about itself rather than holds for us:
+        // slot health, the panel's own state, and the group and macro tables a
+        // target picker reads. `SettingsData` is re-read after every write on
+        // this page, so these follow the device rather than freezing at open.
         self.live.status = cs.status.clone();
+        self.live.ext = cs.ext.clone();
         self.live.display_status = cs.display_status.clone();
         self.live.groups = cs.groups.clone();
         self.live.macros = cs.macros.clone();
@@ -2224,7 +2227,11 @@ impl SettingsPage for SurfacesPage {
                         self.ir_messages.remove(&sub);
                         PageEvent::Session(SessionRequest::new(
                             TAG_LEARN | sub as u32,
-                            move |session| m::run_unit(session, LEARN_PROMPT, |s| s.arm_learn()),
+                            // The arm answers PIN_CONFIG_SUCCESS or
+                            // CS_STATUS_NO_IR (control_surfaces.h:798), so a
+                            // refusal says so rather than waiting for a button
+                            // the device is not listening for.
+                            move |session| m::run_code(session, LEARN_PROMPT, |s| s.arm_learn()),
                         ))
                     }
                     _ => {
@@ -2254,7 +2261,7 @@ impl SettingsPage for SurfacesPage {
                         .insert(sub, ("Learn cancelled.".into(), false));
                 }
                 PageEvent::Session(SessionRequest::new(TAG_LEARN_CANCEL, |session| {
-                    m::run_unit(session, "Learn cancelled", |s| s.cancel_learn())
+                    m::run_code(session, "Learn cancelled", |s| s.cancel_learn())
                 }))
             }
             (Item::IrNoun(sub), Action::Selected(c)) => {
@@ -2559,8 +2566,9 @@ impl SettingsPage for SurfacesPage {
             && let Some(d) = c.to_digit(10)
             && d >= 1
         {
-            let slot = d as usize - 1;
-            if slot < self.slot_count() && self.configured(slot) {
+            // The nth card on screen, the way a digit jumps to the nth band:
+            // with controls in slots 1 and 6, `2` opens the second card.
+            if let Some(slot) = self.visible().get(d as usize - 1).copied() {
                 self.expanded.insert(slot);
                 return PageEvent::Handled;
             }
@@ -3169,6 +3177,152 @@ mod tests {
         assert_eq!(
             m::run(&mut session, move |s| s.write_binding(3, &b)),
             SessionReply::Err("A potentiometer needs an analogue-capable pin".into())
+        );
+    }
+
+    /// Nothing on the control-surface path pushes a notification
+    /// (`survey-firmware.md` 3.14), so an apply that only ever hears "Applied"
+    /// used to leave the card drawing the snapshot Settings opened with: a
+    /// control the device had just brought up still read **Not running**.
+    #[test]
+    fn a_card_follows_the_device_after_a_successful_apply() {
+        use dspi_proto::generated::opcodes as op;
+        use dspi_proto::packets::CsStatusPacket;
+        use dspi_transport::MockTransport;
+
+        let status = |active: u16| {
+            CsStatusPacket {
+                last_status: 0,
+                last_slot: 4,
+                max_bindings: 16,
+                dirty: true,
+                active_mask: active,
+                slot_status: vec![0; 16],
+                ir_active_mask: 0b0001,
+                ir_learn_state: 0,
+                ir_cmd_status: vec![0; 16],
+            }
+            .encode()
+        };
+
+        // The device is holding slot 4 but not running it.
+        let mut d = m::demo::settings_data();
+        d.cs.as_mut().expect("cs").status.active_mask = 0b0000_1111;
+        let (mut s, st) = screen(d);
+        s.pages.surfaces.expanded.insert(4);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("Not running:"), "the card starts inactive:\n{f}");
+
+        // Apply it. The device now reports it running; the page has no other
+        // way to hear that.
+        let mut caps = crate::shell::fixture::caps();
+        caps.cs = Some(m::demo::caps());
+        let wired = CsBinding {
+            component: m::ty::BUTTON,
+            gpio: [16, GPIO_UNUSED],
+            ..Default::default()
+        };
+        let t = MockTransport::new()
+            .data(op::REQ_SET_CS_BINDING, vec![])
+            .data(op::REQ_GET_CS_STATUS, status(0b0001_1111))
+            .data(op::REQ_GET_CS_BINDING, wired.encode().to_vec())
+            .window(
+                op::REQ_GET_ALL_PARAMS_CHUNK,
+                crate::shell::fixture::packet(),
+            );
+        let mut session = dspi_session::Session::new(Box::new(t), caps).expect("session");
+        assert!(s.data.claims.is_none(), "nothing has read the pin map yet");
+
+        let ev = s.pages.surfaces.apply(4);
+        let req = match s.absorb(ev, &st) {
+            ScreenEvent::Session(r) => r,
+            other => panic!("{other:?}"),
+        };
+        let reply = (req.run)(&mut session);
+        assert_eq!(reply, SessionReply::Ok("Applied".into()));
+        s.session_result(req.tag, reply, &st);
+
+        assert!(
+            s.data.cs.as_ref().expect("cs").status.is_slot_active(4),
+            "the re-read reached SettingsData"
+        );
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(!f.contains("Not running:"), "the card caught up:\n{f}");
+
+        // And the pin map came with it, so a GPIO this control now holds is
+        // not offered as free to the next one.
+        let claims = s.data.claims.as_ref().expect("the pin map was re-read");
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.gpio == 16 && c.owner.starts_with("Control Surface")),
+            "{claims:?}"
+        );
+    }
+
+    /// A digit counts the cards on screen. The demo device has controls in
+    /// slots 1 to 5, so this also pins the 1-based convention.
+    #[test]
+    fn a_digit_opens_the_nth_card_not_the_nth_slot() {
+        let mut d = m::demo::settings_data();
+        let cs = d.cs.as_mut().expect("cs");
+        // Leave only slots 2 and 5 configured.
+        for slot in [0usize, 2, 3] {
+            cs.bindings[slot] = CsBinding::default();
+            cs.names[slot] = String::new();
+        }
+        let mut p = SurfacesPage::new(&d);
+        assert_eq!(p.visible(), vec![1, 4]);
+        let (st, cfg) = (m::demo::state(), AppConfig::default());
+        let c = cx(&d, &st, &cfg);
+        assert_eq!(p.key(key(KeyCode::Char('1')), &c), PageEvent::Handled);
+        assert!(p.expanded.contains(&1), "the first card, in slot 2");
+        assert_eq!(p.key(key(KeyCode::Char('2')), &c), PageEvent::Handled);
+        assert!(p.expanded.contains(&4), "the second card, in slot 5");
+        assert_eq!(p.key(key(KeyCode::Char('3')), &c), PageEvent::Unhandled);
+    }
+
+    /// Arming a learn is a write with an answer: `CS_STATUS_NO_IR` when no
+    /// receiver is live (control_surfaces.h:798). Dropping it left the card
+    /// saying "Waiting for a button..." forever.
+    #[test]
+    fn a_refused_learn_arm_says_so_instead_of_waiting() {
+        use dspi_proto::generated::opcodes as op;
+        use dspi_transport::MockTransport;
+
+        let caps = |cs| {
+            let mut c = crate::shell::fixture::caps();
+            c.cs = Some(cs);
+            c
+        };
+        // CS_STATUS_NO_IR from the arm.
+        let t = MockTransport::new().data(op::REQ_CS_IR_LEARN, vec![0x1E]);
+        let mut session =
+            dspi_session::Session::new(Box::new(t), caps(m::demo::caps())).expect("session");
+        assert_eq!(
+            m::run_code(&mut session, LEARN_PROMPT, |s| s.arm_learn()),
+            SessionReply::Err("Set up an IR receiver first".into())
+        );
+
+        // And the page turns that into the card's own error, with nothing left
+        // listening.
+        let (mut p, _, _) = page();
+        p.learning = Some((2, None));
+        let (d, st, cfg) = (
+            m::demo::settings_data(),
+            m::demo::state(),
+            AppConfig::default(),
+        );
+        let c = cx(&d, &st, &cfg);
+        p.session_result(
+            TAG_LEARN | 2,
+            SessionReply::Err("Set up an IR receiver first".into()),
+            &c,
+        );
+        assert!(p.learning.is_none(), "nothing is still listening");
+        assert_eq!(
+            p.ir_messages.get(&2).map(|(t, e)| (t.as_str(), *e)),
+            Some(("Set up an IR receiver first", true))
         );
     }
 

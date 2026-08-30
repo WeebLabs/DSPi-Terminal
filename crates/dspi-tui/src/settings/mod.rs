@@ -89,6 +89,10 @@ pub struct SettingsData {
     /// Every control-surface record the three Control pages show. `None` on a
     /// firmware without them, and while the device has not been read.
     pub cs: Option<cs_model::CsData>,
+    /// The rate the device is actually running at (`REQ_GET_STATUS`
+    /// `SAMPLE_RATE`), which is what the Console's 128x lock reads. The
+    /// configured rate in the bulk packet is what it will run at next time.
+    pub sample_rate_hz: Option<u32>,
 }
 
 impl SettingsData {
@@ -146,7 +150,9 @@ impl SettingsData {
             })
             .collect();
         let cs = cs_model::CsData::read(session);
+        let sample_rate_hz = read_sample_rate(session);
         Self {
+            sample_rate_hz,
             directory,
             startup,
             uart,
@@ -157,6 +163,37 @@ impl SettingsData {
             preset_names,
             cs_dirty: cs.as_ref().is_some_and(|c| c.status.dirty),
             cs,
+        }
+    }
+
+    /// Take on a re-read, leaving what it does not cover.
+    ///
+    /// A `None` field means that read stalled or was not asked for, which is
+    /// not evidence that the device lost the feature: keep what we had.
+    pub fn adopt(&mut self, r: Refresh) {
+        if r.uart.is_some() {
+            self.uart = r.uart;
+        }
+        if r.i2c.is_some() {
+            self.i2c = r.i2c;
+        }
+        if r.iface.is_some() {
+            self.iface = r.iface;
+        }
+        if r.spdif.is_some() {
+            self.spdif = r.spdif;
+        }
+        if r.claims.is_some() {
+            self.claims = r.claims;
+        }
+        if r.sample_rate_hz.is_some() {
+            self.sample_rate_hz = r.sample_rate_hz;
+        }
+        if let Some(cs) = r.cs {
+            // The device's own unsaved flag, which is better evidence than the
+            // optimistic one a successful write sets.
+            self.cs_dirty = cs.status.dirty;
+            self.cs = Some(cs);
         }
     }
 
@@ -213,6 +250,191 @@ impl SettingsData {
             .into_iter()
             .find(|c| c.gpio == gpio && c.owner != excluding)
             .map(|c| c.owner)
+    }
+}
+
+/// What a Settings write can change under the pages' feet.
+///
+/// `survey-firmware.md` 3.14 is explicit: "Binding-config changes do NOT push
+/// notifications; re-read after writing." The same holds for the pin and
+/// interface writes, which answer a `PIN_CONFIG_*` code and change who owns a
+/// GPIO. So every session request this screen makes carries a re-read of these
+/// fields on its way home, and [`SettingsData::adopt`] installs it before the
+/// page that asked hears the reply.
+///
+/// The preset directory and the ten slot names are deliberately absent: no
+/// Settings write touches them, and they cost eleven round trips.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Refresh {
+    pub uart: Option<UartCtrlConfig>,
+    pub i2c: Option<I2cCtrlConfig>,
+    pub iface: Option<CtrlIfaceStatus>,
+    pub spdif: Option<SpdifInputConfig>,
+    pub claims: Option<Vec<PinClaim>>,
+    pub cs: Option<cs_model::CsData>,
+    pub sample_rate_hz: Option<u32>,
+}
+
+/// The rate the pipeline is running at, index `SAMPLE_RATE` of the status
+/// table (`REQ_GET_STATUS`, config.h:193).
+fn read_sample_rate(session: &mut Session) -> Option<u32> {
+    let b = session
+        .with_transport(|t| t.control_in(dspi_proto::generated::opcodes::REQ_GET_STATUS, 15, 4))
+        .ok()?;
+    Some(u32::from_le_bytes([
+        *b.first()?,
+        *b.get(1)?,
+        *b.get(2)?,
+        *b.get(3)?,
+    ]))
+}
+
+impl Refresh {
+    /// The pin map and the two interface configurations: what a hardware page's
+    /// own write can move. About four round trips.
+    pub fn hardware(session: &mut Session) -> Self {
+        use dspi_proto::generated::opcodes as op;
+        let get = |session: &mut Session, opcode: u8, len: u16| -> Option<Vec<u8>> {
+            session
+                .with_transport(|t| t.control_in(opcode, 0, len))
+                .ok()
+        };
+        Self {
+            uart: get(
+                session,
+                op::REQ_GET_UART_CONFIG,
+                UartCtrlConfig::SIZE as u16,
+            )
+            .and_then(|d| UartCtrlConfig::decode(&d).ok()),
+            i2c: get(session, op::REQ_GET_I2C_CONFIG, I2cCtrlConfig::SIZE as u16)
+                .and_then(|d| I2cCtrlConfig::decode(&d).ok()),
+            iface: get(
+                session,
+                op::REQ_GET_CTRL_IFACE_STATUS,
+                CtrlIfaceStatus::SIZE as u16,
+            )
+            .and_then(|d| CtrlIfaceStatus::decode(&d).ok()),
+            spdif: get(
+                session,
+                op::REQ_GET_SPDIF_INPUT_CONFIG,
+                SpdifInputConfig::SIZE as u16,
+            )
+            .and_then(|d| SpdifInputConfig::decode(&d).ok()),
+            claims: dspi_session::PinMap::build(session)
+                .ok()
+                .map(|m| m.claims().to_vec()),
+            cs: None,
+            sample_rate_hz: read_sample_rate(session),
+        }
+    }
+
+    /// The same, plus every control-surface record. A Control page's write
+    /// changes its own slot's health and the pin map together, and a pin a new
+    /// control just claimed must not be offered to the next one.
+    pub fn all(session: &mut Session) -> Self {
+        Self {
+            cs: cs_model::CsData::read(session),
+            ..Self::hardware(session)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writes whose answer the row shows
+// ---------------------------------------------------------------------------
+
+/// The outcome codes a pin, clock or interface write answers
+/// (`PIN_CONFIG_*`, config.h:606-612).
+pub mod pin_status {
+    pub const SUCCESS: u8 = 0x00;
+    pub const INVALID_PIN: u8 = 0x01;
+    pub const PIN_IN_USE: u8 = 0x02;
+    pub const INVALID_OUTPUT: u8 = 0x03;
+    pub const OUTPUT_ACTIVE: u8 = 0x04;
+    /// A non-pin field out of range: a baud rate, an I2C address.
+    pub const INVALID_PARAM: u8 = 0x05;
+}
+
+/// What a page makes of one of those codes: the sentence, and whether it is a
+/// failure. Every site words it the way the Console words that row.
+pub(crate) type Explain = dyn Fn(u8) -> (String, bool);
+
+/// A registry write whose device answer the row shows inline.
+///
+/// Every pin and clock setter is a write-as-read (config.h:596-604): the
+/// transfer succeeds, a refusal leaves the old value in place, and only the
+/// status byte says why. Sending the write as a command instead throws that
+/// byte away, which is how a row came to claim success for a move the device
+/// had refused.
+pub(crate) fn device_write(
+    tag: u32,
+    path: &'static str,
+    indices: Vec<u8>,
+    value: dspi_proto::value::Value,
+    explain: std::rc::Rc<Explain>,
+) -> SessionRequest {
+    SessionRequest::new(tag, move |session| {
+        match session.write(path, &indices, value.clone()) {
+            Err(e) => SessionReply::Err(e.to_string()),
+            Ok(out) => {
+                // An opcode with a plain data stage answers no status byte, so
+                // the confirming readback is the only evidence there is.
+                let code = session.last_write_status().unwrap_or({
+                    if out.is_confirmed() {
+                        pin_status::SUCCESS
+                    } else {
+                        pin_status::INVALID_PARAM
+                    }
+                });
+                reply(explain(code))
+            }
+        }
+    })
+}
+
+/// The same for the two control-interface configurations, whose SET is a plain
+/// data stage with no answer: the outcome lands in
+/// `CtrlIfaceStatus.<iface>_last_status` and has to be read back
+/// (config.h:542-545).
+pub(crate) fn iface_write(
+    tag: u32,
+    path: &'static str,
+    value: dspi_proto::value::Value,
+    uart: bool,
+    explain: std::rc::Rc<Explain>,
+) -> SessionRequest {
+    SessionRequest::new(tag, move |session| {
+        match session.write(path, &[], value.clone()) {
+            Err(e) => SessionReply::Err(e.to_string()),
+            Ok(_) => {
+                let status = session
+                    .with_transport(|t| {
+                        t.control_in(
+                            dspi_proto::generated::opcodes::REQ_GET_CTRL_IFACE_STATUS,
+                            0,
+                            CtrlIfaceStatus::SIZE as u16,
+                        )
+                    })
+                    .ok()
+                    .and_then(|d| CtrlIfaceStatus::decode(&d).ok());
+                // A firmware that cannot answer the status opcode leaves the
+                // write's own success as the only evidence there is.
+                let code = match (status, uart) {
+                    (Some(s), true) => s.uart_last_status,
+                    (Some(s), false) => s.i2c_last_status,
+                    (None, _) => pin_status::SUCCESS,
+                };
+                reply(explain(code))
+            }
+        }
+    })
+}
+
+fn reply((text, failed): (String, bool)) -> SessionReply {
+    if failed {
+        SessionReply::Err(text)
+    } else {
+        SessionReply::Ok(text)
     }
 }
 
@@ -323,6 +545,14 @@ pub(crate) enum Row {
     },
 }
 
+/// A note wraps to as many lines as it needs.
+///
+/// Section footers are the Console's own prose, and clipping them loses whole
+/// sentences: the Groups footer defines "Match Members Exactly", the Surfaces
+/// and Macros footers explain Save against Revert, and Control Interfaces ends
+/// on the I2C pull-ups. The page scrolls, so there is room.
+const NOTE_LINES: usize = usize::MAX;
+
 impl Row {
     pub fn note(text: impl Into<String>) -> Self {
         Self::Note(text.into())
@@ -359,7 +589,7 @@ impl Row {
         match self {
             Row::Blank => 1,
             Row::Section(_) => 1,
-            Row::Note(t) => wrap(t, width.saturating_sub(2) as usize, 4).len() as u16,
+            Row::Note(t) => wrap(t, width.saturating_sub(2) as usize, NOTE_LINES).len() as u16,
             Row::Banner(_, _, body) => {
                 1 + wrap(body, width.saturating_sub(3) as usize, 3).len() as u16
             }
@@ -379,7 +609,7 @@ impl Row {
             Row::Blank => {}
             Row::Section(t) => SectionHeader::new(t, theme).render(area, buf),
             Row::Note(t) => {
-                for (i, line) in wrap(t, area.width.saturating_sub(2) as usize, 4)
+                for (i, line) in wrap(t, area.width.saturating_sub(2) as usize, NOTE_LINES)
                     .iter()
                     .enumerate()
                 {
@@ -648,6 +878,10 @@ pub(crate) enum PageEvent {
     /// Work that needs the session itself: a control-surface write, whose
     /// deferred status protocol the shared command grammar does not speak.
     Session(SessionRequest),
+    /// The same for an output-config edit: a pin or clock write whose
+    /// `PIN_CONFIG_*` answer the row shows inline. Marks the second dirty
+    /// category, as [`PageEvent::IoCommand`] does.
+    IoSession(SessionRequest),
     /// The app-side settings file changed and should be written out.
     Config(Box<AppConfig>),
 }
@@ -775,17 +1009,20 @@ pub fn available(page: Page, state: &DeviceState, connected: bool) -> bool {
         // The I2S clock pins are an RP mux concern; a platform we do not know
         // is assumed not to have them, which is the Console's STM32 rule.
         Page::I2s => matches!(state.caps.platform, Platform::Rp2040 | Platform::Rp2350),
-        Page::Inputs => {
-            feature("spdif_multi_input")
-                || feature("i2s_input_channels")
-                || feature("adat_input")
-                || feature("lg_sound_sync")
-        }
+        // The Console's rule is `inputSourceSupported` alone: a firmware with a
+        // selectable input source has an Inputs page even when it has none of
+        // the optional receivers.
+        Page::Inputs => feature("input_source"),
         Page::Interfaces => feature("uart_control") || feature("i2c_control"),
         // Shown while disconnected too: the page carries its own placeholder.
         Page::Surfaces => state.caps.cs.is_some() || !connected,
         Page::Groups => state.caps.cs.as_ref().is_some_and(|c| c.max_groups > 0),
-        Page::Macros => state.caps.cs.as_ref().is_some_and(|c| c.max_macros > 0),
+        // A macro with no room for a step is not a macro (`csMacrosSupported`).
+        Page::Macros => state
+            .caps
+            .cs
+            .as_ref()
+            .is_some_and(|c| c.max_macros > 0 && c.max_macro_steps > 0),
         _ => true,
     }
 }
@@ -986,10 +1223,12 @@ impl IoSnapshot {
                 }
             ));
         }
-        // The Console restores the slave BCK pair before the clock-pin mode, so
-        // re-entering split finds a valid pair. There is no registry path for
-        // `REQ_SET_I2S_BCK_PIN` with role 1 (`i2s.bck` is role 0 only), so the
-        // slave pair cannot be restored from here; see the phase report.
+        // The slave pair goes back before the clock-pin mode, so re-entering
+        // split finds a valid pair. Role 1 of `REQ_SET_I2S_BCK_PIN`
+        // (config.h:485).
+        if self.bck_pin_slave != now.bck_pin_slave {
+            out.push(format!("i2s.bck.slave {}", self.bck_pin_slave));
+        }
         if self.clock_pin_mode != now.clock_pin_mode {
             out.push(format!(
                 "i2s.clockpins {}",
@@ -1089,6 +1328,10 @@ pub struct SettingsScreen {
     /// Where the app-side settings go. `None` is the platform's own location;
     /// tests point it somewhere disposable so they never touch a real one.
     config_path: Option<std::path::PathBuf>,
+    /// Where a session request leaves the re-read it took on its way home. The
+    /// runner answers a request and then delivers the reply, so this is full
+    /// exactly once, in `session_result`, before the page that asked sees it.
+    refresh: std::rc::Rc<std::cell::RefCell<Option<Refresh>>>,
 }
 
 impl SettingsScreen {
@@ -1123,6 +1366,7 @@ impl SettingsScreen {
             pending: None,
             connected: true,
             config_path: None,
+            refresh: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
         s.select_row_for(state);
         s
@@ -1385,6 +1629,29 @@ impl SettingsScreen {
         };
     }
 
+    /// Wrap a page's session request so it re-reads the device before the
+    /// reply comes home.
+    ///
+    /// Nothing on the control-surface or hardware path pushes a notification
+    /// (`survey-firmware.md` 3.14), so a page that only ever hears "Applied"
+    /// keeps drawing the snapshot Settings opened with: a control that just
+    /// went live still reads Inactive, and a GPIO it just claimed is still
+    /// offered as free to the next one. The re-read happens inside the same
+    /// session call, so there is one round of transfers, not two.
+    fn with_refresh(&self, req: SessionRequest, control: bool) -> SessionRequest {
+        let slot = self.refresh.clone();
+        let inner = req.run.clone();
+        SessionRequest::new(req.tag, move |session| {
+            let reply = (inner)(session);
+            *slot.borrow_mut() = Some(if control {
+                Refresh::all(session)
+            } else {
+                Refresh::hardware(session)
+            });
+            reply
+        })
+    }
+
     fn absorb(&mut self, ev: PageEvent, state: &DeviceState) -> ScreenEvent {
         match ev {
             PageEvent::Handled => ScreenEvent::Handled,
@@ -1403,7 +1670,16 @@ impl SettingsScreen {
                 self.pending = Some(Pending::Page);
                 ScreenEvent::Popup(p)
             }
-            PageEvent::Session(r) => ScreenEvent::Session(r),
+            // Only the three Control pages can change a control-surface
+            // record, and reading them all back is about seventy transfers.
+            PageEvent::Session(r) => {
+                let cs = matches!(self.page, Page::Surfaces | Page::Groups | Page::Macros);
+                ScreenEvent::Session(self.with_refresh(r, cs))
+            }
+            PageEvent::IoSession(r) => {
+                self.begin_output_edit(state);
+                ScreenEvent::Session(self.with_refresh(r, false))
+            }
             PageEvent::Config(c) => {
                 self.config = *c;
                 self.pages.graphing.adopt(self.config.clone());
@@ -1688,6 +1964,12 @@ impl Screen for SettingsScreen {
         if matches!(reply, SessionReply::Ok(_)) {
             self.data.cs_dirty = true;
         }
+        // The request re-read the device on its way home; take that on before
+        // the page draws or hears anything, so its slot health, its panel
+        // state and the pin claims are the device's and not the snapshot's.
+        if let Some(r) = self.refresh.borrow_mut().take() {
+            self.data.adopt(r);
+        }
         let ev = {
             let global_dirty = self.pages.global.dirty(state, &self.data);
             let cx = Cx {
@@ -1701,6 +1983,10 @@ impl Screen for SettingsScreen {
                 Page::Surfaces => self.pages.surfaces.session_result(tag, reply, &cx),
                 Page::Groups => self.pages.groups.session_result(tag, reply, &cx),
                 Page::Macros => self.pages.macros.session_result(tag, reply, &cx),
+                Page::Interfaces => self.pages.interfaces.session_result(tag, reply, &cx),
+                Page::Inputs => self.pages.inputs.session_result(tag, reply, &cx),
+                Page::Outputs => self.pages.outputs.session_result(tag, reply, &cx),
+                Page::I2s => self.pages.i2s.session_result(tag, reply, &cx),
                 _ => PageEvent::Handled,
             }
         };
@@ -1992,6 +2278,7 @@ pub mod demo {
             ],
             cs_dirty: false,
             cs: None,
+            sample_rate_hz: Some(48_000),
         }
     }
 }
@@ -2046,24 +2333,35 @@ pub(crate) mod tests {
             .join("\n")
     }
 
-    const EVERY_PAGE: [Page; 12] = [
-        Page::About,
-        Page::Advanced,
-        Page::Graphing,
-        Page::Overview,
-        Page::Inputs,
-        Page::Outputs,
-        Page::I2s,
-        Page::Global,
-        Page::Surfaces,
-        Page::Interfaces,
-        Page::Groups,
-        Page::Macros,
-    ];
+    /// Every page there is, taken from the sidebar's own groups so a page
+    /// added there cannot be silently skipped by the tests below.
+    fn every_page() -> Vec<Page> {
+        GROUPS
+            .iter()
+            .flat_map(|(_, pages)| *pages)
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn every_page_is_in_a_sidebar_group() {
+        // `Page` has no reflection, so the count is the guard: a variant added
+        // without a group would leave this stale.
+        assert_eq!(every_page().len(), 12);
+        for page in every_page() {
+            assert!(!page.title().is_empty());
+            assert!(!page.short().is_empty());
+            assert_eq!(
+                SettingsScreen::page_from_name(page.title()),
+                Some(page),
+                "{page:?} is not reachable by name"
+            );
+        }
+    }
 
     #[test]
     fn every_page_fills_the_screen_at_both_sizes() {
-        for page in EVERY_PAGE {
+        for page in every_page() {
             let (mut s, st) = screen(page);
             for (w, h) in [(120u16, 40u16), (80, 24)] {
                 let f = frame(&mut s, &st, w, h);
@@ -2134,6 +2432,42 @@ pub(crate) mod tests {
         let f = frame(&mut s, &st, 120, 40);
         assert!(!f.contains("Control Interf."), "{f}");
         assert!(!f.contains("Channel Groups"), "{f}");
+    }
+
+    /// The two availability rules the Console states and this did not: the
+    /// Inputs page hangs off `inputSourceSupported`, and a macro with no room
+    /// for a step is not a macro.
+    #[test]
+    fn availability_follows_the_consoles_two_compound_rules() {
+        let feature = |name: &str, present: bool| dspi_session::probe::Feature {
+            name: name.into(),
+            present,
+            evidence: "probe".into(),
+        };
+
+        // Input source present, every optional receiver absent: the Console
+        // still shows the page, and this used to lose it.
+        let mut st = state();
+        st.caps.features = vec![
+            feature("input_source", true),
+            feature("spdif_multi_input", false),
+            feature("i2s_input_channels", false),
+            feature("adat_input", false),
+            feature("lg_sound_sync", false),
+        ];
+        assert!(available(Page::Inputs, &st, true));
+        st.caps.features = vec![feature("input_source", false)];
+        assert!(!available(Page::Inputs, &st, true));
+
+        // `maxMacros > 0 && maxMacroSteps > 0`.
+        let mut st = state();
+        let mut caps = cs_model::demo::caps();
+        caps.max_macro_steps = 0;
+        st.caps.cs = Some(caps);
+        assert!(!available(Page::Macros, &st, true));
+        assert!(available(Page::Groups, &st, true), "groups are unaffected");
+        st.caps.cs = Some(cs_model::demo::caps());
+        assert!(available(Page::Macros, &st, true));
     }
 
     #[test]
@@ -2270,6 +2604,60 @@ pub(crate) mod tests {
         );
     }
 
+    /// A section footer is the Console's own prose. Clipped at four wrapped
+    /// lines, every one of them lost its last sentence, including the one the
+    /// survey names: the Groups footer is where "Match Members Exactly" is
+    /// defined.
+    #[test]
+    fn a_footer_note_is_not_clipped() {
+        for (page, tail) in [
+            (
+                Page::Groups,
+                "Groups are stored on the device alongside the controls and share their Save and \
+                 Revert.",
+            ),
+            (
+                Page::Surfaces,
+                "use Save to keep them across a reboot, or Revert to discard them.",
+            ),
+            (
+                Page::Interfaces,
+                "Fit external pull-ups (2.2k - 4.7k) on the I2C bus.",
+            ),
+        ] {
+            let st = crate::settings::cs_model::demo::state();
+            let s = SettingsScreen::new(
+                &st,
+                crate::settings::cs_model::demo::settings_data(),
+                AppConfig::default(),
+            )
+            .config_path(scratch("footer"))
+            .open(page, &st);
+            let cx = s.cx(&st);
+            let rows = s.current_ref().rows(&cx);
+            let note = rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::Note(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .find(|t| t.len() > 200)
+                .unwrap_or_else(|| panic!("{page:?} has no footer"));
+            let width = 100u16;
+            let drawn = wrap(&note, width.saturating_sub(2) as usize, NOTE_LINES).join(" ");
+            let want: String = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                drawn.contains(&want),
+                "{page:?} lost its last sentence:\n{drawn}"
+            );
+            assert!(!drawn.contains('…'), "{page:?} was ellipsised:\n{drawn}");
+            // And the row asks for the height that takes.
+            let lines = wrap(&note, width.saturating_sub(2) as usize, NOTE_LINES).len() as u16;
+            assert_eq!(Row::Note(note).height(width), lines);
+            assert!(lines > 4, "{page:?} needs more than the old cap");
+        }
+    }
+
     #[test]
     fn a_page_name_maps_to_its_page() {
         assert_eq!(SettingsScreen::page_from_name("about"), Some(Page::About));
@@ -2298,6 +2686,20 @@ pub(crate) mod tests {
         // The type change leads, as the Console's restore does.
         assert!(cmds[0].starts_with("out.type"), "{cmds:?}");
         assert!(base.restore_commands(&base).is_empty());
+
+        // The slave clock pair goes back, and before the clock-pin mode, so
+        // re-entering split finds a valid pair (config.h:485).
+        let mut moved = base.clone();
+        moved.bck_pin_slave = 2;
+        moved.clock_pin_mode = 1;
+        let cmds = base.restore_commands(&moved);
+        let at = |t: &str| {
+            cmds.iter()
+                .position(|c| c.starts_with(t))
+                .unwrap_or_else(|| panic!("missing {t}: {cmds:?}"))
+        };
+        assert_eq!(cmds[at("i2s.bck.slave")], "i2s.bck.slave 20");
+        assert!(at("i2s.bck.slave") < at("i2s.clockpins"), "{cmds:?}");
     }
 
     /// The key events a key-line token stands for. Settings advertises `Tab`
@@ -2329,7 +2731,7 @@ pub(crate) mod tests {
     /// the key is offered at every focusable row and only has to land on one.
     #[test]
     fn every_advertised_key_is_handled_on_every_page() {
-        for page in EVERY_PAGE {
+        for page in every_page() {
             let advertised = screen(page).0.keys();
             let controls = {
                 let (s, st) = screen(page);
@@ -2359,6 +2761,58 @@ pub(crate) mod tests {
                     assert!(
                         landed,
                         "{:?} does nothing anywhere on {page:?} (from {})",
+                        k.code, help.key
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same, inside an expanded card.
+    ///
+    /// The three Control pages are lists of cards, and most of their rows only
+    /// exist once one is open; the fixture the test above uses has no
+    /// control-surface data at all, so it never reached them.
+    #[test]
+    fn every_advertised_key_is_handled_inside_an_expanded_card() {
+        let open = |page: Page| {
+            let st = cs_model::demo::state();
+            let mut s =
+                SettingsScreen::new(&st, cs_model::demo::settings_data(), AppConfig::default())
+                    .config_path(scratch("cards"))
+                    .open(page, &st);
+            s.focus = Focus::Page;
+            // The card list's first Expand button.
+            s.current().set_cursor(0);
+            s.handle(key(KeyCode::Enter), &st);
+            (s, st)
+        };
+        for page in [Page::Surfaces, Page::Groups, Page::Macros] {
+            let (s, st) = open(page);
+            let cx = s.cx(&st);
+            let controls = s
+                .current_ref()
+                .rows(&cx)
+                .iter()
+                .filter(|r| r.focusable())
+                .count();
+            assert!(controls > 3, "{page:?} did not open a card: {controls}");
+            for help in s.keys() {
+                for k in keys_for(help.key) {
+                    if matches!(k.code, KeyCode::Esc) {
+                        continue;
+                    }
+                    let landed = (0..controls).any(|row| {
+                        let (mut s, st) = open(page);
+                        s.current().set_cursor(row);
+                        let before = (s.page, s.focus, s.current_ref().cursor(), s.page_scroll);
+                        let ev = s.handle(k, &st);
+                        let after = (s.page, s.focus, s.current_ref().cursor(), s.page_scroll);
+                        ev != ScreenEvent::Unhandled || before != after
+                    });
+                    assert!(
+                        landed,
+                        "{:?} does nothing inside an open card on {page:?} (from {})",
                         k.code, help.key
                     );
                 }

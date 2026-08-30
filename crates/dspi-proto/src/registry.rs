@@ -118,6 +118,12 @@ pub enum WValue {
     /// The value itself rides in `wValue`; there is no data stage. This is how
     /// the write-as-read opcodes carry their parameters.
     ValueOnly,
+    /// `(role << 8) | value` on a write, and the bare role on a read.
+    ///
+    /// `REQ_SET_I2S_BCK_PIN` takes the clock role in `wValue`'s high byte
+    /// (config.h:334-336, :485), so master and slave are one opcode with two
+    /// parameters rather than two opcodes.
+    RoleValue(u8),
     /// `(step << 8) | macro`, used by the macro-step write. Indices are given
     /// macro first, so the packing is deliberately reversed here.
     MacroStep,
@@ -1875,6 +1881,27 @@ pub static REGISTRY: &[ParamDesc] = &[
         Some(op::REQ_GET_I2S_BCK_PIN),
         DWar,
         Wv::ValueOnly,
+        Hz::Reconfig,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "i2s.bck.slave",
+        "I2S slave bit clock GPIO",
+        "Bit clock pin the slave role listens on while clock pins are split",
+        System,
+        Expert,
+        Int {
+            unit: Unit::Gpio,
+            min: 0,
+            max: 29,
+        },
+        Tg::None,
+        Some(op::REQ_SET_I2S_BCK_PIN),
+        Some(op::REQ_GET_I2S_BCK_PIN),
+        DWar,
+        // Role 1 is the slave pair; role 0 is `i2s.bck` above (config.h:485).
+        Wv::RoleValue(1),
         Hz::Reconfig,
         Ps::LiveOnly,
         Rq::Always,

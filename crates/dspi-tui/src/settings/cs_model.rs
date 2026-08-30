@@ -844,30 +844,6 @@ pub(crate) fn run(
     }
 }
 
-/// The same, for the two writes that answer nothing: arming and cancelling a
-/// learn.
-pub(crate) fn run_unit(
-    session: &mut Session,
-    ok: &str,
-    f: impl FnOnce(&mut Surfaces<'_>) -> dspi_session::surfaces::Result<()>,
-) -> SessionReply {
-    let limits = session
-        .capabilities()
-        .cs
-        .as_ref()
-        .map(Limits::from)
-        .unwrap_or_default();
-    let out = session.with_transport(|t| {
-        let mut s = Surfaces::new(t, limits);
-        Ok(f(&mut s))
-    });
-    match out {
-        Ok(Ok(())) => SessionReply::Ok(ok.into()),
-        Ok(Err(e)) => SessionReply::Err(e.to_string()),
-        Err(e) => SessionReply::Err(e.to_string()),
-    }
-}
-
 /// The same again, for a write that answers a bare status code rather than a
 /// status packet: firing a macro is immediate, not deferred.
 pub(crate) fn run_code(
@@ -1332,10 +1308,14 @@ pub(crate) fn target_choice(
     }
 }
 
-/// Valid filter bands on one DSP channel: PEQ 0-9 always, plus the four
-/// crossover bands for FILTER_FREQ and FILTER_BYPASS on an output.
+/// Valid filter bands on one DSP channel: every PEQ band the device serves,
+/// plus the four crossover bands for FILTER_FREQ and FILTER_BYPASS on an
+/// output.
+///
+/// The PEQ count is `caps.max_bands`, which the device answers; the `20..=23`
+/// crossover range beside it is a frozen firmware constant.
 pub fn bands_on_channel(state: &DeviceState, n: u8, dsp_channel: u8) -> Vec<u8> {
-    let mut bands: Vec<u8> = (0..10).collect();
+    let mut bands: Vec<u8> = (0..state.caps.max_bands).collect();
     let is_output = dsp_channel >= state.caps.num_inputs;
     if is_output && (n == noun::FILTER_FREQ || n == noun::FILTER_BYPASS) {
         bands.extend([20, 21, 22, 23]);
@@ -1356,7 +1336,7 @@ pub fn band_options(cs: &CsData, state: &DeviceState, n: u8, t: u8, grouped: boo
         .map(|g| g.members())
         .unwrap_or_default();
     if members.is_empty() {
-        return (0..10).collect();
+        return (0..state.caps.max_bands).collect();
     }
     let mut common: Option<BTreeSet<u8>> = None;
     for m in members {
@@ -2514,6 +2494,39 @@ pub mod demo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PEQ band count is device-served (`caps.max_bands`, probe.rs:184);
+    /// only the four crossover bands beside it are a frozen firmware constant.
+    #[test]
+    fn the_band_picker_is_sized_by_the_device() {
+        let mut st = demo::state();
+        st.caps.max_bands = 6;
+        // An input has PEQ bands only.
+        assert_eq!(
+            bands_on_channel(&st, noun::FILTER_FREQ, 0),
+            (0..6).collect::<Vec<u8>>()
+        );
+        // An output adds the crossover range for the two nouns that take it.
+        let out = st.caps.num_inputs;
+        assert_eq!(
+            bands_on_channel(&st, noun::FILTER_FREQ, out),
+            vec![0, 1, 2, 3, 4, 5, 20, 21, 22, 23]
+        );
+        assert_eq!(
+            bands_on_channel(&st, noun::FILTER_GAIN, out),
+            (0..6).collect::<Vec<u8>>()
+        );
+
+        // A group with no members falls back to the same served count.
+        let cs = demo::data();
+        assert_eq!(
+            band_options(&cs, &st, noun::FILTER_FREQ, 7, true),
+            (0..6).collect::<Vec<u8>>()
+        );
+
+        st.caps.max_bands = 16;
+        assert_eq!(bands_on_channel(&st, noun::FILTER_GAIN, 0).len(), 16);
+    }
 
     #[test]
     fn the_name_tables_are_the_consoles() {

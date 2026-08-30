@@ -99,6 +99,10 @@ pub fn explain_status(code: u8) -> String {
         0x02 => "that GPIO is already in use".into(),
         0x03 => "that output or slot does not exist".into(),
         0x04 => "disable the output first".into(),
+        // `PIN_CONFIG_INVALID_PARAM`, config.h:612: a non-pin field out
+        // of range. A display record with a bad I2C address or
+        // brightness reaches it (control_surfaces.h:607).
+        0x05 => "that setting is out of range".into(),
         0x10 => "no such binding slot".into(),
         0x11 => "not a component this firmware knows".into(),
         0x12 => "not a parameter this firmware knows".into(),
@@ -560,14 +564,17 @@ impl<'t> Surfaces<'t> {
 
     // --------------------------------------------------------------- IR learn
 
-    pub fn arm_learn(&mut self) -> Result<()> {
-        arm_learn(self.t)?;
-        Ok(())
+    /// Arm the receiver, answering the device's own verdict.
+    ///
+    /// `control_surfaces.h:798`: the opcode "returns PIN_CONFIG_SUCCESS or
+    /// CS_STATUS_NO_IR (arm without a live IR component)". Dropping that byte
+    /// leaves a refused arm looking like a live one that never hears a button.
+    pub fn arm_learn(&mut self) -> Result<u8> {
+        Ok(arm_learn(self.t)?)
     }
 
-    pub fn cancel_learn(&mut self) -> Result<()> {
-        cancel_learn(self.t)?;
-        Ok(())
+    pub fn cancel_learn(&mut self) -> Result<u8> {
+        Ok(cancel_learn(self.t)?)
     }
 
     pub fn read_learn(&mut self) -> Result<IrLearnResult> {
@@ -620,15 +627,20 @@ pub fn read_status(t: &mut dyn Transport, max_bindings: u8, max_ir: u8) -> TResu
     Status::decode_sized(&d, max_bindings, max_ir).map_err(|e| TransportError::Usb(e.to_string()))
 }
 
-/// Start listening for a remote button.
-pub fn arm_learn(t: &mut dyn Transport) -> TResult<()> {
-    t.control_in(op::REQ_CS_IR_LEARN, learn::ARM, 1)?;
-    Ok(())
+/// Start listening for a remote button, answering `PIN_CONFIG_SUCCESS` or
+/// `CS_STATUS_NO_IR` (control_surfaces.h:798).
+pub fn arm_learn(t: &mut dyn Transport) -> TResult<u8> {
+    Ok(t.control_in(op::REQ_CS_IR_LEARN, learn::ARM, 1)?
+        .first()
+        .copied()
+        .unwrap_or(status::SUCCESS))
 }
 
-pub fn cancel_learn(t: &mut dyn Transport) -> TResult<()> {
-    t.control_in(op::REQ_CS_IR_LEARN, learn::CANCEL, 1)?;
-    Ok(())
+pub fn cancel_learn(t: &mut dyn Transport) -> TResult<u8> {
+    Ok(t.control_in(op::REQ_CS_IR_LEARN, learn::CANCEL, 1)?
+        .first()
+        .copied()
+        .unwrap_or(status::SUCCESS))
 }
 
 /// Poll for a learn result.
@@ -1206,6 +1218,24 @@ mod tests {
         assert_eq!(values, vec![learn::ARM, learn::READ]);
     }
 
+    /// `REQ_CS_IR_LEARN` answers a status byte, and a refused arm is the whole
+    /// reason to read it: without it the page waits for a button on a receiver
+    /// the device never armed (control_surfaces.h:798).
+    #[test]
+    fn arming_a_learn_reports_the_devices_verdict() {
+        use crate::surfaces::status;
+        let mut t = MockTransport::new().data(op::REQ_CS_IR_LEARN, vec![status::SUCCESS]);
+        assert_eq!(surfaces(&mut t).arm_learn().unwrap(), status::SUCCESS);
+
+        // CS_STATUS_NO_IR: arming with no live receiver.
+        let mut t = MockTransport::new().data(op::REQ_CS_IR_LEARN, vec![0x1E]);
+        assert_eq!(surfaces(&mut t).arm_learn().unwrap(), 0x1E);
+        assert_eq!(explain_status(0x1E), "set up an IR receiver first");
+
+        let mut t = MockTransport::new().data(op::REQ_CS_IR_LEARN, vec![status::SUCCESS]);
+        assert_eq!(surfaces(&mut t).cancel_learn().unwrap(), status::SUCCESS);
+    }
+
     #[test]
     fn a_learn_that_times_out_is_distinguishable_from_one_still_waiting() {
         assert_ne!(learn::TIMEOUT, learn::ARMED);
@@ -1240,7 +1270,8 @@ mod tests {
     #[test]
     fn every_status_code_explains_itself() {
         for code in [
-            0x00u8, 0x02, 0x13, 0x15, 0x1A, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+            0x00u8, 0x02, 0x05, 0x13, 0x15, 0x1A, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24,
+            0x25,
         ] {
             let msg = explain_status(code);
             // The bar is "reads as English", not a length: "applied" is a

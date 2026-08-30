@@ -114,6 +114,13 @@ impl GroupsPage {
         self.health = cs.ext.group_status;
     }
 
+    /// Slot health, which the status packet carries eight of whatever
+    /// `max_groups` says (control_surfaces.h): a device reporting more than
+    /// eight has no health to report for the rest, not a panic.
+    fn health(&self, g: usize) -> u8 {
+        self.health.get(g).copied().unwrap_or(0)
+    }
+
     /// Slots holding a group, or with one staged. Deliberately weaker than
     /// `CsGroup::is_configured`, which means "a group the device will accept"
     /// and so demands a member: a card being edited holds a kind and a name
@@ -156,7 +163,7 @@ impl GroupsPage {
         };
         let (pill, tone) = if dirty {
             ("Pending", StatusTone::Warning)
-        } else if self.health[g] != 0 && self.live[g].is_configured() {
+        } else if self.health(g) != 0 && self.live[g].is_configured() {
             ("Inactive", StatusTone::Warning)
         } else if self.live[g].is_configured() {
             ("Active", StatusTone::Ok)
@@ -186,8 +193,8 @@ impl GroupsPage {
                 enabled: true,
             },
         ));
-        if self.health[g] != 0 && self.live[g].is_configured() && !dirty {
-            rows.push((None, Row::Status(m::inactive_reason(self.health[g]), true)));
+        if self.health(g) != 0 && self.live[g].is_configured() && !dirty {
+            rows.push((None, Row::Status(m::inactive_reason(self.health(g)), true)));
         }
         if expanded {
             rows.push((
@@ -474,8 +481,8 @@ impl SettingsPage for GroupsPage {
             && let Some(d) = c.to_digit(10)
             && d >= 1
         {
-            let g = d as usize - 1;
-            if g < self.drafts.len() && self.in_use(g) {
+            // The nth card on screen, not the nth group slot.
+            if let Some(g) = self.visible().get(d as usize - 1).copied() {
                 self.expanded.insert(g);
                 return PageEvent::Handled;
             }
@@ -678,6 +685,68 @@ mod tests {
         let f = frame(&mut s, &st, 120, 40);
         assert!(f.contains("Channel Type"), "the card opened:\n{f}");
         assert!(f.contains("Outputs"), "{f}");
+    }
+
+    /// A digit counts the cards on screen, the way it counts bands: with
+    /// groups in slots 1 and 6, `2` opens the second card and not a slot the
+    /// page is not drawing.
+    #[test]
+    fn a_digit_opens_the_nth_card_not_the_nth_slot() {
+        let mut d = m::demo::settings_data();
+        let cs = d.cs.as_mut().expect("cs");
+        cs.groups = vec![CsGroup::default(); 8];
+        cs.groups[0] = CsGroup {
+            target_kind: m::target::OUTPUT_CH,
+            member_mask: 0b0011,
+            name: "Front Pair".into(),
+        };
+        cs.groups[5] = CsGroup {
+            target_kind: m::target::OUTPUT_CH,
+            member_mask: 0b1100,
+            name: "Rear Pair".into(),
+        };
+        let mut p = GroupsPage::new(&d);
+        assert_eq!(p.visible(), vec![0, 5]);
+        let cx = Cx {
+            state: &m::demo::state(),
+            data: &d,
+            config: &AppConfig::default(),
+            connected: true,
+            global_dirty: false,
+        };
+        assert_eq!(p.key(key(KeyCode::Char('2')), &cx), PageEvent::Handled);
+        assert!(p.expanded.contains(&5), "the second card, in slot 6");
+        assert_eq!(p.key(key(KeyCode::Char('3')), &cx), PageEvent::Unhandled);
+    }
+
+    /// `CsExtStatusPacket` carries eight health bytes whatever `max_groups`
+    /// says, and the slot indices come from the caps. A device reporting more
+    /// than eight has no health for the rest, not a panic.
+    #[test]
+    fn a_device_with_more_group_slots_than_health_bytes_does_not_panic() {
+        let mut d = m::demo::settings_data();
+        let cs = d.cs.as_mut().expect("cs");
+        cs.groups = vec![
+            CsGroup {
+                target_kind: m::target::OUTPUT_CH,
+                member_mask: 0b0011,
+                name: "Zone".into(),
+            };
+            12
+        ];
+        cs.caps.max_groups = 12;
+        let p = GroupsPage::new(&d);
+        assert_eq!(p.health(11), 0, "past the packet's eight");
+        let st = m::demo::state();
+        let cx = Cx {
+            state: &st,
+            data: &d,
+            config: &AppConfig::default(),
+            connected: true,
+            global_dirty: false,
+        };
+        assert_eq!(p.visible().len(), 12);
+        assert!(!p.build(&cx).is_empty());
     }
 
     #[test]

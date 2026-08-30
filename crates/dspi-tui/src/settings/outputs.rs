@@ -9,9 +9,15 @@
 //! [`IoCommand`](super::PageEvent::IoCommand) and why the save bar comes up
 //! while the wiring is device-global.
 
+use std::rc::Rc;
+
+use dspi_proto::value::Value;
+
+use crate::shell::SessionReply;
 use crate::widgets::{Action, Button, Dialog, DialogOutcome, KeyHelp, PopupList};
 
-use super::{Cx, PageEvent, Row, SettingsPage};
+use super::pin_status as st;
+use super::{Cx, Explain, PageEvent, Row, SettingsPage};
 
 /// The factory data pins for the four output slots
 /// (`HardwareSettingsTab.defaultDataPins`).
@@ -176,22 +182,108 @@ impl OutputsPage {
             .and_then(|(i, _)| i)
     }
 
+    /// The Console's sentence for each `PIN_CONFIG_*` code on this row
+    /// (`setPinForOutput`, `handleAdatStatus`).
+    fn explain(item: Item, name: String, pin: u8, owner: Option<String>) -> Rc<Explain> {
+        Rc::new(move |code| match (item, code) {
+            (Item::Type(_), st::SUCCESS) => (name.clone(), false),
+            (Item::Type(_), st::OUTPUT_ACTIVE) => {
+                ("Disable the output before changing its bus".into(), true)
+            }
+            (Item::Type(_), _) => ("Failed to change the output type".into(), true),
+
+            (Item::Pin(_), st::SUCCESS) => (format!("{name} reassigned to GPIO {pin}"), false),
+            (Item::Pin(_), st::INVALID_PIN) => (
+                format!("GPIO {pin} is not available on this platform"),
+                true,
+            ),
+            (Item::Pin(_), st::PIN_IN_USE) => (
+                match &owner {
+                    Some(o) => format!("GPIO {pin} is already assigned to {o}"),
+                    None => format!("GPIO {pin} is already in use by another output"),
+                },
+                true,
+            ),
+            (Item::Pin(_), st::INVALID_OUTPUT) => ("Invalid output index".into(), true),
+            (Item::Pin(_), st::OUTPUT_ACTIVE) => (
+                "PDM output must be disabled before changing its pin".into(),
+                true,
+            ),
+            (Item::Pin(_), _) => ("USB communication error".into(), true),
+
+            (Item::AdatPin, st::SUCCESS) => (format!("ADAT data pin set to GPIO {pin}"), false),
+            (Item::AdatPin, st::PIN_IN_USE) => (
+                match &owner {
+                    Some(o) => format!("GPIO {pin} is already assigned to {o}"),
+                    None => "That pin is already in use".to_string(),
+                },
+                true,
+            ),
+            (Item::AdatPin, st::INVALID_PIN) => {
+                (format!("GPIO {pin} isn't available on this device"), true)
+            }
+            (Item::AdatPin, st::INVALID_OUTPUT) => {
+                ("ADAT output isn't supported on this device".into(), true)
+            }
+            (Item::AdatPin, _) => ("Failed to set ADAT pin".into(), true),
+
+            (Item::AdatEnable, st::SUCCESS) => (name.clone(), false),
+            (Item::AdatEnable, st::INVALID_OUTPUT) => {
+                ("ADAT output isn't supported on this device".into(), true)
+            }
+            (Item::AdatEnable, _) => ("Failed to change the ADAT output".into(), true),
+
+            (Item::ResetPins, st::SUCCESS) => ("All pins reset to defaults".into(), false),
+            (Item::ResetPins, _) => (format!("Failed to reset {name}"), true),
+        })
+    }
+
+    fn write(
+        path: &'static str,
+        indices: Vec<u8>,
+        value: Value,
+        explain: Rc<Explain>,
+    ) -> PageEvent {
+        PageEvent::IoSession(super::device_write(0, path, indices, value, explain))
+    }
+
+    /// The factory GPIO of every output, the sub last.
+    ///
+    /// The Console's Reset writes these concrete pins rather than the
+    /// `PIN_RESET_TO_DEFAULT` sentinel, which is 0xFF and outside the
+    /// parameter's own range.
+    fn factory_pins(cx: &Cx<'_>) -> Vec<u8> {
+        let count = cx.state.output_pins().len();
+        let slots = count.saturating_sub(1);
+        (0..count)
+            .map(|i| {
+                if i < slots {
+                    DEFAULT_DATA_PINS.get(i).copied().unwrap_or(DEFAULT_PDM_PIN)
+                } else {
+                    DEFAULT_PDM_PIN
+                }
+            })
+            .collect()
+    }
+
     fn apply(&mut self, item: Item, choice: usize, cx: &Cx<'_>) -> PageEvent {
+        self.status = None;
         match item {
             Item::Type(slot) => {
                 if slot >= Self::slots(cx) {
                     return PageEvent::Handled;
                 }
-                let kind = if choice == 1 { "i2s" } else { "spdif" };
-                self.status = Some((
-                    format!(
-                        "Output {} set to {}",
-                        slot + 1,
-                        if choice == 1 { "I2S" } else { "S/PDIF" }
-                    ),
-                    false,
-                ));
-                PageEvent::IoCommand(format!("out.type {slot} {kind}"))
+                let name = format!(
+                    "Output {} set to {}",
+                    slot + 1,
+                    if choice == 1 { "I2S" } else { "S/PDIF" }
+                );
+                Self::write(
+                    "out.type",
+                    vec![slot as u8],
+                    Value::Choice(u8::from(choice == 1)),
+                    Self::explain(item, name, 0, None),
+                )
             }
             Item::Pin(index) => {
                 let owner = if index < Self::slots(cx) {
@@ -201,31 +293,33 @@ impl OutputsPage {
                 };
                 let current = cx.state.output_pins().get(index).copied();
                 let candidates = cx.free_pins(&owner, current);
-                let Some(pin) = candidates.get(choice) else {
+                let Some(pin) = candidates.get(choice).copied() else {
                     return PageEvent::Handled;
                 };
-                self.status = Some((format!("{owner} pin set to GPIO {pin}"), false));
-                PageEvent::IoCommand(format!("out.pin {index} {pin}"))
+                let held = cx.data.owner_of(cx.state, pin, &owner);
+                Self::write(
+                    "out.pin",
+                    vec![index as u8],
+                    Value::Int(pin as i64),
+                    Self::explain(item, owner, pin, held),
+                )
             }
             Item::AdatPin => {
                 let (_, current) = cx.state.adat_output();
                 let candidates = cx.free_pins("ADAT Output", Some(current));
-                let Some(pin) = candidates.get(choice) else {
+                let Some(pin) = candidates.get(choice).copied() else {
                     return PageEvent::Handled;
                 };
-                self.status = Some((format!("ADAT data pin set to GPIO {pin}"), false));
-                PageEvent::IoCommand(format!("adat.pin {pin}"))
+                let held = cx.data.owner_of(cx.state, pin, "ADAT Output");
+                Self::write(
+                    "adat.pin",
+                    Vec::new(),
+                    Value::Int(pin as i64),
+                    Self::explain(item, String::new(), pin, held),
+                )
             }
             _ => PageEvent::Handled,
         }
-    }
-
-    /// Every pin back to its factory value, which is what `PIN_RESET_TO_DEFAULT`
-    /// (0xFF) does one output at a time.
-    fn reset_commands(cx: &Cx<'_>) -> Vec<String> {
-        (0..cx.state.output_pins().len())
-            .map(|i| format!("out.pin {i} 255"))
-            .collect()
     }
 }
 
@@ -240,11 +334,14 @@ impl SettingsPage for OutputsPage {
         };
         match (item, action) {
             (Item::AdatEnable, Action::Toggled(on)) => {
-                self.status = Some((
-                    format!("ADAT output {}", if on { "enabled" } else { "disabled" }),
-                    false,
-                ));
-                PageEvent::IoCommand(format!("adat.enable {}", if on { "on" } else { "off" }))
+                self.status = None;
+                let name = format!("ADAT output {}", if on { "enabled" } else { "disabled" });
+                Self::write(
+                    "adat.enable",
+                    Vec::new(),
+                    Value::Bool(on),
+                    Self::explain(item, name, 0, None),
+                )
             }
             (Item::ResetPins, Action::Open) => {
                 self.confirming_reset = true;
@@ -309,8 +406,37 @@ impl SettingsPage for OutputsPage {
         if !std::mem::take(&mut self.confirming_reset) || outcome != DialogOutcome::Button(0) {
             return PageEvent::Handled;
         }
-        self.status = Some(("Output pins reset to defaults".into(), false));
-        PageEvent::IoCommand(Self::reset_commands(cx).join("\n"))
+        self.status = None;
+        // `PIN_RESET_TO_DEFAULT` still goes through the same validation, so a
+        // reset can fail with PIN_IN_USE like any other move (config.h:600).
+        let pins = Self::factory_pins(cx);
+        PageEvent::IoSession(crate::shell::SessionRequest::new(0, move |session| {
+            for (i, pin) in pins.iter().enumerate() {
+                let out = session.write("out.pin", &[i as u8], Value::Int(*pin as i64));
+                let code = match out {
+                    Err(e) => return SessionReply::Err(e.to_string()),
+                    Ok(_) => session.last_write_status().unwrap_or(st::SUCCESS),
+                };
+                if code != st::SUCCESS {
+                    let explain =
+                        Self::explain(Item::ResetPins, format!("Output {}", i + 1), *pin, None);
+                    return SessionReply::Err(explain(code).0);
+                }
+            }
+            SessionReply::Ok("All pins reset to defaults".into())
+        }))
+    }
+
+    fn session_result(&mut self, _tag: u32, reply: SessionReply, _cx: &Cx<'_>) -> PageEvent {
+        self.status = match reply {
+            SessionReply::Ok(m) => Some((m, false)),
+            SessionReply::Err(m) => Some((m, true)),
+            SessionReply::Bytes(_) => None,
+        };
+        match &self.status {
+            Some((m, _)) => PageEvent::Status(m.clone()),
+            None => PageEvent::Handled,
+        }
     }
 }
 
@@ -319,8 +445,39 @@ mod tests {
     use super::super::Page;
     use super::super::tests::{frame, key, screen};
     use super::*;
-    use crate::shell::{Screen, ScreenEvent};
+    use crate::shell::{Screen, ScreenEvent, SessionRequest};
     use crossterm::event::KeyCode;
+    use dspi_transport::MockTransport;
+
+    /// Run a page's write against a device answering `code`, and hand back both
+    /// what the row was told and what went on the wire.
+    fn answered(
+        req: &SessionRequest,
+        code: u8,
+    ) -> (SessionReply, Vec<dspi_transport::mock::Exchange>) {
+        let t = MockTransport::new().answering_everything(vec![code]);
+        let log = t.log_handle();
+        let mut caps = crate::shell::fixture::caps();
+        caps.features = ["adat_output"]
+            .into_iter()
+            .map(|name| dspi_session::probe::Feature {
+                name: name.into(),
+                present: true,
+                evidence: "answered".into(),
+            })
+            .collect();
+        let mut session = dspi_session::Session::new(Box::new(t), caps).expect("session");
+        let reply = (req.run)(&mut session);
+        let sent = log.lock().unwrap().clone();
+        (reply, sent)
+    }
+
+    fn request(ev: ScreenEvent) -> SessionRequest {
+        match ev {
+            ScreenEvent::Session(r) => r,
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn every_slot_gets_a_type_and_a_pin() {
@@ -372,13 +529,50 @@ mod tests {
     fn changing_a_type_or_a_pin_is_an_output_config_edit() {
         let (mut s, st) = screen(Page::Outputs);
         s.handle(key(KeyCode::Tab), &st);
-        match s.handle(key(KeyCode::Right), &st) {
-            ScreenEvent::Command(c) => assert_eq!(c, "out.type 0 i2s"),
-            other => panic!("{other:?}"),
-        }
+        let req = request(s.handle(key(KeyCode::Right), &st));
         assert!(s.output_dirty(), "the save bar's second category");
+        let (reply, _) = answered(&req, st::SUCCESS);
+        s.session_result(req.tag, reply, &st);
         let f = frame(&mut s, &st, 120, 40);
         assert!(f.contains("Output 1 set to I2S"), "the status row: {f}");
+    }
+
+    /// A pin move is a write-as-read: the transfer succeeds whatever the
+    /// device decides, and only the `PIN_CONFIG_*` byte says which
+    /// (config.h:606-612). The row reports that byte, and names the pin's
+    /// owner the way the Console does.
+    #[test]
+    fn a_refused_pin_move_reports_the_devices_reason() {
+        let (mut s, st) = screen(Page::Outputs);
+        s.handle(key(KeyCode::Tab), &st);
+        s.handle(key(KeyCode::Down), &st);
+        let req = request(s.handle(key(KeyCode::Right), &st));
+
+        let (reply, sent) = answered(&req, st::PIN_IN_USE);
+        assert!(
+            sent.iter()
+                .any(|e| e.opcode == dspi_proto::generated::opcodes::REQ_SET_OUTPUT_PIN),
+            "the move went out: {sent:?}"
+        );
+        assert_eq!(
+            reply,
+            SessionReply::Err("GPIO 16 is already in use by another output".into()),
+            "nothing in the pin map holds GPIO 16, so the general clause stands"
+        );
+        s.session_result(req.tag, reply, &st);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("already in use by another output"), "{f}");
+        assert!(!f.contains("reassigned to GPIO"), "no optimistic row: {f}");
+
+        // And a pin the platform has no business offering.
+        let (mut s, st) = screen(Page::Outputs);
+        s.handle(key(KeyCode::Tab), &st);
+        s.handle(key(KeyCode::Down), &st);
+        let req = request(s.handle(key(KeyCode::Right), &st));
+        let (reply, _) = answered(&req, st::INVALID_PIN);
+        s.session_result(req.tag, reply, &st);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("is not available on this platform"), "{f}");
     }
 
     #[test]
@@ -413,14 +607,20 @@ mod tests {
             f.contains("Stream all 8 output channels as one optical ADAT lightpipe"),
             "{f}"
         );
-        match s.handle(key(KeyCode::Char(' ')), &st) {
-            ScreenEvent::Command(c) => assert_eq!(c, "adat.enable off"),
-            other => panic!("{other:?}"),
-        }
+        let req = request(s.handle(key(KeyCode::Char(' ')), &st));
+        let (reply, sent) = answered(&req, st::SUCCESS);
+        assert!(
+            sent.iter()
+                .any(|e| e.opcode == dspi_proto::generated::opcodes::REQ_SET_ADAT_ENABLE),
+            "{sent:?}"
+        );
+        s.session_result(req.tag, reply, &st);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("ADAT output disabled"), "{f}");
     }
 
     #[test]
-    fn reset_pins_confirms_and_then_sends_the_reset_sentinel() {
+    fn reset_pins_confirms_and_then_writes_the_factory_pins() {
         let (mut s, st) = screen(Page::Outputs);
         s.handle(key(KeyCode::Tab), &st);
         for _ in 0..20 {
@@ -430,12 +630,34 @@ mod tests {
             ScreenEvent::Dialog(d) => assert_eq!(d.title, "Reset Pins?"),
             other => panic!("{other:?}"),
         }
-        match s.dialog_result(DialogOutcome::Button(0), &st) {
-            ScreenEvent::Command(c) => {
-                assert_eq!(c.lines().count(), 5);
-                assert_eq!(c.lines().next().unwrap(), "out.pin 0 255");
-            }
-            other => panic!("{other:?}"),
+        let req = request(s.dialog_result(DialogOutcome::Button(0), &st));
+        let (reply, sent) = answered(&req, st::SUCCESS);
+        let moves: Vec<u16> = sent
+            .iter()
+            .filter(|e| e.opcode == dspi_proto::generated::opcodes::REQ_SET_OUTPUT_PIN)
+            .map(|e| e.value)
+            .collect();
+        assert_eq!(moves.len(), 5, "one per output: {sent:?}");
+        // `(gpio << 8) | index`: the four data pins then the PDM sub.
+        assert_eq!(
+            moves,
+            vec![0x0600, 0x0701, 0x0802, 0x0903, 0x0A04],
+            "the factory pins, in slot order"
+        );
+        s.session_result(req.tag, reply, &st);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("All pins reset to defaults"), "{f}");
+
+        // A reset is validated like any other move, so one that collides says
+        // which output it gave up on.
+        let (mut s, st) = screen(Page::Outputs);
+        s.handle(key(KeyCode::Tab), &st);
+        for _ in 0..20 {
+            s.handle(key(KeyCode::Down), &st);
         }
+        s.handle(key(KeyCode::Enter), &st);
+        let req = request(s.dialog_result(DialogOutcome::Button(0), &st));
+        let (reply, _) = answered(&req, st::PIN_IN_USE);
+        assert_eq!(reply, SessionReply::Err("Failed to reset Output 1".into()));
     }
 }

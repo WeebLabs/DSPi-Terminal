@@ -121,6 +121,13 @@ impl MacrosPage {
         }
     }
 
+    /// Slot health, which the status packet carries eight of whatever
+    /// `max_macros` says (control_surfaces.h): a device reporting more than
+    /// eight has no health to report for the rest, not a panic.
+    fn health(&self, i: usize) -> u8 {
+        self.health.get(i).copied().unwrap_or(0)
+    }
+
     fn adopt(&mut self, cs: &CsData) {
         if self.drafts.len() != cs.macros.len() {
             self.max_steps = cs.caps.max_macro_steps.max(1) as usize;
@@ -396,7 +403,7 @@ impl MacrosPage {
             ("Pending", StatusTone::Warning)
         } else if running {
             ("Running", StatusTone::Ok)
-        } else if self.health[i] != 0 && self.live[i].step_count > 0 {
+        } else if self.health(i) != 0 && self.live[i].step_count > 0 {
             ("Inactive", StatusTone::Warning)
         } else if self.live[i].step_count > 0 {
             ("Active", StatusTone::Ok)
@@ -430,8 +437,8 @@ impl MacrosPage {
                 enabled: true,
             },
         ));
-        if self.health[i] != 0 && self.live[i].step_count > 0 && !dirty {
-            rows.push((None, Row::Status(m::inactive_reason(self.health[i]), true)));
+        if self.health(i) != 0 && self.live[i].step_count > 0 && !dirty {
+            rows.push((None, Row::Status(m::inactive_reason(self.health(i)), true)));
         }
         if expanded {
             for s in 0..draft.step_count as usize {
@@ -860,8 +867,8 @@ impl SettingsPage for MacrosPage {
             && let Some(d) = c.to_digit(10)
             && d >= 1
         {
-            let i = d as usize - 1;
-            if i < self.drafts.len() && self.in_use(i) {
+            // The nth card on screen, not the nth macro slot.
+            if let Some(i) = self.visible().get(d as usize - 1).copied() {
                 self.expanded.insert(i);
                 return PageEvent::Handled;
             }
@@ -974,6 +981,38 @@ mod tests {
         assert!(f.contains("No Macros Configured"), "{f}");
         assert!(f.contains("mute after a delay"), "{f}");
         assert!(f.contains("Add Macro"), "{f}");
+    }
+
+    /// Nothing pushes sequencer progress to the host, so the Running badge and
+    /// the slot health are only as fresh as the last read of the extended
+    /// status. They follow a re-read rather than freezing at the snapshot
+    /// Settings opened with.
+    #[test]
+    fn the_running_badge_and_the_health_follow_a_re_read() {
+        let (mut s, st) = screen(m::demo::settings_data());
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(!f.contains("Running"), "nothing is running yet:\n{f}");
+
+        let adopt = |s: &mut SettingsScreen, f: &dyn Fn(&mut CsData)| {
+            let mut fresh = m::demo::data();
+            f(&mut fresh);
+            s.data.adopt(super::super::Refresh {
+                cs: Some(fresh),
+                ..Default::default()
+            });
+        };
+
+        adopt(&mut s, &|cs| {
+            cs.ext.macro_running = 0;
+            cs.ext.macro_step = 1;
+        });
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("Running"), "the device says macro 1 fired:\n{f}");
+
+        adopt(&mut s, &|cs| cs.ext.macro_status[0] = 0x20);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(!f.contains("Running"), "it stopped:\n{f}");
+        assert!(f.contains("Not running:"), "and its health came too:\n{f}");
     }
 
     #[test]
