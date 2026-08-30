@@ -6,9 +6,9 @@
 //! are staged here and the resulting DC boost is shown before anything is
 //! written, exactly as the Console does it.
 //!
-//! `Qp` is a readout rather than a field: it rides the wire in the 18-byte
-//! form of the band packet, and the shared command grammar has no way to say
-//! it. Everything else applies as one ordinary `eq` command.
+//! All four parameters are editable. `Qp` rides the wire in the 18-byte form of
+//! the band packet and travels in the command grammar as the seventh token of
+//! `eq` (DESIGN 11), so the whole alignment applies as one ordinary command.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dspi_proto::value::EqParamPacket;
@@ -37,18 +37,32 @@ enum Item {
     F0,
     Q0,
     Fp,
+    Qp,
     Revert,
     Apply,
 }
 
-const ITEMS: [Item; 5] = [Item::F0, Item::Q0, Item::Fp, Item::Revert, Item::Apply];
+const ITEMS: [Item; 6] = [
+    Item::F0,
+    Item::Q0,
+    Item::Fp,
+    Item::Qp,
+    Item::Revert,
+    Item::Apply,
+];
+
+/// The index of the Revert and Apply buttons in [`ITEMS`].
+const REVERT: usize = 4;
+const APPLY: usize = 5;
+
+/// The device's own default target Q: `bulk_params.h:135-137` reads the
+/// reserved pair as `Q * 512` with zero meaning 0.707.
+pub const DEFAULT_QP: f32 = 0.707;
 
 pub const CAPTION: &str =
     "Re-align a sealed woofer's rolloff from the driver's (f0, Q0) to a target (fp, Qp).";
 pub const BOOST_CAPTION: &str = "Real low-frequency gain (40 x log10(f0/fp)). It uses driver \
      excursion and amp headroom - reduce preamp or master volume to match.";
-pub const QP_NOTE: &str =
-    "Qp is shown only: the command grammar has no field for it, so it keeps its stored value.";
 
 pub struct LinkwitzPanel {
     /// What the device has now.
@@ -74,6 +88,12 @@ impl LinkwitzPanel {
         boost_of(&self.draft)
     }
 
+    /// The draft's target Q, with the firmware's default standing in for a band
+    /// that has never carried one.
+    pub fn qp(&self) -> f32 {
+        self.draft.qp.unwrap_or(DEFAULT_QP)
+    }
+
     /// Whether the draft holds edits that are not on the device yet. Compared
     /// with tolerances because applying quantises.
     pub fn dirty(&self) -> bool {
@@ -82,6 +102,7 @@ impl LinkwitzPanel {
         (d.freq - p.freq).abs() >= 0.05
             || (d.q - p.q).abs() >= 0.0005
             || (d.gain_db - p.gain_db).abs() >= 0.05
+            || (self.qp() - p.qp.unwrap_or(DEFAULT_QP)).abs() >= 0.0005
     }
 
     fn value(&self, item: Item) -> f64 {
@@ -89,6 +110,7 @@ impl LinkwitzPanel {
             Item::F0 => self.draft.freq as f64,
             Item::Q0 => self.draft.q as f64,
             Item::Fp => self.draft.gain_db as f64,
+            Item::Qp => self.qp() as f64,
             _ => 0.0,
         }
     }
@@ -98,6 +120,9 @@ impl LinkwitzPanel {
             Item::F0 => self.draft.freq = v.clamp(10.0, 24000.0) as f32,
             Item::Q0 => self.draft.q = v.clamp(0.1, 20.0) as f32,
             Item::Fp => self.draft.gain_db = v.clamp(10.0, 24000.0) as f32,
+            // The Console's Qp field is `minValue: 0.1`, like Q0; the sidecar
+            // encodes `Q * 512` into a u16, so 20 is well inside the wire range.
+            Item::Qp => self.draft.qp = Some(v.clamp(0.1, 20.0) as f32),
             _ => {}
         }
     }
@@ -105,7 +130,7 @@ impl LinkwitzPanel {
     /// The Console's steps: 1 Hz for a frequency, 0.01 for a Q.
     fn step(item: Item) -> f64 {
         match item {
-            Item::Q0 => 0.01,
+            Item::Q0 | Item::Qp => 0.01,
             _ => 1.0,
         }
     }
@@ -115,6 +140,7 @@ impl LinkwitzPanel {
             Item::F0 => format!("{:.0} Hz", self.draft.freq),
             Item::Q0 => q_text(self.draft.q as f64),
             Item::Fp => format!("{:.0} Hz", self.draft.gain_db),
+            Item::Qp => q_text(self.qp() as f64),
             _ => String::new(),
         }
     }
@@ -201,6 +227,7 @@ impl LinkwitzPanel {
     fn raw(&self, item: Item) -> String {
         match item {
             Item::Q0 => q_text(self.draft.q as f64),
+            Item::Qp => q_text(self.qp() as f64),
             Item::F0 => format!("{:.0}", self.draft.freq),
             Item::Fp => format!("{:.0}", self.draft.gain_db),
             _ => String::new(),
@@ -210,7 +237,9 @@ impl LinkwitzPanel {
     /// The box the panel wants, centred in `area`.
     pub fn size(&self, area: Rect) -> Rect {
         let w = 52u16.min(area.width.saturating_sub(2)).max(24);
-        let h = 14u16.min(area.height).max(6);
+        // Two caption lines, a blank, the two parameter rows, a blank, the DC
+        // boost and its two lines, then the button row inside a border.
+        let h = 12u16.min(area.height).max(6);
         Rect::new(
             area.x + (area.width.saturating_sub(w)) / 2,
             area.y + (area.height.saturating_sub(h)) / 2,
@@ -295,12 +324,12 @@ impl LinkwitzPanel {
                 armed_text(2, self.text(Item::Fp)),
                 field(2, self.edit.is_some() && focused(2)),
             );
-            buf.set_string(inner.x + 24, y, " Qp", theme.label());
+            buf.set_string(inner.x + 24, y, format!("{}Qp", mark(3)), theme.label());
             buf.set_string(
                 inner.x + 27,
                 y,
-                q_text(self.draft.qp.unwrap_or(0.707) as f64),
-                theme.label(),
+                armed_text(3, self.text(Item::Qp)),
+                field(3, self.edit.is_some() && focused(3)),
             );
             y += 1;
         }
@@ -334,9 +363,6 @@ impl LinkwitzPanel {
         for l in wrap(BOOST_CAPTION, w, 2) {
             line(buf, &mut y, &l, theme.label());
         }
-        for l in wrap(QP_NOTE, w, 2) {
-            line(buf, &mut y, &l, theme.label());
-        }
 
         // Status and buttons on the last row.
         let by = bottom - 1;
@@ -346,7 +372,7 @@ impl LinkwitzPanel {
             ("Applied", theme.label())
         };
         buf.set_string(inner.x, by, status, style);
-        let buttons = [(3usize, "Revert"), (4, "Apply")];
+        let buttons = [(REVERT, "Revert"), (APPLY, "Apply")];
         let total: u16 = buttons.iter().map(|(_, b)| b.len() as u16 + 4).sum();
         let mut x = inner.x + inner.width.saturating_sub(total);
         for (i, label) in buttons {
@@ -456,8 +482,8 @@ mod tests {
         assert!(p.dirty());
         let f = draw(&p, 56, 16);
         assert!(f.contains("Not applied yet"), "{f}");
-        // Revert is the fourth item.
-        for _ in 0..3 {
+        // Revert is the fifth item, after f0, Q0, fp and Qp.
+        for _ in 0..REVERT {
             p.handle(key(KeyCode::Down));
         }
         p.handle(key(KeyCode::Enter));
@@ -469,7 +495,7 @@ mod tests {
     fn apply_hands_back_the_band_and_escape_drops_the_draft() {
         let mut p = LinkwitzPanel::new(band(40.0, 0.5, 25.0));
         p.handle(key(KeyCode::Right));
-        for _ in 0..4 {
+        for _ in 0..APPLY {
             p.handle(key(KeyCode::Down));
         }
         match p.handle(key(KeyCode::Enter)) {
@@ -493,5 +519,77 @@ mod tests {
         p.handle(key(KeyCode::Down));
         p.handle(key(KeyCode::Right));
         assert!((p.draft.q - 0.51).abs() < 1e-4, "{}", p.draft.q);
+    }
+
+    /// D4: Qp is the fourth Linkwitz parameter and the Console's popover edits
+    /// it (`Components.swift:1793`, step 0.01, min 0.1). It was a readout here,
+    /// which put one of the four out of reach.
+    #[test]
+    fn qp_is_editable_and_steps_by_a_hundredth() {
+        let mut p = LinkwitzPanel::new(band(40.0, 0.5, 25.0));
+        // f0, Q0, fp, then Qp.
+        for _ in 0..3 {
+            p.handle(key(KeyCode::Down));
+        }
+        p.handle(key(KeyCode::Right));
+        assert!((p.qp() - 0.717).abs() < 1e-4, "{}", p.qp());
+        assert!(p.dirty(), "a Qp edit is an unapplied change");
+        let f = draw(&p, 56, 16);
+        assert!(f.contains("▸Qp"), "the cursor reaches Qp: {f}");
+        assert!(f.contains("0.717") && f.contains("Not applied yet"), "{f}");
+
+        // Shift is ten steps, and typing replaces.
+        p.handle(key(KeyCode::Enter));
+        for c in "1.2".chars() {
+            p.handle(key(KeyCode::Char(c)));
+        }
+        p.handle(key(KeyCode::Enter));
+        assert!((p.qp() - 1.2).abs() < 1e-4, "{}", p.qp());
+        // Below the Console's minimum it clamps rather than going to zero.
+        p.handle(key(KeyCode::Enter));
+        for c in "0".chars() {
+            p.handle(key(KeyCode::Char(c)));
+        }
+        p.handle(key(KeyCode::Enter));
+        assert!((p.qp() - 0.1).abs() < 1e-4, "{}", p.qp());
+    }
+
+    /// The edited Qp has to leave the panel, or the write drops it.
+    #[test]
+    fn apply_carries_the_edited_qp_into_the_band() {
+        let mut p = LinkwitzPanel::new(band(40.0, 0.5, 25.0));
+        for _ in 0..3 {
+            p.handle(key(KeyCode::Down));
+        }
+        for _ in 0..3 {
+            p.handle(key(KeyCode::Right));
+        }
+        for _ in 0..(APPLY - 3) {
+            p.handle(key(KeyCode::Down));
+        }
+        match p.handle(key(KeyCode::Enter)) {
+            PanelEvent::Apply(b) => {
+                let qp = b.qp.expect("a Linkwitz band carries its target Q");
+                assert!((qp - 0.737).abs() < 1e-4, "{qp}");
+                // And the seventh `eq` token is where it goes on the wire.
+                let state = crate::shell::fixture::state();
+                let lines = crate::screens::band_command(&state, 16, 0, &b);
+                assert_eq!(lines[0], "eq out.9 1 linkwitz 40 0.5 25 0.737");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A band the device has never given a target Q still opens on the
+    /// firmware's default rather than on zero.
+    #[test]
+    fn a_band_with_no_stored_qp_opens_on_the_firmware_default() {
+        let mut b = band(40.0, 0.5, 25.0);
+        b.qp = None;
+        let p = LinkwitzPanel::new(b);
+        assert_eq!(p.qp(), DEFAULT_QP);
+        assert!(!p.dirty(), "showing the default is not an edit");
+        let f = draw(&p, 56, 16);
+        assert!(f.contains("Qp") && f.contains("0.707"), "{f}");
     }
 }
