@@ -440,6 +440,34 @@ mod tests {
         );
     }
 
+    /// D47: the four dB rows here are the clearest case. Harmonics runs
+    /// -24..12 and is a signed quantity; Drive 0..18 and Original Bass -60..0
+    /// are not, and both used to carry a `+`.
+    #[test]
+    fn only_the_db_row_whose_range_crosses_zero_carries_a_sign() {
+        let (mut p, state) = panel();
+        let f = testing::draw(&mut p, &state, 100, 60);
+        assert!(f.contains("Harmonics"), "{f}");
+        assert!(
+            f.lines()
+                .any(|l| l.contains("Harmonics") && l.contains('+'))
+                || f.lines()
+                    .any(|l| l.contains("Harmonics") && l.contains("-")),
+            "a signed row keeps its sign: {f}"
+        );
+        for row in ["Drive", "Original Bass"] {
+            let line = f
+                .lines()
+                .find(|l| l.contains(row))
+                .unwrap_or_else(|| panic!("no {row} row:\n{f}"));
+            assert!(
+                !line.contains('+'),
+                "{row} is not a signed quantity: {line}"
+            );
+            assert!(line.contains(" dB"), "{line}");
+        }
+    }
+
     #[test]
     fn golden_frames_at_both_sizes() {
         let (_, state) = panel();

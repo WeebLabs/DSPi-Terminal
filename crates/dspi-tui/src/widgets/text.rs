@@ -77,9 +77,18 @@ pub fn pct(v: f64) -> String {
 }
 
 /// A value with a unit, choosing the format by the unit string.
-pub fn with_unit(v: f64, unit: &str, decimals: usize) -> String {
+///
+/// `signed` says whether the field's own range crosses zero. Only then does a
+/// dB reading carry a `+`: a gain that can go either way is a signed quantity
+/// and `DESIGN.md` 2.1 draws it `+8.8 dB`, but a level or an amount with a
+/// one-sided range is not, and `+4.5 dB` for a crossfeed Feed Level of 0..15
+/// or `+80 dB` for a Reference SPL of 40..100 says something the field cannot
+/// mean. The Console's own `ValueField` (`Components.swift:2152`) never signs
+/// anything at all.
+pub fn with_unit(v: f64, unit: &str, decimals: usize, signed: bool) -> String {
     match unit {
         "Hz" => hz(v),
+        "dB" if !signed => format!("{v:.d$} dB", d = decimals),
         "dB" => {
             if decimals == 0 {
                 format!("{:+.0} dB", v)
@@ -162,6 +171,29 @@ mod tests {
         assert_eq!(q(1.0), "1");
         assert_eq!(ms(2.5), "2.5 ms");
         assert_eq!(pct(31.4), "31%");
+    }
+
+    /// D47: only a dB field whose range crosses zero is a signed quantity.
+    /// Everything else read `+4.5 dB`, `+80 dB`, `+12.0 dB`, which says
+    /// something those fields cannot mean.
+    #[test]
+    fn only_a_range_that_crosses_zero_signs_its_db() {
+        // Band gain, preamp, output gain: signed.
+        assert_eq!(with_unit(8.8, "dB", 1, true), "+8.8 dB");
+        assert_eq!(with_unit(-8.6, "dB", 1, true), "-8.6 dB");
+        assert_eq!(with_unit(0.0, "dB", 0, true), "+0 dB");
+        // Crossfeed Feed Level 0..15, Loudness Reference SPL 40..100,
+        // Leveller Max Gain 0..35, Psybass Drive 0..18.
+        assert_eq!(with_unit(4.5, "dB", 1, false), "4.5 dB");
+        assert_eq!(with_unit(80.0, "dB", 0, false), "80 dB");
+        assert_eq!(with_unit(12.0, "dB", 1, false), "12.0 dB");
+        // Psybass Original Bass -60..0 and Leveller Gate Threshold -96..0 do
+        // not cross zero either, so they keep their minus and gain no plus.
+        assert_eq!(with_unit(-30.0, "dB", 1, false), "-30.0 dB");
+        assert_eq!(with_unit(0.0, "dB", 1, false), "0.0 dB");
+        // No other unit is affected.
+        assert_eq!(with_unit(2856.0, "Hz", 0, true), "2856 Hz");
+        assert_eq!(with_unit(2.5, "ms", 1, true), "2.5 ms");
     }
 
     #[test]
