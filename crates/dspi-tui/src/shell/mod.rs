@@ -875,18 +875,19 @@ impl Shell {
             return;
         }
 
-        // The graph names its channel in the title, DESIGN 12.2.
+        // The graph names its channel in the title, DESIGN 12.2. Without a
+        // graph the pane is the detail's alone and takes its title.
         let title = if self.graph_popout || r.graph.height > 0 {
             match &self.model.graph_channel {
                 Some(name) => format!("Filter Response · {name}"),
                 None => "Filter Response".to_string(),
             }
         } else {
-            String::new()
+            self.detail.title()
         };
         let focused = screen_focused;
         let mut block = self.block(&title, focused, t);
-        if !title.is_empty() {
+        if self.graph_popout || r.graph.height > 0 {
             // The Console's pop-out button; `g` here.
             block = block.title_top(
                 ratatui::text::Line::from(if t.glyphs == Glyphs::Ascii {
