@@ -61,6 +61,9 @@ enum Line {
     Routing,
     Divider,
     Row(Row),
+    /// The second line of an input: its trim and the crosspoint gains,
+    /// under the connect dots of `Row(Row::Input(i))`.
+    Gains(usize),
 }
 
 /// Which dialog the panel put on screen, so its answer comes back to the right
@@ -206,15 +209,19 @@ impl MatrixPanel {
         rows[self.row.min(rows.len() - 1)]
     }
 
-    /// Every line the body draws, in order: the ROUTING band, one row per
-    /// input, a rule, then the output rows. The Console divides the inputs
-    /// into stereo pairs; here every input stands on its own, since the
-    /// pairing said nothing the names do not.
+    /// Every line the body draws, in order: the ROUTING band, two lines per
+    /// input (the connect dots, then the trim and the gains), a rule, then
+    /// the output rows. The Console divides the inputs into stereo pairs and
+    /// puts a crosspoint's dot and gain in one cell; here every input stands
+    /// on its own and the dots and the gains are rows of their own, so a
+    /// glance down a column reads the routing and a glance along a row the
+    /// levels.
     fn lines(&self, state: &DeviceState) -> Vec<Line> {
         let n = self.inputs(state);
         let mut v = vec![Line::Routing];
         for i in 0..n {
             v.push(Line::Row(Row::Input(i)));
+            v.push(Line::Gains(i));
         }
         v.push(Line::Divider);
         v.extend([
@@ -497,7 +504,9 @@ impl MatrixPanel {
         }
     }
 
-    fn draw_crosspoint(
+    /// The dots line of an input: `●` where it feeds the column, `○` where
+    /// it does not, centred in the column like the MUTE row's.
+    fn draw_connect(
         &self,
         p: &mut Paint,
         x: u16,
@@ -517,43 +526,55 @@ impl MatrixPanel {
             (true, false) => "●",
             (false, false) => "○",
         };
-        let dot_style = if live && c.enabled {
+        let style = if live && c.enabled {
             Style::default().fg(column_color(state, theme, output, output == self.col))
+        } else if focused {
+            theme.focused()
         } else {
             theme.label()
         };
-        p.buf.set_string(x, y, dot, dot_style);
+        p.buf.set_string(x + (self.col_w - 1) / 2, y, dot, style);
+        if focused {
+            self.draw_brackets(p, x, y);
+        }
+    }
 
-        match self.edit.as_ref().filter(|_| focused) {
-            Some(e) => {
-                let text = fit_right(&format!("[{}]", e.text), 9);
-                p.buf.set_string(x + 2, y, text, theme.editing());
-            }
-            None => {
-                // Connected cells right-align so the decimals line up down the
-                // column; a disconnected one has no number to line up.
-                let (gain, style) = if c.enabled {
-                    (fit_right(&format!("{:.1}", c.gain_db), 5), theme.value())
-                } else {
-                    (fit_centre("-", 5), theme.label())
-                };
-                let style = if !live {
-                    theme.label()
-                } else if focused {
-                    theme.focused()
-                } else {
-                    style
-                };
-                p.buf.set_string(x + 2, y, gain, style);
-                if c.phase_invert {
-                    let style = if live {
-                        theme.warning_style()
-                    } else {
-                        theme.label()
-                    };
-                    p.buf.set_string(x + 8, y, "INV", style);
-                }
-            }
+    /// The gains line of an input: the crosspoint gain under each connected
+    /// dot, `INV` after it when inverted, nothing under a `○`.
+    fn draw_gain(&self, p: &mut Paint, x: u16, y: u16, input: usize, output: usize, focused: bool) {
+        let (theme, state) = (p.theme, p.state);
+        let c = state.crosspoint(input, output);
+        let live = state.output(output).enabled;
+        let w = self.col_w as usize - 1;
+        let armed = focused && self.edit.is_some();
+        let text = match self.edit.as_ref().filter(|_| focused) {
+            Some(e) => format!("[{}]", e.text),
+            None if c.enabled => format!(
+                "{:.1} dB{}",
+                c.gain_db,
+                if c.phase_invert { " INV" } else { "" }
+            ),
+            None => String::new(),
+        };
+        let style = if armed {
+            theme.editing()
+        } else if focused {
+            theme.focused()
+        } else if live {
+            theme.value()
+        } else {
+            theme.label()
+        };
+        let len = text.chars().count();
+        let start = x + (w.saturating_sub(len) / 2) as u16;
+        p.buf.set_string(start, y, &text, style);
+        if !armed && c.enabled && c.phase_invert {
+            let style = if live {
+                theme.warning_style()
+            } else {
+                theme.label()
+            };
+            p.buf.set_string(start + len as u16 - 3, y, "INV", style);
         }
         if focused {
             self.draw_brackets(p, x, y);
@@ -644,33 +665,36 @@ impl MatrixPanel {
             Row::Input(i) => {
                 let color = theme.hue_for(ChannelRole::Input(i as u8), here);
                 let name = channel_name(state, i);
-                if !is_8ch(state) {
-                    let text = fit_left(&name, LABEL_W as usize - 2);
-                    p.buf.set_string(x + 1, y, text, Style::default().fg(color));
-                    return;
-                }
-                p.buf
-                    .set_string(x + 1, y, fit_left(&name, 7), Style::default().fg(color));
-                // The Console's per-input trim, bound to `preampDB[input]`.
-                let focused = here && self.trim;
-                let text = match self.edit.as_ref().filter(|_| focused) {
-                    Some(e) => format!("[{}]", e.text),
-                    None => format!("{:+.1} dB", state.preamp_db(i)),
-                };
-                let style = if focused && self.edit.is_some() {
-                    theme.editing()
-                } else if focused {
-                    theme.focused()
-                } else {
-                    theme.value()
-                };
-                p.buf.set_string(x + 8, y, fit_right(&text, 8), style);
+                let text = fit_left(&name, LABEL_W as usize - 2);
+                p.buf.set_string(x + 1, y, text, Style::default().fg(color));
             }
             Row::Enable => p.buf.set_string(x + 1, y, "ENABLE", theme.section()),
             Row::Gain => p.buf.set_string(x + 1, y, "GAIN", theme.section()),
             Row::Delay => p.buf.set_string(x + 1, y, "DELAY", theme.section()),
             Row::Mute => p.buf.set_string(x + 1, y, "MUTE", theme.section()),
         }
+    }
+
+    /// The label of an input's gains line: the Console's per-input trim,
+    /// bound to `preampDB[input]`, which only the 8-channel matrix has.
+    fn draw_trim(&self, p: &mut Paint, y: u16, input: usize, here: bool) {
+        let (area, theme, state) = (p.area, p.theme, p.state);
+        if !is_8ch(state) {
+            return;
+        }
+        let focused = here && self.trim;
+        let text = match self.edit.as_ref().filter(|_| focused) {
+            Some(e) => format!("[{}]", e.text),
+            None => format!("{:+.1} dB", state.preamp_db(input)),
+        };
+        let style = if focused && self.edit.is_some() {
+            theme.editing()
+        } else if focused {
+            theme.focused()
+        } else {
+            theme.label()
+        };
+        p.buf.set_string(area.x + 2, y, fit_right(&text, 8), style);
     }
 
     fn draw_routing(&self, p: &mut Paint, y: u16, grid_w: u16) {
@@ -727,10 +751,12 @@ impl Screen for MatrixPanel {
             .iter()
             .position(|l| *l == Line::Row(here))
             .unwrap_or(0);
+        // An input's gains line travels with its dots line.
+        let last_needed = cursor_line + usize::from(matches!(here, Row::Input(_)));
         let first = if lines.len() <= body_h {
             0
         } else {
-            cursor_line
+            last_needed
                 .saturating_sub(body_h - 1)
                 .min(lines.len() - body_h)
         };
@@ -772,11 +798,18 @@ impl Screen for MatrixPanel {
                         let x = area.x + LABEL_W + i as u16 * self.col_w;
                         let cell = on_row && !self.trim && o == self.col;
                         match row {
-                            Row::Input(input) => {
-                                self.draw_crosspoint(&mut p, x, y, *input, o, cell)
-                            }
+                            Row::Input(input) => self.draw_connect(&mut p, x, y, *input, o, cell),
                             other => self.draw_output_cell(&mut p, x, y, *other, o, cell),
                         }
+                    }
+                }
+                Line::Gains(input) => {
+                    let on_row = focused && Row::Input(*input) == here;
+                    self.draw_trim(&mut p, y, *input, on_row);
+                    for (i, &o) in cols.iter().enumerate() {
+                        let x = area.x + LABEL_W + i as u16 * self.col_w;
+                        let cell = on_row && !self.trim && o == self.col;
+                        self.draw_gain(&mut p, x, y, *input, o, cell);
                     }
                 }
             }
@@ -1092,8 +1125,15 @@ mod tests {
             assert_eq!(f.lines().count(), h as usize, "{w}x{h}");
             assert!(f.contains("Matrix Mixer"), "{w}x{h}: {f}");
             assert!(f.contains("INPUTS"), "the sidebar is still there: {f}");
-            for want in ["ROUTING", "OUT1", "FL", "ENABLE", "GAIN", "DELAY", "MUTE"] {
+            for want in ["ROUTING", "OUT1", "FL"] {
                 assert!(f.contains(want), "{w}x{h} has no {want}:\n{f}");
+            }
+            // Two lines per input: at 80x24 the output rows are below the
+            // fold and the reticle scrolls them in; from 120x40 they show.
+            if h >= 40 {
+                for want in ["ENABLE", "GAIN", "DELAY", "MUTE"] {
+                    assert!(f.contains(want), "{w}x{h} has no {want}:\n{f}");
+                }
             }
             // The Console's two routing actions, which only 8-channel mode has.
             assert!(
@@ -1159,11 +1199,13 @@ mod tests {
         let state = connected(0, 3);
         let mut p = panel();
         let f = text(&draw(&mut p, &state, 120, 20));
-        let fl = f.lines().nth(3).expect("the FL row");
-        assert!(fl.contains('●') && fl.contains("0.0"), "{fl}");
-        assert!(fl.contains('○') && fl.contains('-'), "{fl}");
+        let fl = f.lines().nth(3).expect("the FL dots row");
+        assert!(fl.contains('●') && fl.contains('○'), "{fl}");
+        assert!(!fl.contains("0.0"), "gains are on the next line: {fl}");
+        let gains = f.lines().nth(4).expect("the FL gains row");
+        assert!(gains.contains("0.0 dB"), "{gains}");
         // The trim only exists in 8-channel mode; the stereo matrix has none.
-        assert!(fl.contains("+0.0 dB"), "the input trim: {fl}");
+        assert!(gains.contains("+0.0 dB"), "the input trim: {gains}");
         let stereo_frame = text(&draw(&mut panel(), &stereo(), 120, 20));
         assert!(!stereo_frame.contains("+0.0 dB"), "{stereo_frame}");
     }
@@ -1187,10 +1229,11 @@ mod tests {
     fn a_disabled_outputs_cells_draw_dim() {
         let t = theme();
         // The fixture connects input 2 to output 2, so the cell has a colour to
-        // lose. Row order: headers, ROUTING, FL, FR, FC.
+        // lose. Line order: headers, ROUTING, then two lines per input, so
+        // FC's dots are on line 7.
         let col_w = col_width(120, 9);
-        let (x, y) = (LABEL_W + 2 * col_w, 5u16);
-        let live = draw(&mut panel(), &fixture::state(), 120, 20);
+        let (x, y) = (LABEL_W + 2 * col_w + (col_w - 1) / 2, 7u16);
+        let live = draw(&mut panel(), &fixture::state(), 120, 30);
         assert_eq!(live[(x, y)].symbol(), "●");
         assert_eq!(
             live[(x, y)].fg,
@@ -1198,11 +1241,13 @@ mod tests {
             "the output's colour"
         );
 
-        let off = draw(&mut panel(), &outputs_off(&[2]), 120, 20);
+        let off = draw(&mut panel(), &outputs_off(&[2]), 120, 30);
         assert_eq!(off[(x, y)].symbol(), "●", "still connected");
         assert_eq!(off[(x, y)].fg, t.dim, "but the whole column is dim");
-        // And so is the output's own strip beneath it.
-        let gain: Vec<_> = (0..col_w - 1).map(|dx| off[(x + dx, 13)].fg).collect();
+        // And so is the output's own strip beneath it: the GAIN row is line
+        // 21, after sixteen input lines and the rule.
+        let x = LABEL_W + 2 * col_w;
+        let gain: Vec<_> = (0..col_w - 1).map(|dx| off[(x + dx, 21)].fg).collect();
         assert!(gain.iter().all(|c| *c == t.dim), "the GAIN row: {gain:?}");
     }
 
@@ -1243,8 +1288,9 @@ mod tests {
         let dividers = f.lines().filter(|l| l.contains("──")).count();
         assert_eq!(dividers, 1, "one rule above ENABLE:\n{f}");
         let lines: Vec<&str> = f.lines().collect();
-        assert!(lines[3].starts_with("▸FL") && lines[4].starts_with(" FR"));
-        assert!(lines[5].starts_with(" FC"), "no pair divider:\n{f}");
+        assert!(lines[3].starts_with("▸FL") && lines[4].starts_with("   +0.0 dB"));
+        assert!(lines[5].starts_with(" FR"), "no pair divider:\n{f}");
+        assert!(lines[7].starts_with(" FC"), "{f}");
         let s = text(&draw(&mut panel(), &stereo(), 120, 24));
         let dividers = s.lines().filter(|l| l.contains("──")).count();
         assert_eq!(dividers, 1, "the same rule in stereo:\n{s}");

@@ -546,12 +546,14 @@ Replaces the detail pane:
 ```
 Column headers in the output colour (section 12: the focused column's);
 input labels in the input colour; the input trim column only in
-8-channel mode. Every input has a row of its own: the Console's stereo
-pair dividers are not drawn, and one rule parts the inputs from the
-ENABLE, GAIN, DELAY and MUTE rows. Columns are at least 13 cells and
+8-channel mode. Every input has two lines of its own: the connect dots
+(`●`/`○`, centred in the column) on the first, its trim and the
+crosspoint gains on the second, a gain only under a `●` and `INV` after
+it in `warning`. The Console's stereo pair dividers are not drawn, and
+one rule parts the inputs from the ENABLE, GAIN, DELAY and MUTE rows.
+The reticle brackets both lines of the input it is on. Columns are at least 13 cells and
 widen to 18 as the pane allows, so nine outputs sit uncrowded at 200
-columns and scroll at 120. A cell shows `●`/`○` and the gain; `INV` in
-`warning` when inverted. Cells of a disabled output in `dim`. A column
+columns and scroll at 120. Cells of a disabled output in `dim`. A column
 that would conflict with Core 1 carries a `warning` `!` after its
 descriptor in the header, once, rather than in every cell. Keys: arrows move the reticle; `Space` connects / disconnects;
 `Enter` edits the gain; `i` inverts; `←`/`→` on a gain nudges by 0.5 dB;
