@@ -2,7 +2,8 @@
 //!
 //!   gallery [width] [height] [console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
-//!                     |leveller|psybass|upmixer|signals] [--settings <page>] [--ansi]
+//!                     |leveller|psybass|upmixer|signals|stats|monitor
+//!                     |autoeq] [--settings <page>] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
 //! can be looked at by piping to a terminal. `--screen` picks what fills the
@@ -12,8 +13,9 @@
 //! overview, inputs, outputs, i2s, global, surfaces, interfaces, groups, macros.
 
 use dspi_tui::screens::{
-    CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel, OutputPage, Overview,
-    PsybassPanel, SignalsPanel, UpmixerPanel, shared,
+    AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
+    MonitorPanel, OutputPage, Overview, PsybassPanel, SignalsPanel, StatsPanel, UpmixerPanel,
+    shared,
 };
 use dspi_tui::settings::{AppConfig, SettingsScreen};
 use dspi_tui::shell::{Focus, Screen, Selection, Shell, Tool, fixture};
@@ -69,6 +71,13 @@ fn main() {
     // The tool panels are gated on device features, so the gallery's fixture
     // reports them present; without that every panel would draw its "requires
     // newer firmware" banner and there would be nothing to review.
+    let section = |name: &str| {
+        dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, o, _)| *o)
+            .expect("section")
+    };
     let mut state = fixture::state();
     for name in ["psychoacoustic_bass", "upmixer", "test_signals"] {
         state.caps.features.push(dspi_session::probe::Feature {
@@ -88,13 +97,6 @@ fn main() {
     // The shell fixture leaves every DSP block at zero, which makes a panel a
     // page of flat sliders and an empty graph. Give each one the Console's own
     // defaults so a design review sees a working panel.
-    let section = |name: &str| {
-        dspi_proto::generated::SECTIONS
-            .iter()
-            .find(|(n, _, _)| *n == name)
-            .map(|(_, o, _)| *o)
-            .expect("section")
-    };
     let g = section("global");
     state.bulk.patch(g + 5, &[1]);
     state.bulk.patch(g + 6, &0x01FFu16.to_le_bytes());
@@ -142,6 +144,140 @@ fn main() {
         state
     };
     let shared = shared();
+
+    // The three panels of `DESIGN.md` 7.10 to 7.12 draw from the application's
+    // own state rather than from the device, so the gallery has to fill that
+    // in too: an empty stats snapshot is a page of dashes and an empty log is
+    // an empty box, neither of which is a design to review.
+    {
+        let mut app = shared.borrow_mut();
+        app.stats = dspi_tui::actions::Stats {
+            read: true,
+            clock_hz: 300_000_000,
+            core_mv: 1150,
+            sample_rate_hz: 48_000,
+            temp_centi_c: 4231,
+            pdm_ring_under: 3,
+            usb_ring_over: 1,
+            starvation_total: 7,
+            starvation_delta: 2,
+            starvation_per_instance: [4, 3, 0, 0],
+            polls_since_starvation: Some(0),
+            polls_between_starvations: Some(15),
+            buffers: Some(dspi_proto::packets::BufferStatsPacket {
+                num_spdif: 2,
+                flags: dspi_proto::packets::BufferStatsPacket::FLAG_STREAMING
+                    | dspi_proto::packets::BufferStatsPacket::FLAG_PDM_ACTIVE,
+                sequence: 9,
+                spdif: [
+                    dspi_proto::packets::SpdifBufferStats {
+                        consumer_fill_pct: 50,
+                        consumer_min_fill_pct: 20,
+                        consumer_max_fill_pct: 80,
+                        ..Default::default()
+                    },
+                    dspi_proto::packets::SpdifBufferStats {
+                        consumer_fill_pct: 92,
+                        consumer_min_fill_pct: 40,
+                        consumer_max_fill_pct: 100,
+                        ..Default::default()
+                    },
+                    Default::default(),
+                    Default::default(),
+                ],
+                pdm: dspi_proto::packets::PdmBufferStats {
+                    dma_fill_pct: 20,
+                    dma_min_fill_pct: 10,
+                    dma_max_fill_pct: 35,
+                    ring_fill_pct: 12,
+                    ring_min_fill_pct: 8,
+                    ring_max_fill_pct: 60,
+                },
+            }),
+            spdif_rx: Some(dspi_proto::packets::SpdifRxStatusPacket {
+                state: dspi_proto::enums::SpdifRxState::Locked,
+                input_source: dspi_proto::enums::InputSource::from_raw(4),
+                lock_count: 2,
+                loss_count: 1,
+                sample_rate: 44_100,
+                fifo_fill_pct: 55,
+                lib_state: 2,
+                callback_counts: 0x21,
+                ..Default::default()
+            }),
+            spdif_rx_pin: Some(20),
+            lg: Some(dspi_proto::packets::LgSoundSyncStatus {
+                enabled: true,
+                present: true,
+                volume: 42,
+                muted: false,
+            }),
+            adat: Some(dspi_proto::packets::AdatStatus {
+                enabled: true,
+                active: true,
+                pin: 6,
+                rate_ok: true,
+                resync_count: 1,
+                slip_count: 0,
+            }),
+            ..Default::default()
+        };
+
+        app.log.active = true;
+        let mut at = 0.125;
+        for (seq, event) in [
+            (7u8, dspi_session::Event::PresetLoaded { slot: 2 }),
+            (
+                8,
+                dspi_session::Event::ParamChanged {
+                    offset: section("user_volume") as u16,
+                    source: dspi_session::Source::Uac1,
+                    bytes: (-30.0f32).to_le_bytes().to_vec(),
+                },
+            ),
+            (
+                9,
+                dspi_session::Event::ParamChanged {
+                    offset: (section("outputs") + 12 + 4) as u16,
+                    source: dspi_session::Source::Gpio,
+                    bytes: (-3.5f32).to_le_bytes().to_vec(),
+                },
+            ),
+            (
+                10,
+                dspi_session::Event::ParamChanged {
+                    offset: (section("eq") + 16) as u16,
+                    source: dspi_session::Source::HostSet,
+                    bytes: {
+                        let mut b = vec![0u8; 16];
+                        b[0] = 1;
+                        b[4..8].copy_from_slice(&2856.0f32.to_le_bytes());
+                        b[8..12].copy_from_slice(&3.58f32.to_le_bytes());
+                        b[12..16].copy_from_slice(&(-8.6f32).to_le_bytes());
+                        b
+                    },
+                },
+            ),
+            (
+                11,
+                dspi_session::Event::I2sSlaveState {
+                    state: 3,
+                    rate_hz: 48_000,
+                },
+            ),
+        ] {
+            app.log.push(
+                at,
+                &dspi_session::Notification {
+                    seq,
+                    event,
+                    lost: false,
+                },
+            );
+            at += 0.734;
+        }
+    }
+
     let tool = match screen.as_str() {
         "matrix" => Some((
             Tool::Matrix,
@@ -170,6 +306,20 @@ fn main() {
         "signals" => Some((
             Tool::Signals,
             Box::new(SignalsPanel::new()) as Box<dyn Screen>,
+        )),
+        "stats" => Some((
+            Tool::Stats,
+            Box::new(StatsPanel::new(shared.clone())) as Box<dyn Screen>,
+        )),
+        "monitor" => Some((
+            Tool::Monitor,
+            Box::new(MonitorPanel::new(shared.clone())) as Box<dyn Screen>,
+        )),
+        // The browser loads the real database, so this is the one panel whose
+        // gallery frame depends on what is installed rather than on a fixture.
+        "autoeq" => Some((
+            Tool::AutoEq,
+            Box::new(AutoEqPanel::searching(shared.clone(), "sennheiser")) as Box<dyn Screen>,
         )),
         _ => None,
     };

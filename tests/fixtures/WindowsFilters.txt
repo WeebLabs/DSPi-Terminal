@@ -1,0 +1,25 @@
+# DSPi Console Filter Settings
+# Exported: 2026-03-14 09:21:04
+
+[Master L]
+Preamp -6,5 dB
+Filter  1: ON  PK  Fc 105,0 Hz  Gain 8,8 dB  Q 0,70
+Filter  2: ON  LS  Fc 1.234,5 Hz  Gain -3,0 dB  Q 0,71
+Filter  3: ON  NO  Fc 60,0 Hz  Q 8,00  BYP
+Filter  4: OFF
+
+[Master R]
+Preamp -6,5 dB
+Filter  1: ON  PK  Fc 105,0 Hz  Gain 8,8 dB  Q 0,70
+
+[SPDIF 1 L]
+Filter  1: ON  HP  Fc 80,0 Hz  Q 0,71
+Crossover  1: ON  LR  HP  Fc 2000,0 Hz  Slope 24 dB/oct
+Crossover  2: ON  BW  LP  Fc 4000,0 Hz  Slope 12 dB/oct
+
+[SPDIF 1 R]
+Filter  1: ON  HP  Fc 80,0 Hz  Q 0,71
+
+[PDM]
+Filter  1: ON  LP  Fc 80,0 Hz  Q 0,71
+Crossover  1: ON  Bessel  LP  Fc 120,0 Hz  Slope 24 dB/oct

@@ -1,0 +1,15 @@
+Filter Settings file
+
+Room EQ V5.31.3
+Dated: 14/03/2026 09:21:04
+
+Notes:
+
+Equaliser: Generic
+Preamp: -6.5 dB
+Filter  1: ON  PK       Fc    31.5 Hz  Gain  -4.20 dB  Q  3.500
+Filter  2: ON  PK       Fc    63.0 Hz  Gain   3.10 dB  Q  1.800
+Filter  3: ON  LSC      Fc   105.0 Hz  Gain   8.80 dB  Q  0.707
+Filter  4: ON  HSC      Fc 10000.0 Hz  Gain  -0.80 dB  Q  0.707
+Filter  5: ON  None
+Filter  6: ON  None

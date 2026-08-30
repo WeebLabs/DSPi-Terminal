@@ -23,12 +23,13 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Widget};
 
+use crate::actions;
 use crate::app::Performance;
 use crate::graph::GraphCurve;
 use crate::screens::{
-    self, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel, OutputPage,
-    Overview, PresetChoice, PresetMenu, PsybassPanel, Shared, SignalsPanel, UpmixerPanel,
-    clipboard, panel, presets,
+    self, AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
+    MonitorPanel, OutputPage, Overview, PresetChoice, PresetMenu, PsybassPanel, Shared,
+    SignalsPanel, StatsPanel, UpmixerPanel, clipboard, panel, presets,
 };
 use crate::settings::{AppConfig, SettingsData, SettingsScreen};
 use crate::shell::{
@@ -146,10 +147,9 @@ impl Screens for ConsoleScreens {
             Tool::Psybass => Box::new(PsybassPanel::new()),
             Tool::Upmixer => Box::new(UpmixerPanel::new()),
             Tool::Signals => Box::new(SignalsPanel::new()),
-            _ => Box::new(Placeholder::new(
-                tool.title(),
-                "This panel arrives in a later phase.",
-            )),
+            Tool::Stats => Box::new(StatsPanel::new(self.shared.clone())),
+            Tool::Monitor => Box::new(MonitorPanel::new(self.shared.clone())),
+            Tool::AutoEq => Box::new(AutoEqPanel::new(self.shared.clone())),
         }
     }
 
@@ -173,6 +173,29 @@ impl Screens for ConsoleScreens {
         *self.settings.borrow_mut() = SettingsData::read(session);
     }
 }
+
+/// The verbs the interface answers itself: the Console's File, Tools and
+/// AutoEQ menus.
+///
+/// They are not parameters, so they are not in the shared grammar and a shell
+/// one-shot cannot run them; they need an interface with dialogs in it. They
+/// are still typed and completed like everything else, because a person who
+/// has learned `:` should not have to learn a second way to reach half of what
+/// the program does.
+pub const APP_VERBS: &[(&str, &str)] = &[
+    ("import", "Import Filters..."),
+    ("export", "Export Filters..."),
+    ("import-config", "Import Device Configuration..."),
+    ("export-config", "Export Device Configuration..."),
+    ("autoeq", "AutoEQ: browse profiles, or `autoeq update`"),
+    ("save-master", "Save Master Volume"),
+    ("save-output-config", "Save Output Configuration"),
+    ("commit", "Commit Parameters..."),
+    ("revert", "Revert to Saved..."),
+    ("factory-reset", "Factory Reset..."),
+    ("bootloader", "Firmware Update..."),
+    ("device", "Device picker"),
+];
 
 /// The `:` line and the `Ctrl-P` palette.
 #[derive(Debug, Clone, PartialEq)]
@@ -204,6 +227,21 @@ impl Prompt {
             tokens.pop().unwrap_or("")
         };
         self.candidates = dspi_cmd::complete(&tokens, partial, ctx);
+        // The interface's own verbs are offered alongside the grammar's, so
+        // the palette is the whole program rather than the half of it that is
+        // parameters.
+        if tokens.is_empty() {
+            let mine: Vec<Candidate> = APP_VERBS
+                .iter()
+                .filter(|(name, _)| name.starts_with(partial))
+                .map(|(name, detail)| Candidate {
+                    value: (*name).to_string(),
+                    detail: (*detail).to_string(),
+                    kind: dspi_cmd::complete::CandidateKind::Verb,
+                })
+                .collect();
+            self.candidates.splice(0..0, mine);
+        }
         self.index = 0;
     }
 
@@ -345,7 +383,6 @@ enum AppDialog {
     Unsaved {
         then: PendingAction,
     },
-    SavePreset,
     Rename {
         channel: usize,
     },
@@ -360,12 +397,48 @@ enum AppDialog {
     Core1 {
         index: u8,
     },
+    /// A path to read or write, by what it is for.
+    Path(FileAction),
+    /// Which channels an import lands on, and what each row stands for.
+    ImportChannels {
+        file: Box<dspi_session::filterfile::FilterFile>,
+        targets: Vec<actions::ImportTarget>,
+    },
+    /// The `.dspipreset` options checklist, holding the document it describes.
+    ConfigOptions(Box<dspi_session::preset_file::PresetDocument>),
+    /// A report with nothing left to decide.
+    Report,
+    Commit,
+    Revert,
+    FactoryReset,
+    Bootloader,
+    /// The wait after the reboot; it closes itself.
+    BootWait,
+    /// Which device to talk to, with the serial each row stands for.
+    DevicePicker(Vec<String>),
+    /// The AutoEQ Update Database menu, and the confirm in front of the
+    /// rebuild.
+    AutoEqUpdate,
+    AutoEqRebuild,
+    AutoEqRebuildProgress,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Which file action a path dialog is collecting a path for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileAction {
+    ImportFilters,
+    ExportFilters,
+    ImportConfig,
+    ExportConfig,
+    ImportAutoEqDatabase,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum PendingAction {
     Quit,
     LoadPreset(u8),
+    /// Open another device, by serial.
+    SwitchDevice(String),
 }
 
 pub struct Live {
@@ -388,6 +461,19 @@ pub struct Live {
     /// so the only way to move the gauges is to ask, and once a second is
     /// enough for a meter a person is watching.
     last_upmix_poll: Instant,
+    /// When the Stats panel's diagnostics were last read, on the Console's own
+    /// two-second cadence.
+    last_stats_poll: Instant,
+    /// When the notification log started, which is what its time column counts
+    /// from.
+    started: Instant,
+    /// The bootloader handoff, while it is running.
+    boot: Option<actions::BootloaderWatch>,
+    /// An AutoEQ rebuild, while it is running.
+    rebuild: Option<dspi_session::autoeq::RebuildHandle>,
+    /// The serial of a device to open in place of this one. The event loop
+    /// owns the transport, so the picker asks and the loop does it.
+    pub switch_to: Option<String>,
 }
 
 impl Live {
@@ -432,6 +518,11 @@ impl Live {
             should_quit: false,
             last_tick: Instant::now(),
             last_upmix_poll: Instant::now() - Duration::from_secs(2),
+            last_stats_poll: Instant::now() - Duration::from_secs(3),
+            started: Instant::now(),
+            boot: None,
+            rebuild: None,
+            switch_to: None,
         };
         live.sync_model();
         live
@@ -660,11 +751,23 @@ impl Live {
     /// an edit mirrored onto a linked input pair, Clear All over a whole bank,
     /// a channel paste. The echo line ends up showing the last of them, which
     /// is the one the person's finger was on.
+    /// A `#` line is not a command but the note to leave on the echo line once
+    /// the block has run, which is how a screen that issues a hundred writes
+    /// for one gesture says what it just did.
     pub fn run_commands(&mut self, session: &mut Session, lines: &str) {
+        let mut note = None;
         for line in lines.lines() {
-            if !line.trim().is_empty() {
-                self.run_command(session, line);
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
+            match line.strip_prefix('#') {
+                Some(text) => note = Some(text.trim().to_string()),
+                None => self.run_command(session, line),
+            }
+        }
+        if let Some(note) = note {
+            self.note(note);
         }
     }
 
@@ -720,6 +823,13 @@ impl Live {
     /// Run a typed command against the device.
     pub fn run_command(&mut self, session: &mut Session, line: &str) {
         let tokens = dspi_cmd::tokenize(line);
+        if let Some(first) = tokens.first()
+            && APP_VERBS.iter().any(|(n, _)| n == first)
+        {
+            let args: Vec<&str> = tokens[1..].iter().map(String::as_str).collect();
+            self.app_verb(session, first, &args);
+            return;
+        }
         let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
         let cmd = match dspi_cmd::parse(&refs, &self.ctx) {
             Ok(c) => c,
@@ -779,6 +889,204 @@ impl Live {
                 other => self.note(format!("`{other}` only works from the shell")),
             },
         }
+    }
+
+    /// One of the interface's own verbs: the Console's File, Tools and AutoEQ
+    /// menus.
+    ///
+    /// Each one either acts at once or raises the first dialog of its flow;
+    /// the rest of each flow is in `finish_dialog`, so a whole flow reads in
+    /// one place rather than being spread through the key handler.
+    fn app_verb(&mut self, session: &mut Session, verb: &str, args: &[&str]) {
+        match verb {
+            "import" => self.ask_path(session, FileAction::ImportFilters, args),
+            "export" => self.ask_path(session, FileAction::ExportFilters, args),
+            "import-config" => self.ask_path(session, FileAction::ImportConfig, args),
+            "export-config" => self.ask_path(session, FileAction::ExportConfig, args),
+            "commit" => {
+                let slot = self.state.caps.active_preset.unwrap_or(0);
+                self.dialog = Some((AppDialog::Commit, actions::commit_dialog(slot)));
+            }
+            "revert" => self.dialog = Some((AppDialog::Revert, actions::revert_dialog())),
+            "factory-reset" => {
+                self.dialog = Some((AppDialog::FactoryReset, actions::factory_reset_dialog()))
+            }
+            "bootloader" => self.dialog = Some((AppDialog::Bootloader, actions::firmware_dialog())),
+            "save-master" => match actions::save_master_volume(session, &self.state) {
+                Ok(m) | Err(m) => self.note(m),
+            },
+            "save-output-config" => match actions::save_output_config(session) {
+                Ok(m) | Err(m) => self.note(m),
+            },
+            "device" => self.open_device_picker(),
+            "autoeq" => match args.first().copied() {
+                Some("update") => self.autoeq_update(),
+                _ => self.open_tool(Tool::AutoEq),
+            },
+            other => self.note(format!("`{other}` is not one of this interface's verbs")),
+        }
+    }
+
+    /// Raise a path dialog, or act at once when the path came with the verb:
+    /// `:export tuning.txt` should not stop to ask.
+    fn ask_path(&mut self, session: &mut Session, action: FileAction, args: &[&str]) {
+        if let Some(path) = args.first().filter(|p| !p.is_empty()) {
+            self.run_file_action(session, action, path);
+            return;
+        }
+        let (title, body, default, button) = match action {
+            FileAction::ImportFilters => (
+                "Import Filters",
+                "A REW, DSPi or DSPi for Windows filter file.",
+                String::new(),
+                "Import",
+            ),
+            FileAction::ExportFilters => (
+                "Export Filters",
+                "Where to write this device's filters.",
+                actions::DEFAULT_FILTER_NAME.to_string(),
+                "Export",
+            ),
+            FileAction::ImportConfig => (
+                "Import Device Configuration",
+                "A .dspipreset document.",
+                String::new(),
+                "Import",
+            ),
+            FileAction::ExportConfig => (
+                "Export Device Configuration",
+                "Where to write this device's whole configuration.",
+                actions::DEFAULT_CONFIG_NAME.to_string(),
+                "Export",
+            ),
+            FileAction::ImportAutoEqDatabase => (
+                "Import AutoEQ Database",
+                "Select an autoeq_database.json file.",
+                String::new(),
+                "Import",
+            ),
+        };
+        self.dialog = Some((
+            AppDialog::Path(action),
+            actions::path_dialog(title, body, &default, button),
+        ));
+    }
+
+    /// A path has been settled on: read it, write it, or move to the step that
+    /// needs to ask something else.
+    fn run_file_action(&mut self, session: &mut Session, action: FileAction, path: &str) {
+        match action {
+            FileAction::ExportFilters => match actions::export_filters(&self.state, path) {
+                Ok(m) => self.note(m),
+                Err(e) => self.note(e),
+            },
+            FileAction::ExportConfig => match actions::export_config(session, path) {
+                Ok(m) => self.note(m),
+                Err(e) => self.note(e),
+            },
+            FileAction::ImportFilters => {
+                let text = match std::fs::read_to_string(actions::expand(path)) {
+                    Ok(t) => t,
+                    Err(e) => return self.note(format!("Failed to read file: {e}")),
+                };
+                match dspi_session::filterfile::parse(&text) {
+                    Ok(file) => {
+                        let (dialog, targets) = actions::channel_picker(&file, &self.state);
+                        if targets.is_empty() {
+                            return self.note("No valid filters found in file");
+                        }
+                        self.dialog = Some((
+                            AppDialog::ImportChannels {
+                                file: Box::new(file),
+                                targets,
+                            },
+                            dialog,
+                        ));
+                    }
+                    Err(_) => self.note("Failed to parse DSPi Console filter file"),
+                }
+            }
+            FileAction::ImportConfig => match actions::read_config(path) {
+                Ok(doc) => {
+                    let dialog = actions::import_options_dialog(&doc, &self.state);
+                    self.dialog = Some((AppDialog::ConfigOptions(Box::new(doc)), dialog));
+                }
+                Err(e) => self.note(e),
+            },
+            FileAction::ImportAutoEqDatabase => {
+                match dspi_session::autoeq::import_database(&actions::expand(path)) {
+                    Ok(n) => {
+                        self.reload_autoeq();
+                        self.note(format!("Database updated successfully.  Entries: {n}"));
+                    }
+                    Err(e) => self.note(format!("Failed to import database: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Throw away the cached database so the next look at it re-reads.
+    fn reload_autoeq(&mut self) {
+        let mut shared = self.shared.borrow_mut();
+        shared.autoeq = None;
+        shared.favourites = dspi_session::autoeq::load_favourites();
+    }
+
+    fn open_device_picker(&mut self) {
+        let devices = actions::device_list();
+        if devices.len() < 2 {
+            self.note(if devices.is_empty() {
+                "No devices found"
+            } else {
+                "One device connected"
+            });
+            return;
+        }
+        let serials: Vec<String> = devices.iter().map(|d| d.serial.clone()).collect();
+        let items: Vec<String> = devices
+            .iter()
+            .map(|d| format!("{}  {}", d.short_name(), d.bus_id))
+            .collect();
+        let here = self.state.caps.serial.clone();
+        let cursor = serials.iter().position(|s| *s == here).unwrap_or(0);
+        self.dialog = Some((
+            AppDialog::DevicePicker(serials),
+            Dialog::list("Device", "", items, cursor),
+        ));
+    }
+
+    /// The Console's Update Database menu, with its three methods.
+    fn autoeq_update(&mut self) {
+        let db = self.shared.borrow().autoeq.clone();
+        let (count, date) = match &db {
+            Some(d) => (
+                d.entries.len(),
+                if d.generated_at.is_empty() {
+                    "Unknown".to_string()
+                } else {
+                    d.generated_at.clone()
+                },
+            ),
+            None => (0, "Unknown".to_string()),
+        };
+        let mut buttons = vec![
+            Button::new("Rebuild from GitHub"),
+            Button::new("Import File..."),
+        ];
+        // Only offered once there is a user copy to throw away, as the
+        // Console's menu does.
+        if dspi_session::autoeq::has_user_database() {
+            buttons.push(Button::new("Reset to Built-in"));
+        }
+        buttons.push(Button::new("Cancel"));
+        self.dialog = Some((
+            AppDialog::AutoEqUpdate,
+            Dialog::confirm(
+                "Update AutoEQ Database",
+                format!("Current database: {date}\nEntries: {count}\n\nChoose an update method:"),
+                buttons,
+            ),
+        ));
     }
 
     fn select(&mut self, sel: Selection) {
@@ -949,17 +1257,13 @@ impl Live {
             ShellEvent::Palette => self.prompt = Some(Prompt::new(true, &self.ctx)),
             ShellEvent::CommandLine => self.prompt = Some(Prompt::new(false, &self.ctx)),
             ShellEvent::SavePreset => {
-                let slot = self.state.caps.active_preset.map(|p| p + 1).unwrap_or(1);
-                self.dialog = Some((
-                    AppDialog::SavePreset,
-                    Dialog::confirm(
-                        "Save Preset",
-                        format!("Save current parameters to preset slot {slot}?"),
-                        vec![Button::new("Save"), Button::new("Cancel")],
-                    ),
-                ));
+                // Ctrl-S and `:commit` are the Console's one Commit Parameters
+                // action, so they raise one dialog rather than two copies of
+                // the same wording that could drift apart.
+                let slot = self.state.caps.active_preset.unwrap_or(0);
+                self.dialog = Some((AppDialog::Commit, actions::commit_dialog(slot)));
             }
-            ShellEvent::DevicePicker => self.note("One device connected"),
+            ShellEvent::DevicePicker => self.open_device_picker(),
             ShellEvent::Undo => self.undo(session, false),
             ShellEvent::Redo => self.undo(session, true),
             ShellEvent::Quit => {
@@ -1096,9 +1400,6 @@ impl Live {
             (AppDialog::Unsaved { then }, DialogOutcome::Button(1)) => {
                 self.run_pending(session, then)
             }
-            (AppDialog::SavePreset, DialogOutcome::Button(0)) => {
-                self.save_active_preset(session);
-            }
             (AppDialog::Rename { channel }, DialogOutcome::Text(name)) => {
                 self.set(session, "ch.name", &[channel as u8], Value::Text(name));
                 // The detail region names the channel in its title, so it has
@@ -1138,8 +1439,185 @@ impl Live {
                 }
                 self.refresh_presets(session);
             }
+
+            // ---------------------------------------------------- file flows
+            (AppDialog::Path(action), DialogOutcome::Text(path)) => {
+                if !path.trim().is_empty() {
+                    self.run_file_action(session, action, path.trim());
+                }
+            }
+            (AppDialog::ImportChannels { file, targets }, DialogOutcome::Checked(checked, 0)) => {
+                let targets: Vec<actions::ImportTarget> = targets
+                    .into_iter()
+                    .zip(checked)
+                    .map(|(mut t, on)| {
+                        t.checked = on;
+                        t
+                    })
+                    .collect();
+                let count = targets.iter().filter(|t| t.checked).count();
+                let (commands, notes) = actions::import_commands(&file, &self.state, &targets);
+                self.run_commands(session, &commands.join("\n"));
+                let report = actions::import_report(&file, &self.state, count, &notes);
+                self.note(report);
+            }
+            (AppDialog::ConfigOptions(doc), DialogOutcome::Checked(checked, 0)) => {
+                let options = dspi_session::preset_file::ApplyOptions {
+                    audio_processing: true,
+                    volume_levels: checked.first().copied().unwrap_or(false),
+                    hardware_io: checked.get(1).copied().unwrap_or(false),
+                };
+                // The Console shows a progress sheet here. Applying is
+                // synchronous over the same control endpoint everything else
+                // uses, so what a bar would animate is a few hundred
+                // milliseconds of transfers; the report is the part that
+                // matters and it comes up when they are done.
+                let report = dspi_session::preset_file::apply(session, &doc, options);
+                self.refresh(session);
+                self.dialog = Some((
+                    AppDialog::Report,
+                    Dialog::report("Import Device Configuration", report.lines(false)),
+                ));
+            }
+
+            // --------------------------------------------------------- tools
+            (AppDialog::Commit, DialogOutcome::Button(0)) => {
+                if self.save_active_preset(session) {
+                    self.note("Preset saved successfully");
+                }
+            }
+            (AppDialog::Revert, DialogOutcome::Button(0)) => {
+                // The old synchronous REQ_LOAD_PARAMS crashed the device on
+                // S/PDIF input and was reassigned; a host reverts by re-loading
+                // the active slot, which is deferred and stream-safe
+                // (config.h:201-204).
+                match self.state.caps.active_preset {
+                    Some(slot) => {
+                        self.load_preset(session, slot);
+                        self.note("Parameters reverted successfully");
+                    }
+                    None => self
+                        .note("No saved parameters found.  The device is using factory defaults."),
+                }
+            }
+            (AppDialog::FactoryReset, DialogOutcome::Button(0)) => {
+                match session.write("dev.reset", &[], Value::Trigger) {
+                    Ok(_) => {
+                        self.refresh(session);
+                        self.state.mark_saved();
+                        self.note("Factory reset complete");
+                    }
+                    Err(_) => self.note("Failed to reset parameters"),
+                }
+            }
+            (AppDialog::Bootloader, DialogOutcome::Button(0)) => {
+                // The device answers, waits 100 ms and resets; there is nothing
+                // to acknowledge and every later transfer will fail, which is
+                // expected rather than an error (survey 6.2).
+                let _ = session.write("dev.bootloader", &[], Value::Trigger);
+                let watch = actions::BootloaderWatch::new();
+                self.dialog = Some((
+                    AppDialog::BootWait,
+                    Dialog::progress("Firmware Update", watch.status()),
+                ));
+                self.boot = Some(watch);
+            }
+            (AppDialog::BootWait, _) => self.boot = None,
+            (AppDialog::DevicePicker(serials), DialogOutcome::Picked(i)) => {
+                if let Some(serial) = serials.get(i).cloned() {
+                    self.switch_device(serial);
+                }
+            }
+
+            // -------------------------------------------------------- autoeq
+            (AppDialog::AutoEqUpdate, DialogOutcome::Button(0)) => {
+                self.dialog = Some((
+                    AppDialog::AutoEqRebuild,
+                    Dialog::confirm(
+                        "Rebuild AutoEQ Database",
+                        dspi_session::autoeq::rebuild_warning(),
+                        vec![Button::new("Rebuild"), Button::new("Cancel")],
+                    )
+                    .default_button(1),
+                ));
+            }
+            (AppDialog::AutoEqUpdate, DialogOutcome::Button(1)) => {
+                self.ask_path(session, FileAction::ImportAutoEqDatabase, &[])
+            }
+            (AppDialog::AutoEqUpdate, DialogOutcome::Button(2)) => {
+                match dspi_session::autoeq::reset_to_builtin() {
+                    Ok(n) => {
+                        self.reload_autoeq();
+                        self.note(format!("Reset to built-in database.  Entries: {n}"));
+                    }
+                    Err(e) => self.note(format!("Failed to reset: {e}")),
+                }
+            }
+            (AppDialog::AutoEqRebuild, DialogOutcome::Button(0)) => {
+                let handle = dspi_session::autoeq::rebuild_from_github(Box::new(
+                    dspi_session::autoeq::CurlFetch,
+                ));
+                self.dialog = Some((
+                    AppDialog::AutoEqRebuildProgress,
+                    Dialog::progress("Updating Database", "Connecting to GitHub..."),
+                ));
+                self.rebuild = Some(handle);
+            }
+            (AppDialog::AutoEqRebuildProgress, _) => {
+                // Escape on the progress dialog stops the download rather than
+                // leaving a thread hammering GitHub with nobody watching.
+                self.rebuild = None;
+                self.note("Rebuild cancelled");
+            }
             _ => {}
         }
+    }
+
+    /// Switch to another device, asking first if this one has unsaved changes.
+    fn switch_device(&mut self, serial: String) {
+        if serial == self.state.caps.serial {
+            return;
+        }
+        if self.state.has_unsaved_changes() {
+            self.dialog = Some((
+                AppDialog::Unsaved {
+                    then: PendingAction::SwitchDevice(serial),
+                },
+                self.unsaved_dialog(),
+            ));
+        } else {
+            self.switch_to = Some(serial);
+        }
+    }
+
+    /// Open another device in place of this one.
+    ///
+    /// Everything that describes the old device goes: the capabilities, the
+    /// bulk shadow, the meters, the preset names and the diagnostics. Keeping
+    /// any of it would show one device's numbers under another one's name.
+    pub fn adopt(&mut self, session: &mut Session, state: DeviceState) {
+        let caps = &state.caps;
+        self.ctx = Context {
+            channel_slugs: caps.channels.iter().map(|c| c.slug.clone()).collect(),
+            num_inputs: caps.num_inputs,
+            num_outputs: caps.num_outputs,
+            max_bands: caps.max_bands,
+        };
+        let n = caps.num_channels as usize;
+        self.peaks = vec![PeakHold::default(); n];
+        self.visible = vec![true; n];
+        self.state = state;
+        {
+            let mut shared = self.shared.borrow_mut();
+            shared.stats = actions::Stats::default();
+            shared.preset_names.clear();
+            shared.occupied = 0;
+            shared.default_slot = None;
+        }
+        self.shell.model.connected = true;
+        self.select(Selection::Overview);
+        self.refresh_presets(session);
+        self.note(format!("Switched to {}", self.state.caps.serial));
     }
 
     /// One item of the Preset row's menu.
@@ -1261,6 +1739,7 @@ impl Live {
         match then {
             PendingAction::Quit => self.should_quit = true,
             PendingAction::LoadPreset(slot) => self.load_preset(session, slot),
+            PendingAction::SwitchDevice(serial) => self.switch_to = Some(serial),
         }
     }
 
@@ -1276,6 +1755,17 @@ impl Live {
             return;
         }
         if let Some((kind, d)) = &mut self.dialog {
+            // A path field completes on Tab the way a shell does. The dialog
+            // widget cannot do this itself: only the flow knows the field is a
+            // path rather than a name.
+            if key.code == KeyCode::Tab
+                && matches!(kind, AppDialog::Path(_))
+                && let crate::widgets::DialogKind::Text { value, .. } = &mut d.kind
+                && let Some(completed) = actions::complete_path(value)
+            {
+                *value = completed;
+                return;
+            }
             if let Some(outcome) = d.handle(key) {
                 let kind = kind.clone();
                 self.dialog = None;
@@ -1330,6 +1820,24 @@ impl Live {
         }
     }
 
+    /// Refresh the Stats panel's diagnostics, every two seconds and only while
+    /// that panel is on screen.
+    ///
+    /// None of it is in the bulk packet and none of it is notified, so it can
+    /// only be asked for; two dozen control transfers every two seconds is
+    /// worth it for a panel someone is reading and worth nothing otherwise.
+    fn poll_stats(&mut self, session: &mut Session, now: Instant) {
+        if !matches!(self.shell.tool, Some((Tool::Stats, _)))
+            || now.duration_since(self.last_stats_poll) < Duration::from_secs(2)
+        {
+            return;
+        }
+        self.last_stats_poll = now;
+        let previous = self.shared.borrow().stats.clone();
+        let stats = actions::read_stats(session, &self.state, &previous);
+        self.shared.borrow_mut().stats = stats;
+    }
+
     /// Meters, notifications, status expiry, peak ballistics.
     pub fn tick(&mut self, session: &mut Session, notifications: Option<&Notifications>) {
         let now = Instant::now();
@@ -1343,11 +1851,19 @@ impl Live {
             self.state.update_meters(m);
         }
         self.poll_upmix_status(session, now);
+        self.poll_stats(session, now);
 
         let mut reread = false;
         let mut changed_elsewhere: Option<(&'static str, Source)> = None;
         if let Some(n) = notifications {
+            self.shared.borrow_mut().log.active = true;
+            let at = now.duration_since(self.started).as_secs_f64();
             for note in n.drain() {
+                // The monitor is fed from this drain rather than from a reader
+                // of its own: two readers on one endpoint would each see half
+                // the events, and the log has to keep running while the panel
+                // is closed so opening it shows what just happened.
+                self.shared.borrow_mut().log.push(at, &note);
                 match self.state.apply(&note) {
                     Applied::Section { name, source } => {
                         if !source.is_ours() {
@@ -1382,7 +1898,51 @@ impl Live {
             self.shell.model.status = None;
             self.status_until = None;
         }
+        self.advance_boot();
+        self.advance_rebuild();
         self.sync_model();
+    }
+
+    /// Move the bootloader handoff along, and close it out when it lands.
+    fn advance_boot(&mut self) {
+        let Some(watch) = self.boot.as_mut() else {
+            return;
+        };
+        watch.poll(&actions::RealBootProbe);
+        let (status, fraction, finished) = (watch.status(), watch.fraction(), watch.finished());
+        if let Some((AppDialog::BootWait, dialog)) = self.dialog.as_mut() {
+            dialog.set_progress(fraction, status.clone());
+            if finished {
+                // A progress dialog has no buttons, so the wait becomes a
+                // report the person can dismiss once it has an answer.
+                *dialog = Dialog::report("Firmware Update", vec![status]);
+            }
+        }
+        if finished {
+            self.dialog = self.dialog.take().map(|(_, d)| (AppDialog::Report, d));
+            self.boot = None;
+        }
+    }
+
+    /// Move the AutoEQ rebuild's progress dialog along.
+    fn advance_rebuild(&mut self) {
+        let Some(handle) = self.rebuild.as_mut() else {
+            return;
+        };
+        let progress = handle.poll().clone();
+        if let Some((AppDialog::AutoEqRebuildProgress, dialog)) = self.dialog.as_mut() {
+            dialog.set_progress(progress.fraction, progress.status.clone());
+        }
+        let Some(done) = progress.done else { return };
+        self.rebuild = None;
+        self.dialog = None;
+        match done {
+            Ok(n) => {
+                self.reload_autoeq();
+                self.note(format!("Database rebuilt successfully!  Entries: {n}"));
+            }
+            Err(e) => self.note(format!("Rebuild failed: {e}")),
+        }
     }
 
     pub fn draw(&mut self, area: Rect, buf: &mut Buffer) {
@@ -1406,6 +1966,21 @@ impl Live {
             p.draw(area, buf, &theme);
         }
     }
+}
+
+/// Open another DSPi by serial, probing it from scratch.
+///
+/// Nothing about the old device is carried over: a different unit can have a
+/// different channel count, a different firmware and different features, and
+/// reusing any of that would show one device's shape under another's name.
+fn open_device(serial: &str) -> Result<(Session, DeviceState), String> {
+    let mut transport =
+        dspi_transport::UsbTransport::open_serial(serial).map_err(|e| e.to_string())?;
+    let caps = dspi_session::probe(&mut transport).map_err(|e| e.to_string())?;
+    let mut session =
+        Session::new(Box::new(transport), caps.clone()).ok_or("unusable channel map")?;
+    let bulk = session.snapshot().map_err(|e| e.to_string())?;
+    Ok((session, DeviceState::new(caps, bulk)))
 }
 
 /// Run the live interface until the person quits.
@@ -1439,6 +2014,15 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
                     live.should_quit = true;
                 }
                 live.handle_key(session, key);
+            }
+            if let Some(serial) = live.switch_to.take() {
+                match open_device(&serial) {
+                    Ok((next, state)) => {
+                        *session = next;
+                        live.adopt(session, state);
+                    }
+                    Err(e) => live.note(format!("Could not open {serial}: {e}")),
+                }
             }
             if live.should_quit {
                 return Ok(());
@@ -1514,10 +2098,28 @@ mod tests {
     /// The same runner, wired to the Console's screens rather than the
     /// placeholders.
     fn console() -> (Live, Session, LogHandle) {
-        let mock = MockTransport::new()
+        console_with(false)
+    }
+
+    /// The same runner against a device that answers every opcode rather than
+    /// stalling the ones the fixture does not script.
+    ///
+    /// The File and Tools verbs touch dozens of opcodes each, and an
+    /// unscripted one costs the transport's whole busy-retry backoff; a test
+    /// of what reaches the wire should not spend minutes waiting for a mock to
+    /// decide it is not going to answer.
+    fn answering() -> (Live, Session, LogHandle) {
+        console_with(true)
+    }
+
+    fn console_with(answer_everything: bool) -> (Live, Session, LogHandle) {
+        let mut mock = MockTransport::new()
             .window(op::REQ_GET_ALL_PARAMS_CHUNK, packet())
             .data(op::REQ_GET_USER_VOLUME, (-12.5f32).to_le_bytes().to_vec())
             .data(op::REQ_GET_STATUS, vec![0; 41]);
+        if answer_everything {
+            mock = mock.answering_everything(vec![0; 64]);
+        }
         let log = mock.log_handle();
         let session = Session::new(Box::new(mock), caps()).unwrap();
         let state = DeviceState::new(
@@ -1665,6 +2267,340 @@ mod tests {
         assert!(matches!(l.dialog, Some((AppDialog::Unsaved { .. }, _))));
         l.handle_key(&mut s, key(KeyCode::Char('d')));
         assert!(l.should_quit, "Discard quits");
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dspi-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir.join(name)
+    }
+
+    /// Every File and Tools verb is offered by the palette, or half the
+    /// program is unreachable without reading the source.
+    #[test]
+    fn the_palette_offers_the_interfaces_own_verbs() {
+        let (l, _, _) = console();
+        let p = Prompt::new(true, &l.ctx);
+        for (verb, _) in APP_VERBS {
+            assert!(
+                p.candidates.iter().any(|c| c.value == *verb),
+                "{verb} is not in the palette"
+            );
+        }
+        // And they complete like anything else.
+        let mut p = Prompt::new(true, &l.ctx);
+        p.input = "import".into();
+        p.refresh(&l.ctx);
+        let offered: Vec<&str> = p.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert!(offered.contains(&"import") && offered.contains(&"import-config"));
+    }
+
+    #[test]
+    fn export_writes_a_filter_file_without_asking_when_the_path_came_with_the_verb() {
+        let (mut l, mut s, _) = console();
+        let path = scratch("tuning.txt");
+        l.run_command(&mut s, &format!("export {}", path.display()));
+        assert!(l.dialog.is_none(), "no dialog when the path was given");
+        assert_eq!(
+            l.shell.model.status.as_deref(),
+            Some("Filters exported successfully")
+        );
+        let text = std::fs::read_to_string(&path).expect("the file");
+        assert!(text.contains("# DSPi Console Filter Settings"), "{text}");
+        assert!(text.contains("[Input 0: FL]"), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The whole import flow: a path, then the channel checklist, then the
+    /// bands on the wire and the Console's report.
+    #[test]
+    fn import_asks_which_channels_then_writes_the_bands() {
+        let (mut l, mut s, log) = answering();
+        let path = scratch("rew.txt");
+        std::fs::write(
+            &path,
+            "Preamp: -6.5 dB\nFilter 1: ON PK Fc 100 Hz Gain 3.0 dB Q 1.00\n",
+        )
+        .unwrap();
+
+        l.run_command(&mut s, &format!("import {}", path.display()));
+        let (kind, dialog) = l.dialog.as_ref().expect("the channel picker");
+        assert!(matches!(kind, AppDialog::ImportChannels { .. }));
+        assert_eq!(dialog.title, "Import Filters");
+        assert!(
+            dialog
+                .body
+                .contains("Found 1 filter(s) and a -6.5 dB preamp")
+        );
+
+        // Take everything but the first channel off, then import.
+        l.handle_key(&mut s, key(KeyCode::Down));
+        for _ in 0..7 {
+            l.handle_key(&mut s, key(KeyCode::Char(' ')));
+            l.handle_key(&mut s, key(KeyCode::Down));
+        }
+        l.handle_key(&mut s, key(KeyCode::Enter));
+
+        let bands = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.opcode == op::REQ_SET_EQ_PARAM)
+            .count();
+        assert_eq!(bands, 10, "one channel's whole bank, filled and cleared");
+        assert_eq!(
+            l.shell.model.status.as_deref(),
+            Some("Filters imported to 1 channel(s)")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_config_export_and_import_round_trip_through_the_options_checklist() {
+        let (mut l, mut s, _) = answering();
+        let path = scratch("config.dspipreset");
+        l.run_command(&mut s, &format!("export-config {}", path.display()));
+        assert!(
+            l.shell
+                .model
+                .status
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Configuration exported.")),
+            "{:?}",
+            l.shell.model.status
+        );
+
+        l.run_command(&mut s, &format!("import-config {}", path.display()));
+        let (kind, dialog) = l.dialog.as_ref().expect("the options checklist");
+        assert!(matches!(kind, AppDialog::ConfigOptions(_)));
+        assert!(
+            dialog.body.contains(
+                "EQ, crossover, delays, gains, routing and the DSP features are always applied."
+            ),
+            "{}",
+            dialog.body
+        );
+        // Import with both options left off, which is the Console's default.
+        l.handle_key(&mut s, key(KeyCode::Enter));
+        let (kind, dialog) = l.dialog.as_ref().expect("the report");
+        assert!(matches!(kind, AppDialog::Report));
+        match &dialog.kind {
+            crate::widgets::DialogKind::Report { lines, .. } => {
+                assert!(lines[0].starts_with("Applied "), "{lines:?}");
+                assert!(
+                    lines
+                        .last()
+                        .unwrap()
+                        .contains("These changes are live but not yet stored on the device."),
+                    "{lines:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_path_dialog_completes_on_tab() {
+        let (mut l, mut s, _) = console();
+        let path = scratch("completable.txt");
+        std::fs::write(&path, "x").unwrap();
+        l.run_command(&mut s, "import");
+        let stem = path
+            .to_string_lossy()
+            .replace("completable.txt", "completab");
+        if let Some((_, d)) = l.dialog.as_mut()
+            && let crate::widgets::DialogKind::Text { value, .. } = &mut d.kind
+        {
+            *value = stem;
+        }
+        l.handle_key(&mut s, key(KeyCode::Tab));
+        let Some((_, d)) = l.dialog.as_ref() else {
+            panic!("the dialog closed")
+        };
+        match &d.kind {
+            crate::widgets::DialogKind::Text { value, .. } => {
+                assert_eq!(value, &path.to_string_lossy().to_string())
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_tools_verbs_confirm_before_they_act() {
+        let (mut l, mut s, log) = answering();
+
+        l.run_command(&mut s, "commit");
+        assert_eq!(
+            l.dialog.as_ref().unwrap().1.body,
+            "Save current parameters to preset slot 3?"
+        );
+        l.handle_key(&mut s, key(KeyCode::Enter));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.opcode == op::REQ_PRESET_SAVE),
+            "Save writes the preset"
+        );
+
+        l.run_command(&mut s, "factory-reset");
+        let (_, d) = l.dialog.as_ref().unwrap();
+        assert!(d.critical, "a factory reset is a critical confirm");
+        // Escape leaves the device alone.
+        l.handle_key(&mut s, key(KeyCode::Esc));
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.opcode == op::REQ_FACTORY_RESET),
+            "cancelling wrote nothing"
+        );
+        l.run_command(&mut s, "factory-reset");
+        l.handle_key(&mut s, key(KeyCode::Char('r')));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.opcode == op::REQ_FACTORY_RESET)
+        );
+        assert_eq!(
+            l.shell.model.status.as_deref(),
+            Some("Factory reset complete")
+        );
+    }
+
+    /// Revert re-loads the active slot: the old synchronous load opcode was
+    /// reassigned because it crashed the device on S/PDIF input.
+    #[test]
+    fn revert_reloads_the_active_preset_rather_than_the_reassigned_opcode() {
+        let (mut l, mut s, log) = console();
+        l.run_command(&mut s, "revert");
+        assert_eq!(l.dialog.as_ref().unwrap().1.title, "Revert to Saved");
+        l.handle_key(&mut s, key(KeyCode::Char('r')));
+        let sent = log.lock().unwrap();
+        assert!(sent.iter().any(|e| e.opcode == op::REQ_PRESET_LOAD));
+        assert!(
+            !sent.iter().any(|e| e.opcode == op::REQ_SAVE_OUTPUT_CONFIG),
+            "0x52 is Save Output Configuration now, not Load Params"
+        );
+    }
+
+    #[test]
+    fn save_master_and_save_output_config_report_what_they_did() {
+        let (mut l, mut s, log) = answering();
+        l.run_command(&mut s, "save-master");
+        assert!(
+            l.shell
+                .model
+                .status
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Master volume saved (")),
+            "{:?}",
+            l.shell.model.status
+        );
+        assert!(
+            l.shell
+                .model
+                .status
+                .as_deref()
+                .is_some_and(|m| m.ends_with("It will be applied on next boot.")),
+            "{:?}",
+            l.shell.model.status
+        );
+        l.run_command(&mut s, "save-output-config");
+        assert_eq!(
+            l.shell.model.status.as_deref(),
+            Some("Output configuration saved. It will be applied on next boot.")
+        );
+        let sent = log.lock().unwrap();
+        assert!(sent.iter().any(|e| e.opcode == op::REQ_SAVE_MASTER_VOLUME));
+        assert!(sent.iter().any(|e| e.opcode == op::REQ_SAVE_OUTPUT_CONFIG));
+    }
+
+    /// The bootloader jump has no acknowledgement and every later transfer
+    /// fails, so what the person sees afterwards is the whole of the feature.
+    #[test]
+    fn the_firmware_update_confirms_then_waits_for_the_drive() {
+        let (mut l, mut s, log) = console();
+        l.run_command(&mut s, "bootloader");
+        let (_, d) = l.dialog.as_ref().expect("the confirm");
+        assert!(d.critical);
+        assert_eq!(d.buttons[0].label, "Reboot into Bootloader");
+        l.handle_key(&mut s, key(KeyCode::Char('r')));
+
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.opcode == op::REQ_ENTER_BOOTLOADER)
+        );
+        assert!(l.boot.is_some(), "the wait started");
+        let (kind, d) = l.dialog.as_ref().expect("the progress dialog");
+        assert!(matches!(kind, AppDialog::BootWait));
+        assert_eq!(d.title, "Firmware Update");
+        match &d.kind {
+            crate::widgets::DialogKind::Progress { status, .. } => {
+                assert_eq!(status, "Waiting for the device to disconnect...")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_autoeq_verb_opens_the_browser_and_its_update_menu() {
+        let (mut l, mut s, _) = console();
+        l.run_command(&mut s, "autoeq");
+        assert!(matches!(l.shell.tool, Some((Tool::AutoEq, _))));
+
+        l.run_command(&mut s, "autoeq update");
+        let (kind, d) = l.dialog.as_ref().expect("the update menu");
+        assert!(matches!(kind, AppDialog::AutoEqUpdate));
+        assert_eq!(d.title, "Update AutoEQ Database");
+        assert!(d.body.contains("Choose an update method:"), "{}", d.body);
+        assert_eq!(d.buttons[0].label, "Rebuild from GitHub");
+        assert_eq!(d.buttons[1].label, "Import File...");
+
+        // The rebuild is opt-in behind a warning that names what it fetches.
+        l.handle_key(&mut s, key(KeyCode::Enter));
+        let (kind, d) = l.dialog.as_ref().expect("the rebuild confirm");
+        assert!(matches!(kind, AppDialog::AutoEqRebuild));
+        assert!(d.body.contains("api.github.com"), "{}", d.body);
+        assert_eq!(d.default, 1, "Cancel is the default");
+    }
+
+    /// One device is not a picker; the Console only offers one with more than
+    /// one attached.
+    #[test]
+    fn the_device_picker_says_so_when_there_is_nothing_to_pick() {
+        let (mut l, mut s, _) = console();
+        l.handle_event(&mut s, ShellEvent::DevicePicker);
+        assert!(l.dialog.is_none());
+        assert!(
+            l.shell
+                .model
+                .status
+                .as_deref()
+                .is_some_and(|m| m.contains("device")),
+            "{:?}",
+            l.shell.model.status
+        );
+    }
+
+    /// A switch with unsaved changes asks first, and only goes through once
+    /// the answer is in.
+    #[test]
+    fn switching_device_with_unsaved_changes_asks_first() {
+        let (mut l, mut s, _) = console();
+        let (_, g, _) = dspi_proto::generated::SECTIONS[1];
+        l.state.bulk.patch(g, &(-6.0f32).to_le_bytes());
+        l.sync_model();
+        l.switch_device("OTHER0000000001".into());
+        assert!(l.switch_to.is_none(), "not yet");
+        assert!(matches!(l.dialog, Some((AppDialog::Unsaved { .. }, _))));
+        l.handle_key(&mut s, key(KeyCode::Char('d')));
+        assert_eq!(l.switch_to.as_deref(), Some("OTHER0000000001"));
     }
 
     #[test]

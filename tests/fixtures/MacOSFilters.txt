@@ -1,0 +1,24 @@
+# DSPi Console Filter Settings
+# Exported: 2026-03-14 09:21:04
+# Format: 2
+
+[Input 0: FL]
+Preamp -5.3 dB
+Filter  1: ON  LS      Fc   105.0 Hz  Gain  +8.8 dB  Q  0.71
+Filter  2: ON  PK      Fc    64.0 Hz  Gain  -6.2 dB  Q  0.30
+Filter  3: ON  PK      Fc  2856.0 Hz  Gain  -8.6 dB  Q  3.58  [Bypassed]
+Filter  4: OFF
+
+[Input 1: FR]
+Preamp -5.3 dB
+Filter  1: ON  LS      Fc   105.0 Hz  Gain  +8.8 dB  Q  0.71
+
+[Output 0: OUT L (Enabled)]
+Filter  1: ON  HP1     Fc    80.0 Hz  Q  0.71
+Filter  2: ON  LT      Fc    40.0 Hz  Q  0.50  Fp    28.0 Hz  Qp  0.71
+Xover   1: ON  LR4HP   Fc  2000.0 Hz
+Xover   2: ON  BW2LP   Fc  4000.0 Hz
+
+[Output 8: Sub (Enabled)]
+Filter  1: ON  LP      Fc    80.0 Hz  Q  0.71
+Xover   1: ON  BES4LP  Fc   120.0 Hz
