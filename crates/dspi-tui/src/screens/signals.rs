@@ -377,7 +377,13 @@ impl SignalsPanel {
     }
 
     /// Why Start is refused, in the Console's words.
+    ///
+    /// `TestSignalsView.swift:293-302`, in its order: the connection first,
+    /// because without a device the other three questions are about nothing.
     fn blocker(&self, state: &DeviceState) -> Option<&'static str> {
+        if !state.connected {
+            return Some("No device connected");
+        }
         if !Self::supported(state) {
             return Some("Firmware has no signal generator");
         }
@@ -1183,6 +1189,27 @@ mod tests {
         state.siggen_state = Some((0, 3, 4, 0xFF));
         let f = testing::draw(&mut p, &state, 100, 60);
         assert!(f.contains("Stopped by preset load"), "{f}");
+    }
+
+    /// D10: `TestSignalsView.swift:294` puts the connection ahead of the other
+    /// three blockers. Without it a disconnected device read `Ready · Sine`
+    /// with Start enabled, and pressing it wrote into nothing.
+    #[test]
+    fn a_missing_device_blocks_start_before_any_other_reason() {
+        let (mut p, mut state) = panel();
+        let f = testing::draw(&mut p, &state, 100, 60);
+        assert!(f.contains("Ready · Sine"), "{f}");
+
+        state.connected = false;
+        // Even with nothing selected, which is the next blocker in line.
+        p.draft.channel_mask = 0;
+        assert_eq!(
+            p.handle(key(KeyCode::Char(' ')), &state),
+            ScreenEvent::Status("No device connected".into())
+        );
+        let f = testing::draw(&mut p, &state, 100, 60);
+        assert!(f.contains("No device connected"), "{f}");
+        assert!(!f.contains("Ready · Sine"), "{f}");
     }
 
     #[test]
