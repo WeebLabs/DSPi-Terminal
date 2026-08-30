@@ -395,7 +395,7 @@ enum AppDialog {
     Rename {
         channel: usize,
     },
-    PresetList,
+    PresetList(Vec<Option<PresetChoice>>),
     /// The `Copy to...` submenu, with the slot each row stands for.
     PresetCopyTo(Vec<u8>),
     PresetRename(u8),
@@ -1312,8 +1312,8 @@ impl Live {
             ShellEvent::Preset(None) => {
                 let active = self.state.caps.active_preset.unwrap_or(0);
                 let dirty = self.state.has_unsaved_changes();
-                let popup = PresetMenu::popup(&self.shared.borrow(), active, dirty);
-                self.popup = Some((AppDialog::PresetList, popup));
+                let (popup, choices) = PresetMenu::popup(&self.shared.borrow(), active, dirty);
+                self.popup = Some((AppDialog::PresetList(choices), popup));
             }
             ShellEvent::Source(Some(delta)) => {
                 if let Some((choices, idx)) = &self.shell.model.source {
@@ -1470,22 +1470,16 @@ impl Live {
     /// Identify: a counted blip melody so the listener can tell which speaker
     /// is which. It is only offered while the generator exists.
     fn identify(&mut self, session: &mut Session, row: usize) {
-        if !panel::has_feature(&self.state, "test_signals") {
-            self.note("Firmware has no signal generator");
-            return;
-        }
         let ni = self.state.caps.num_inputs as usize;
         let output = row.saturating_sub(ni);
         let name = screens::channel_name(&self.state, row);
-        self.run_commands(
-            session,
-            &format!(
-                "sig.config type=channel-id channels=0x{:X} invert=0x0 level=-20 duration=0 \
-                 repeat=1 gap=0 flags=walk p1=120\nsig.control start",
-                1u16 << output
-            ),
-        );
-        self.note(format!("Identifying {name}"));
+        match screens::identify_command(&self.state, output) {
+            Some(cmd) => {
+                self.run_commands(session, &cmd);
+                self.note(format!("Identifying {name}"));
+            }
+            None => self.note("Firmware has no signal generator"),
+        }
     }
 
     fn request_preset(&mut self, session: &mut Session, slot: u8) {
@@ -1565,8 +1559,8 @@ impl Live {
                 let sel = self.shell.model.selection;
                 self.shell.detail = self.screens.detail(&self.state, sel);
             }
-            (AppDialog::PresetList, DialogOutcome::Picked(i)) => {
-                self.preset_action(session, PresetMenu::choice(i))
+            (AppDialog::PresetList(choices), DialogOutcome::Picked(i)) => {
+                self.preset_action(session, choices.get(i).copied().flatten())
             }
             (AppDialog::PresetCopyTo(slots), DialogOutcome::Picked(i)) => {
                 if let Some(dest) = slots.get(i).copied() {
@@ -2447,8 +2441,20 @@ mod tests {
         let (_, popup) = l.popup.as_ref().expect("the preset popup");
         assert_eq!(popup.items[0], "1: Empty");
         assert_eq!(popup.items[11], "Save");
-        assert_eq!(popup.items[16], "Clear All Slots...");
-        // Picking an action rather than a slot opens its own step.
+        // Nothing is stored on the fixture device, so the Clear rows are
+        // absent, as the Console hides them; Copy to... is the last action.
+        assert_eq!(popup.items.last().map(String::as_str), Some("Copy to..."));
+        assert!(!popup.items.iter().any(|i| i.starts_with("Clear")));
+        // With a stored slot the menu ends in Clear All Slots..., and picking
+        // it opens its own step.
+        l.popup = None;
+        l.shared.borrow_mut().occupied = 0b101;
+        l.handle_key(&mut s, key(KeyCode::Enter));
+        let (_, popup) = l.popup.as_ref().expect("the preset popup");
+        assert_eq!(
+            popup.items.last().map(String::as_str),
+            Some("Clear All Slots...")
+        );
         l.handle_key(&mut s, key(KeyCode::End));
         l.handle_key(&mut s, key(KeyCode::Enter));
         assert!(matches!(l.dialog, Some((AppDialog::PresetClearAll, _))));

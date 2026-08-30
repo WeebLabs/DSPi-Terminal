@@ -45,49 +45,55 @@ impl PresetMenu {
     }
 
     /// The Preset row's popup: the slots, a rule, then the actions.
-    pub fn popup(shared: &SharedState, active: u8, dirty: bool) -> PopupList {
-        let mut items: Vec<String> = (0..SLOTS as u8)
-            .map(|slot| {
-                let mut label = Self::slot_label(shared, slot);
-                // Only the active slot ever carries the dirty marker, so at
-                // most one `*` is ever on screen.
-                if slot == active && dirty {
-                    label.push('*');
-                }
-                label
-            })
-            .collect();
+    /// The Preset row's popup: the slots, a rule, then the actions, with
+    /// what each row means alongside so the caller never counts rows. The
+    /// Clear rows appear only when there is something to clear
+    /// (`ContentView.swift:1249-1257`).
+    pub fn popup(
+        shared: &SharedState,
+        active: u8,
+        dirty: bool,
+    ) -> (PopupList, Vec<Option<PresetChoice>>) {
+        let mut items: Vec<String> = Vec::new();
+        let mut choices: Vec<Option<PresetChoice>> = Vec::new();
+        for slot in 0..SLOTS as u8 {
+            let mut label = Self::slot_label(shared, slot);
+            // Only the active slot ever carries the dirty marker, so at
+            // most one `*` is ever on screen.
+            if slot == active && dirty {
+                label.push('*');
+            }
+            items.push(label);
+            choices.push(Some(PresetChoice::Slot(slot)));
+        }
+        let mut push = |label: String, choice: Option<PresetChoice>| {
+            items.push(label);
+            choices.push(choice);
+        };
         // A header with no text is the rule between the slots and the actions.
-        items.push("#".into());
-        items.push("Save".into());
-        items.push("Rename...".into());
+        push("#".into(), None);
+        push("Save".into(), Some(PresetChoice::Save));
+        push("Rename...".into(), Some(PresetChoice::Rename));
         // `ContentView.swift:1238-1239` disables Set as Default when the
         // startup mode already points at this slot; `default_slot` is `Some`
         // only in that mode. A leading `#` is the popup's un-pickable, dimmed
         // form, which is what a disabled menu item looks like.
-        items.push(if shared.default_slot == Some(active) {
-            "#Set as Default".into()
+        if shared.default_slot == Some(active) {
+            push("#Set as Default".into(), None);
         } else {
-            "Set as Default".to_string()
-        });
-        items.push("Copy to...".into());
-        items.push(format!("Clear \"{}\"...", Self::slot_label(shared, active)));
-        items.push("Clear All Slots...".into());
-        PopupList::new("Preset", items, active as usize)
-    }
-
-    /// What the popup's index means.
-    pub fn choice(index: usize) -> Option<PresetChoice> {
-        Some(match index {
-            0..=9 => PresetChoice::Slot(index as u8),
-            11 => PresetChoice::Save,
-            12 => PresetChoice::Rename,
-            13 => PresetChoice::SetDefault,
-            14 => PresetChoice::CopyTo,
-            15 => PresetChoice::Clear,
-            16 => PresetChoice::ClearAll,
-            _ => return None,
-        })
+            push("Set as Default".into(), Some(PresetChoice::SetDefault));
+        }
+        push("Copy to...".into(), Some(PresetChoice::CopyTo));
+        if shared.occupied & (1 << active) != 0 {
+            push(
+                format!("Clear \"{}\"...", Self::slot_label(shared, active)),
+                Some(PresetChoice::Clear),
+            );
+        }
+        if shared.occupied != 0 {
+            push("Clear All Slots...".into(), Some(PresetChoice::ClearAll));
+        }
+        (PopupList::new("Preset", items, active as usize), choices)
     }
 
     /// The `Copy to...` submenu: the nine other slots.
@@ -148,7 +154,7 @@ mod tests {
     #[test]
     fn the_menu_lists_the_slots_then_the_console_actions() {
         let s = shared();
-        let p = PresetMenu::popup(&s, 2, true);
+        let (p, _) = PresetMenu::popup(&s, 2, true);
         assert_eq!(p.items[0], "1: Studio");
         assert_eq!(p.items[1], "2: Empty");
         assert_eq!(p.items[2], "3: Living Room*", "the dirty marker");
@@ -165,7 +171,7 @@ mod tests {
     #[test]
     fn only_the_active_slot_carries_the_marker() {
         let s = shared();
-        let p = PresetMenu::popup(&s, 2, false);
+        let (p, _) = PresetMenu::popup(&s, 2, false);
         assert_eq!(p.items[2], "3: Living Room");
         assert_eq!(p.items.iter().filter(|i| i.ends_with('*')).count(), 0);
     }
@@ -176,29 +182,47 @@ mod tests {
     fn set_as_default_is_disabled_on_the_slot_that_already_is_the_default() {
         let mut s = shared();
         s.default_slot = Some(2);
-        let p = PresetMenu::popup(&s, 2, false);
+        let (p, _) = PresetMenu::popup(&s, 2, false);
         assert_eq!(p.items[13], "#Set as Default", "dimmed and unpickable");
         // The rest of the menu keeps its indices.
         assert_eq!(p.items[12], "Rename...");
         assert_eq!(p.items[14], "Copy to...");
 
         // Another slot still offers it.
-        let p = PresetMenu::popup(&s, 0, false);
+        let (p, _) = PresetMenu::popup(&s, 0, false);
         assert_eq!(p.items[13], "Set as Default");
         // And so does a device whose startup mode is not "a specified slot".
         s.default_slot = None;
-        let p = PresetMenu::popup(&s, 2, false);
+        let (p, _) = PresetMenu::popup(&s, 2, false);
         assert_eq!(p.items[13], "Set as Default");
     }
 
     #[test]
     fn indices_map_to_the_actions_and_the_rule_maps_to_nothing() {
-        assert_eq!(PresetMenu::choice(0), Some(PresetChoice::Slot(0)));
-        assert_eq!(PresetMenu::choice(9), Some(PresetChoice::Slot(9)));
-        assert_eq!(PresetMenu::choice(10), None);
-        assert_eq!(PresetMenu::choice(11), Some(PresetChoice::Save));
-        assert_eq!(PresetMenu::choice(16), Some(PresetChoice::ClearAll));
-        assert_eq!(PresetMenu::choice(17), None);
+        let s = shared();
+        let (_, c) = PresetMenu::popup(&s, 2, false);
+        assert_eq!(c[0], Some(PresetChoice::Slot(0)));
+        assert_eq!(c[9], Some(PresetChoice::Slot(9)));
+        assert_eq!(c[10], None);
+        assert_eq!(c[11], Some(PresetChoice::Save));
+        assert_eq!(*c.last().unwrap(), Some(PresetChoice::ClearAll));
+        // An empty active slot has no Clear row; a device with nothing
+        // stored has no Clear All either.
+        let (p, c) = PresetMenu::popup(&s, 1, false);
+        assert!(
+            !p.items.iter().any(|i| i.starts_with("Clear \"")),
+            "{:?}",
+            p.items
+        );
+        assert!(c.contains(&Some(PresetChoice::ClearAll)));
+        let mut empty = shared();
+        empty.occupied = 0;
+        let (p, _) = PresetMenu::popup(&empty, 1, false);
+        assert!(
+            !p.items.iter().any(|i| i.starts_with("Clear")),
+            "{:?}",
+            p.items
+        );
     }
 
     #[test]

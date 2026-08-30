@@ -767,3 +767,18 @@ Recorded as they were taken, so the document stays the spec.
 - **The graph pane is titled `Filter Response`** with `⤢ g` at its right
   as the pop-out affordance; the graph and the detail share one box with a
   rule between them rather than two boxes, which saves two rows at 80x24.
+
+- **A dimmed row can still be edited.** The Console draws the crossfeed
+  parameters at half opacity outside the Custom voicing and the test-signal
+  output chips dim when the matrix has the output off, yet both stay live
+  (editing a crossfeed value switches the voicing to Custom). The panel
+  rows carry a `dimmed` flag that changes only how they draw.
+- **FREQ nudges by a semitone ratio** (2^(1/12)) rather than the Console's
+  10 Hz scroll step, which is unusable at 10 kHz from a keyboard; typed
+  entry takes any value.
+- **The starvation timers step in 2 s poll intervals**, the rate the Stats
+  panel refreshes at, rather than counting wall-clock seconds between
+  polls, so the display is deterministic under test.
+- **The Preset menu offers `Clear` only for a stored slot and `Clear All`
+  only when something is stored**, as the Console does, and the popup
+  carries what each row means so nothing counts rows.
