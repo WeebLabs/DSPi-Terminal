@@ -25,13 +25,17 @@
 pub mod about;
 pub mod advanced;
 pub mod config;
+pub mod cs_model;
 pub mod global;
 pub mod graphing;
+pub mod groups;
 pub mod i2s;
 pub mod inputs;
 pub mod interfaces;
+pub mod macros;
 pub mod outputs;
 pub mod overview;
+pub mod surfaces;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use dspi_proto::Platform;
@@ -45,7 +49,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::widgets::{Block, BorderType, Borders, Widget};
 
-use crate::shell::{Screen, ScreenEvent};
+use crate::shell::{Screen, ScreenEvent, SessionReply, SessionRequest};
 use crate::theme::{Glyphs, Theme};
 use crate::widgets::text::{truncate, wrap};
 use crate::widgets::{
@@ -79,9 +83,12 @@ pub struct SettingsData {
     pub claims: Option<Vec<PinClaim>>,
     /// Preset slot names, for the Default Preset picker.
     pub preset_names: Vec<String>,
-    /// The device's own Control Surfaces unsaved flag (survey 3.5). Phase 7B
-    /// sets it; until then Settings never shows the control-surface category.
+    /// The device's own Control Surfaces unsaved flag (survey 3.5), from the
+    /// status packet's `dirty` byte.
     pub cs_dirty: bool,
+    /// Every control-surface record the three Control pages show. `None` on a
+    /// firmware without them, and while the device has not been read.
+    pub cs: Option<cs_model::CsData>,
 }
 
 impl SettingsData {
@@ -138,6 +145,7 @@ impl SettingsData {
                 _ => String::new(),
             })
             .collect();
+        let cs = cs_model::CsData::read(session);
         Self {
             directory,
             startup,
@@ -147,7 +155,8 @@ impl SettingsData {
             spdif,
             claims,
             preset_names,
-            cs_dirty: false,
+            cs_dirty: cs.as_ref().is_some_and(|c| c.status.dirty),
+            cs,
         }
     }
 
@@ -636,6 +645,9 @@ pub(crate) enum PageEvent {
     Status(String),
     Dialog(Dialog),
     Popup(PopupList),
+    /// Work that needs the session itself: a control-surface write, whose
+    /// deferred status protocol the shared command grammar does not speak.
+    Session(SessionRequest),
     /// The app-side settings file changed and should be written out.
     Config(Box<AppConfig>),
 }
@@ -661,6 +673,14 @@ pub(crate) trait SettingsPage {
     fn key(&mut self, _key: KeyEvent, _cx: &Cx<'_>) -> PageEvent {
         PageEvent::Unhandled
     }
+    /// A session request this page made has an answer.
+    fn session_result(&mut self, _tag: u32, _reply: SessionReply, _cx: &Cx<'_>) -> PageEvent {
+        PageEvent::Handled
+    }
+    /// Called before every draw and every key, so a page can follow device
+    /// state that arrives on its own: the IR learn result comes in on the
+    /// notification stream, not as the answer to anything this page asked.
+    fn observe(&mut self, _cx: &Cx<'_>) {}
 }
 
 pub(crate) const PAGE_KEYS: &[KeyHelp] = &[
@@ -1043,33 +1063,9 @@ struct Pages {
     i2s: i2s::I2sPage,
     global: global::GlobalPage,
     interfaces: interfaces::InterfacesPage,
-    /// The three Phase 7B pages share one placeholder.
-    later: LaterPage,
-}
-
-/// A page Phase 7B fills in.
-pub(crate) struct LaterPage {
-    title: &'static str,
-}
-
-impl SettingsPage for LaterPage {
-    fn rows(&self, _cx: &Cx<'_>) -> Vec<Row> {
-        vec![
-            Row::section(self.title),
-            Row::Blank,
-            Row::note("Control surfaces arrive with Phase 7B."),
-        ]
-    }
-    fn act(&mut self, _index: usize, _action: Action, _cx: &Cx<'_>) -> PageEvent {
-        PageEvent::Handled
-    }
-    fn cursor(&self) -> usize {
-        0
-    }
-    fn set_cursor(&mut self, _i: usize) {}
-    fn keys(&self) -> &'static [KeyHelp] {
-        PAGE_KEYS
-    }
+    surfaces: surfaces::SurfacesPage,
+    groups: groups::GroupsPage,
+    macros: macros::MacrosPage,
 }
 
 pub struct SettingsScreen {
@@ -1108,7 +1104,9 @@ impl SettingsScreen {
                 i2s: i2s::I2sPage::default(),
                 global: global::GlobalPage::new(state, &data),
                 interfaces: interfaces::InterfacesPage::new(&data),
-                later: LaterPage { title: "" },
+                surfaces: surfaces::SurfacesPage::new(&data),
+                groups: groups::GroupsPage::new(&data),
+                macros: macros::MacrosPage::new(&data),
             },
             data,
             config,
@@ -1203,6 +1201,27 @@ impl SettingsScreen {
         }
     }
 
+    /// Let a page follow device state that arrives on its own, before it is
+    /// asked for rows or keys. The IR learn result is the case that needs it:
+    /// it lands in `DeviceState` from the notification stream, as the answer to
+    /// nothing this screen asked for.
+    fn observe_page(&mut self, state: &DeviceState) {
+        let global_dirty = self.pages.global.dirty(state, &self.data);
+        let cx = Cx {
+            state,
+            data: &self.data,
+            config: &self.config,
+            connected: self.connected,
+            global_dirty,
+        };
+        match self.page {
+            Page::Surfaces => self.pages.surfaces.observe(&cx),
+            Page::Groups => self.pages.groups.observe(&cx),
+            Page::Macros => self.pages.macros.observe(&cx),
+            _ => {}
+        }
+    }
+
     fn current(&mut self) -> &mut dyn SettingsPage {
         match self.page {
             Page::About => &mut self.pages.about,
@@ -1214,10 +1233,9 @@ impl SettingsScreen {
             Page::I2s => &mut self.pages.i2s,
             Page::Global => &mut self.pages.global,
             Page::Interfaces => &mut self.pages.interfaces,
-            Page::Surfaces | Page::Groups | Page::Macros => {
-                self.pages.later.title = self.page.title();
-                &mut self.pages.later
-            }
+            Page::Surfaces => &mut self.pages.surfaces,
+            Page::Groups => &mut self.pages.groups,
+            Page::Macros => &mut self.pages.macros,
         }
     }
 
@@ -1232,7 +1250,9 @@ impl SettingsScreen {
             Page::I2s => &self.pages.i2s,
             Page::Global => &self.pages.global,
             Page::Interfaces => &self.pages.interfaces,
-            Page::Surfaces | Page::Groups | Page::Macros => &self.pages.later,
+            Page::Surfaces => &self.pages.surfaces,
+            Page::Groups => &self.pages.groups,
+            Page::Macros => &self.pages.macros,
         }
     }
 
@@ -1383,6 +1403,7 @@ impl SettingsScreen {
                 self.pending = Some(Pending::Page);
                 ScreenEvent::Popup(p)
             }
+            PageEvent::Session(r) => ScreenEvent::Session(r),
             PageEvent::Config(c) => {
                 self.config = *c;
                 self.pages.graphing.adopt(self.config.clone());
@@ -1527,6 +1548,7 @@ impl Screen for SettingsScreen {
         if area.height < 4 || area.width < 40 {
             return;
         }
+        self.observe_page(state);
         let dirty = self.dirty(state);
         let body_h = area.height.saturating_sub(u16::from(dirty));
         // Wide enough for the longest label, "Control Interfaces" shortened.
@@ -1570,6 +1592,7 @@ impl Screen for SettingsScreen {
     }
 
     fn handle(&mut self, key: KeyEvent, state: &DeviceState) -> ScreenEvent {
+        self.observe_page(state);
         // History, from anywhere on the page.
         match key.code {
             KeyCode::Char('[') => {
@@ -1637,6 +1660,39 @@ impl Screen for SettingsScreen {
                 Page::I2s => self.pages.i2s.popup_result(choice, &cx),
                 Page::Global => self.pages.global.popup_result(choice, &cx),
                 Page::Interfaces => self.pages.interfaces.popup_result(choice, &cx),
+                Page::Surfaces => self.pages.surfaces.popup_result(choice, &cx),
+                Page::Groups => self.pages.groups.popup_result(choice, &cx),
+                Page::Macros => self.pages.macros.popup_result(choice, &cx),
+            }
+        };
+        self.absorb(ev, state)
+    }
+
+    fn session_result(
+        &mut self,
+        tag: u32,
+        reply: SessionReply,
+        state: &DeviceState,
+    ) -> ScreenEvent {
+        // Every control-surface write is a live preview: the device holds it in
+        // RAM and reports itself dirty until a save reaches flash, which is the
+        // save bar's third category (survey-firmware 3.14).
+        if matches!(reply, SessionReply::Ok(_)) {
+            self.data.cs_dirty = true;
+        }
+        let ev = {
+            let global_dirty = self.pages.global.dirty(state, &self.data);
+            let cx = Cx {
+                state,
+                data: &self.data,
+                config: &self.config,
+                connected: self.connected,
+                global_dirty,
+            };
+            match self.page {
+                Page::Surfaces => self.pages.surfaces.session_result(tag, reply, &cx),
+                Page::Groups => self.pages.groups.session_result(tag, reply, &cx),
+                Page::Macros => self.pages.macros.session_result(tag, reply, &cx),
                 _ => PageEvent::Handled,
             }
         };
@@ -1671,7 +1727,9 @@ impl Screen for SettingsScreen {
                         Page::I2s => self.pages.i2s.dialog_result(outcome, &cx),
                         Page::Global => self.pages.global.dialog_result(outcome, &cx),
                         Page::Interfaces => self.pages.interfaces.dialog_result(outcome, &cx),
-                        _ => PageEvent::Handled,
+                        Page::Surfaces => self.pages.surfaces.dialog_result(outcome, &cx),
+                        Page::Groups => self.pages.groups.dialog_result(outcome, &cx),
+                        Page::Macros => self.pages.macros.dialog_result(outcome, &cx),
                     }
                 };
                 self.absorb(ev, state)
@@ -1816,7 +1874,9 @@ impl SettingsScreen {
                     Page::I2s => self.pages.i2s.act(cursor, action, &cx),
                     Page::Global => self.pages.global.act(cursor, action, &cx),
                     Page::Interfaces => self.pages.interfaces.act(cursor, action, &cx),
-                    _ => PageEvent::Handled,
+                    Page::Surfaces => self.pages.surfaces.act(cursor, action, &cx),
+                    Page::Groups => self.pages.groups.act(cursor, action, &cx),
+                    Page::Macros => self.pages.macros.act(cursor, action, &cx),
                 }
             };
             return self.absorb(ev, state);
@@ -1836,6 +1896,9 @@ impl SettingsScreen {
             match self.page {
                 Page::Global => self.pages.global.key(key, &cx),
                 Page::Interfaces => self.pages.interfaces.key(key, &cx),
+                Page::Surfaces => self.pages.surfaces.key(key, &cx),
+                Page::Groups => self.pages.groups.key(key, &cx),
+                Page::Macros => self.pages.macros.key(key, &cx),
                 _ => PageEvent::Unhandled,
             }
         };
@@ -1920,6 +1983,7 @@ pub mod demo {
                 String::new(),
             ],
             cs_dirty: false,
+            cs: None,
         }
     }
 }
