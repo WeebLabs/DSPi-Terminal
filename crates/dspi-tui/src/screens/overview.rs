@@ -446,7 +446,17 @@ fn draw_cell(
         return;
     }
 
-    let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
+    // The summary gets one row, or two when it will not fit and the plot can
+    // spare a row: a narrow cell says `HP 60 Hz LR4` over `2 bands` rather
+    // than `HP 60 Hz LR4 · 2 b…`.
+    let text_w = inner.width.saturating_sub(1) as usize;
+    let lines = summary_lines(&cell.summary, text_w);
+    let summary_rows = if lines.len() > 1 && inner.height >= 5 {
+        2
+    } else {
+        1
+    };
+    let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - summary_rows);
     if cell.flat {
         // A constant line says nothing a word cannot say better.
         buf.set_string(
@@ -465,12 +475,40 @@ fn draw_cell(
         }];
         Graph::new(&curve, settings, t).render(plot, buf);
     }
-    buf.set_string(
-        inner.x + 1,
-        inner.y + inner.height - 1,
-        fit_left(&cell.summary, inner.width.saturating_sub(1) as usize),
-        t.label(),
-    );
+    // With one row and a summary that needs two, the whole line is shown
+    // cut rather than its first half shown whole.
+    let shown: Vec<&str> = if summary_rows == 1 {
+        vec![cell.summary.as_str()]
+    } else {
+        lines.iter().map(String::as_str).collect()
+    };
+    for (i, line) in shown.iter().enumerate() {
+        buf.set_string(
+            inner.x + 1,
+            inner.y + inner.height - summary_rows + i as u16,
+            fit_left(line, text_w),
+            t.label(),
+        );
+    }
+}
+
+/// The summary as it fits `width`: one line when it does, else its ` · `
+/// parts packed onto two.
+fn summary_lines(summary: &str, width: usize) -> Vec<String> {
+    if summary.chars().count() <= width {
+        return vec![summary.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for part in summary.split(" · ") {
+        match lines.last_mut() {
+            Some(last) if last.chars().count() + 3 + part.chars().count() <= width => {
+                last.push_str(" · ");
+                last.push_str(part);
+            }
+            _ => lines.push(part.to_string()),
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -670,7 +708,34 @@ mod tests {
             );
         }
         assert!(!f.contains('▼'), "nothing left to scroll to:\n{f}");
-        assert!(f.contains("1 band ·"), "singular: {f}");
+        assert!(f.contains(" 1 band "), "singular: {f}");
+    }
+
+    #[test]
+    fn a_narrow_cell_wraps_its_summary_at_the_separators() {
+        assert_eq!(summary_lines("5 bands", 19), vec!["5 bands"]);
+        assert_eq!(
+            summary_lines("HP 60 Hz LR4 · 2 bands", 19),
+            vec!["HP 60 Hz LR4", "2 bands"]
+        );
+        assert_eq!(
+            summary_lines("LP 80 Hz LR4 · -3.0 dB · 2.5 ms", 19),
+            vec!["LP 80 Hz LR4", "-3.0 dB · 2.5 ms"]
+        );
+        // Seventeen cells at 94x35 are 22 wide: the summaries wrap whole.
+        let state = fixture::full_state();
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut s = Overview::new(shared());
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(94, 35)).unwrap();
+        term.draw(|f| s.draw(f.area(), f.buffer_mut(), &t, &state, true))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let f: String = (0..35)
+            .map(|y| (0..94).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(f.contains(" preamp -5.3 dB "), "{f}");
+        assert!(!f.contains("…│"), "no summary is cut: {f}");
     }
 
     #[test]
