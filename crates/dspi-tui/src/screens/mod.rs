@@ -542,7 +542,10 @@ pub(crate) mod tests {
             for (w, h) in [(120u16, 40u16), (80, 24)] {
                 let f = frame(&mut s, w, h);
                 assert_eq!(f.lines().count(), h as usize, "{name} at {w}x{h}");
-                assert!(f.contains("INPUTS"), "the sidebar is still there: {name}");
+                assert!(
+                    f.contains("INPUTS") || f.contains("OUTPUTS"),
+                    "the sidebar is still there: {name}"
+                );
                 assert!(
                     !f.contains("arrives in Phase"),
                     "{name} at {w}x{h} is still a placeholder:\n{f}"

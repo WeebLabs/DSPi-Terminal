@@ -63,7 +63,7 @@ the conventions in sections 4 and 5.
 │                         ││ ●▸ 3  Peaking             [2856 Hz]    -8.6 dB     3.580            │
 │                         ││ ○  4  Peaking              1880 Hz     +3.6 dB     1.690            │
 │─────────────────────────││    5  Off                                                           │
-│ M Matrix  X Xfeed ● L Loud ○ V Lev ○  P Bass ●  T Stats  , Settings  b Bypass ○                 │
+│ ● Crossfeed  ○ Loudness  ○ Leveller  ● Bass   Matrix  Stats  Settings  ○ Bypass  (see 2.3)     │
 │ Preset    ‹ 3: Living Room * ›                                                                  │
 │ Source    ‹ USB ›                                                                               │
 │ Volume    User  -12.0 dB  ━━━━━━━━━━━━━━━━━━●━━━━━━                                             │
@@ -106,7 +106,10 @@ Mirrors the Console's bottom inset, top to bottom:
 
 ```
 │─────────────────────────│
-│ M  X● L○ V○ P● T  ,  b○ │   the quick strip: one cell per tool
+│ ● Crossfeed   Matrix    │   the quick strip: the Console's tool
+│ ○ Loudness    Stats     │   buttons as words, four rows of two
+│ ○ Leveller    Settings  │
+│ ● Bass        ○ Bypass  │
 │ Preset  ‹3: Living Rm*› │
 │ Source  ‹USB›           │
 │ Volume  User   -12.0 dB │
@@ -114,11 +117,17 @@ Mirrors the Console's bottom inset, top to bottom:
 │ C0 ▓▓▓░░ 31% C1 ▓▓▓▓░ 74%│
 ```
 
-The quick strip is one focusable row. Each cell is a key letter and, for
-the four toggleable features, a dot: `●` on, `○` off. With the strip
-focused, `←`/`→` move between cells, `Space` toggles the feature (Console
-left-click), `Enter` opens its panel (Console right-click). The letters are
-also global keys (section 3). Bypass Master EQ is the `b` cell.
+The quick strip is one focusable block of four rows: the four DSP
+features with a state dot down the left (`●` on in `ok`, `○` off in
+`dim`), the openers and Bypass Master EQ down the right, Bypass in
+`warning` when it is on. The words are the Console's button names, said
+whole; at 80 columns the dot loses its space so they still fit. With the
+strip focused, arrows move between the eight items and leave the block
+from its top and bottom edges, `Space` toggles a feature (Console
+left-click), `Enter` opens its panel (Console right-click). The shortcut
+letters live on the key line and in the help (section 3), not in the
+block: `X`, `V` and `T` are the Console's mnemonics, not initials, and
+they said nothing next to the words.
 
 Preset and Source are picker rows: `←`/`→` cycle, `Enter` opens the list.
 The Preset row's context actions (Save, Rename, Set as Default, Copy to,

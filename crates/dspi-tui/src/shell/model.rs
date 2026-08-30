@@ -41,6 +41,21 @@ pub enum VolumeMode {
     Master,
 }
 
+/// The quick strip's shape on screen: four rows of two, the DSP features
+/// with their state down the left and the openers, then Bypass, down the
+/// right. Entries are indices into `ShellModel::strip`.
+pub const STRIP_GRID: [[usize; 2]; 4] = [[1, 0], [2, 5], [3, 6], [4, 7]];
+
+/// Where a strip index sits in [`STRIP_GRID`]: `(row, column)`.
+pub fn strip_position(index: usize) -> (usize, usize) {
+    for (r, row) in STRIP_GRID.iter().enumerate() {
+        if let Some(c) = row.iter().position(|i| *i == index) {
+            return (r, c);
+        }
+    }
+    (0, 0)
+}
+
 /// One cell of the quick strip under the channel list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripItem {
@@ -119,17 +134,17 @@ impl ShellModel {
             },
             StripItem {
                 key: 'X',
-                label: "Xfeed",
+                label: "Crossfeed",
                 state: Some(false),
             },
             StripItem {
                 key: 'L',
-                label: "Loud",
+                label: "Loudness",
                 state: Some(false),
             },
             StripItem {
                 key: 'V',
-                label: "Lev",
+                label: "Leveller",
                 state: Some(false),
             },
             StripItem {

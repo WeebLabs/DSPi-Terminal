@@ -21,17 +21,17 @@ that says which Console feature lives where, and what is still open.
 │ ▪LFE    ░░░░░░▏ IN4││                     ┆                    ┆        ┆           ┆      │
 │ ▪BL     ░░░░░░▏ IN5││-20                  ┆                    ┆        ┆           ┆      │
 │ ▪BR     ░░░░░░▏ IN6││      20      50    100   200      500   1k    2k      5k     10k  20k│
-│ ▪SL     ░░░░░░▏ IN7││─ ● FL ───────────────────────────────────────────────────────────────│
+│ ▪SL     ░░░░░░▏ IN7││──────────────────────────────────────────────────────────────────────│
 │ ▪SR     ░░░░░░▏ IN8││ Link 1/2   ▸Preamp +0.0 dB ━━━━━━━━━━━━━━━━━━━━━━━━●━━━━   Clear PEQ │
 │                    ││──────────────────────────────────────────────────────────────────────│
-│ OUTPUTS            ││   # TYPE                       FREQ      GAIN   WIDTH                │
-│ ▪OUT L ▓▓▓▓▓▌▏ OUT1▼│ ● 1 Low Shelf 12 dB/oct      105 Hz   +8.8 dB   0.707                │
-│────────────────────││ ● 2 Peaking                   64 Hz   -6.2 dB     0.3                │
-│ M X●L○V○P● T , b○  ││ ● 3 Peaking                 2856 Hz   -8.6 dB    3.58                │
-│ Preset ‹3: Livin…› ││ ● 4 Peaking                 1880 Hz   +3.6 dB    1.69                │
-│ Source ‹USB›       ││ ● 5 Peaking                 6749 Hz   +4.0 dB    4.74                │
-│ Vol User  -12.0 dB ││   6 Off                                                              │
-│ ━━━━━━━━━━━━━━━●━━ ││   7 Off                                                              │
+│ OUTPUTS            ▼│   # TYPE                       FREQ      GAIN   WIDTH                │
+│ ●Crossfeed Matrix  ││ ● 1 Low Shelf 12 dB/oct      105 Hz   +8.8 dB   0.707                │
+│ ○Loudness  Stats   ││ ● 2 Peaking                   64 Hz   -6.2 dB     0.3                │
+│ ○Leveller  Settings││ ● 3 Peaking                 2856 Hz   -8.6 dB    3.58                │
+│ ●Bass      ○Bypass ││ ● 4 Peaking                 1880 Hz   +3.6 dB    1.69                │
+│ Preset ‹3: Livin…› ││ ● 5 Peaking                 6749 Hz   +4.0 dB    4.74                │
+│ Source ‹USB›       ││   6 Off                                                              │
+│ User -12.0 ━━━━━●━ ││   7 Off                                                              │
 │ C0 ▓░ 31% C1 ▓░ 74%││   8 Off                                                             ▼│
 ╰────────────────────╯╰──────────────────────────────────────────────────────────────────────╯
  :eq in.1 3 freq 2856                                     Enable All │ Bypass All  Clear All

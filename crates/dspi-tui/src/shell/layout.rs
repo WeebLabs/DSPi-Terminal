@@ -34,6 +34,15 @@ impl Density {
         }
     }
 
+    /// Rows the footer block takes. Compact gives two back to the channel
+    /// list: no divider, and the volume on one row.
+    pub fn footer_rows(self) -> u16 {
+        match self {
+            Self::Compact => FOOTER_ROWS - 2,
+            _ => FOOTER_ROWS,
+        }
+    }
+
     pub fn sidebar_width(self) -> u16 {
         match self {
             Self::Compact => 22,
@@ -85,9 +94,9 @@ pub struct Regions {
     pub keys: Rect,
 }
 
-/// The footer block needs seven rows: divider, strip, preset, source, volume
-/// label, slider, cpu.
-pub const FOOTER_ROWS: u16 = 7;
+/// The footer block needs ten rows: divider, the four rows of the quick
+/// strip, preset, source, volume label, slider, cpu.
+pub const FOOTER_ROWS: u16 = 10;
 
 pub fn compute(area: Rect, graph_height: GraphHeight) -> Option<Regions> {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -104,7 +113,7 @@ pub fn compute(area: Rect, graph_height: GraphHeight) -> Option<Regions> {
     let pane = Rect::new(body.x + sw, body.y, body.width - sw, body.height);
 
     let inner_side = inset(sidebar);
-    let footer_h = FOOTER_ROWS.min(inner_side.height);
+    let footer_h = density.footer_rows().min(inner_side.height);
     let sidebar_list = Rect::new(
         inner_side.x,
         inner_side.y,

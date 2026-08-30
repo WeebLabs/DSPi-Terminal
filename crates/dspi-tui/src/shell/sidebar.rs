@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Widget;
 
-use super::model::{ChannelItem, Selection, ShellModel, VolumeMode};
+use super::model::{ChannelItem, STRIP_GRID, Selection, ShellModel, VolumeMode};
 use crate::theme::{ColorDepth, Glyphs, Theme};
 use crate::widgets::text::{fit_left, fit_right, truncate};
 use crate::widgets::{LevelMeter, slider};
@@ -249,20 +249,33 @@ pub fn draw_footer(
     let t = theme;
     let w = area.width as usize;
     let mut y = area.y;
-    let divider = if t.glyphs == Glyphs::Ascii {
-        "-"
-    } else {
-        "─"
-    };
-    buf.set_string(area.x, y, divider.repeat(w), t.chrome_style());
-    y += 1;
+    // At 80 columns the list needs every row it can get: the divider goes
+    // (the strip's first row marks the boundary) and the volume takes one
+    // row instead of two.
+    let compact = w < 22;
+    if !compact {
+        let divider = if t.glyphs == Glyphs::Ascii {
+            "-"
+        } else {
+            "─"
+        };
+        buf.set_string(area.x, y, divider.repeat(w), t.chrome_style());
+        y += 1;
+    }
 
-    // The quick strip: `M X● L○ V○ P● T , b○`. When that does not fit, the
-    // toggles close up against each other; their dots keep them readable.
-    let texts: Vec<(String, Option<bool>)> = model
-        .strip
-        .iter()
-        .map(|item| {
+    // The quick strip as a block of words, DESIGN 2.3: the four DSP features
+    // with their state down the left, the openers and Bypass down the right.
+    // At 20 columns the dot loses its space so every word still fits whole.
+    let roomy = w >= 22;
+    let left_w = if roomy { 11 } else { 10 };
+    let gap = w.saturating_sub(1 + left_w + 8).clamp(1, 3) as u16;
+    let right_x = area.x + 1 + left_w as u16 + gap;
+    for row in STRIP_GRID {
+        if y >= area.y + area.height {
+            break;
+        }
+        for (col, i) in row.iter().enumerate() {
+            let item = &model.strip[*i];
             let dot = match (item.state, t.glyphs) {
                 (Some(true), Glyphs::Ascii) => "*",
                 (Some(false), Glyphs::Ascii) => "o",
@@ -270,41 +283,29 @@ pub fn draw_footer(
                 (Some(false), _) => "○",
                 (None, _) => "",
             };
-            (format!("{}{}", item.key, dot), item.state)
-        })
-        .collect();
-    let full: usize = texts
-        .iter()
-        .map(|(s, _)| s.chars().count() + 1)
-        .sum::<usize>()
-        + 1;
-    let tight = full > w;
-    let mut x = area.x + 1;
-    for (i, (text, state)) in texts.iter().enumerate() {
-        let base = match state {
-            Some(true) => Style::default().fg(t.ok),
-            Some(false) => t.label(),
-            None => t.value(),
-        };
-        let style = if focus == Some(FooterRow::Strip) && i == strip_cursor {
-            t.pill(t.accent).add_modifier(Modifier::BOLD)
-        } else {
-            base
-        };
-        let tw = text.chars().count() as u16;
-        if x + tw > area.x + area.width {
-            break;
+            let text = match (item.state, roomy) {
+                (None, _) => item.label.to_string(),
+                (Some(_), true) => format!("{dot} {}", item.label),
+                (Some(_), false) => format!("{dot}{}", item.label),
+            };
+            // Bypass on is a warning, not a feature that is on.
+            let base = match (item.state, item.key) {
+                (Some(true), 'b') => Style::default().fg(t.warning),
+                (Some(true), _) => Style::default().fg(t.ok),
+                (Some(false), _) => t.label(),
+                (None, _) => t.value(),
+            };
+            let style = if focus == Some(FooterRow::Strip) && *i == strip_cursor {
+                t.pill(t.accent).add_modifier(Modifier::BOLD)
+            } else {
+                base
+            };
+            let x = if col == 0 { area.x + 1 } else { right_x };
+            let room = (area.x + area.width).saturating_sub(x) as usize;
+            buf.set_string(x, y, truncate(&text, room), style);
         }
-        buf.set_string(x, y, text, style);
-        let next_is_toggle = texts.get(i + 1).is_some_and(|(_, st)| st.is_some());
-        let gap = if tight && state.is_some() && next_is_toggle {
-            0
-        } else {
-            1
-        };
-        x += tw + gap;
+        y += 1;
     }
-    y += 1;
 
     let picker = |buf: &mut Buffer, y: u16, label: &str, value: &str, focused: bool| {
         let label_style = if focused { t.focused() } else { t.label() };
@@ -339,12 +340,43 @@ pub fn draw_footer(
         }
         y += 1;
     }
-    if y + 1 < area.y + area.height {
-        let vf = focus == Some(FooterRow::Volume);
-        let mode = match model.volume_mode {
-            VolumeMode::User => "User",
-            VolumeMode::Master => "Master",
+    let vf = focus == Some(FooterRow::Volume);
+    let mode = match model.volume_mode {
+        VolumeMode::User => "User",
+        VolumeMode::Master => "Master",
+    };
+    let frac = match model.volume_mode {
+        VolumeMode::User => user_fraction(model.volume_db),
+        VolumeMode::Master => master_fraction(model.volume_db),
+    };
+    let slider_color = if model.volume_mode == VolumeMode::Master {
+        t.danger
+    } else {
+        t.fg
+    };
+    if compact && y < area.y + area.height {
+        // `User -12.0 ━━━━━━━●━`: the mode, the level without its unit, and
+        // what is left for the slider.
+        let readout = if model.volume_mode == VolumeMode::Master && model.volume_db <= -128.0 {
+            "-inf".to_string()
+        } else {
+            format!("{:.1}", model.volume_db)
         };
+        buf.set_string(
+            area.x + 1,
+            y,
+            mode,
+            if vf { t.focused() } else { t.label() },
+        );
+        let rx = area.x + 2 + mode.len() as u16;
+        buf.set_string(rx, y, &readout, t.value());
+        let sx = rx + readout.len() as u16 + 1;
+        let sw = (area.x + area.width).saturating_sub(sx + 1);
+        if sw >= 5 {
+            slider::draw(Rect::new(sx, y, sw, 1), buf, frac, slider_color, vf, t);
+        }
+        y += 1;
+    } else if y + 1 < area.y + area.height {
         let readout = if model.volume_mode == VolumeMode::Master && model.volume_db <= -128.0 {
             "-inf".to_string()
         } else {
@@ -376,20 +408,11 @@ pub fn draw_footer(
             t.value(),
         );
         y += 1;
-        let frac = match model.volume_mode {
-            VolumeMode::User => user_fraction(model.volume_db),
-            VolumeMode::Master => master_fraction(model.volume_db),
-        };
-        let color = if model.volume_mode == VolumeMode::Master {
-            t.danger
-        } else {
-            t.fg
-        };
         slider::draw(
             Rect::new(area.x + 1, y, area.width - 2, 1),
             buf,
             frac,
-            color,
+            slider_color,
             vf,
             t,
         );

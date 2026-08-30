@@ -21,7 +21,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Widget};
 
 pub use layout::{Density, Regions};
-pub use model::{ChannelItem, GraphHeight, Selection, ShellModel, StripItem, VolumeMode};
+pub use model::{
+    ChannelItem, GraphHeight, STRIP_GRID, Selection, ShellModel, StripItem, VolumeMode,
+    strip_position,
+};
 pub use screen::{Placeholder, Screen, ScreenEvent, SessionReply, SessionRequest};
 pub use sidebar::FooterRow;
 
@@ -609,6 +612,30 @@ impl Shell {
 
     fn handle_footer(&mut self, row: FooterRow, key: KeyEvent, out: &mut Vec<ShellEvent>) {
         let has_source = self.model.source.is_some();
+        // The strip is a block of four rows: arrows move within it first,
+        // and leave it only from its edges.
+        if row == FooterRow::Strip {
+            let (r, c) = strip_position(self.strip_cursor);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') if r > 0 => {
+                    self.strip_cursor = STRIP_GRID[r - 1][c];
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') if r + 1 < STRIP_GRID.len() => {
+                    self.strip_cursor = STRIP_GRID[r + 1][c];
+                    return;
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.strip_cursor = STRIP_GRID[r][0];
+                    return;
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.strip_cursor = STRIP_GRID[r][1];
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 let p = row.prev(has_source);
@@ -632,11 +659,6 @@ impl Shell {
         }
         match row {
             FooterRow::Strip => match key.code {
-                KeyCode::Left => self.strip_cursor = self.strip_cursor.saturating_sub(1),
-                KeyCode::Right => {
-                    self.strip_cursor =
-                        (self.strip_cursor + 1).min(self.model.strip.len().saturating_sub(1))
-                }
                 KeyCode::Char(' ') => out.push(ShellEvent::StripToggle(self.strip_cursor)),
                 KeyCode::Enter => out.push(ShellEvent::StripOpen(self.strip_cursor)),
                 _ => {}
@@ -1446,6 +1468,28 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn the_strip_is_a_grid_the_arrows_walk_and_leave_from_its_edges() {
+        let (mut s, _) = shell(120, 40);
+        s.focus = Focus::Footer(FooterRow::Strip);
+        s.strip_cursor = 1; // Crossfeed, top left
+        s.handle(key(KeyCode::Right), &fixture::state());
+        assert_eq!(s.strip_cursor, 0, "Matrix, top right");
+        s.handle(key(KeyCode::Down), &fixture::state());
+        assert_eq!(s.strip_cursor, 5, "Stats");
+        s.handle(key(KeyCode::Left), &fixture::state());
+        assert_eq!(s.strip_cursor, 2, "Loudness");
+        s.handle(key(KeyCode::Down), &fixture::state());
+        s.handle(key(KeyCode::Down), &fixture::state());
+        assert_eq!(s.strip_cursor, 4, "Bass, bottom left");
+        s.handle(key(KeyCode::Down), &fixture::state());
+        assert_eq!(s.focus, Focus::Footer(FooterRow::Preset), "off the bottom");
+        s.focus = Focus::Footer(FooterRow::Strip);
+        s.strip_cursor = 0;
+        s.handle(key(KeyCode::Up), &fixture::state());
+        assert_eq!(s.focus, Focus::Sidebar, "off the top");
     }
 
     /// A key that is advertised must do something: produce an event, move
