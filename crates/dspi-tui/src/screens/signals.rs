@@ -279,7 +279,9 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("← →", "Adjust"),
     KeyHelp::new("Enter", "Edit or choose"),
     KeyHelp::new("Space", "Start or stop"),
-    KeyHelp::new("S", "Stop now"),
+    // `TestSignalsView.swift:913`: the Console's tooltip on the second stop
+    // button, which is the only place it explains the difference.
+    KeyHelp::new("S", "Stop immediately, no fade"),
     KeyHelp::new("a", "All outputs"),
     KeyHelp::new("n", "No outputs"),
     KeyHelp::new("Backspace", "Reset"),
@@ -377,7 +379,13 @@ impl SignalsPanel {
     }
 
     /// Why Start is refused, in the Console's words.
+    ///
+    /// `TestSignalsView.swift:293-302`, in its order: the connection first,
+    /// because without a device the other three questions are about nothing.
     fn blocker(&self, state: &DeviceState) -> Option<&'static str> {
+        if !state.connected {
+            return Some("No device connected");
+        }
         if !Self::supported(state) {
             return Some("Firmware has no signal generator");
         }
@@ -579,13 +587,6 @@ impl SignalsPanel {
                 title: "Outputs".into(),
                 action: Some("a All   n None".into()),
             },
-            // The Console says "Click to select, click again to invert"; here
-            // Space belongs to the transport, so Enter is the gesture.
-            Row::Caption(
-                "Enter selects, Enter again inverts polarity (ø). Dimmed outputs are disabled \
-                 in the matrix mixer and stay silent."
-                    .into(),
-            ),
         ];
         let chips = (0..Self::outputs(state))
             .map(|o| {
@@ -607,14 +608,27 @@ impl SignalsPanel {
                     // A disabled output is still selectable, as it is in the
                     // Console; it just stays silent, which the caption says.
                     enabled: true,
+                    // `TestSignalsView.swift:557`,
+                    // `.opacity(matrixEnabled ? 1.0 : 0.4)`: an output the
+                    // matrix mixer has switched off is the dim one the caption
+                    // is talking about.
+                    dimmed: !state.output(o).enabled,
                 }
             })
             .collect();
+        // `DESIGN.md` 7.8's template is header, chips, caption. The Console
+        // says "Click to select, click again to invert"; here Space belongs to
+        // the transport, so Enter is the gesture.
         rows.push(Row::Chips {
             chips,
             cursor: self.chip,
             polarity: true,
         });
+        rows.push(Row::Caption(
+            "Enter selects, Enter again inverts polarity (ø). Dimmed outputs are disabled \
+             in the matrix mixer and stay silent."
+                .into(),
+        ));
 
         rows.push(Row::Blank);
         rows.push(Row::Section {
@@ -1068,6 +1082,41 @@ mod tests {
         }
     }
 
+    /// D49: the difference between the two stops is explained nowhere but the
+    /// Console's tooltip, so the key line carries its words.
+    #[test]
+    fn the_key_line_says_what_stop_now_actually_does() {
+        assert!(
+            KEYS.iter()
+                .any(|k| k.key == "S" && k.does == "Stop immediately, no fade"),
+            "{KEYS:?}"
+        );
+        let (_, state) = panel();
+        let f = testing::frame(
+            Tool::Signals,
+            Box::new(SignalsPanel::new()),
+            &state,
+            120,
+            40,
+        );
+        assert!(f.contains("Stop immediately, no fade"), "{f}");
+    }
+
+    /// D45: `DESIGN.md` 7.8's template is header, chips, caption.
+    #[test]
+    fn the_outputs_caption_sits_under_the_chip_row() {
+        let (p, state) = panel();
+        let rows = p.rows(&state, panel::key_theme());
+        let chips = rows
+            .iter()
+            .position(|r| matches!(r, Row::Chips { .. }))
+            .expect("a chip row");
+        match rows.get(chips + 1) {
+            Some(Row::Caption(c)) => assert!(c.starts_with("Enter selects"), "{c}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn golden_frames_at_both_sizes() {
         let (_, state) = panel();
@@ -1183,6 +1232,79 @@ mod tests {
         state.siggen_state = Some((0, 3, 4, 0xFF));
         let f = testing::draw(&mut p, &state, 100, 60);
         assert!(f.contains("Stopped by preset load"), "{f}");
+    }
+
+    /// D10: `TestSignalsView.swift:294` puts the connection ahead of the other
+    /// three blockers. Without it a disconnected device read `Ready · Sine`
+    /// with Start enabled, and pressing it wrote into nothing.
+    /// D25: the caption promises "Dimmed outputs are disabled in the matrix
+    /// mixer and stay silent", and `TestSignalsView.swift:557` is where the dim
+    /// comes from. Every chip was built at full strength, so nothing was ever
+    /// dim and the sentence described nothing.
+    #[test]
+    fn an_output_the_matrix_has_switched_off_is_drawn_dim_but_stays_selectable() {
+        let (mut p, mut state) = panel();
+        let theme = panel::key_theme();
+        let dimmed = |p: &SignalsPanel, state: &DeviceState| -> Vec<bool> {
+            p.rows(state, theme)
+                .iter()
+                .find_map(|r| match r {
+                    Row::Chips { chips, .. } => {
+                        Some(chips.iter().map(|c| c.dimmed).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .expect("the outputs row")
+        };
+        assert!(
+            dimmed(&p, &state).iter().all(|d| !d),
+            "the fixture has every output on"
+        );
+
+        // Turn output 2 off in the matrix mixer.
+        let (_, outputs, _) = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "outputs")
+            .copied()
+            .unwrap();
+        state.bulk.patch(outputs + 12, &[0]);
+        assert!(!state.output(1).enabled);
+        let flags = dimmed(&p, &state);
+        assert!(flags[1], "output 2 is dim: {flags:?}");
+        assert!(!flags[0] && !flags[2], "and only output 2: {flags:?}");
+
+        let name = super::super::channel_name(&state, state.caps.num_inputs as usize + 1);
+        assert_eq!(
+            testing::fg_of(&mut p, &state, 100, 60, &name),
+            theme.dim,
+            "a dim chip is drawn in the caption colour"
+        );
+
+        // It is still selectable, exactly as the Console leaves its button live.
+        p.chip = 1;
+        p.body.focus = focus_of(&p, &state, |r| matches!(r, Row::Chips { .. }));
+        assert!(matches!(
+            p.handle(key(KeyCode::Enter), &state),
+            ScreenEvent::Command(_)
+        ));
+    }
+
+    #[test]
+    fn a_missing_device_blocks_start_before_any_other_reason() {
+        let (mut p, mut state) = panel();
+        let f = testing::draw(&mut p, &state, 100, 60);
+        assert!(f.contains("Ready · Sine"), "{f}");
+
+        state.connected = false;
+        // Even with nothing selected, which is the next blocker in line.
+        p.draft.channel_mask = 0;
+        assert_eq!(
+            p.handle(key(KeyCode::Char(' ')), &state),
+            ScreenEvent::Status("No device connected".into())
+        );
+        let f = testing::draw(&mut p, &state, 100, 60);
+        assert!(f.contains("No device connected"), "{f}");
+        assert!(!f.contains("Ready · Sine"), "{f}");
     }
 
     #[test]

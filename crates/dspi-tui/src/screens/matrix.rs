@@ -422,11 +422,13 @@ impl MatrixPanel {
         for (n, &o) in cols.iter().enumerate() {
             let x = area.x + LABEL_W + n as u16 * COL_W;
             let name = channel_name(state, output_channel(state, o));
+            // `DESIGN.md` 7.7: "Column headers in the output colour". Both
+            // header rows name the same column, so both take it.
             p.buf.set_string(
                 x,
                 area.y,
                 fit_centre(&name, COL_W as usize - 1),
-                theme.label(),
+                Style::default().fg(column_color(state, theme, o)),
             );
             p.buf.set_string(
                 x,
@@ -498,9 +500,11 @@ impl MatrixPanel {
         };
         p.buf.set_string(x, y, dot, dot_style);
 
-        // The Console outlines the PDM column in orange while enabling it
-        // would take the EQ workers down; a terminal marks the cell instead.
-        if Some(output) == pdm_output(state) && would_conflict(state, output) {
+        // The Console outlines a conflicting column in orange; a terminal
+        // marks the cell instead. `would_conflict` is symmetric, and the
+        // ENABLE row already colours both sides, so the marker does too:
+        // marking only PDM said the interlock ran one way.
+        if would_conflict(state, output) {
             p.buf.set_string(x + 1, y, "!", theme.warning_style());
         }
 
@@ -861,7 +865,12 @@ impl Screen for MatrixPanel {
                 let cmds = clipboard::paste_commands(&clip, state, channel, None);
                 ScreenEvent::Command(cmds.join("\n"))
             }
-            KeyCode::Char('I') => ScreenEvent::Status("Identify arrives with Phase 6".into()),
+            // The same blip melody the sidebar's `i` plays, on the output the
+            // reticle is over.
+            KeyCode::Char('I') => match super::identify_command(state, self.col) {
+                Some(cmds) => ScreenEvent::Command(cmds),
+                None => ScreenEvent::Status("Firmware has no signal generator".into()),
+            },
             _ => ScreenEvent::Unhandled,
         }
     }
@@ -1142,6 +1151,20 @@ mod tests {
         assert!(!stereo_frame.contains("+0.0 dB"), "{stereo_frame}");
     }
 
+    /// D52: `DESIGN.md` 7.7 says "Column headers in the output colour". Only
+    /// the descriptor row had it; the name row above was drawn as a caption.
+    #[test]
+    fn both_header_rows_are_in_the_columns_output_colour() {
+        let t = theme();
+        let f = draw(&mut panel(), &fixture::state(), 200, 20);
+        for (col, channel) in [(0usize, 8u8), (2, 10), (8, 16)] {
+            let x = LABEL_W + col as u16 * COL_W + 2;
+            let want = t.channel_of(channel, 8, 9);
+            assert_eq!(f[(x, 0)].fg, want, "the name row of column {col}");
+            assert_eq!(f[(x, 1)].fg, want, "the descriptor row of column {col}");
+        }
+    }
+
     #[test]
     fn a_disabled_outputs_cells_draw_dim() {
         let t = theme();
@@ -1164,16 +1187,30 @@ mod tests {
         assert!(gain.iter().all(|c| *c == t.dim), "the GAIN row: {gain:?}");
     }
 
+    /// D51: the interlock is symmetric, so the marker is too. Marking only
+    /// PDM said that enabling an EQ-worker output while PDM runs was free,
+    /// when the ENABLE row was already colouring both sides orange.
     #[test]
-    fn a_core_one_collision_marks_the_pdm_column() {
-        // Every output is on in the fixture, so enabling PDM would take the EQ
-        // workers down and the Console outlines the column.
+    fn a_core_one_collision_marks_both_sides_of_the_interlock() {
+        let count = |f: &str| f.matches("○!").count() + f.matches("●!").count();
+
+        // Every output is on in the fixture, so every column on both sides of
+        // the interlock is in collision: PDM and the six EQ workers.
         let f = text(&draw(&mut panel(), &fixture::state(), 200, 20));
-        assert!(f.contains("○!"), "the conflict mark:\n{f}");
-        // With the EQ workers off there is nothing to collide with.
+        let per_row = count(f.lines().find(|l| l.starts_with("▸FL")).expect("FL row"));
+        assert_eq!(per_row, 7, "PDM plus outputs 3 to 8:\n{f}");
+
+        // With the EQ workers off, PDM is free, but each of them would still
+        // collide with the PDM output that is still running.
         let clear = outputs_off(&[2, 3, 4, 5, 6, 7]);
         let f = text(&draw(&mut panel(), &clear, 200, 20));
-        assert!(!f.contains("○!"), "{f}");
+        let row = f.lines().find(|l| l.starts_with("▸FL")).expect("FL row");
+        assert_eq!(count(row), 6, "the six EQ workers, not PDM:\n{f}");
+
+        // With PDM off as well, nothing is in collision with anything.
+        let clear = outputs_off(&[2, 3, 4, 5, 6, 7, 8]);
+        let f = text(&draw(&mut panel(), &clear, 200, 20));
+        assert_eq!(count(&f), 0, "{f}");
     }
 
     #[test]
@@ -1464,12 +1501,27 @@ mod tests {
         assert!(c.contains("eq out.2 20 highpass 80 0.707 0"), "{c}");
     }
 
+    /// D23: `I` was a placeholder long after the signal generator arrived. It
+    /// plays the same blip melody the sidebar's `i` does, on the column the
+    /// reticle is over.
     #[test]
-    fn identify_waits_for_phase_six() {
+    fn identify_plays_the_channel_id_tone_on_the_column_under_the_reticle() {
         let mut p = panel();
+        let state = crate::screens::panel::testing::state();
+        p.col = 2;
+        match p.handle(key(KeyCode::Char('I')), &state) {
+            ScreenEvent::Command(c) => {
+                assert!(c.starts_with("sig.config type=channel-id"), "{c}");
+                assert!(c.contains("channels=0x4"), "the third output: {c}");
+                assert!(c.contains("flags=walk") && c.contains("p1=120"), "{c}");
+                assert!(c.ends_with("sig.control start"), "{c}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A firmware with no generator says so rather than writing nothing.
         assert_eq!(
             p.handle(key(KeyCode::Char('I')), &fixture::state()),
-            ScreenEvent::Status("Identify arrives with Phase 6".into())
+            ScreenEvent::Status("Firmware has no signal generator".into())
         );
     }
 

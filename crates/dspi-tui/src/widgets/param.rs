@@ -212,7 +212,13 @@ impl<'a> ParamRow<'a> {
     fn value_text(&self) -> String {
         match self.edit {
             Some(e) => format!("[{}]", e.text),
-            None => with_unit(self.value, self.unit, self.decimals),
+            // A field is a signed quantity when its own range crosses zero.
+            None => with_unit(
+                self.value,
+                self.unit,
+                self.decimals,
+                self.min < 0.0 && self.max > 0.0,
+            ),
         }
     }
 }

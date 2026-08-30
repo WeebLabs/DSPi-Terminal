@@ -137,12 +137,6 @@ impl PsybassPanel {
                 title: "Outputs".into(),
                 action: Some("Presets ▾".into()),
             },
-            Row::Caption(
-                "Enhance only the small-speaker outputs. Mask off the sub and any full-range \
-                 outputs - synthesizing harmonics on a channel that can reproduce real bass is \
-                 counterproductive."
-                    .into(),
-            ),
         ];
         let chips = (0..state.caps.num_outputs as usize)
             .map(|o| ChipSpec {
@@ -158,13 +152,23 @@ impl PsybassPanel {
                     state.caps.num_outputs,
                 )),
                 enabled: true,
+                // `PsychoacousticBassView.swift:282-296` dims a chip only for
+                // being off, never for the matrix mixer.
+                dimmed: false,
             })
             .collect();
+        // `DESIGN.md` 7.8's template is header, chips, caption.
         rows.push(Row::Chips {
             chips,
             cursor: self.chip,
             polarity: false,
         });
+        rows.push(Row::Caption(
+            "Enhance only the small-speaker outputs. Mask off the sub and any full-range \
+             outputs - synthesizing harmonics on a channel that can reproduce real bass is \
+             counterproductive."
+                .into(),
+        ));
         rows.push(Row::Blank);
         rows.push(Row::Section {
             title: "Parameters".into(),
@@ -434,6 +438,49 @@ mod tests {
             p.handle(key(KeyCode::Char(' ')), &state),
             ScreenEvent::Unhandled,
             "and nothing on it is operable"
+        );
+    }
+
+    /// D47: the four dB rows here are the clearest case. Harmonics runs
+    /// -24..12 and is a signed quantity; Drive 0..18 and Original Bass -60..0
+    /// are not, and both used to carry a `+`.
+    #[test]
+    fn only_the_db_row_whose_range_crosses_zero_carries_a_sign() {
+        let (mut p, state) = panel();
+        let f = testing::draw(&mut p, &state, 100, 60);
+        assert!(f.contains("Harmonics"), "{f}");
+        assert!(
+            f.lines()
+                .any(|l| l.contains("Harmonics") && l.contains('+'))
+                || f.lines()
+                    .any(|l| l.contains("Harmonics") && l.contains("-")),
+            "a signed row keeps its sign: {f}"
+        );
+        for row in ["Drive", "Original Bass"] {
+            let line = f
+                .lines()
+                .find(|l| l.contains(row))
+                .unwrap_or_else(|| panic!("no {row} row:\n{f}"));
+            assert!(
+                !line.contains('+'),
+                "{row} is not a signed quantity: {line}"
+            );
+            assert!(line.contains(" dB"), "{line}");
+        }
+    }
+
+    /// D45: `DESIGN.md` 7.8's template is header, chips, caption.
+    #[test]
+    fn the_caption_sits_under_the_chip_row() {
+        let (p, state) = panel();
+        let rows = p.rows(&state, panel::key_theme());
+        let chips = rows
+            .iter()
+            .position(|r| matches!(r, Row::Chips { .. }))
+            .expect("a chip row");
+        assert!(
+            matches!(rows.get(chips + 1), Some(Row::Caption(_))),
+            "{rows:?}"
         );
     }
 

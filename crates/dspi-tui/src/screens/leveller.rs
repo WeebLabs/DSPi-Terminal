@@ -92,6 +92,7 @@ impl LevellerPanel {
                 },
                 color: theme.role_color(ChannelRole::Input(c as u8)),
                 enabled: true,
+                dimmed: false,
             })
             .collect();
         Row::Chips {

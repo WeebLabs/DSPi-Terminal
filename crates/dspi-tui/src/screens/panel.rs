@@ -88,6 +88,11 @@ pub struct Param {
     pub caption: Option<String>,
     pub ends: Option<(String, String)>,
     pub enabled: bool,
+    /// Drawn as inactive but still editable, which is the Console's
+    /// `.opacity(0.5)` on a section whose controls stay live: the crossfeed
+    /// parameters outside the Custom voicing, where an edit switches the
+    /// voicing rather than being refused (`CrossfeedView.swift:301`).
+    pub dimmed: bool,
 }
 
 impl Param {
@@ -104,6 +109,7 @@ impl Param {
             caption: None,
             ends: None,
             enabled: true,
+            dimmed: false,
         }
     }
     pub fn step(mut self, s: f64) -> Self {
@@ -125,6 +131,17 @@ impl Param {
     pub fn enabled(mut self, e: bool) -> Self {
         self.enabled = e;
         self
+    }
+    pub fn dimmed(mut self, d: bool) -> Self {
+        self.dimmed = d;
+        self
+    }
+
+    /// The row as it is drawn. A dimmed parameter borrows the disabled
+    /// styling and nothing else: `handle` still goes through [`Self::widget`],
+    /// so the keys keep working.
+    fn drawn<'a>(&'a self, theme: &'a Theme) -> ParamRow<'a> {
+        self.widget(theme).enabled(self.enabled && !self.dimmed)
     }
 
     fn widget<'a>(&'a self, theme: &'a Theme) -> ParamRow<'a> {
@@ -157,6 +174,10 @@ pub struct ChipSpec {
     pub state: ChipState,
     pub color: Color,
     pub enabled: bool,
+    /// Drawn dim but still selectable, the Console's
+    /// `.opacity(matrixEnabled ? 1.0 : 0.4)` on a chip whose button is live
+    /// (`TestSignalsView.swift:557`).
+    pub dimmed: bool,
 }
 
 /// What a panel's graph draws.
@@ -265,6 +286,19 @@ pub enum Row {
 /// brackets, and a space. Eight is the longest name in the signal catalogue.
 const TILE_WIDTH: u16 = 11;
 
+/// The column a one-line radio row's detail starts in, measured from the end
+/// of its disc. `DESIGN.md` 7.8 aligns `Jan Meier` and the three shorter names
+/// on the same edge, and `Jan Meier` is the longest of them.
+const RADIO_LABEL_W: usize = 12;
+
+/// Whether a radio row's detail fits beside its label rather than under it.
+///
+/// Measured against the widest disc, `(*)` in ASCII, so the answer does not
+/// change with the glyph set: `height` has no theme to ask.
+fn radio_on_one_line(width: u16, detail: &str) -> bool {
+    2 + 3 + RADIO_LABEL_W + detail.chars().count() <= width as usize
+}
+
 impl Row {
     /// Can the keyboard land here?
     pub fn focusable(&self) -> bool {
@@ -303,7 +337,13 @@ impl Row {
             }
             Row::Toggle { caption: c, .. } => 1 + if width < 40 { 0 } else { caption(c) },
             Row::Segmented { .. } => 1,
-            Row::Radio { .. } => 2,
+            Row::Radio { detail, .. } => {
+                if radio_on_one_line(width, detail) {
+                    1
+                } else {
+                    2
+                }
+            }
             Row::Chips { .. } => 1,
             Row::Buttons { .. } => 1,
             Row::Graph(_) => GRAPH_ROWS,
@@ -801,7 +841,7 @@ fn draw_row(
             }
         }
         Row::Param(p) => {
-            p.widget(theme)
+            p.drawn(theme)
                 .focused(focused)
                 .edit(edit)
                 .compact(area.width < 40)
@@ -833,7 +873,9 @@ fn draw_row(
                 .enabled(*enabled)
                 .render(area, buf);
         }
-        Row::Radio { label, detail, on } => {
+        Row::Radio {
+            label, detail, on, ..
+        } => {
             let disc = match (*on, theme.glyphs) {
                 (true, Glyphs::Ascii) => "(*)",
                 (false, Glyphs::Ascii) => "( )",
@@ -853,23 +895,26 @@ fn draw_row(
             };
             buf.set_string(area.x + 1, area.y, disc, style);
             let lx = area.x + 2 + disc.chars().count() as u16;
-            buf.set_string(
-                lx,
-                area.y,
-                truncate(label, area.width.saturating_sub(6) as usize),
-                if focused {
-                    theme.focused()
-                } else {
-                    theme.value()
-                },
-            );
-            if area.height > 1 {
+            let label_style = if focused {
+                theme.focused()
+            } else {
+                theme.value()
+            };
+            let room = area.width.saturating_sub(lx - area.x) as usize;
+            if area.height == 1 {
+                // `DESIGN.md` 7.8: `● Default    700 Hz / 4.5 dB - Balanced,
+                // most popular`, on one row, with the details in a column.
+                buf.set_string(lx, area.y, fit_left(label, RADIO_LABEL_W), label_style);
+                let dx = lx + RADIO_LABEL_W as u16;
                 buf.set_string(
-                    lx,
-                    area.y + 1,
-                    truncate(detail, area.width.saturating_sub(6) as usize),
+                    dx,
+                    area.y,
+                    truncate(detail, room.saturating_sub(RADIO_LABEL_W)),
                     theme.label(),
                 );
+            } else {
+                buf.set_string(lx, area.y, truncate(label, room), label_style);
+                buf.set_string(lx, area.y + 1, truncate(detail, room), theme.label());
             }
         }
         Row::Chips {
@@ -883,7 +928,8 @@ fn draw_row(
                     label: &c.label,
                     state: c.state,
                     color: c.color,
-                    enabled: c.enabled,
+                    // Drawing only: `handle` below keeps a dimmed chip live.
+                    enabled: c.enabled && !c.dimmed,
                 });
             }
             r.focused(focused, *cursor)
@@ -1263,6 +1309,35 @@ pub(crate) mod testing {
             .join("\n")
     }
 
+    /// The foreground colour the row holding `needle` is drawn in, taken from
+    /// the first cell of that word. A text frame cannot tell a dimmed row from
+    /// a live one, and the dimming rules are half the parity work.
+    pub fn fg_of(
+        screen: &mut dyn crate::shell::Screen,
+        state: &DeviceState,
+        w: u16,
+        h: u16,
+        needle: &str,
+    ) -> ratatui::style::Color {
+        let t = crate::theme::Theme::console(
+            crate::theme::ColorDepth::TrueColor,
+            crate::theme::Glyphs::Braille,
+        );
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| screen.draw(f.area(), f.buffer_mut(), &t, state, true))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        for y in 0..h {
+            let line: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(at) = line.find(needle) {
+                let x = line[..at].chars().count() as u16;
+                return buf[(x, y)].fg;
+            }
+        }
+        panic!("{needle:?} is not on the frame");
+    }
+
     /// A tool panel inside the shell, so a golden frame is what a person
     /// actually sees at 80x24 and 120x40.
     pub fn frame(
@@ -1373,6 +1448,7 @@ mod tests {
             state: ChipState::On,
             color: t.outputs[0],
             enabled: true,
+            dimmed: false,
         }];
         let plain = Row::Chips {
             chips: chips.clone(),

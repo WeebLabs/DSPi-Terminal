@@ -28,8 +28,16 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("/", "Search"),
     KeyHelp::new("↑ ↓", "Select"),
     KeyHelp::new("f", "Favourite"),
+    // `DSPi_ConsoleApp.swift:10004`, the last item of the Favorite Profiles
+    // menu. It has no confirm there and none here; it is disabled when the
+    // list is empty, which in a terminal is the note below.
+    KeyHelp::new("F", "Clear Favourites"),
     KeyHelp::new("Enter", "Apply"),
 ];
+
+/// The Console's own words for an empty favourites menu,
+/// `DSPi_ConsoleApp.swift:9997`.
+pub const NO_FAVOURITES: &str = "No favourites yet";
 
 /// The Console's placeholder and its three empty states.
 pub const SEARCH_PLACEHOLDER: &str = "Search headphones...";
@@ -167,6 +175,30 @@ impl AutoEqPanel {
         } else {
             "Removed from favourites".into()
         })
+    }
+
+    /// Empty the favourites list, `AutoEQManager.clearFavorites()`.
+    fn clear_favourites(&mut self) -> ScreenEvent {
+        let had = {
+            let mut s = self.shared.borrow_mut();
+            let had = s.favourites.len();
+            s.favourites.clear();
+            had
+        };
+        if had == 0 {
+            return ScreenEvent::Status(NO_FAVOURITES.into());
+        }
+        self.cursor = 0;
+        self.scroll = 0;
+        if self.persist
+            && let Err(e) = dspi_session::autoeq::save_favourites(&[])
+        {
+            return ScreenEvent::Status(e.to_string());
+        }
+        ScreenEvent::Status(format!(
+            "Cleared {had} favourite{}",
+            if had == 1 { "" } else { "s" }
+        ))
     }
 
     /// The commands that put a profile on every input channel.
@@ -422,6 +454,7 @@ impl Screen for AutoEqPanel {
                 }
                 None => ScreenEvent::Status(NOTHING_SELECTED.into()),
             },
+            KeyCode::Char('F') => self.clear_favourites(),
             KeyCode::Enter => match hits.get(self.cursor).and_then(|id| db.get(id)) {
                 Some(entry) => {
                     let (commands, note) = Self::apply_commands(entry, state);
@@ -444,7 +477,7 @@ mod tests {
     use crate::screens::panel::testing;
     use crate::screens::shared;
     use crate::shell::Tool;
-    use crate::widgets::testing::key;
+    use crate::widgets::testing::{key, shift};
     use dspi_session::autoeq::{Entry, Filter};
 
     fn entry(id: &str, mfr: &str, model: &str, source: &str) -> Entry {
@@ -592,6 +625,34 @@ mod tests {
         );
         let _ = p.handle(key(KeyCode::Char('f')), &state);
         assert!(shared.borrow().favourites.is_empty());
+    }
+
+    /// D41: the Console's Favorite Profiles menu ends in Clear Favorites
+    /// (`DSPi_ConsoleApp.swift:10004`) and the Terminal had no such verb, so a
+    /// favourites list could only be emptied one heart at a time.
+    #[test]
+    fn shift_f_clears_the_whole_favourites_list() {
+        let (mut p, state, shared) = panel();
+        // Nothing to clear reads as the Console's disabled menu item does.
+        assert_eq!(
+            p.handle(shift(KeyCode::Char('F')), &state),
+            ScreenEvent::Status(NO_FAVOURITES.into())
+        );
+
+        typed(&mut p, &state, "hd 600");
+        p.handle(key(KeyCode::Char('f')), &state);
+        assert_eq!(shared.borrow().favourites.len(), 1);
+        // With the search empty the favourites are the list.
+        p.query.clear();
+
+        assert_eq!(
+            p.handle(shift(KeyCode::Char('F')), &state),
+            ScreenEvent::Status("Cleared 1 favourite".into())
+        );
+        assert!(shared.borrow().favourites.is_empty());
+        // And the list falls back to its empty note rather than a stale row.
+        let f = testing::draw(&mut p, &state, 100, 20);
+        assert!(f.contains("No favourites yet"), "{f}");
     }
 
     /// While the search field is taking keys, `f` is a letter; the rest of the

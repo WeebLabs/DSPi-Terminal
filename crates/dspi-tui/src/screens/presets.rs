@@ -61,7 +61,15 @@ impl PresetMenu {
         items.push("#".into());
         items.push("Save".into());
         items.push("Rename...".into());
-        items.push("Set as Default".into());
+        // `ContentView.swift:1238-1239` disables Set as Default when the
+        // startup mode already points at this slot; `default_slot` is `Some`
+        // only in that mode. A leading `#` is the popup's un-pickable, dimmed
+        // form, which is what a disabled menu item looks like.
+        items.push(if shared.default_slot == Some(active) {
+            "#Set as Default".into()
+        } else {
+            "Set as Default".to_string()
+        });
         items.push("Copy to...".into());
         items.push(format!("Clear \"{}\"...", Self::slot_label(shared, active)));
         items.push("Clear All Slots...".into());
@@ -160,6 +168,27 @@ mod tests {
         let p = PresetMenu::popup(&s, 2, false);
         assert_eq!(p.items[2], "3: Living Room");
         assert_eq!(p.items.iter().filter(|i| i.ends_with('*')).count(), 0);
+    }
+
+    /// D19: the Console greys Set as Default out when this slot is already the
+    /// one the device boots into, and the answer is on hand in `default_slot`.
+    #[test]
+    fn set_as_default_is_disabled_on_the_slot_that_already_is_the_default() {
+        let mut s = shared();
+        s.default_slot = Some(2);
+        let p = PresetMenu::popup(&s, 2, false);
+        assert_eq!(p.items[13], "#Set as Default", "dimmed and unpickable");
+        // The rest of the menu keeps its indices.
+        assert_eq!(p.items[12], "Rename...");
+        assert_eq!(p.items[14], "Copy to...");
+
+        // Another slot still offers it.
+        let p = PresetMenu::popup(&s, 0, false);
+        assert_eq!(p.items[13], "Set as Default");
+        // And so does a device whose startup mode is not "a specified slot".
+        s.default_slot = None;
+        let p = PresetMenu::popup(&s, 2, false);
+        assert_eq!(p.items[13], "Set as Default");
     }
 
     #[test]

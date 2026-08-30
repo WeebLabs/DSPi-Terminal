@@ -296,6 +296,32 @@ impl FilterList {
             .scroll(self.scroll)
             .render(area, buf);
 
+        // `DESIGN.md` 7.6 gives the Linkwitz row all four of its values on one
+        // line, `f0 40 Hz Q0 0.5 → fp 25 Hz Qp 0.71  +8.2 dB  ⚙`, which is
+        // wider than any one column. It is painted over the FREQ / GAIN /
+        // WIDTH span the row left empty.
+        if self.mode == FilterMode::Peq {
+            let mut fx = area.x + 2;
+            for c in columns.iter().take(2) {
+                fx += c.width + 1;
+            }
+            let room = (area.x + area.width).saturating_sub(fx) as usize;
+            for (i, b) in bands.iter().enumerate().skip(self.scroll).take(body) {
+                if !b.filter_type.is_linkwitz() {
+                    continue;
+                }
+                let y = area.y + 1 + (i - self.scroll) as u16;
+                let text = linkwitz_line(b, theme);
+                let armed = focused && i == self.band && field == Some(Field::Config);
+                let style = if armed {
+                    theme.focused()
+                } else {
+                    theme.value()
+                };
+                buf.set_string(fx, y, crate::widgets::text::truncate(&text, room), style);
+            }
+        }
+
         // The bypass disc lives in the margin the table leaves free, and is
         // hidden entirely when the firmware has no per-band bypass.
         if supports_bypass(state) {
@@ -324,11 +350,13 @@ impl FilterList {
                     return cells;
                 }
                 if b.filter_type.is_linkwitz() {
-                    // The Console replaces the numerics with one settings
-                    // button; the values themselves live in its panel.
-                    cells.push(Cell::from("⚙"));
-                    cells.push(Cell::dim(format!("f0 {} Hz", number(b.freq))));
-                    cells.push(Cell::dim(format!("fp {} Hz", number(b.gain_db))));
+                    // Its four values do not fit the FREQ / GAIN / WIDTH
+                    // columns one apiece, so `DESIGN.md` 7.6 runs them across
+                    // the three as one line, which `draw` paints over the span
+                    // these three empty cells leave.
+                    cells.push(Cell::default());
+                    cells.push(Cell::default());
+                    cells.push(Cell::default());
                     return cells;
                 }
                 cells.push(Cell::from(format!("{:.0} Hz", b.freq)));
@@ -534,7 +562,7 @@ impl FilterList {
                 ScreenEvent::Handled
             }
             Field::Gain => {
-                self.edit = Some(seed(format!("{:.1}", band.gain_db)));
+                self.edit = Some(seed(gain_text(band.gain_db as f64)));
                 ScreenEvent::Handled
             }
             Field::Q => {
@@ -704,6 +732,22 @@ fn seed(text: String) -> NumberEdit {
     NumberEdit { text, dirty: false }
 }
 
+/// The Linkwitz row's inline reading: driver, target, the implied DC boost,
+/// and the button that opens the panel (`DESIGN.md` 7.6).
+fn linkwitz_line(b: &EqParamPacket, theme: &Theme) -> String {
+    let ascii = theme.glyphs == Glyphs::Ascii;
+    format!(
+        "f0 {} Hz Q0 {} {} fp {} Hz Qp {}  {:+.1} dB  {}",
+        number(b.freq),
+        q_text(b.q as f64),
+        if ascii { "->" } else { "→" },
+        number(b.gain_db),
+        q_text(b.qp.unwrap_or(super::linkwitz::DEFAULT_QP) as f64),
+        super::linkwitz::boost_of(b),
+        if ascii { "cfg" } else { "⚙" },
+    )
+}
+
 fn disc(b: &EqParamPacket, theme: &Theme) -> (&'static str, Style) {
     let ascii = theme.glyphs == Glyphs::Ascii;
     if b.filter_type == FilterType::Flat {
@@ -740,8 +784,24 @@ fn set_field(b: &mut EqParamPacket, field: Field, v: f64) {
 fn format_field(field: Field, v: f64) -> String {
     match field {
         Field::Freq => format!("{v:.0}"),
-        Field::Gain => format!("{v:.1}"),
+        Field::Gain => gain_text(v),
         _ => q_text(v),
+    }
+}
+
+/// A band gain as the armed cell carries it.
+///
+/// The WIDTH and GAIN columns show one decimal, but the Console's GAIN
+/// `ValueField` is 3 dp and `DESIGN.md` 5 says "gain 1 dp displayed, 3 dp
+/// editable". Seeding the edit at one decimal quantised the stored value:
+/// arming a band whose gain is 8.875 and pressing anything wrote 8.9 back.
+fn gain_text(v: f64) -> String {
+    let s = format!("{v:.3}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-" || s == "-0" {
+        "0".into()
+    } else {
+        s.to_string()
     }
 }
 
@@ -969,15 +1029,16 @@ mod tests {
             lines[0].contains("GAIN") && lines[0].contains("WIDTH"),
             "{f}"
         );
-        // A low shelf has a gain but no Q.
+        // A 12 dB/oct shelf has a gain and a Q, exactly as DESIGN 2.1's
+        // reference row draws it.
         assert!(lines[1].contains("Low Shelf 12 dB/oct"), "{f}");
         assert!(
             lines[1].contains("105 Hz") && lines[1].contains("+8.8 dB"),
             "{f}"
         );
         assert!(
-            !lines[1].trim_end().ends_with("0.707"),
-            "no Q on a shelf: {f}"
+            lines[1].trim_end().ends_with("0.707"),
+            "a 12 dB/oct shelf carries its Q in WIDTH: {f}"
         );
         // A peaking band has both.
         assert!(
@@ -988,6 +1049,55 @@ mod tests {
         assert!(lines[6].contains("Off"), "{f}");
         // The armed disc is in the margin.
         assert!(lines[1].contains('●'), "{f}");
+    }
+
+    /// D54: `DESIGN.md` 7.6 draws the Linkwitz row's four values inline,
+    /// `f0 40 Hz Q0 0.5 → fp 25 Hz Qp 0.71  +8.2 dB  ⚙`. The row used to show
+    /// f0, fp and the gear alone, so half its parameters were invisible.
+    #[test]
+    fn the_linkwitz_row_shows_all_four_values_and_the_boost() {
+        let mut state = fixture::state();
+        let (_, eq, _) = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "eq")
+            .copied()
+            .unwrap();
+        // Channel 16 band 0: a Linkwitz Transform, f0 40, Q0 0.5, fp 25.
+        let at = eq + 16 * 12 * 16;
+        state.bulk.patch(at, &[11, 0]);
+        state
+            .bulk
+            .patch(at + 2, &((0.71 * 512.0) as u16).to_le_bytes());
+        state.bulk.patch(at + 4, &40.0f32.to_le_bytes());
+        state.bulk.patch(at + 8, &0.5f32.to_le_bytes());
+        state.bulk.patch(at + 12, &25.0f32.to_le_bytes());
+
+        let mut l = list(16);
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 11)).unwrap();
+        term.draw(|f| l.draw(f.area(), f.buffer_mut(), &t, &state, true))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let line: String = (0..90).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(line.contains("Linkwitz Transform"), "{line}");
+        assert!(
+            line.contains("f0 40 Hz Q0 0.5 → fp 25 Hz Qp 0.709"),
+            "{line}"
+        );
+        assert!(line.contains("+8.2 dB"), "the implied DC boost: {line}");
+        assert!(line.contains('⚙'), "{line}");
+
+        // ASCII glyphs get an ASCII arrow and button.
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Ascii);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 11)).unwrap();
+        term.draw(|f| l.draw(f.area(), f.buffer_mut(), &t, &state, true))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let line: String = (0..90).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(
+            line.contains("-> fp 25 Hz") && line.contains("cfg"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -1015,10 +1125,77 @@ mod tests {
         assert_eq!(l.field, 3);
         l.handle(key(KeyCode::Right), &state);
         assert_eq!(l.field, 3, "clamped to the fields this type has");
-        // Band 1 is a low shelf: no Q, so three fields.
+        // Band 1 is a 12 dB/oct low shelf, which has all four.
         l.handle(key(KeyCode::Up), &state);
         assert_eq!(l.band, 0);
         assert_eq!(l.field, 0);
+        for _ in 0..4 {
+            l.handle(key(KeyCode::Right), &state);
+        }
+        assert_eq!(l.field, 3, "type, freq, gain, Q");
+    }
+
+    /// D3: the second-order shelves take a Q, and it has to be reachable from
+    /// the list, not only visible in it.
+    #[test]
+    fn a_twelve_db_per_octave_shelf_offers_an_editable_q() {
+        let state = fixture::state();
+        let mut l = list(0);
+        let shelf = l.bands(&state)[0];
+        assert_eq!(shelf.filter_type, FilterType::LowShelf);
+        assert_eq!(
+            l.fields(&shelf),
+            vec![Field::Type, Field::Freq, Field::Gain, Field::Q]
+        );
+        // The first-order shelf beside it in the menu still has none.
+        let mut first_order = shelf;
+        first_order.filter_type = FilterType::LowShelf1;
+        assert_eq!(
+            l.fields(&first_order),
+            vec![Field::Type, Field::Freq, Field::Gain]
+        );
+
+        l.field = 3;
+        assert_eq!(l.handle(key(KeyCode::Enter), &state), ScreenEvent::Handled);
+        assert_eq!(l.edit.as_ref().unwrap().text, "0.707");
+        for c in "1.2".chars() {
+            l.handle(key(KeyCode::Char(c)), &state);
+        }
+        assert_eq!(
+            l.handle(key(KeyCode::Enter), &state),
+            ScreenEvent::Command("eq in.1 1 lowshelf 105 1.2 8.8".into())
+        );
+    }
+
+    /// D21: the Console's GAIN field is 3 dp. Arming at one decimal threw away
+    /// the other two, and the next nudge wrote the rounded value back.
+    #[test]
+    fn arming_a_gain_keeps_all_three_decimals() {
+        let mut state = fixture::state();
+        let (_, eq, _) = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "eq")
+            .copied()
+            .unwrap();
+        // Band 1 of channel 0 is the low shelf; give it a gain with three.
+        state.bulk.patch(eq + 12, &8.875f32.to_le_bytes());
+
+        let mut l = list(0);
+        l.field = 2; // GAIN
+        l.handle(key(KeyCode::Enter), &state);
+        assert_eq!(l.edit.as_ref().unwrap().text, "8.875");
+        // The table itself still shows one decimal.
+        let cells = l.row(0, &l.bands(&state)[0]);
+        assert_eq!(cells[3].text, "+8.9 dB");
+
+        // And a nudge moves the stored value, not the rounded one.
+        match l.handle(key(KeyCode::Right), &state) {
+            ScreenEvent::Command(c) => {
+                assert!(c.ends_with(" 8.975"), "{c}");
+                assert_eq!(l.edit.as_ref().unwrap().text, "8.975");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

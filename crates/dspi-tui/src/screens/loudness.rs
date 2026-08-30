@@ -92,11 +92,6 @@ impl LoudnessPanel {
                 title: "Outputs".into(),
                 action: Some("Presets ▾".into()),
             });
-            rows.push(Row::Caption(
-                "Compensate only the outputs feeding your low-level listening chain. Keep \
-                 bass-managed pairs (mains + sub) together so the crossover stays coherent."
-                    .into(),
-            ));
             let chips = (0..state.caps.num_outputs as usize)
                 .map(|o| ChipSpec {
                     label: (o + 1).to_string(),
@@ -111,13 +106,22 @@ impl LoudnessPanel {
                         state.caps.num_outputs,
                     )),
                     enabled: true,
+                    // `LoudnessView.swift:331-348` dims a chip only for being
+                    // off, never for the matrix mixer.
+                    dimmed: false,
                 })
                 .collect();
+            // `DESIGN.md` 7.8's template is header, chips, caption.
             rows.push(Row::Chips {
                 chips,
                 cursor: self.chip,
                 polarity: false,
             });
+            rows.push(Row::Caption(
+                "Compensate only the outputs feeding your low-level listening chain. Keep \
+                 bass-managed pairs (mains + sub) together so the crossover stays coherent."
+                    .into(),
+            ));
         }
 
         rows.push(Row::Blank);
@@ -315,6 +319,21 @@ mod tests {
         state.bulk.patch(section("global") + 5, &[0]);
         let f = testing::draw(&mut p, &state, 100, 40);
         assert!(f.contains("Disabled"), "{f}");
+    }
+
+    /// D45: `DESIGN.md` 7.8's template is header, chips, caption.
+    #[test]
+    fn the_caption_sits_under_the_chip_row() {
+        let (p, state) = panel();
+        let rows = p.rows(&state, panel::key_theme());
+        let chips = rows
+            .iter()
+            .position(|r| matches!(r, Row::Chips { .. }))
+            .expect("a chip row");
+        assert!(
+            matches!(rows.get(chips + 1), Some(Row::Caption(_))),
+            "{rows:?}"
+        );
     }
 
     #[test]
