@@ -187,12 +187,18 @@ fn parse_set(tokens: &[&str], ctx: &Context) -> Result<Command, ParseError> {
         });
     }
 
-    if rest.len() < want + 1 {
+    // Too few tokens is two different mistakes: indices missing, or the
+    // indices all present and the value missing. `set vol.user` used to be
+    // told it "needs 0 index(es)", which named the wrong gap.
+    if rest.len() < want {
         return Err(ParseError::WrongArity {
             path: d.path.into(),
             want,
-            got: rest.len().saturating_sub(want.min(rest.len())),
+            got: rest.len(),
         });
+    }
+    if rest.len() == want {
+        return Err(ParseError::MissingValue(d.path.into()));
     }
 
     let indices = parse_indices(d, &rest[..want], ctx)?;
@@ -1021,7 +1027,11 @@ mod tests {
     #[test]
     fn missing_values_are_reported_not_guessed() {
         let e = p("vol.user").unwrap_err();
-        assert!(matches!(e, ParseError::WrongArity { .. }), "{e}");
+        assert!(matches!(e, ParseError::MissingValue(_)), "{e}");
+        assert_eq!(e.to_string(), "`vol.user` needs a value");
+        // Too few indices still reads as an index problem.
+        let e = p("eq.freq 0").unwrap_err();
+        assert!(matches!(e, ParseError::WrongArity { got: 1, .. }), "{e}");
     }
 
     #[test]

@@ -405,14 +405,35 @@ impl Session {
         self.check_indices(d, indices)?;
         let wvalue = self.build_read_wvalue(d, indices);
         let repr = d.kind.repr();
-        // EQ scalars always answer four bytes regardless of the field's width.
+        // EQ scalars always answer four bytes regardless of the field's
+        // width; a crosspoint answers its whole 8-byte MatrixRoutePacket
+        // (config.h:845-851).
         let len = if matches!(d.wvalue, WValue::EqScalar(_)) {
             4
+        } else if matches!(d.wvalue, WValue::Crosspoint) {
+            8
         } else {
             repr.len().max(1)
         };
 
         let bytes = with_busy_retry(|| self.transport.control_in(get, wvalue, len as u16), get)?;
+
+        // A crosspoint reads back in the words the grammar writes it:
+        // `on -6.0 dB inv`, `off`.
+        if matches!(d.wvalue, WValue::Crosspoint) && bytes.len() >= 8 {
+            let enabled = bytes[2] != 0;
+            let invert = bytes[3] != 0;
+            let gain = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let mut text = if enabled {
+                format!("on {gain:+.1} dB")
+            } else {
+                "off".to_string()
+            };
+            if invert {
+                text.push_str(" inv");
+            }
+            return Ok(Value::Text(text));
+        }
 
         Ok(decode_read(d, &bytes))
     }
@@ -1636,6 +1657,35 @@ mod matrix_tests {
         assert!((strips[0].gain_db + 6.0).abs() < 1e-5);
         assert!((strips[0].delay_ms - 4.2).abs() < 1e-5);
         assert!(!strips[1].enabled);
+    }
+
+    #[test]
+    fn a_crosspoint_reads_back_in_the_grammars_own_words() {
+        let t = MockTransport::new()
+            .window(op::REQ_GET_ALL_PARAMS_CHUNK, bulk_with_matrix())
+            .data(
+                op::REQ_GET_MATRIX_ROUTE,
+                [
+                    0u8,
+                    4,
+                    1,
+                    1,
+                    (-6.0f32).to_le_bytes()[0],
+                    (-6.0f32).to_le_bytes()[1],
+                    (-6.0f32).to_le_bytes()[2],
+                    (-6.0f32).to_le_bytes()[3],
+                ],
+            );
+        let log = t.log_handle();
+        let mut s = session_over(Box::new(t));
+        let v = s.read("mix", &[0, 4]).unwrap();
+        assert_eq!(v, Value::Text("on -6.0 dB inv".into()));
+        let seen = log.lock().unwrap();
+        let read = seen
+            .iter()
+            .find(|e| e.opcode == op::REQ_GET_MATRIX_ROUTE)
+            .expect("the read went out");
+        assert_eq!(read.value, 0x0004, "input 0, output 4");
     }
 
     /// Reading the matrix a crosspoint at a time would be 72 transfers on an
