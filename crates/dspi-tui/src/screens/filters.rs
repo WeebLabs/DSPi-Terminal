@@ -296,6 +296,32 @@ impl FilterList {
             .scroll(self.scroll)
             .render(area, buf);
 
+        // `DESIGN.md` 7.6 gives the Linkwitz row all four of its values on one
+        // line, `f0 40 Hz Q0 0.5 → fp 25 Hz Qp 0.71  +8.2 dB  ⚙`, which is
+        // wider than any one column. It is painted over the FREQ / GAIN /
+        // WIDTH span the row left empty.
+        if self.mode == FilterMode::Peq {
+            let mut fx = area.x + 2;
+            for c in columns.iter().take(2) {
+                fx += c.width + 1;
+            }
+            let room = (area.x + area.width).saturating_sub(fx) as usize;
+            for (i, b) in bands.iter().enumerate().skip(self.scroll).take(body) {
+                if !b.filter_type.is_linkwitz() {
+                    continue;
+                }
+                let y = area.y + 1 + (i - self.scroll) as u16;
+                let text = linkwitz_line(b, theme);
+                let armed = focused && i == self.band && field == Some(Field::Config);
+                let style = if armed {
+                    theme.focused()
+                } else {
+                    theme.value()
+                };
+                buf.set_string(fx, y, crate::widgets::text::truncate(&text, room), style);
+            }
+        }
+
         // The bypass disc lives in the margin the table leaves free, and is
         // hidden entirely when the firmware has no per-band bypass.
         if supports_bypass(state) {
@@ -324,11 +350,13 @@ impl FilterList {
                     return cells;
                 }
                 if b.filter_type.is_linkwitz() {
-                    // The Console replaces the numerics with one settings
-                    // button; the values themselves live in its panel.
-                    cells.push(Cell::from("⚙"));
-                    cells.push(Cell::dim(format!("f0 {} Hz", number(b.freq))));
-                    cells.push(Cell::dim(format!("fp {} Hz", number(b.gain_db))));
+                    // Its four values do not fit the FREQ / GAIN / WIDTH
+                    // columns one apiece, so `DESIGN.md` 7.6 runs them across
+                    // the three as one line, which `draw` paints over the span
+                    // these three empty cells leave.
+                    cells.push(Cell::default());
+                    cells.push(Cell::default());
+                    cells.push(Cell::default());
                     return cells;
                 }
                 cells.push(Cell::from(format!("{:.0} Hz", b.freq)));
@@ -704,6 +732,22 @@ fn seed(text: String) -> NumberEdit {
     NumberEdit { text, dirty: false }
 }
 
+/// The Linkwitz row's inline reading: driver, target, the implied DC boost,
+/// and the button that opens the panel (`DESIGN.md` 7.6).
+fn linkwitz_line(b: &EqParamPacket, theme: &Theme) -> String {
+    let ascii = theme.glyphs == Glyphs::Ascii;
+    format!(
+        "f0 {} Hz Q0 {} {} fp {} Hz Qp {}  {:+.1} dB  {}",
+        number(b.freq),
+        q_text(b.q as f64),
+        if ascii { "->" } else { "→" },
+        number(b.gain_db),
+        q_text(b.qp.unwrap_or(super::linkwitz::DEFAULT_QP) as f64),
+        super::linkwitz::boost_of(b),
+        if ascii { "cfg" } else { "⚙" },
+    )
+}
+
 fn disc(b: &EqParamPacket, theme: &Theme) -> (&'static str, Style) {
     let ascii = theme.glyphs == Glyphs::Ascii;
     if b.filter_type == FilterType::Flat {
@@ -1005,6 +1049,55 @@ mod tests {
         assert!(lines[6].contains("Off"), "{f}");
         // The armed disc is in the margin.
         assert!(lines[1].contains('●'), "{f}");
+    }
+
+    /// D54: `DESIGN.md` 7.6 draws the Linkwitz row's four values inline,
+    /// `f0 40 Hz Q0 0.5 → fp 25 Hz Qp 0.71  +8.2 dB  ⚙`. The row used to show
+    /// f0, fp and the gear alone, so half its parameters were invisible.
+    #[test]
+    fn the_linkwitz_row_shows_all_four_values_and_the_boost() {
+        let mut state = fixture::state();
+        let (_, eq, _) = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "eq")
+            .copied()
+            .unwrap();
+        // Channel 16 band 0: a Linkwitz Transform, f0 40, Q0 0.5, fp 25.
+        let at = eq + 16 * 12 * 16;
+        state.bulk.patch(at, &[11, 0]);
+        state
+            .bulk
+            .patch(at + 2, &((0.71 * 512.0) as u16).to_le_bytes());
+        state.bulk.patch(at + 4, &40.0f32.to_le_bytes());
+        state.bulk.patch(at + 8, &0.5f32.to_le_bytes());
+        state.bulk.patch(at + 12, &25.0f32.to_le_bytes());
+
+        let mut l = list(16);
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 11)).unwrap();
+        term.draw(|f| l.draw(f.area(), f.buffer_mut(), &t, &state, true))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let line: String = (0..90).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(line.contains("Linkwitz Transform"), "{line}");
+        assert!(
+            line.contains("f0 40 Hz Q0 0.5 → fp 25 Hz Qp 0.709"),
+            "{line}"
+        );
+        assert!(line.contains("+8.2 dB"), "the implied DC boost: {line}");
+        assert!(line.contains('⚙'), "{line}");
+
+        // ASCII glyphs get an ASCII arrow and button.
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Ascii);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 11)).unwrap();
+        term.draw(|f| l.draw(f.area(), f.buffer_mut(), &t, &state, true))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let line: String = (0..90).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(
+            line.contains("-> fp 25 Hz") && line.contains("cfg"),
+            "{line}"
+        );
     }
 
     #[test]

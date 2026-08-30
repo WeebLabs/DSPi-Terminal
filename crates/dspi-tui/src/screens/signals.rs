@@ -279,7 +279,9 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("← →", "Adjust"),
     KeyHelp::new("Enter", "Edit or choose"),
     KeyHelp::new("Space", "Start or stop"),
-    KeyHelp::new("S", "Stop now"),
+    // `TestSignalsView.swift:913`: the Console's tooltip on the second stop
+    // button, which is the only place it explains the difference.
+    KeyHelp::new("S", "Stop immediately, no fade"),
     KeyHelp::new("a", "All outputs"),
     KeyHelp::new("n", "No outputs"),
     KeyHelp::new("Backspace", "Reset"),
@@ -1078,6 +1080,26 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// D49: the difference between the two stops is explained nowhere but the
+    /// Console's tooltip, so the key line carries its words.
+    #[test]
+    fn the_key_line_says_what_stop_now_actually_does() {
+        assert!(
+            KEYS.iter()
+                .any(|k| k.key == "S" && k.does == "Stop immediately, no fade"),
+            "{KEYS:?}"
+        );
+        let (_, state) = panel();
+        let f = testing::frame(
+            Tool::Signals,
+            Box::new(SignalsPanel::new()),
+            &state,
+            120,
+            40,
+        );
+        assert!(f.contains("Stop immediately, no fade"), "{f}");
     }
 
     /// D45: `DESIGN.md` 7.8's template is header, chips, caption.
