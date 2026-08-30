@@ -844,30 +844,6 @@ pub(crate) fn run(
     }
 }
 
-/// The same, for the two writes that answer nothing: arming and cancelling a
-/// learn.
-pub(crate) fn run_unit(
-    session: &mut Session,
-    ok: &str,
-    f: impl FnOnce(&mut Surfaces<'_>) -> dspi_session::surfaces::Result<()>,
-) -> SessionReply {
-    let limits = session
-        .capabilities()
-        .cs
-        .as_ref()
-        .map(Limits::from)
-        .unwrap_or_default();
-    let out = session.with_transport(|t| {
-        let mut s = Surfaces::new(t, limits);
-        Ok(f(&mut s))
-    });
-    match out {
-        Ok(Ok(())) => SessionReply::Ok(ok.into()),
-        Ok(Err(e)) => SessionReply::Err(e.to_string()),
-        Err(e) => SessionReply::Err(e.to_string()),
-    }
-}
-
 /// The same again, for a write that answers a bare status code rather than a
 /// status packet: firing a macro is immediate, not deferred.
 pub(crate) fn run_code(

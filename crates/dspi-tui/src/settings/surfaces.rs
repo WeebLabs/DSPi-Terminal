@@ -2224,7 +2224,11 @@ impl SettingsPage for SurfacesPage {
                         self.ir_messages.remove(&sub);
                         PageEvent::Session(SessionRequest::new(
                             TAG_LEARN | sub as u32,
-                            move |session| m::run_unit(session, LEARN_PROMPT, |s| s.arm_learn()),
+                            // The arm answers PIN_CONFIG_SUCCESS or
+                            // CS_STATUS_NO_IR (control_surfaces.h:798), so a
+                            // refusal says so rather than waiting for a button
+                            // the device is not listening for.
+                            move |session| m::run_code(session, LEARN_PROMPT, |s| s.arm_learn()),
                         ))
                     }
                     _ => {
@@ -2254,7 +2258,7 @@ impl SettingsPage for SurfacesPage {
                         .insert(sub, ("Learn cancelled.".into(), false));
                 }
                 PageEvent::Session(SessionRequest::new(TAG_LEARN_CANCEL, |session| {
-                    m::run_unit(session, "Learn cancelled", |s| s.cancel_learn())
+                    m::run_code(session, "Learn cancelled", |s| s.cancel_learn())
                 }))
             }
             (Item::IrNoun(sub), Action::Selected(c)) => {
@@ -3169,6 +3173,50 @@ mod tests {
         assert_eq!(
             m::run(&mut session, move |s| s.write_binding(3, &b)),
             SessionReply::Err("A potentiometer needs an analogue-capable pin".into())
+        );
+    }
+
+    /// Arming a learn is a write with an answer: `CS_STATUS_NO_IR` when no
+    /// receiver is live (control_surfaces.h:798). Dropping it left the card
+    /// saying "Waiting for a button..." forever.
+    #[test]
+    fn a_refused_learn_arm_says_so_instead_of_waiting() {
+        use dspi_proto::generated::opcodes as op;
+        use dspi_transport::MockTransport;
+
+        let caps = |cs| {
+            let mut c = crate::shell::fixture::caps();
+            c.cs = Some(cs);
+            c
+        };
+        // CS_STATUS_NO_IR from the arm.
+        let t = MockTransport::new().data(op::REQ_CS_IR_LEARN, vec![0x1E]);
+        let mut session =
+            dspi_session::Session::new(Box::new(t), caps(m::demo::caps())).expect("session");
+        assert_eq!(
+            m::run_code(&mut session, LEARN_PROMPT, |s| s.arm_learn()),
+            SessionReply::Err("Set up an IR receiver first".into())
+        );
+
+        // And the page turns that into the card's own error, with nothing left
+        // listening.
+        let (mut p, _, _) = page();
+        p.learning = Some((2, None));
+        let (d, st, cfg) = (
+            m::demo::settings_data(),
+            m::demo::state(),
+            AppConfig::default(),
+        );
+        let c = cx(&d, &st, &cfg);
+        p.session_result(
+            TAG_LEARN | 2,
+            SessionReply::Err("Set up an IR receiver first".into()),
+            &c,
+        );
+        assert!(p.learning.is_none(), "nothing is still listening");
+        assert_eq!(
+            p.ir_messages.get(&2).map(|(t, e)| (t.as_str(), *e)),
+            Some(("Set up an IR receiver first", true))
         );
     }
 
