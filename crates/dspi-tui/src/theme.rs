@@ -2,7 +2,7 @@
 //!
 //! Two principles from the design: **data is bright, chrome is dim**, so values
 //! and curves carry the colour while borders sit back; and **colour means
-//! something**, so a channel's hue is the same in the graph, the legend and the
+//! something**, so a channel's hue is the same in the graph, the sidebar and the
 //! meters, and semantic colours are reserved for pending, clipping and hazard.
 
 use ratatui::style::{Color, Modifier, Style};

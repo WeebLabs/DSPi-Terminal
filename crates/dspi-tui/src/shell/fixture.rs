@@ -27,7 +27,6 @@ fn item(
         level,
         peak: level * 1.2,
         clipped: false,
-        visible: true,
         inactive: false,
         index,
     }
@@ -59,7 +58,6 @@ fn curve(item: &ChannelItem, bands: &[dsp::Band], gain: f64, selected: bool) -> 
         magnitude: dsp::curve(bands, gain),
         phase: Some(dsp::phase_curve(bands)),
         selected,
-        visible: item.visible,
     }
 }
 
@@ -110,38 +108,13 @@ pub fn rp2350(theme: &Theme) -> ShellModel {
     m.echo = ":eq in.1 3 freq 2856".into();
 
     let tuned = tuning();
-    let flat: Vec<dsp::Band> = Vec::new();
-    let lp = vec![dsp::Band {
-        filter_type: FilterType::LowPass,
-        freq: 80.0,
-        q: 0.707,
-        gain_db: 0.0,
-        bypass: false,
-    }];
-    let hp = vec![dsp::Band {
-        filter_type: FilterType::HighPass,
-        freq: 80.0,
-        q: 0.707,
-        gain_db: 0.0,
-        bypass: false,
-    }];
-    let mut curves = Vec::new();
-    for (i, it) in m.inputs.iter().enumerate() {
-        let bands = if i < 2 { &tuned } else { &flat };
-        curves.push(curve(it, bands, 0.0, m.selection == Selection::Input(i)));
-    }
-    for (o, it) in m.outputs.iter().enumerate() {
-        let bands = if o < 2 {
-            &hp
-        } else if o == 8 {
-            &lp
-        } else {
-            &flat
-        };
-        let gain = if o == 8 { -3.0 } else { 0.0 };
-        curves.push(curve(it, bands, gain, false));
-    }
-    m.curves = curves;
+    // FL is selected and linked to FR, so the graph carries FR's curve in
+    // grey underneath FL's. The outputs' tunings live in `state()`; the
+    // shell model only carries what the graph draws.
+    let mut partner = curve(&m.inputs[1], &tuned, 0.0, false);
+    partner.color = theme.dim;
+    m.curves = vec![partner, curve(&m.inputs[0], &tuned, 0.0, true)];
+    m.graph_channel = Some("FL".into());
     m
 }
 
@@ -161,11 +134,6 @@ pub fn rp2040(theme: &Theme) -> ShellModel {
     let mut sub = item(theme, "Sub", ChannelRole::Sub, 6, 5, 0.4);
     sub.descriptor = "OUT5".into();
     m.outputs.push(sub);
-    m.curves.truncate(2);
-    let flat: Vec<dsp::Band> = Vec::new();
-    for it in &m.outputs {
-        m.curves.push(curve(it, &flat, 0.0, false));
-    }
     m
 }
 

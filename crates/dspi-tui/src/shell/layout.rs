@@ -77,10 +77,9 @@ pub struct Regions {
     pub sidebar_footer: Rect,
     /// The whole detail pane box, border included.
     pub pane: Rect,
-    /// Inside the pane: graph plot area (may be zero-height), legend row,
-    /// and the detail region.
+    /// Inside the pane: graph plot area (may be zero-height) and the detail
+    /// region beneath it.
     pub graph: Rect,
-    pub legend: Rect,
     pub detail: Rect,
     pub echo: Rect,
     pub keys: Rect,
@@ -90,7 +89,7 @@ pub struct Regions {
 /// label, slider, cpu.
 pub const FOOTER_ROWS: u16 = 7;
 
-pub fn compute(area: Rect, graph_height: GraphHeight, legend_rows: u16) -> Option<Regions> {
+pub fn compute(area: Rect, graph_height: GraphHeight) -> Option<Regions> {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         return None;
     }
@@ -122,26 +121,15 @@ pub fn compute(area: Rect, graph_height: GraphHeight, legend_rows: u16) -> Optio
     let inner_pane = inset(pane);
     let mut g = density.graph_rows(graph_height);
     // The detail always keeps at least six rows.
-    let legend_rows = if graph_height == GraphHeight::Hidden {
-        1
-    } else {
-        legend_rows.clamp(1, 2)
-    };
-    if g + legend_rows + 6 > inner_pane.height {
-        g = inner_pane.height.saturating_sub(legend_rows + 6);
+    if g + 6 > inner_pane.height {
+        g = inner_pane.height.saturating_sub(6);
     }
     let graph = Rect::new(inner_pane.x, inner_pane.y, inner_pane.width, g);
-    let legend = Rect::new(
+    let detail = Rect::new(
         inner_pane.x,
         inner_pane.y + g,
         inner_pane.width,
-        legend_rows,
-    );
-    let detail = Rect::new(
-        inner_pane.x,
-        inner_pane.y + g + legend_rows,
-        inner_pane.width,
-        inner_pane.height.saturating_sub(g + legend_rows),
+        inner_pane.height.saturating_sub(g),
     );
 
     Some(Regions {
@@ -152,7 +140,6 @@ pub fn compute(area: Rect, graph_height: GraphHeight, legend_rows: u16) -> Optio
         sidebar_footer,
         pane,
         graph,
-        legend,
         detail,
         echo,
         keys,
@@ -175,12 +162,11 @@ mod tests {
 
     #[test]
     fn the_reference_layout_has_a_twelve_row_graph() {
-        let r = compute(Rect::new(0, 0, 120, 40), GraphHeight::Medium, 1).unwrap();
+        let r = compute(Rect::new(0, 0, 120, 40), GraphHeight::Medium).unwrap();
         assert_eq!(r.density, Density::Normal);
         assert_eq!(r.sidebar.width, 24);
         assert_eq!(r.graph.height, 12);
-        assert_eq!(r.legend.height, 1);
-        assert_eq!(r.detail.y, r.legend.y + 1);
+        assert_eq!(r.detail.y, r.graph.y + 12);
         assert_eq!(r.echo.y, 38);
         assert_eq!(r.keys.y, 39);
         assert_eq!(r.sidebar_footer.height, FOOTER_ROWS);
@@ -189,32 +175,32 @@ mod tests {
 
     #[test]
     fn the_minimum_fits_and_below_it_does_not() {
-        let r = compute(Rect::new(0, 0, 80, 24), GraphHeight::Medium, 1).unwrap();
+        let r = compute(Rect::new(0, 0, 80, 24), GraphHeight::Medium).unwrap();
         assert_eq!(r.density, Density::Compact);
         assert_eq!(r.graph.height, 7);
         assert!(r.detail.height >= 6, "{:?}", r.detail);
-        assert!(compute(Rect::new(0, 0, 79, 24), GraphHeight::Medium, 1).is_none());
-        assert!(compute(Rect::new(0, 0, 80, 23), GraphHeight::Medium, 1).is_none());
-        let hidden = compute(Rect::new(0, 0, 80, 24), GraphHeight::Hidden, 1).unwrap();
+        assert!(compute(Rect::new(0, 0, 79, 24), GraphHeight::Medium).is_none());
+        assert!(compute(Rect::new(0, 0, 80, 23), GraphHeight::Medium).is_none());
+        let hidden = compute(Rect::new(0, 0, 80, 24), GraphHeight::Hidden).unwrap();
         assert_eq!(hidden.graph.height, 0);
         assert!(hidden.detail.height > r.detail.height);
     }
 
     #[test]
     fn wide_terminals_get_a_bigger_sidebar_and_graph() {
-        let r = compute(Rect::new(0, 0, 200, 60), GraphHeight::Medium, 1).unwrap();
+        let r = compute(Rect::new(0, 0, 200, 60), GraphHeight::Medium).unwrap();
         assert_eq!(r.density, Density::Wide);
         assert_eq!(r.sidebar.width, 28);
         assert_eq!(r.graph.height, 20);
-        let r = compute(Rect::new(0, 0, 200, 60), GraphHeight::Large, 1).unwrap();
+        let r = compute(Rect::new(0, 0, 200, 60), GraphHeight::Large).unwrap();
         assert_eq!(r.graph.height, 30);
     }
 
     #[test]
     fn a_large_graph_still_leaves_the_detail_six_rows() {
-        let r = compute(Rect::new(0, 0, 80, 24), GraphHeight::Large, 2).unwrap();
+        let r = compute(Rect::new(0, 0, 80, 24), GraphHeight::Large).unwrap();
         assert!(r.detail.height >= 6);
-        assert_eq!(r.legend.height, 2);
+        assert_eq!(r.graph.height + r.detail.height, 19, "the pane's inside");
         assert_eq!(GraphHeight::Large.next(), GraphHeight::Hidden);
     }
 }

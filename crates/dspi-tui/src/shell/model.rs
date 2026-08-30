@@ -19,8 +19,6 @@ pub struct ChannelItem {
     pub level: f32,
     pub peak: f32,
     pub clipped: bool,
-    /// Whether its curve is shown on the graph.
-    pub visible: bool,
     /// Muted or disabled: drawn dim.
     pub inactive: bool,
     /// The unified channel index, for the screens.
@@ -97,7 +95,11 @@ pub struct ShellModel {
     pub cpu: (u8, u8),
     pub graph: GraphSettings,
     pub graph_height: GraphHeight,
+    /// What the graph draws: the graphed channel last, its linked partner
+    /// first in grey when shown (DESIGN 12.2). Empty in the overview.
     pub curves: Vec<GraphCurve>,
+    /// The name of the graphed channel, for the pane title.
+    pub graph_channel: Option<String>,
     pub cursor_hz: Option<f64>,
     pub marker_hz: Option<f64>,
     /// The echo line: the last command, dimmed.
@@ -174,6 +176,7 @@ impl ShellModel {
             graph: GraphSettings::default(),
             graph_height: GraphHeight::Medium,
             curves: Vec::new(),
+            graph_channel: None,
             cursor_hz: None,
             marker_hz: None,
             echo: String::new(),

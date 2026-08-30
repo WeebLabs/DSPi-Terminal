@@ -1,14 +1,15 @@
 //! The response graph, following the Console's `GraphView.swift`.
 //!
 //! Log frequency across a settable window, linear dB about a settable centre,
-//! an adaptive dB grid, the phase of the selected channel on a right-hand axis
-//! that scales with the vertical zoom, and identical-curve grouping so eight
-//! channels with the same tuning draw as one line rather than eight on top of
-//! each other. Curves that do not contain the selected channel are dotted.
+//! an adaptive dB grid, and the phase of the principal curve on a right-hand
+//! axis that scales with the vertical zoom. It draws the curves it is given,
+//! in order, each in its own colour: the shell hands it one channel and, for
+//! a linked pair, the partner underneath in grey (DESIGN 12); the tool panels
+//! hand it their two or three series.
 //!
 //! The graph is render-only: it takes curves that the screen has already
 //! computed with `dspi_proto::dsp`, and it answers questions (value at a
-//! frequency, the legend) without owning any state.
+//! frequency) without owning any state.
 
 use dspi_proto::dsp;
 use ratatui::buffer::Buffer;
@@ -17,7 +18,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
 use crate::theme::{ColorDepth, Glyphs, Theme};
-use crate::widgets::LegendPill;
 
 /// Settings > Graphing, with the Console's defaults.
 #[derive(Debug, Clone, PartialEq)]
@@ -114,8 +114,8 @@ pub struct GraphCurve {
     pub magnitude: Vec<f64>,
     /// Degrees at the same frequencies, wrapped to +/-180.
     pub phase: Option<Vec<f64>>,
+    /// The principal curve: bold in mono, and the one whose phase is drawn.
     pub selected: bool,
-    pub visible: bool,
 }
 
 /// Interpolate a 201-point log-spaced curve at any frequency.
@@ -131,47 +131,6 @@ pub fn value_at(points: &[f64], hz: f64) -> f64 {
     let a = points[i];
     let b = points[(i + 1).min(points.len() - 1)];
     a + (b - a) * frac
-}
-
-/// Group visible curves whose magnitudes are bit-identical, as the Console's
-/// `groupedChannels()` does. Each group lists curve indices; the first is
-/// drawn and the rest are marked `=` in the legend.
-pub fn groups(curves: &[GraphCurve]) -> Vec<Vec<usize>> {
-    let mut out: Vec<Vec<usize>> = Vec::new();
-    for (i, c) in curves.iter().enumerate() {
-        if !c.visible {
-            continue;
-        }
-        if let Some(g) = out.iter_mut().find(|g| {
-            let rep = &curves[g[0]];
-            rep.magnitude.len() == c.magnitude.len()
-                && rep
-                    .magnitude
-                    .iter()
-                    .zip(&c.magnitude)
-                    .all(|(a, b)| a.to_bits() == b.to_bits())
-        }) {
-            g.push(i);
-        } else {
-            out.push(vec![i]);
-        }
-    }
-    out
-}
-
-/// The legend pills for a set of curves.
-pub fn legend(curves: &[GraphCurve]) -> Vec<LegendPill> {
-    let gs = groups(curves);
-    curves
-        .iter()
-        .enumerate()
-        .map(|(i, c)| LegendPill {
-            descriptor: c.descriptor.clone(),
-            color: c.color,
-            visible: c.visible,
-            grouped: gs.iter().any(|g| g.len() > 1 && g[1..].contains(&i)),
-        })
-        .collect()
 }
 
 pub struct Graph<'a> {
@@ -206,11 +165,10 @@ impl<'a> Graph<'a> {
         self
     }
 
-    /// The readout for the cursor: every visible curve's dB at that frequency.
+    /// The readout for the cursor: every curve's dB at that frequency.
     pub fn readout(&self, hz: f64) -> Vec<(String, f64)> {
         self.curves
             .iter()
-            .filter(|c| c.visible)
             .map(|c| (c.descriptor.clone(), value_at(&c.magnitude, hz)))
             .collect()
     }
@@ -368,76 +326,30 @@ impl Widget for Graph<'_> {
             }
         }
 
-        // Curves, one per group, unselected groups first so the selected one
-        // lands on top.
-        let gs = groups(self.curves);
-        let any_selected = self.curves.iter().any(|c| c.selected && c.visible);
-        let mut order: Vec<&Vec<usize>> = gs.iter().collect();
-        order.sort_by_key(|g| g.iter().any(|&i| self.curves[i].selected));
-        let low_depth = matches!(t.depth, ColorDepth::Ansi16 | ColorDepth::Mono);
-        let mut end_labels: Vec<(u16, String, Color)> = Vec::new();
-        for g in order {
-            let rep = &self.curves[g[0]];
-            let selected = g.iter().any(|&i| self.curves[i].selected);
-            let dotted = any_selected && !selected;
-            let sample = |frac: f64| -> f64 { value_at(&rep.magnitude, s.hz_at(frac)) };
+        // Curves in the order given, so the last one lands on top.
+        for c in self.curves {
+            let sample = |frac: f64| -> f64 { value_at(&c.magnitude, s.hz_at(frac)) };
             let style = if t.depth == ColorDepth::Mono {
-                Style::default().add_modifier(if selected {
+                Style::default().add_modifier(if c.selected {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
                 })
             } else {
-                Style::default().fg(rep.color)
+                Style::default().fg(c.color)
             };
-            draw_curve(plot, buf, t, &sample, &to_row, dotted, style);
-            if low_depth || g.len() > 1 && !any_selected {
-                // Label the curve at its right end so the reader can tell
-                // which line is which when hue cannot carry it.
-                let db = sample(1.0);
-                let y = plot.y + (to_row(db, rows).round() as u16).min(plot.height - 1);
-                let label = if g.len() > 1 {
-                    format!("{}=", rep.descriptor)
-                } else {
-                    rep.descriptor.clone()
-                };
-                end_labels.push((y, label, rep.color));
-            }
-        }
-        // Labels that land on the same row are stacked rather than overprinted.
-        let mut used_rows: Vec<u16> = Vec::new();
-        for (y, label, color) in end_labels {
-            let w = label.len() as u16;
-            let mut y = y;
-            for candidate in [y, y + 1, y.saturating_sub(1), y + 2, y.saturating_sub(2)] {
-                if candidate >= plot.y
-                    && candidate < plot.y + plot.height
-                    && !used_rows.contains(&candidate)
-                {
-                    y = candidate;
-                    break;
-                }
-            }
-            used_rows.push(y);
-            if plot.width > w + 1 {
-                let style = if t.depth == ColorDepth::Mono {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(color)
-                };
-                buf.set_string(plot.x + plot.width - w, y, &label, style);
-            }
+            draw_curve(plot, buf, t, &sample, &to_row, false, style);
         }
 
-        // Phase of the selected (or first visible) curve, dotted, on its own
-        // axis; drawn last so it is never hidden.
+        // Phase of the principal (or first) curve, dotted, on its own axis;
+        // drawn last so it is never hidden.
         if s.show_phase {
             let half = s.phase_span();
             let target = self
                 .curves
                 .iter()
-                .find(|c| c.selected && c.visible)
-                .or_else(|| self.curves.iter().find(|c| c.visible));
+                .find(|c| c.selected)
+                .or_else(|| self.curves.first());
             if let Some(c) = target
                 && let Some(ph) = &c.phase
             {
@@ -553,7 +465,8 @@ fn draw_curve(
                     continue;
                 }
                 let dy = dy as usize;
-                // The Console's dash for an unselected group is 6 on, 4 off.
+                // The phase overlay is dashed 6 on, 4 off so it reads apart
+                // from the magnitude curve.
                 if dotted && dx % 10 >= 6 {
                     prev = None;
                     continue;
@@ -628,7 +541,6 @@ mod tests {
             magnitude: vec![0.0; dsp::POINTS],
             phase: Some(vec![0.0; dsp::POINTS]),
             selected: false,
-            visible: true,
         }
     }
 
@@ -646,29 +558,7 @@ mod tests {
             magnitude: dsp::curve(&bands, 0.0),
             phase: Some(dsp::phase_curve(&bands)),
             selected: false,
-            visible: true,
         }
-    }
-
-    #[test]
-    fn identical_curves_group_and_the_legend_marks_the_followers() {
-        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
-        let curves = vec![
-            tuned("IN1", t.inputs[0], 6.0),
-            tuned("IN2", t.inputs[1], 6.0),
-            tuned("OUT1", t.outputs[0], -3.0),
-            flat("OUT2", t.outputs[1]),
-        ];
-        assert_eq!(groups(&curves), vec![vec![0, 1], vec![2], vec![3]]);
-        let l = legend(&curves);
-        assert!(!l[0].grouped && l[1].grouped && !l[2].grouped);
-        let mut hidden = curves.clone();
-        hidden[0].visible = false;
-        assert_eq!(
-            groups(&hidden),
-            vec![vec![1], vec![2], vec![3]],
-            "a hidden curve leaves its group"
-        );
     }
 
     #[test]
@@ -728,43 +618,30 @@ mod tests {
     }
 
     #[test]
-    fn unselected_curves_are_dotted_and_the_selected_one_is_on_top() {
+    fn the_last_curve_draws_over_the_one_before_it() {
         let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
-        let mut curves = vec![
-            tuned("IN1", t.inputs[0], 6.0),
-            tuned("IN2", t.inputs[1], -6.0),
-        ];
+        let mut curves = vec![tuned("IN2", t.dim, 6.0), tuned("IN1", t.inputs[0], 6.0)];
         curves[1].selected = true;
         let s = GraphSettings::default();
         let buf = render_buf(Graph::new(&curves, &s, &t), 60, 12);
-        let mut dotted_cells = 0;
-        let mut solid_cells = 0;
+        let mut under = 0;
+        let mut over = 0;
         for y in 0..11 {
             for x in 4..60 {
                 let cell = &buf[(x, y)];
-                if cell.fg == t.inputs[0] {
-                    dotted_cells += 1;
-                } else if cell.fg == t.inputs[1] {
-                    solid_cells += 1;
+                if cell.fg == t.dim {
+                    under += 1;
+                } else if cell.fg == t.inputs[0] {
+                    over += 1;
                 }
             }
         }
-        assert!(
-            dotted_cells > 0 && solid_cells > dotted_cells,
-            "{dotted_cells} dotted, {solid_cells} solid"
+        assert!(over > 0 && under == 0, "{under} under, {over} over");
+        assert_eq!(
+            Graph::new(&curves, &s, &t).readout(1000.0).len(),
+            2,
+            "the readout names both"
         );
-    }
-
-    #[test]
-    fn low_colour_depth_labels_each_curve_at_its_end() {
-        let t = Theme::console(ColorDepth::Ansi16, Glyphs::Braille);
-        let curves = vec![flat("IN1", t.inputs[0]), tuned("OUT1", t.outputs[0], 6.0)];
-        let s = GraphSettings::default();
-        let out = render(Graph::new(&curves, &s, &t), 60, 12);
-        assert!(out.contains("IN1") && out.contains("OUT1"), "{out}");
-        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
-        let out = render(Graph::new(&curves, &s, &t), 60, 12);
-        assert!(!out.contains("IN1"), "truecolor needs no end labels: {out}");
     }
 
     #[test]

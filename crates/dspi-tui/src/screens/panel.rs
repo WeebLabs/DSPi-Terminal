@@ -1154,7 +1154,6 @@ fn draw_graph(area: Rect, buf: &mut Buffer, theme: &Theme, g: &PanelGraph) {
                     magnitude: points.clone(),
                     phase: None,
                     selected: false,
-                    visible: true,
                 })
                 .collect();
             Graph::new(&curves, &settings, theme).render(area, buf);

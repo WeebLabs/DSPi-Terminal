@@ -470,7 +470,9 @@ pub struct Live {
     popup: Option<(AppDialog, PopupList)>,
     status_until: Option<Instant>,
     peaks: Vec<PeakHold>,
-    visible: Vec<bool>,
+    /// Whether a linked partner's curve is drawn under the selected one;
+    /// `.` toggles it (DESIGN 12.2).
+    partner_shown: bool,
     screens: Box<dyn Screens>,
     /// The state the screens share, when the factory keeps one.
     shared: Shared,
@@ -487,9 +489,9 @@ pub struct Live {
     last_screen_poll: Instant,
     /// A hazardous command has been confirmed and may go through once.
     hazard_confirmed: bool,
-    /// The pop-out graph's own visibility map, when it does not follow the
-    /// selection.
-    popout_visible: Option<Vec<bool>>,
+    /// The channel the pop-out graph is pinned to when Graphing says it does
+    /// not follow the selection.
+    popout_pinned: Option<usize>,
     devices_checked: Option<Instant>,
     /// When the upmixer's telemetry was last read. It is not a notification,
     /// so the only way to move the gauges is to ask, and once a second is
@@ -546,7 +548,7 @@ impl Live {
             popup: None,
             status_until: None,
             peaks: vec![PeakHold::default(); n],
-            visible: vec![true; n],
+            partner_shown: true,
             screens,
             shared,
             should_quit: false,
@@ -557,7 +559,7 @@ impl Live {
             notes: None,
             last_screen_poll: Instant::now(),
             hazard_confirmed: false,
-            popout_visible: None,
+            popout_pinned: None,
             devices_checked: None,
             last_upmix_poll: Instant::now() - Duration::from_secs(2),
             last_stats_poll: Instant::now() - Duration::from_secs(3),
@@ -591,28 +593,24 @@ impl Live {
         };
         m.preset_dirty = s.has_unsaved_changes();
 
-        let item =
-            |ch: usize, role: ChannelRole, inactive: bool, peaks: &[PeakHold], visible: &[bool]| {
-                ChannelItem {
-                    name: {
-                        let n = s.channel_name(ch);
-                        if n.is_empty() {
-                            role.descriptor(no as u8)
-                        } else {
-                            n
-                        }
-                    },
-                    descriptor: role.descriptor(no as u8),
-                    role,
-                    color: t.role_color(role),
-                    level: s.meters.peaks.get(ch).copied().unwrap_or(0.0),
-                    peak: peaks.get(ch).map(|p| p.peak).unwrap_or(0.0),
-                    clipped: s.is_clipped(ch),
-                    visible: visible.get(ch).copied().unwrap_or(true),
-                    inactive,
-                    index: ch as u8,
+        let item = |ch: usize, role: ChannelRole, inactive: bool, peaks: &[PeakHold]| ChannelItem {
+            name: {
+                let n = s.channel_name(ch);
+                if n.is_empty() {
+                    role.descriptor(no as u8)
+                } else {
+                    n
                 }
-            };
+            },
+            descriptor: role.descriptor(no as u8),
+            role,
+            color: t.role_color(role),
+            level: s.meters.peaks.get(ch).copied().unwrap_or(0.0),
+            peak: peaks.get(ch).map(|p| p.peak).unwrap_or(0.0),
+            clipped: s.is_clipped(ch),
+            inactive,
+            index: ch as u8,
+        };
         let active_inputs = s.meters.active_inputs as usize;
         m.inputs = (0..ni)
             .map(|i| {
@@ -621,7 +619,6 @@ impl Live {
                     ChannelRole::Input(i as u8),
                     active_inputs > 0 && i >= active_inputs,
                     &self.peaks,
-                    &self.visible,
                 )
             })
             .collect();
@@ -629,13 +626,7 @@ impl Live {
             .map(|o| {
                 let out = s.output(o);
                 let role = ChannelRole::of((ni + o) as u8, ni as u8, no as u8);
-                item(
-                    ni + o,
-                    role,
-                    !out.enabled || out.mute,
-                    &self.peaks,
-                    &self.visible,
-                )
+                item(ni + o, role, !out.enabled || out.mute, &self.peaks)
             })
             .collect();
 
@@ -692,14 +683,20 @@ impl Live {
         self.shown_volume = Some(target);
         m.cpu = (s.meters.cpu0, s.meters.cpu1);
 
-        // Curves: PEQ plus crossover bands, with output gain folded in.
+        // Curves: the graphed channel's PEQ plus crossover bands, with output
+        // gain folded in, and its linked partner's underneath in grey.
         let selected_index: Option<usize> = match m.selection {
             Selection::Overview => None,
             Selection::Input(i) => Some(i),
             Selection::Output(o) => Some(ni + o),
         };
-        let mut curves = Vec::with_capacity(ni + no);
-        for ch in 0..ni + no {
+        let graphed = self.popout_pinned.or(selected_index);
+        let partner = graphed
+            .filter(|_| self.partner_shown)
+            .and_then(|ch| self.shared.borrow().linked_partner(ch, ni));
+        let mut curves = Vec::with_capacity(2);
+        for ch in partner.into_iter().chain(graphed) {
+            let principal = Some(ch) == graphed;
             let mut bands: Vec<dsp::Band> = s
                 .bands(ch as u8)
                 .iter()
@@ -726,24 +723,18 @@ impl Live {
             let role = ChannelRole::of(ch as u8, ni as u8, no as u8);
             curves.push(GraphCurve {
                 descriptor: role.descriptor(no as u8),
-                color: t.role_color(role),
+                color: if principal { t.role_color(role) } else { t.dim },
                 magnitude: reveal(dsp::curve(&bands, gain), self.started, self.perf.animate),
-                phase: if selected_index == Some(ch) || m.graph.show_phase {
+                phase: if principal && m.graph.show_phase {
                     Some(dsp::phase_curve(&bands))
                 } else {
                     None
                 },
-                selected: selected_index == Some(ch),
-                visible: self
-                    .popout_visible
-                    .as_ref()
-                    .unwrap_or(&self.visible)
-                    .get(ch)
-                    .copied()
-                    .unwrap_or(true),
+                selected: principal,
             });
         }
         m.curves = curves;
+        m.graph_channel = graphed.map(|ch| screens::channel_name(s, ch));
     }
 
     fn note(&mut self, text: impl Into<String>) {
@@ -1277,11 +1268,8 @@ impl Live {
     pub fn handle_event(&mut self, session: &mut Session, ev: ShellEvent) {
         match ev {
             ShellEvent::Select(sel) => self.select(sel),
-            ShellEvent::ToggleVisible(row) => {
-                let target = self.popout_visible.as_mut().unwrap_or(&mut self.visible);
-                if let Some(v) = target.get_mut(row) {
-                    *v = !*v;
-                }
+            ShellEvent::GraphPartner => {
+                self.partner_shown = !self.partner_shown;
                 self.sync_model();
             }
             ShellEvent::StripToggle(i) => {
@@ -1424,12 +1412,13 @@ impl Live {
             }
             ShellEvent::GraphPopout => {
                 self.shell.graph_popout = !self.shell.graph_popout;
-                // The pop-out keeps its own visibility map unless Graphing
-                // says it follows the selection (the Console's setting).
-                self.popout_visible = if self.shell.graph_popout
+                // The pop-out stays on the channel it opened on unless
+                // Graphing says it follows the selection (the Console's
+                // setting).
+                self.popout_pinned = if self.shell.graph_popout
                     && !self.screens.config().graphing.popout_follows_selection
                 {
-                    Some(self.visible.clone())
+                    self.shell.model.row_of_selection()
                 } else {
                     None
                 };
@@ -1773,7 +1762,7 @@ impl Live {
         };
         let n = caps.num_channels as usize;
         self.peaks = vec![PeakHold::default(); n];
-        self.visible = vec![true; n];
+        self.popout_pinned = None;
         self.state = state;
         // The Console discards Settings drafts and device facts on a different
         // serial; the pages re-read on their next open.
@@ -2385,13 +2374,44 @@ mod tests {
         assert_eq!(m.preset_label, "3: Empty");
         assert!(!m.preset_dirty);
         assert_eq!(m.serial_short, "1B8B4E3A");
-        assert_eq!(m.curves.len(), 17);
+        assert!(m.curves.is_empty(), "the overview graphs nothing");
+        assert_eq!(m.graph_channel, None);
         // An unnamed channel shows its descriptor instead of a blank.
         let (mut l, _, _) = live();
         let (_, n, _) = dspi_proto::generated::SECTIONS[9];
         l.state.bulk.patch(n + 32, &[0; 32]);
         l.sync_model();
         assert_eq!(l.shell.model.inputs[1].name, "IN2");
+    }
+
+    #[test]
+    fn the_graph_carries_the_selected_channel_and_its_linked_partner() {
+        let (mut l, mut session, _) = live();
+        l.select(Selection::Input(0));
+        let m = &l.shell.model;
+        assert_eq!(m.curves.len(), 1, "unlinked: the channel alone");
+        assert_eq!(m.graph_channel.as_deref(), Some("FL"));
+        assert!(m.curves[0].selected);
+        assert_eq!(m.curves[0].color, l.shell.theme.inputs[0]);
+
+        l.shared.borrow_mut().set_linked(0, true);
+        l.sync_model();
+        let m = &l.shell.model;
+        assert_eq!(m.curves.len(), 2, "linked: the partner underneath");
+        assert_eq!(m.curves[0].descriptor, "IN2");
+        assert_eq!(m.curves[0].color, l.shell.theme.dim);
+        assert!(!m.curves[0].selected);
+        assert_eq!(m.curves[1].descriptor, "IN1");
+
+        l.handle_event(&mut session, ShellEvent::GraphPartner);
+        assert_eq!(l.shell.model.curves.len(), 1, "`.` hides the partner");
+        l.handle_event(&mut session, ShellEvent::GraphPartner);
+        assert_eq!(l.shell.model.curves.len(), 2);
+
+        // An output has no partner, whatever the link says.
+        l.select(Selection::Output(0));
+        assert_eq!(l.shell.model.curves.len(), 1);
+        assert_eq!(l.shell.model.graph_channel.as_deref(), Some("OUT L"));
     }
 
     /// The same runner, wired to the Console's screens rather than the

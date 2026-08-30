@@ -1,7 +1,7 @@
 //! The shell: the Console's window shape in a terminal.
 //!
 //! A channel sidebar with meters and pills on the left; on the right the
-//! response graph with its legend and, beneath it, the detail region that
+//! response graph and, beneath it, the detail region that
 //! shows the overview, an input or an output. Tool panels replace the right
 //! pane; Settings replaces the screen. The shell owns focus, the Escape stack,
 //! popups, dialogs and the help overlay, and asks the application for
@@ -25,10 +25,10 @@ pub use model::{ChannelItem, GraphHeight, Selection, ShellModel, StripItem, Volu
 pub use screen::{Placeholder, Screen, ScreenEvent, SessionReply, SessionRequest};
 pub use sidebar::FooterRow;
 
-use crate::graph::{Graph, legend};
+use crate::graph::Graph;
 use crate::theme::{Glyphs, Theme};
 use crate::widgets::text::{fit_left, truncate};
-use crate::widgets::{Action, Dialog, HelpOverlay, KeyHelp, LegendRow, PopupList};
+use crate::widgets::{Action, Dialog, HelpOverlay, KeyHelp, PopupList};
 
 /// The Console's tool windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +100,6 @@ impl Tool {
 pub enum Focus {
     Sidebar,
     Footer(FooterRow),
-    Legend,
     /// The detail region, a tool panel, or Settings: whichever screen is on
     /// top.
     Screen,
@@ -110,8 +109,6 @@ pub enum Focus {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShellEvent {
     Select(Selection),
-    /// Toggle a channel's curve, by sidebar row.
-    ToggleVisible(usize),
     /// A quick-strip feature was toggled (Space), by strip index.
     StripToggle(usize),
     /// A quick-strip item was opened (Enter), by strip index.
@@ -147,6 +144,8 @@ pub enum ShellEvent {
     GraphPhase,
     GraphHeight,
     GraphPopout,
+    /// `.`: show or hide the linked partner's curve under the selected one.
+    GraphPartner,
     Rename(usize),
     CopyParams(usize),
     PasteParams(usize),
@@ -170,7 +169,6 @@ pub struct Shell {
     pub sidebar_cursor: usize,
     pub sidebar_scroll: usize,
     pub strip_cursor: usize,
-    pub legend_cursor: usize,
     pub detail: Box<dyn Screen>,
     pub tool: Option<(Tool, Box<dyn Screen>)>,
     pub settings: Option<Box<dyn Screen>>,
@@ -193,7 +191,7 @@ const GLOBAL_KEYS: &[KeyHelp] = &[
     KeyHelp::new("Ctrl-S", "Commit parameters to the preset"),
     KeyHelp::new("Ctrl-D", "Device picker"),
     KeyHelp::new("Ctrl-Z Ctrl-Y", "Undo, redo"),
-    KeyHelp::new("= g p + -", "Graph height, pop-out, phase, zoom"),
+    KeyHelp::new("= g p . + -", "Graph height, pop-out, phase, partner, zoom"),
     KeyHelp::new("b c", "Bypass master EQ, clear clips"),
     KeyHelp::new("q", "Quit"),
 ];
@@ -201,7 +199,6 @@ const GLOBAL_KEYS: &[KeyHelp] = &[
 const SIDEBAR_KEYS: &[KeyHelp] = &[
     KeyHelp::new("↑ ↓", "Select a channel"),
     KeyHelp::new("Enter", "Back to the overview"),
-    KeyHelp::new("Space", "Show or hide its curve"),
     KeyHelp::new("r", "Rename"),
     KeyHelp::new("y Y", "Copy, paste parameters"),
     KeyHelp::new("i", "Identify (outputs)"),
@@ -215,12 +212,6 @@ const FOOTER_KEYS: &[KeyHelp] = &[
     KeyHelp::new("Backspace", "Reset the volume"),
 ];
 
-const LEGEND_KEYS: &[KeyHelp] = &[
-    KeyHelp::new("← →", "Move between channels"),
-    KeyHelp::new("Space", "Show or hide"),
-    KeyHelp::new("h l", "Move the cursor"),
-];
-
 impl Shell {
     pub fn new(model: ShellModel, theme: Theme, detail: Box<dyn Screen>) -> Self {
         let cursor = model.row_of_selection().unwrap_or(0);
@@ -231,7 +222,6 @@ impl Shell {
             sidebar_cursor: cursor,
             sidebar_scroll: 0,
             strip_cursor: 0,
-            legend_cursor: 0,
             detail,
             tool: None,
             settings: None,
@@ -448,7 +438,6 @@ impl Shell {
         match self.focus {
             Focus::Sidebar => self.handle_sidebar(key, &mut out),
             Focus::Footer(row) => self.handle_footer(row, key, &mut out),
-            Focus::Legend => self.handle_legend(key, &mut out),
             Focus::Screen => {}
         }
         if !out.is_empty() {
@@ -460,6 +449,7 @@ impl Shell {
             KeyCode::Char('=') => out.push(ShellEvent::GraphHeight),
             KeyCode::Char('g') => out.push(ShellEvent::GraphPopout),
             KeyCode::Char('p') => out.push(ShellEvent::GraphPhase),
+            KeyCode::Char('.') => out.push(ShellEvent::GraphPartner),
             KeyCode::Char('+') => out.push(ShellEvent::GraphZoom(-10.0)),
             KeyCode::Char('-') => out.push(ShellEvent::GraphZoom(10.0)),
             KeyCode::Char('h') => out.push(self.cursor_step(-1)),
@@ -536,16 +526,11 @@ impl Shell {
             Focus::Footer(r) => {
                 let n = r.next(has_source);
                 if n == r {
-                    if self.graph_visible() {
-                        Focus::Legend
-                    } else {
-                        Focus::Screen
-                    }
+                    Focus::Screen
                 } else {
                     Focus::Footer(n)
                 }
             }
-            Focus::Legend => Focus::Screen,
             Focus::Screen => Focus::Sidebar,
         }
     }
@@ -562,19 +547,18 @@ impl Shell {
                     Focus::Footer(p)
                 }
             }
-            Focus::Legend => Focus::Footer(FooterRow::Volume),
-            Focus::Screen => {
-                if self.graph_visible() {
-                    Focus::Legend
-                } else {
-                    Focus::Footer(FooterRow::Volume)
-                }
-            }
+            Focus::Screen => Focus::Footer(FooterRow::Volume),
         }
     }
 
-    fn graph_visible(&self) -> bool {
-        self.tool.is_none() && self.model.graph_height != GraphHeight::Hidden
+    /// The graph's rows for this frame: none in the overview, whose grid
+    /// carries the curves itself, and none while a tool covers the pane.
+    fn graph_height(&self) -> GraphHeight {
+        if self.model.selection == Selection::Overview || self.tool.is_some() {
+            GraphHeight::Hidden
+        } else {
+            self.model.graph_height
+        }
     }
 
     fn handle_sidebar(&mut self, key: KeyEvent, out: &mut Vec<ShellEvent>) {
@@ -610,7 +594,6 @@ impl Shell {
                     out.push(ShellEvent::Select(here));
                 }
             }
-            KeyCode::Char(' ') => out.push(ShellEvent::ToggleVisible(self.sidebar_cursor)),
             KeyCode::Char('r') => out.push(ShellEvent::Rename(self.sidebar_cursor)),
             KeyCode::Char('y') => out.push(ShellEvent::CopyParams(self.sidebar_cursor)),
             KeyCode::Char('Y') => out.push(ShellEvent::PasteParams(self.sidebar_cursor)),
@@ -694,23 +677,12 @@ impl Shell {
         }
     }
 
-    fn handle_legend(&mut self, key: KeyEvent, out: &mut Vec<ShellEvent>) {
-        let pills = legend(&self.model.curves);
-        let row = LegendRow::new(&pills, &self.theme).focused(true, self.legend_cursor);
-        match row.handle(key) {
-            Some(Action::Selected(i)) => self.legend_cursor = i,
-            Some(Action::Chip(i, _)) => out.push(ShellEvent::ToggleVisible(i)),
-            _ => {}
-        }
-    }
-
     /// Keys for the key line: the focused region's, then the globals that
     /// fit.
     fn key_line(&mut self) -> Vec<KeyHelp> {
         let mut keys: Vec<KeyHelp> = match self.focus {
             Focus::Sidebar => SIDEBAR_KEYS.to_vec(),
             Focus::Footer(_) => FOOTER_KEYS.to_vec(),
-            Focus::Legend => LEGEND_KEYS.to_vec(),
             Focus::Screen => {
                 let (s, _) = self.top();
                 s.keys().to_vec()
@@ -725,12 +697,7 @@ impl Shell {
 
     pub fn draw(&mut self, area: Rect, buf: &mut Buffer, state: &DeviceState) {
         let t = self.theme.clone();
-        let pills = legend(&self.model.curves);
-        let pane_w = area
-            .width
-            .saturating_sub(Density::of(area.width, area.height).sidebar_width() + 2);
-        let legend_rows = LegendRow::rows_needed(&pills, pane_w, t.glyphs);
-        let Some(regions) = layout::compute(area, self.model.graph_height, legend_rows) else {
+        let Some(regions) = layout::compute(area, self.graph_height()) else {
             let msg = "Terminal too small: needs 80x24";
             let x = area.x + area.width.saturating_sub(msg.len() as u16) / 2;
             buf.set_string(x, area.y + area.height / 2, msg, t.value());
@@ -766,7 +733,6 @@ impl Shell {
             let title = match self.focus {
                 Focus::Sidebar => "Channels".to_string(),
                 Focus::Footer(_) => "Preset, source and volume".to_string(),
-                Focus::Legend => "Graph".to_string(),
                 Focus::Screen => {
                     let (s, _) = self.top();
                     s.title()
@@ -775,7 +741,6 @@ impl Shell {
             let region_keys: Vec<KeyHelp> = match self.focus {
                 Focus::Sidebar => SIDEBAR_KEYS.to_vec(),
                 Focus::Footer(_) => FOOTER_KEYS.to_vec(),
-                Focus::Legend => LEGEND_KEYS.to_vec(),
                 Focus::Screen => {
                     let (s, _) = self.top();
                     s.keys().to_vec()
@@ -910,13 +875,17 @@ impl Shell {
             return;
         }
 
+        // The graph names its channel in the title, DESIGN 12.2.
         let title = if self.graph_popout || r.graph.height > 0 {
-            "Filter Response"
+            match &self.model.graph_channel {
+                Some(name) => format!("Filter Response · {name}"),
+                None => "Filter Response".to_string(),
+            }
         } else {
-            ""
+            String::new()
         };
-        let focused = screen_focused || self.focus == Focus::Legend;
-        let mut block = self.block(title, focused, t);
+        let focused = screen_focused;
+        let mut block = self.block(&title, focused, t);
         if !title.is_empty() {
             // The Console's pop-out button; `g` here.
             block = block.title_top(
@@ -933,25 +902,13 @@ impl Shell {
 
         let inner = layout::inset(r.pane);
         if self.graph_popout {
-            // The pop-out: the graph fills the pane with its legend beneath.
-            let graph_area = Rect::new(
-                inner.x,
-                inner.y,
-                inner.width,
-                inner.height.saturating_sub(1),
-            );
-            let legend_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-            self.draw_graph(graph_area, legend_area, buf, t);
+            // The pop-out: the graph fills the pane.
+            self.draw_graph(inner, buf, t);
             return;
         }
 
         if r.graph.height > 0 {
-            self.draw_graph(r.graph, r.legend, buf, t);
-            // A rule between the graph and the detail.
-            let y = r.detail.y;
-            if y > r.legend.y && y < r.pane.y + r.pane.height - 1 {
-                // The legend row doubles as the divider region; nothing to draw.
-            }
+            self.draw_graph(r.graph, buf, t);
         }
         let detail_focused = screen_focused;
         let title = self.detail.title();
@@ -1006,19 +963,12 @@ impl Shell {
             .title_style(if focused { t.focused() } else { t.section() })
     }
 
-    fn draw_graph(&self, graph_area: Rect, legend_area: Rect, buf: &mut Buffer, t: &Theme) {
+    fn draw_graph(&self, graph_area: Rect, buf: &mut Buffer, t: &Theme) {
         let m = &self.model;
         Graph::new(&m.curves, &m.graph, t)
             .cursor(m.cursor_hz)
             .marker(m.marker_hz)
             .render(graph_area, buf);
-        let pills = legend(&m.curves);
-        let mut row =
-            LegendRow::new(&pills, t).focused(self.focus == Focus::Legend, self.legend_cursor);
-        if m.graph.show_phase {
-            row = row.trailing("φ phase");
-        }
-        row.render(legend_area, buf);
     }
 
     fn draw_settings(&mut self, r: &Regions, buf: &mut Buffer, t: &Theme, state: &DeviceState) {
@@ -1175,7 +1125,12 @@ mod tests {
         );
         assert!(f.contains("OUTPUTS"));
         assert!(f.contains("Sub"));
-        assert!(f.contains("● IN1"), "legend pills");
+        assert!(
+            lines[1].contains("Filter Response · FL"),
+            "the graph names its channel: {:?}",
+            lines[1]
+        );
+        assert!(!f.contains("● IN1"), "no legend pills: {f}");
         assert!(f.contains("● FL"), "detail title in the selected channel");
         assert!(f.contains("Preset ‹3: Living"), "{f}");
         assert!(f.contains("Volume User"), "{f}");
@@ -1224,8 +1179,8 @@ mod tests {
             vec![ShellEvent::Select(Selection::Overview)]
         );
         assert_eq!(
-            s.handle(key(KeyCode::Char(' ')), &fixture::state()),
-            vec![ShellEvent::ToggleVisible(1)]
+            s.handle(key(KeyCode::Char('.')), &fixture::state()),
+            vec![ShellEvent::GraphPartner]
         );
         for _ in 0..20 {
             s.handle(key(KeyCode::Down), &fixture::state());
@@ -1248,8 +1203,6 @@ mod tests {
         assert_eq!(s.focus, Focus::Footer(FooterRow::Source));
         s.handle(key(KeyCode::Tab), &fixture::state());
         assert_eq!(s.focus, Focus::Footer(FooterRow::Volume));
-        s.handle(key(KeyCode::Tab), &fixture::state());
-        assert_eq!(s.focus, Focus::Legend);
         s.handle(key(KeyCode::Tab), &fixture::state());
         assert_eq!(s.focus, Focus::Screen);
         s.handle(key(KeyCode::Tab), &fixture::state());
@@ -1480,7 +1433,6 @@ mod tests {
         let regions: Vec<(Focus, &[KeyHelp])> = vec![
             (Focus::Sidebar, SIDEBAR_KEYS),
             (Focus::Footer(FooterRow::Volume), FOOTER_KEYS),
-            (Focus::Legend, LEGEND_KEYS),
             (Focus::Sidebar, GLOBAL_KEYS),
         ];
         for (focus, keys) in regions {
@@ -1493,10 +1445,9 @@ mod tests {
                     s.sidebar_cursor = 10;
                     s.model.selection = Selection::Output(2);
                     s.strip_cursor = 1;
-                    s.legend_cursor = 3;
-                    let before = (s.focus, s.help, s.legend_cursor, s.strip_cursor);
+                    let before = (s.focus, s.help, s.strip_cursor);
                     let events = s.handle(k, &fixture::state());
-                    let after = (s.focus, s.help, s.legend_cursor, s.strip_cursor);
+                    let after = (s.focus, s.help, s.strip_cursor);
                     assert!(
                         !events.is_empty() || before != after,
                         "{:?} does nothing in {:?} (from {:?})",

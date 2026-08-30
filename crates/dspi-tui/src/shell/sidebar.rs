@@ -108,7 +108,7 @@ fn draw_row(
         .inactive(item.inactive)
         .render(Rect::new(mx, area.y, meter_w + 1, 1), buf);
     let px = mx + meter_w + 2;
-    let pill_style = if t.quiet() || !item.visible {
+    let pill_style = if t.quiet() {
         t.label()
     } else if t.depth == ColorDepth::Mono {
         Style::default().add_modifier(Modifier::REVERSED)
