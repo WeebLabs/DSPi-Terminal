@@ -106,6 +106,9 @@ pub struct Stats {
     pub core_mv: u32,
     pub sample_rate_hz: u32,
     pub temp_centi_c: i32,
+    /// What the second core is doing (`REQ_GET_CORE1_MODE`, config.h:251).
+    /// `None` on firmware that stalls the opcode, in which case the row goes.
+    pub core1: Option<dspi_proto::enums::Core1Mode>,
     pub pdm_ring_over: u32,
     pub pdm_ring_under: u32,
     pub pdm_dma_over: u32,
@@ -182,6 +185,15 @@ pub fn read_stats(session: &mut Session, state: &DeviceState, previous: &Stats) 
         starvation_total: status_word(session, status::STARVATION_TOTAL).unwrap_or_default(),
         ..Default::default()
     };
+
+    // `REQ_GET_CORE1_MODE` answers one byte of `Core1Mode` (config.h:251,
+    // :757-761). The enum is open, so an unrecognised mode says its number
+    // rather than being clamped to Idle.
+    s.core1 = session
+        .with_transport(|t| t.control_in(op::REQ_GET_CORE1_MODE, 0, 1))
+        .ok()
+        .and_then(|b| b.first().copied())
+        .map(dspi_proto::enums::Core1Mode::from_raw);
 
     // Wrap-safe, because the counter is a u32 that wraps rather than saturating.
     s.starvation_delta = s.starvation_total.wrapping_sub(previous.starvation_total);

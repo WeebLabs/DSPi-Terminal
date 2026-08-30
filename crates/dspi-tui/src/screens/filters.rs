@@ -534,7 +534,7 @@ impl FilterList {
                 ScreenEvent::Handled
             }
             Field::Gain => {
-                self.edit = Some(seed(format!("{:.1}", band.gain_db)));
+                self.edit = Some(seed(gain_text(band.gain_db as f64)));
                 ScreenEvent::Handled
             }
             Field::Q => {
@@ -740,8 +740,24 @@ fn set_field(b: &mut EqParamPacket, field: Field, v: f64) {
 fn format_field(field: Field, v: f64) -> String {
     match field {
         Field::Freq => format!("{v:.0}"),
-        Field::Gain => format!("{v:.1}"),
+        Field::Gain => gain_text(v),
         _ => q_text(v),
+    }
+}
+
+/// A band gain as the armed cell carries it.
+///
+/// The WIDTH and GAIN columns show one decimal, but the Console's GAIN
+/// `ValueField` is 3 dp and `DESIGN.md` 5 says "gain 1 dp displayed, 3 dp
+/// editable". Seeding the edit at one decimal quantised the stored value:
+/// arming a band whose gain is 8.875 and pressing anything wrote 8.9 back.
+fn gain_text(v: f64) -> String {
+    let s = format!("{v:.3}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-" || s == "-0" {
+        "0".into()
+    } else {
+        s.to_string()
     }
 }
 
@@ -1056,6 +1072,37 @@ mod tests {
             l.handle(key(KeyCode::Enter), &state),
             ScreenEvent::Command("eq in.1 1 lowshelf 105 1.2 8.8".into())
         );
+    }
+
+    /// D21: the Console's GAIN field is 3 dp. Arming at one decimal threw away
+    /// the other two, and the next nudge wrote the rounded value back.
+    #[test]
+    fn arming_a_gain_keeps_all_three_decimals() {
+        let mut state = fixture::state();
+        let (_, eq, _) = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "eq")
+            .copied()
+            .unwrap();
+        // Band 1 of channel 0 is the low shelf; give it a gain with three.
+        state.bulk.patch(eq + 12, &8.875f32.to_le_bytes());
+
+        let mut l = list(0);
+        l.field = 2; // GAIN
+        l.handle(key(KeyCode::Enter), &state);
+        assert_eq!(l.edit.as_ref().unwrap().text, "8.875");
+        // The table itself still shows one decimal.
+        let cells = l.row(0, &l.bands(&state)[0]);
+        assert_eq!(cells[3].text, "+8.9 dB");
+
+        // And a nudge moves the stored value, not the rounded one.
+        match l.handle(key(KeyCode::Right), &state) {
+            ScreenEvent::Command(c) => {
+                assert!(c.ends_with(" 8.975"), "{c}");
+                assert_eq!(l.edit.as_ref().unwrap().text, "8.975");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

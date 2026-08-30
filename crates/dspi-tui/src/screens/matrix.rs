@@ -861,7 +861,12 @@ impl Screen for MatrixPanel {
                 let cmds = clipboard::paste_commands(&clip, state, channel, None);
                 ScreenEvent::Command(cmds.join("\n"))
             }
-            KeyCode::Char('I') => ScreenEvent::Status("Identify arrives with Phase 6".into()),
+            // The same blip melody the sidebar's `i` plays, on the output the
+            // reticle is over.
+            KeyCode::Char('I') => match super::identify_command(state, self.col) {
+                Some(cmds) => ScreenEvent::Command(cmds),
+                None => ScreenEvent::Status("Firmware has no signal generator".into()),
+            },
             _ => ScreenEvent::Unhandled,
         }
     }
@@ -1464,12 +1469,27 @@ mod tests {
         assert!(c.contains("eq out.2 20 highpass 80 0.707 0"), "{c}");
     }
 
+    /// D23: `I` was a placeholder long after the signal generator arrived. It
+    /// plays the same blip melody the sidebar's `i` does, on the column the
+    /// reticle is over.
     #[test]
-    fn identify_waits_for_phase_six() {
+    fn identify_plays_the_channel_id_tone_on_the_column_under_the_reticle() {
         let mut p = panel();
+        let state = crate::screens::panel::testing::state();
+        p.col = 2;
+        match p.handle(key(KeyCode::Char('I')), &state) {
+            ScreenEvent::Command(c) => {
+                assert!(c.starts_with("sig.config type=channel-id"), "{c}");
+                assert!(c.contains("channels=0x4"), "the third output: {c}");
+                assert!(c.contains("flags=walk") && c.contains("p1=120"), "{c}");
+                assert!(c.ends_with("sig.control start"), "{c}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A firmware with no generator says so rather than writing nothing.
         assert_eq!(
             p.handle(key(KeyCode::Char('I')), &fixture::state()),
-            ScreenEvent::Status("Identify arrives with Phase 6".into())
+            ScreenEvent::Status("Firmware has no signal generator".into())
         );
     }
 

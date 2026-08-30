@@ -391,6 +391,21 @@ pub fn band_command(
     out
 }
 
+/// The Console's Identify, as commands: the channel-ID blip melody on one
+/// output, so a listener can tell which speaker is which.
+///
+/// `None` when the firmware has no signal generator to play it with, which is
+/// the same gate the sidebar's `i` applies.
+pub fn identify_command(state: &DeviceState, output: usize) -> Option<String> {
+    panel::has_feature(state, "test_signals").then(|| {
+        format!(
+            "sig.config type=channel-id channels=0x{:X} invert=0x0 level=-20 duration=0 \
+             repeat=1 gap=0 flags=walk p1=120\nsig.control start",
+            1u16 << output
+        )
+    })
+}
+
 /// A band reset to its default (flat) state, as the Console's Clear does.
 pub fn cleared_band(channel: u8, band: u8) -> EqParamPacket {
     EqParamPacket {

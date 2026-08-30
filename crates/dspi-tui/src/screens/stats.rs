@@ -226,6 +226,13 @@ impl StatsPanel {
             ),
         ];
 
+        // `survey-console.md` 2.20 names core1 mode among the System
+        // Information rows. Firmware that stalls `REQ_GET_CORE1_MODE` leaves it
+        // `None`, and an absent reading takes its row with it.
+        if let Some(mode) = s.core1 {
+            rows.push(Row::info("Core 1 Mode", mode.label()));
+        }
+
         if let Some(rx) = &s.spdif_rx {
             let (word, tone) = spdif_state(rx.state);
             let locked = rx.state == dspi_proto::enums::SpdifRxState::Locked;
@@ -796,6 +803,7 @@ mod tests {
             core_mv: 1150,
             sample_rate_hz: 48_000,
             temp_centi_c: 4231,
+            core1: Some(dspi_proto::enums::Core1Mode::EqWorker),
             pdm_ring_over: 0,
             pdm_ring_under: 3,
             usb_ring_over: 1,
@@ -914,6 +922,8 @@ mod tests {
             "1.15 V",
             "48.0 kHz",
             "42.3 °C",
+            "Core 1 Mode",
+            "EQ worker",
             "Active Source",
             "S/PDIF 2",
             "44.1 kHz",
@@ -939,6 +949,33 @@ mod tests {
             assert!(f.contains(want), "missing row {want}:\n{f}");
         }
         assert!(f.contains(FOOTER), "the refresh cadence: {f}");
+    }
+
+    /// D42: `survey-console.md` 2.20 lists core1 mode in System Information,
+    /// and `REQ_GET_CORE1_MODE` (0x7A) has been in the registry all along.
+    #[test]
+    fn the_core_one_mode_row_names_what_the_second_core_is_doing() {
+        use dspi_proto::enums::Core1Mode;
+        let (mut p, state, shared) = panel();
+        for (mode, want) in [
+            (Core1Mode::Idle, "Idle"),
+            (Core1Mode::Pdm, "PDM"),
+            (Core1Mode::EqWorker, "EQ worker"),
+            // Open enum: an unknown mode says its number rather than lying.
+            (Core1Mode::from_raw(9), "type 9, unrecognised"),
+        ] {
+            shared.borrow_mut().stats.core1 = Some(mode);
+            let f = testing::draw(&mut p, &state, 100, 90);
+            assert!(
+                f.contains("Core 1 Mode") && f.contains(want),
+                "{mode:?}: {f}"
+            );
+        }
+        // Firmware that stalls the opcode loses the row, as every other
+        // stalled read here does.
+        shared.borrow_mut().stats.core1 = None;
+        let f = testing::draw(&mut p, &state, 100, 90);
+        assert!(!f.contains("Core 1 Mode"), "{f}");
     }
 
     /// A stalled read means the firmware does not have the feature, and the
