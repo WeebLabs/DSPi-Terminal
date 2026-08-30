@@ -1031,16 +1031,23 @@ pub(crate) fn enum_value_label(cx: &Cx<'_>, cs: &CsData, n: u8, value: i32) -> S
 // The caps-driven option lists
 // ---------------------------------------------------------------------------
 
-/// Nouns a component type can drive: a non-empty action intersection.
+/// Nouns a component type can drive: a non-empty action intersection, and a
+/// target space this device actually has.
 ///
 /// A noun whose caps `actions` mask is zero is unavailable on this platform
-/// (ADAT on an RP2040, say) and intersects with nothing, so it never appears.
+/// (ADAT on an RP2040, say) and intersects with nothing, so it never appears. A
+/// noun that addresses a channel space with no channels in it is unavailable
+/// the other way round: there is nowhere for it to point, and the picker under
+/// it would be empty.
 pub fn valid_nouns(cs: &CsData, t: u8) -> Vec<u8> {
     let Some(td) = cs.type_desc(t) else {
         return Vec::new();
     };
     (0..cs.nouns.len() as u8)
-        .filter(|n| cs.nouns[*n as usize].actions & td.actions != 0)
+        .filter(|n| {
+            let nd = &cs.nouns[*n as usize];
+            nd.actions & td.actions != 0 && (nd.target_kind == target::NONE || nd.target_count > 0)
+        })
         .collect()
 }
 
@@ -1288,7 +1295,13 @@ pub(crate) fn target_choices(
     if grouped && !groups.contains(&target) {
         groups.push(target);
     }
-    choices.extend(groups.iter().map(|g| group_menu_label(cs, *g)));
+    // The Console sections the menu into Channels and Groups; a terminal popup
+    // is one flat list, so the group half says so on each row instead.
+    choices.extend(
+        groups
+            .iter()
+            .map(|g| format!("Group: {}", group_menu_label(cs, *g))),
+    );
     let selected = if grouped {
         channels + groups.iter().position(|g| *g == target).unwrap_or(0)
     } else {

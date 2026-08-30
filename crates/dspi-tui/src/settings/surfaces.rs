@@ -382,7 +382,17 @@ impl SurfacesPage {
         let mut one = |item: Item, label: &str, detail: &str, is_second: bool| {
             let pins = m::pin_candidates(cx, &self.live, &self.drafts, slot, is_second);
             let current = if is_second { b.gpio[1] } else { b.gpio[0] };
-            let mut choices: Vec<String> = pins.iter().map(|p| format!("GPIO {p}")).collect();
+            // A free pin is just "GPIO n"; a claimed one that is still offered
+            // - a button sharing another button's GPIO, one gesture each -
+            // names its owner, so nothing is picked up by accident.
+            let owner = m::slot_owner(slot);
+            let mut choices: Vec<String> = pins
+                .iter()
+                .map(|p| match cx.data.owner_of(cx.state, *p, &owner) {
+                    Some(who) => format!("GPIO {p} ({who})"),
+                    None => format!("GPIO {p}"),
+                })
+                .collect();
             let selected = match pins.iter().position(|p| *p == current) {
                 Some(i) => i,
                 None => {
@@ -3159,6 +3169,61 @@ mod tests {
         assert_eq!(
             m::run(&mut session, move |s| s.write_binding(3, &b)),
             SessionReply::Err("A potentiometer needs an analogue-capable pin".into())
+        );
+    }
+
+    /// A control-surface write is a live preview the device holds in RAM, so a
+    /// successful apply raises the save bar's third category and its own
+    /// subtitle, not the flash one.
+    #[test]
+    fn an_applied_control_raises_the_control_surface_save_category() {
+        let (mut s, st) = screen(m::demo::settings_data());
+        assert!(!s.dirty(&st));
+        s.session_result(1, SessionReply::Ok("Applied".into()), &st);
+        assert!(s.dirty(&st));
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(
+            f.contains("Your controls are live now; saving keeps them across a reboot."),
+            "{f}"
+        );
+        // A refusal is not a change the device is holding.
+        let (mut s, st) = screen(m::demo::settings_data());
+        s.session_result(1, SessionReply::Err("nope".into()), &st);
+        assert!(!s.dirty(&st));
+    }
+
+    /// A group and a channel share the `target` byte, so the merged picker has
+    /// to say which one a row is.
+    #[test]
+    fn the_target_picker_lists_channels_then_groups() {
+        let (mut p, d, st) = page();
+        let cfg = AppConfig::default();
+        let c = cx(&d, &st, &cfg);
+        p.expanded.insert(2); // the pot, on Output Gain
+        let rows = p.build(&c);
+        let Some((_, Row::Pick { label, choices, .. })) =
+            rows.iter().find(|(i, _)| *i == Some(Item::Target(2)))
+        else {
+            panic!("no target row");
+        };
+        assert_eq!(label, "Channel or Group");
+        assert!(choices[0].starts_with("OUT"), "{choices:?}");
+        assert!(
+            choices.iter().any(|x| x == "Group: Front Pair (2 ch)"),
+            "{choices:?}"
+        );
+        // Picking the group sets the flag rather than a channel number.
+        let n = choices.len() - 1;
+        p.act(index_of(&p, &c, Item::Target(2)), Action::Selected(n), &c);
+        assert_eq!(p.drafts[2].flags & m::flag::GROUP, m::flag::GROUP);
+        assert_eq!(p.drafts[2].target, 0, "the group index, not a channel");
+        // And picking a channel back drops the two group modifiers with it.
+        p.drafts[2].flags |= m::flag::LINK_ABS;
+        p.act(index_of(&p, &c, Item::Target(2)), Action::Selected(1), &c);
+        assert_eq!(
+            p.drafts[2].flags & (m::flag::GROUP | m::flag::LINK_ABS),
+            0,
+            "a modifier left set is rejected with the whole binding"
         );
     }
 
