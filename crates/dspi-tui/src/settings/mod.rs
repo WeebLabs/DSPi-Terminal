@@ -1084,10 +1084,12 @@ impl IoSnapshot {
                 }
             ));
         }
-        // The Console restores the slave BCK pair before the clock-pin mode, so
-        // re-entering split finds a valid pair. There is no registry path for
-        // `REQ_SET_I2S_BCK_PIN` with role 1 (`i2s.bck` is role 0 only), so the
-        // slave pair cannot be restored from here; see the phase report.
+        // The slave pair goes back before the clock-pin mode, so re-entering
+        // split finds a valid pair. Role 1 of `REQ_SET_I2S_BCK_PIN`
+        // (config.h:485).
+        if self.bck_pin_slave != now.bck_pin_slave {
+            out.push(format!("i2s.bck.slave {}", self.bck_pin_slave));
+        }
         if self.clock_pin_mode != now.clock_pin_mode {
             out.push(format!(
                 "i2s.clockpins {}",
@@ -2434,6 +2436,20 @@ pub(crate) mod tests {
         // The type change leads, as the Console's restore does.
         assert!(cmds[0].starts_with("out.type"), "{cmds:?}");
         assert!(base.restore_commands(&base).is_empty());
+
+        // The slave clock pair goes back, and before the clock-pin mode, so
+        // re-entering split finds a valid pair (config.h:485).
+        let mut moved = base.clone();
+        moved.bck_pin_slave = 2;
+        moved.clock_pin_mode = 1;
+        let cmds = base.restore_commands(&moved);
+        let at = |t: &str| {
+            cmds.iter()
+                .position(|c| c.starts_with(t))
+                .unwrap_or_else(|| panic!("missing {t}: {cmds:?}"))
+        };
+        assert_eq!(cmds[at("i2s.bck.slave")], "i2s.bck.slave 20");
+        assert!(at("i2s.bck.slave") < at("i2s.clockpins"), "{cmds:?}");
     }
 
     /// The key events a key-line token stands for. Settings advertises `Tab`

@@ -615,6 +615,11 @@ pub(crate) fn wvalue_for(d: &ParamDesc, indices: &[u8], value: &Value) -> u16 {
                 (v << 8) | indices.first().copied().unwrap_or(0) as u16
             }
             WValue::ValueOnly => value.as_f32().unwrap_or(0.0) as u16,
+            // `(role << 8) | value`: the role picks which of the opcode's two
+            // parameters this write is for (config.h:334).
+            WValue::RoleValue(role) => {
+                ((role as u16) << 8) | (value.as_f32().unwrap_or(0.0) as u16 & 0xFF)
+            }
         }
     }
 }
@@ -634,6 +639,9 @@ pub(crate) fn read_wvalue_for(d: &ParamDesc, indices: &[u8]) -> u16 {
             WValue::Target | WValue::ValueSlot | WValue::ValueIndex | WValue::MacroStep => {
                 indices.first().copied().unwrap_or(0) as u16
             }
+            // The read takes the bare role, not the packed pair
+            // (`fetchI2SBckPin(role:)`, config.h:336).
+            WValue::RoleValue(role) => role as u16,
             _ => 0,
         }
     }
@@ -948,6 +956,17 @@ mod tests {
             wvalue_for(by_path("cs.caps").unwrap(), &[], &Value::Trigger),
             0xFFFF
         );
+
+        // (role << 8) | gpio, and the bare role on the way back
+        // (config.h:334-336). Master and slave share one opcode, so the role
+        // is the only thing telling the two clock pairs apart.
+        let master = by_path("i2s.bck").unwrap();
+        let slave = by_path("i2s.bck.slave").unwrap();
+        assert_eq!(master.set, slave.set, "one opcode, two roles");
+        assert_eq!(wvalue_for(master, &[], &Value::Int(14)), 0x000E);
+        assert_eq!(wvalue_for(slave, &[], &Value::Int(26)), 0x011A);
+        assert_eq!(read_wvalue_for(master, &[]), 0);
+        assert_eq!(read_wvalue_for(slave, &[]), 1);
     }
 
     /// A read addresses the parameter but must never smuggle a value into wValue.

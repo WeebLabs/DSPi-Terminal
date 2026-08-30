@@ -143,10 +143,9 @@ impl I2sPage {
                     } else {
                         "Stored but inactive while clock pins are shared.".to_string()
                     }),
-                    // No registry path carries the slave role of
-                    // `REQ_SET_I2S_BCK_PIN`, so the row reports the stored pair
-                    // rather than pretending it can move it.
-                    enabled: false,
+                    // Editable in Split, where the pair is live; in Unified it
+                    // is stored but inactive and the Console disables it.
+                    enabled: mode == 1 && cx.connected,
                 },
             ));
         }
@@ -262,6 +261,20 @@ impl I2sPage {
                     "i2s.clockpins {}",
                     if split { "split" } else { "unified" }
                 ))
+            }
+            Item::SlaveBck => {
+                let pins = Self::bck_candidates(cx, "I2S Slave BCK", i2s.bck_pin_slave);
+                let Some(p) = pins.get(choice) else {
+                    return PageEvent::Handled;
+                };
+                self.status = Some((
+                    format!(
+                        "Slave BCK pin set to GPIO {p}, LRCLK = GPIO {}",
+                        p.wrapping_add(1)
+                    ),
+                    false,
+                ));
+                PageEvent::IoCommand(format!("i2s.bck.slave {p}"))
             }
             Item::MckPin => {
                 let pins = Self::mck_candidates(cx);
@@ -385,6 +398,59 @@ mod tests {
             "{f}"
         );
         assert!(f.contains("Slave BCK Pin"), "{f}");
+    }
+
+    /// A split-mode device has two clock pairs, and the slave one is only
+    /// reachable through role 1 of `REQ_SET_I2S_BCK_PIN` (config.h:485).
+    #[test]
+    fn the_slave_bck_pin_is_editable_in_split_mode() {
+        let sec = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "i2s_config")
+            .map(|(_, o, _)| *o)
+            .unwrap();
+        // clock_pin_mode_p1 = 2 is SPLIT (bulk_params.h:160).
+        let mut st = state();
+        st.bulk.patch(sec + 8, &[2]);
+        let mut s = SettingsScreen::new(&st, data(), AppConfig::default()).open(Page::I2s, &st);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("Slave BCK Pin"), "{f}");
+        assert!(f.contains("LRCK: GPIO 21 (BCK + 1)"), "the live pair:\n{f}");
+
+        // The row is the third focusable one: BCK, Clock Pins, Slave BCK.
+        s.handle(key(KeyCode::Tab), &st);
+        s.handle(key(KeyCode::Down), &st);
+        s.handle(key(KeyCode::Down), &st);
+        match s.handle(key(KeyCode::Right), &st) {
+            ScreenEvent::Command(c) => {
+                assert!(c.starts_with("i2s.bck.slave "), "{c}");
+                assert_ne!(c, "i2s.bck.slave 20", "it moved off the stored pin");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            s.output_dirty(),
+            "moving a clock pin is an output-config edit"
+        );
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("Slave BCK pin set to GPIO"), "{f}");
+        assert!(f.contains("LRCLK = GPIO"), "{f}");
+    }
+
+    /// In Unified the pair is stored but dormant, which is what the Console
+    /// says and why it disables the row there.
+    #[test]
+    fn the_slave_bck_row_is_inert_while_the_clock_pins_are_shared() {
+        let (mut s, st) = screen(Page::I2s);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(
+            f.contains("Stored but inactive while clock pins are shared."),
+            "{f}"
+        );
+        s.handle(key(KeyCode::Tab), &st);
+        s.handle(key(KeyCode::Down), &st);
+        s.handle(key(KeyCode::Down), &st);
+        assert_eq!(s.handle(key(KeyCode::Right), &st), ScreenEvent::Unhandled);
     }
 
     #[test]
