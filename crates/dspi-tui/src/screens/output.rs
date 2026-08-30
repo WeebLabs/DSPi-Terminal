@@ -499,6 +499,10 @@ impl Screen for OutputPage {
         }
     }
 
+    fn actions(&self, state: &DeviceState) -> Vec<(String, bool)> {
+        self.list.actions(state, true)
+    }
+
     fn keys(&self) -> &'static [KeyHelp] {
         KEYS
     }

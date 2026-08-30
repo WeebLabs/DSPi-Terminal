@@ -169,6 +169,32 @@ impl FilterList {
         }
     }
 
+    /// The Console's footer strip for the echo line: `Enable All │ Bypass
+    /// All   Clear All   PEQ │ XO`, each half greyed when it would be a
+    /// no-op (`BypassAllControls`), the mode tabs showing the other mode as
+    /// the live one.
+    pub fn actions(&self, state: &DeviceState, xo_available: bool) -> Vec<(String, bool)> {
+        let bands = self.bands(state);
+        let live: Vec<&EqParamPacket> = bands
+            .iter()
+            .filter(|b| b.filter_type != FilterType::Flat)
+            .collect();
+        let any_bypassed = live.iter().any(|b| b.bypass);
+        let any_armed = live.iter().any(|b| !b.bypass);
+        let mut out = vec![
+            ("Enable All".to_string(), any_bypassed),
+            ("|".to_string(), true),
+            ("Bypass All".to_string(), any_armed),
+            ("Clear All".to_string(), !live.is_empty()),
+        ];
+        if xo_available {
+            out.push(("PEQ".to_string(), self.mode == FilterMode::Xo));
+            out.push(("|".to_string(), true));
+            out.push(("XO".to_string(), self.mode == FilterMode::Peq));
+        }
+        out
+    }
+
     pub fn bands(&self, state: &DeviceState) -> Vec<EqParamPacket> {
         match self.mode {
             FilterMode::Peq => state.bands(self.channel as u8),
@@ -988,6 +1014,25 @@ pub fn family_menu(current: FilterType) -> (PopupList, Vec<Option<Family>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_action_strip_greys_what_would_do_nothing() {
+        let state = crate::shell::fixture::state();
+        // FL has five live bands, none bypassed.
+        let list = super::FilterList::new(0);
+        let a = list.actions(&state, true);
+        let get = |name: &str| a.iter().find(|(l, _)| l == name).map(|(_, e)| *e).unwrap();
+        assert!(!get("Enable All"), "nothing is bypassed");
+        assert!(get("Bypass All"));
+        assert!(get("Clear All"));
+        assert!(!get("PEQ") && get("XO"), "PEQ is the current mode");
+        // An input has no crossover tabs.
+        assert!(!list.actions(&state, false).iter().any(|(l, _)| l == "XO"));
+        // A channel with no bands offers nothing.
+        let empty = super::FilterList::new(2);
+        let a = empty.actions(&state, false);
+        assert!(a.iter().filter(|(l, _)| l != "|").all(|(_, e)| !e), "{a:?}");
+    }
+
     use super::*;
     use crate::shell::fixture;
     use crate::theme::{ColorDepth, Glyphs};
