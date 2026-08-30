@@ -725,7 +725,7 @@ mod tests {
 #[cfg(test)]
 mod detection_tests {
     use super::*;
-    use crate::app::glyphs_for;
+    use crate::perf::glyphs_for;
 
     fn env() -> TermEnv {
         TermEnv::default()

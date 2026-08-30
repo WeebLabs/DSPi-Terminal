@@ -67,7 +67,7 @@ pub fn run() -> u8 {
 fn terminal_check() -> Status {
     let (cols, rows) = dspi_tui::terminal_size().unwrap_or((0, 0));
     let depth = dspi_tui::theme::ColorDepth::detect();
-    let glyphs = dspi_tui::app::detect_glyphs();
+    let glyphs = dspi_tui::perf::detect_glyphs();
 
     let msg = format!("terminal {cols}x{rows}, {depth:?} colour, {glyphs:?} glyphs");
     if cols < 60 || rows < 12 {

@@ -72,7 +72,7 @@ fn main() -> ExitCode {
         Some("raw") => cmd_raw(serial, &positional(&flags), json),
         Some("autoeq") => cmd_autoeq(serial, &positional(&flags), &flags),
         Some("--install-udev") => doctor::install_udev(),
-        Some("screenshot") => cmd_screenshot(serial, &positional(&flags)),
+        Some("screenshot") => cmd_screenshot(serial, &positional(&flags), &flags),
         Some("export") => cmd_export(serial, &positional(&flags)),
         Some("import") => cmd_import(serial, &positional(&flags), &flags),
         Some("dump") => cmd_dump(serial, json),
@@ -660,55 +660,52 @@ fn legacy_channel(name: &str, caps: &dspi_session::Capabilities) -> Option<u8> {
     }
 }
 
-fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
+fn cmd_screenshot(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
     let width: u16 = args.first().and_then(|a| a.parse().ok()).unwrap_or(120);
     let height: u16 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(40);
-    let panel = args.get(2).copied().unwrap_or("dashboard");
+    let screen = args.get(2).copied().unwrap_or("overview");
+    let ansi = flags.contains(&"--ansi");
 
-    let session = match connect(serial) {
+    let mut session = match connect(serial) {
         Ok(s) => s,
         Err(c) => return c,
     };
     let theme = dspi_tui::Theme::new(
-        dspi_tui::theme::Palette::Amber,
-        dspi_tui::theme::ColorDepth::TrueColor,
-        dspi_tui::app::detect_glyphs(),
+        dspi_tui::theme::Palette::Console,
+        if ansi {
+            dspi_tui::theme::ColorDepth::detect()
+        } else {
+            dspi_tui::theme::ColorDepth::TrueColor
+        },
+        dspi_tui::perf::detect_glyphs(),
     );
-    let mut app = dspi_tui::App::from_session(theme, &session);
-    let mut session = session;
-    load_everything(&mut session, &mut app);
-
-    app.panel = match panel {
-        "cursor" => {
-            // Park the cursor on 1 kHz so the readout is exercised.
-            app.cursor = Some(dspi_proto::dsp::POINTS / 2 + 20);
-            dspi_tui::app::Panel::Filters
+    let bulk = match session.snapshot() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("dspi: could not read the device state: {e}");
+            return exit::TRANSPORT;
         }
-        "grid" => {
-            app.grid_mode = true;
-            dspi_tui::app::Panel::Main
-        }
-        "surfaces" => dspi_tui::app::Panel::Surfaces,
-        "main" => dspi_tui::app::Panel::Main,
-        "matrix" => dspi_tui::app::Panel::Matrix,
-        "input" => dspi_tui::app::Panel::Input,
-        "dynamics" => dspi_tui::app::Panel::Dynamics,
-        "spatial" => dspi_tui::app::Panel::Spatial,
-        "system" => dspi_tui::app::Panel::System,
-        "presets" => dspi_tui::app::Panel::Presets,
-        "filters" => dspi_tui::app::Panel::Filters,
-        "meters" => {
-            app.meters_expanded = true;
-            dspi_tui::app::Panel::Main
-        }
-        _ => dspi_tui::app::Panel::Main,
     };
-
-    // The panel changed after the initial load, so refresh for the new one.
-    app.rebuild_fields();
-    app.load_fields(&mut session);
-
-    println!("{}", dspi_tui::render_to_string(&app, width, height));
+    let state = dspi_session::DeviceState::new(session.capabilities().clone(), bulk);
+    let mut live = dspi_tui::live::Live::new(
+        state,
+        theme,
+        dspi_tui::perf::Performance::lite(),
+        Box::new(dspi_tui::live::ConsoleScreens::new()),
+    );
+    live.refresh_presets(&mut session);
+    live.tick(&mut session, None);
+    if !live.show(&mut session, screen) {
+        eprintln!("dspi: unknown screen {screen}; see `dspi screenshot --help`");
+        return exit::USAGE;
+    }
+    live.tick(&mut session, None);
+    let frame = if ansi {
+        dspi_tui::render_frame_ansi(width, height, |area, buf| live.draw(area, buf))
+    } else {
+        dspi_tui::render_frame(width, height, |area, buf| live.draw(area, buf))
+    };
+    println!("{frame}");
     exit::OK
 }
 
@@ -721,12 +718,12 @@ fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) 
     let theme = dspi_tui::Theme::new(
         palette,
         dspi_tui::theme::ColorDepth::detect(),
-        dspi_tui::app::detect_glyphs(),
+        dspi_tui::perf::detect_glyphs(),
     );
     let perf = if lite {
-        dspi_tui::app::Performance::lite()
+        dspi_tui::perf::Performance::lite()
     } else {
-        dspi_tui::app::Performance::detect()
+        dspi_tui::perf::Performance::detect()
     };
 
     // One chunked read seeds everything the bulk packet covers, so the first
@@ -743,7 +740,7 @@ fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) 
         state,
         theme,
         perf,
-        Box::new(dspi_tui::live::PlaceholderScreens),
+        Box::new(dspi_tui::live::ConsoleScreens::new()),
     );
 
     match dspi_tui::live::run(live, &mut session) {
@@ -884,55 +881,6 @@ fn section_offset(name: &str) -> usize {
         .find(|(n, _, _)| *n == name)
         .map(|(_, o, _)| *o)
         .unwrap_or(0)
-}
-
-/// Fill the app from the device.
-///
-/// One function, used by both the live interface and the screenshot path.
-/// Having two was a real bug rather than a tidiness point: the screenshot
-/// loaded the matrix and the control surfaces and the interactive app did not,
-/// so the Matrix panel said "No routing read yet." forever on a device that had
-/// routing, and Surfaces claimed the firmware had none.
-fn load_everything(session: &mut Session, app: &mut dspi_tui::App) {
-    load_bands(session, app);
-    if let Ok(m) = session.meters() {
-        app.apply_meters(&m);
-    }
-    app.rebuild_fields();
-    app.load_fields(session);
-    app.load_matrix(session);
-    app.load_surfaces(session);
-}
-
-/// Read every band on every channel, from one bulk snapshot.
-///
-/// The EQ table is a section of the bulk packet, so the whole thing arrives in
-/// six transfers. Asking `GET_EQ_PARAM` for each field instead costs five
-/// transfers per band — 850 of them on an RP2350 — and took 24 seconds on real
-/// hardware against 20 ms for the snapshot.
-///
-/// Falls back to the scalar path if the snapshot fails, so a device whose wire
-/// format this build does not know still populates what it can.
-fn load_bands(session: &mut Session, app: &mut dspi_tui::App) {
-    let snapshot = session.snapshot().ok();
-    for ch in 0..app.channels.len() {
-        for band in 0..app.channels[ch].bands.len() {
-            let read = match &snapshot {
-                Some(s) => s.band(ch as u8, band as u8),
-                None => session.read_band(ch as u8, band as u8).ok(),
-            };
-            if let Some(p) = read {
-                app.channels[ch].bands[band] = dspi_proto::dsp::Band {
-                    filter_type: p.filter_type,
-                    freq: p.freq,
-                    q: p.q,
-                    gain_db: p.gain_db,
-                    bypass: p.bypass,
-                };
-            }
-        }
-        app.recompute(ch);
-    }
 }
 
 /// Search the AutoEQ database, or apply a profile.

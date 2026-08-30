@@ -24,8 +24,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Widget};
 
 use crate::actions;
-use crate::app::Performance;
 use crate::graph::GraphCurve;
+use crate::perf::Performance;
 use crate::screens::{
     self, AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
     MonitorPanel, OutputPage, Overview, PresetChoice, PresetMenu, PsybassPanel, Shared,
@@ -733,7 +733,7 @@ impl Live {
             }
             Ok(Outcome::Rejected { actual, .. }) => {
                 let shown = dspi_proto::registry::by_path(path)
-                    .map(|d| crate::fields::display_value(d, &actual))
+                    .map(|d| display_value(d, &actual))
                     .unwrap_or_default();
                 self.note(format!("{path} was not applied; device kept {shown}"));
             }
@@ -849,7 +849,7 @@ impl Live {
             dspi_cmd::Command::Get { path, ref indices } => match session.read(path, indices) {
                 Ok(v) => {
                     let shown = dspi_proto::registry::by_path(path)
-                        .map(|d| crate::fields::display_value(d, &v))
+                        .map(|d| display_value(d, &v))
                         .unwrap_or_default();
                     self.note(format!("{path} = {shown}"));
                 }
@@ -1382,6 +1382,32 @@ impl Live {
     fn open_tool(&mut self, tool: Tool) {
         let screen = self.screens.tool(&self.state, tool);
         self.shell.open_tool(tool, screen);
+    }
+
+    /// Show a screen by name, as `dspi screenshot` and the gallery ask:
+    /// `overview`, `input` (the first input), `output` (the first output),
+    /// a tool's lowercase title word (`matrix`, `crossfeed`, `loudness`,
+    /// `leveller`, `psybass`, `upmixer`, `signals`, `stats`, `monitor`,
+    /// `autoeq`), or `settings`. Returns false for a name it does not know.
+    pub fn show(&mut self, session: &mut Session, name: &str) -> bool {
+        match name.to_ascii_lowercase().as_str() {
+            "overview" => self.select(Selection::Overview),
+            "input" => self.select(Selection::Input(0)),
+            "output" => self.select(Selection::Output(0)),
+            "matrix" => self.open_tool(Tool::Matrix),
+            "crossfeed" => self.open_tool(Tool::Crossfeed),
+            "loudness" => self.open_tool(Tool::Loudness),
+            "leveller" => self.open_tool(Tool::Leveller),
+            "psybass" | "bass" => self.open_tool(Tool::Psybass),
+            "upmixer" => self.open_tool(Tool::Upmixer),
+            "signals" => self.open_tool(Tool::Signals),
+            "stats" => self.open_tool(Tool::Stats),
+            "monitor" => self.open_tool(Tool::Monitor),
+            "autoeq" => self.open_tool(Tool::AutoEq),
+            "settings" => self.open_settings(session),
+            _ => return false,
+        }
+        true
     }
 
     fn open_settings(&mut self, session: &mut Session) {
@@ -2031,6 +2057,17 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
     })();
     ratatui::restore();
     result
+}
+
+/// A value in the words the registry uses for it: a choice by name, a number
+/// with its unit.
+fn display_value(d: &dspi_proto::registry::ParamDesc, v: &Value) -> String {
+    if let (dspi_proto::registry::Kind::Choice(variants), Some(n)) = (d.kind, v.as_u8())
+        && let Some((_, name)) = variants.iter().find(|(raw, _)| *raw == n)
+    {
+        return (*name).to_string();
+    }
+    v.display(d.kind.unit())
 }
 
 #[cfg(test)]

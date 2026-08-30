@@ -5,14 +5,11 @@
 //! screens do not re-implement arrows and Enter differently. The design these
 //! widgets follow is `docs/plan/DESIGN.md` section 6.
 //!
-//! `legacy` holds the widgets the previous interface drew with; it goes when
-//! the screens that use it are rewritten.
 
 pub mod card;
 pub mod chips;
 pub mod dialog;
 pub mod help;
-pub mod legacy;
 pub mod legend;
 pub mod meter;
 pub mod param;
@@ -25,8 +22,6 @@ pub mod status;
 pub mod table;
 pub mod text;
 pub mod toggle;
-
-pub use legacy::*;
 
 pub use card::Card;
 pub use chips::{ChipRow, ChipState};
