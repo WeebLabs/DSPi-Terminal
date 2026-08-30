@@ -533,34 +533,40 @@ Footer actions (on the echo line's right side while the list is focused):
 Replaces the detail pane:
 
 ```
- Matrix Mixer                                     Direct 1:1   Clear
-                 OUT1      OUT2      OUT3      OUT4      OUT9
+                 OUT L        OUT R        OUT 3        Sub
+                 OUT1         OUT2         OUT3 !       OUT9 !
  ROUTING
- FL   -5.3 dB   ● 0.0    ○  -      ○  -      ○  -      ● -6.0 INV
- FR   -5.3 dB   ○  -     ● 0.0     ○  -      ○  -      ● -6.0
+ FL                ●            ○            ○            ●
+                0.0 dB                                 -6.0 dB INV
+ FR                ○            ●            ○            ●
+                             0.0 dB                    -6.0 dB
  ...
- ENABLE          ⏻ on     ⏻ on     ⏻ off     ⏻ off     ⏻ on
- GAIN            0.0 dB   0.0 dB   0.0 dB    0.0 dB   -3.0 dB
- DELAY           0.0 ms   0.0 ms   0.0 ms    0.0 ms    2.5 ms
- MUTE            ○        ○        ○         ○         ●
+                ───────────────────────────────────────────────
+ ENABLE          ⏻ on         ⏻ on         ⏻ off        ⏻ on
+ GAIN            0.0 dB       0.0 dB       0.0 dB      -3.0 dB
+ DELAY           0.0 ms       0.0 ms       0.0 ms       2.5 ms
+ MUTE              ○            ○            ○            ●
 ```
 Column headers in the output colour (section 12: the focused column's);
-input labels in the input colour; the input trim column only in
-8-channel mode. Every input has two lines of its own: the connect dots
-(`●`/`○`, centred in the column) on the first, its trim and the
+input labels in the input colour. Every input has two lines of its own:
+the connect dots (`●`/`○`, centred in the column) on the first, the
 crosspoint gains on the second, a gain only under a `●` and `INV` after
 it in `warning`. The Console's stereo pair dividers are not drawn, and
 one rule parts the inputs from the ENABLE, GAIN, DELAY and MUTE rows.
-The reticle brackets both lines of the input it is on. Columns are at least 13 cells and
-widen to 18 as the pane allows, so nine outputs sit uncrowded at 200
-columns and scroll at 120. Cells of a disabled output in `dim`. A column
-that would conflict with Core 1 carries a `warning` `!` after its
-descriptor in the header, once, rather than in every cell. Keys: arrows move the reticle; `Space` connects / disconnects;
-`Enter` edits the gain; `i` inverts; `←`/`→` on a gain nudges by 0.5 dB;
-in the ENABLE row `Space` toggles with the conflict confirms; `d` Direct
-1:1; `D` Clear (confirm); `r` rename the column's output; `y`/`Y` copy /
-paste; `I` identify. Scrolls horizontally when there are more columns than
-fit, with the input label column pinned.
+The Console's per-input trim column is not shown: the preamp belongs to
+the input page. Columns are at least 13 cells and widen to 18 as the
+pane allows, so nine outputs sit uncrowded at 200 columns and scroll at
+120. The reticle brackets both lines of the input it is on. Cells of a
+disabled output in `dim`. A column that would conflict with Core 1
+carries a `warning` `!` after its descriptor in the header, once, rather
+than in every cell. The Console's Direct 1:1 and Clear buttons are the
+`d` and `D` keys and appear on the key line, not in the band.
+Keys: arrows move the reticle; `Space` connects / disconnects; `Enter`
+edits the gain; `i` inverts; `←`/`→` on a gain nudges by 0.5 dB; in the
+ENABLE row `Space` toggles with the conflict confirms; `d` Direct 1:1;
+`D` Clear (confirm); `r` rename the column's output; `y`/`Y` copy /
+paste; `I` identify. Scrolls horizontally when there are more columns
+than fit, with the input label column pinned.
 
 ### 7.8 Tool panel template (`L` `X` `V` `P` `U`)
 

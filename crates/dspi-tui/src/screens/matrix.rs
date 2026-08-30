@@ -22,11 +22,11 @@ use ratatui::style::{Color, Style};
 use super::{Shared, channel_name, clipboard, max_delay_ms, number, output_channel};
 use crate::shell::{Screen, ScreenEvent};
 use crate::theme::{ChannelRole, Glyphs, Theme};
-use crate::widgets::text::{fit_centre, fit_left, fit_right};
+use crate::widgets::text::{fit_centre, fit_left};
 use crate::widgets::{Button, Dialog, DialogOutcome, KeyHelp, NumberEdit};
 
-/// The pinned input-label column: a name, its trim, and air between them.
-const LABEL_W: u16 = 18;
+/// The pinned input-label column: a name and air after it.
+const LABEL_W: u16 = 16;
 /// The narrowest output column: the connect dot, the gain, `INV`, and a
 /// gutter that doubles as the focus bracket of the next column. Columns
 /// grow up to [`MAX_COL_W`] when the pane has the room, so the grid is
@@ -61,8 +61,8 @@ enum Line {
     Routing,
     Divider,
     Row(Row),
-    /// The second line of an input: its trim and the crosspoint gains,
-    /// under the connect dots of `Row(Row::Input(i))`.
+    /// The second line of an input: the crosspoint gains, under the connect
+    /// dots of `Row(Row::Input(i))`.
     Gains(usize),
 }
 
@@ -86,11 +86,9 @@ struct Paint<'a> {
 
 pub struct MatrixPanel {
     shared: Shared,
-    /// The reticle: a row, an output column, and whether it sits on the input
-    /// trim in the pinned label column instead.
+    /// The reticle: a row and an output column.
     row: usize,
     col: usize,
-    trim: bool,
     /// The leftmost visible output column.
     scroll: usize,
     /// The column width of the last frame, from [`col_width`].
@@ -182,7 +180,6 @@ impl MatrixPanel {
             shared,
             row: 0,
             col: 0,
-            trim: false,
             scroll: 0,
             col_w: MIN_COL_W,
             edit: None,
@@ -210,7 +207,7 @@ impl MatrixPanel {
     }
 
     /// Every line the body draws, in order: the ROUTING band, two lines per
-    /// input (the connect dots, then the trim and the gains), a rule, then
+    /// input (the connect dots, then the gains), a rule, then
     /// the output rows. The Console divides the inputs into stereo pairs and
     /// puts a crosspoint's dot and gain in one cell; here every input stands
     /// on its own and the dots and the gains are rows of their own, so a
@@ -238,11 +235,6 @@ impl MatrixPanel {
         (width.saturating_sub(LABEL_W) / col_width(width, n_out)).max(1) as usize
     }
 
-    /// Is the trim field reachable from where the reticle is?
-    fn trim_available(&self, state: &DeviceState) -> bool {
-        is_8ch(state) && matches!(self.row_at(state), Row::Input(_))
-    }
-
     // -- Commands ----------------------------------------------------------
 
     /// One crosspoint write, carrying the two fields that are not changing.
@@ -267,12 +259,6 @@ impl MatrixPanel {
 
     /// The value under the reticle, for arming an edit.
     fn value_at(&self, state: &DeviceState) -> Option<f64> {
-        if self.trim {
-            let Row::Input(i) = self.row_at(state) else {
-                return None;
-            };
-            return Some(state.preamp_db(i) as f64);
-        }
         match self.row_at(state) {
             Row::Input(i) => Some(state.crosspoint(i, self.col).gain_db as f64),
             Row::Gain => Some(state.output(self.col).gain_db as f64),
@@ -284,13 +270,6 @@ impl MatrixPanel {
     /// The command that writes `v` where the reticle is.
     fn write_at(&self, state: &DeviceState, v: f64) -> ScreenEvent {
         let o = self.col;
-        if self.trim {
-            let Row::Input(i) = self.row_at(state) else {
-                return ScreenEvent::Handled;
-            };
-            let v = v.clamp(GAIN_MIN, GAIN_MAX);
-            return ScreenEvent::Command(format!("pre {i} {}", number(v as f32)));
-        }
         match self.row_at(state) {
             Row::Input(i) => {
                 let c = state.crosspoint(i, o);
@@ -320,11 +299,10 @@ impl MatrixPanel {
     fn nudge(&self, state: &DeviceState, dir: f64, coarse: bool) -> f64 {
         let mult = if coarse { 10.0 } else { 1.0 };
         let row = self.row_at(state);
-        let (value, step) = match (self.trim, row) {
-            (true, Row::Input(i)) => (state.preamp_db(i) as f64, 0.5),
-            (_, Row::Input(i)) => (state.crosspoint(i, self.col).gain_db as f64, 0.5),
-            (_, Row::Gain) => (state.output(self.col).gain_db as f64, 0.5),
-            (_, Row::Delay) => (state.output(self.col).delay_ms as f64, 0.1),
+        let (value, step) = match row {
+            Row::Input(i) => (state.crosspoint(i, self.col).gain_db as f64, 0.5),
+            Row::Gain => (state.output(self.col).gain_db as f64, 0.5),
+            Row::Delay => (state.output(self.col).delay_ms as f64, 0.1),
             _ => (0.0, 0.0),
         };
         value + dir * step * mult
@@ -675,42 +653,12 @@ impl MatrixPanel {
         }
     }
 
-    /// The label of an input's gains line: the Console's per-input trim,
-    /// bound to `preampDB[input]`, which only the 8-channel matrix has.
-    fn draw_trim(&self, p: &mut Paint, y: u16, input: usize, here: bool) {
-        let (area, theme, state) = (p.area, p.theme, p.state);
-        if !is_8ch(state) {
-            return;
-        }
-        let focused = here && self.trim;
-        let text = match self.edit.as_ref().filter(|_| focused) {
-            Some(e) => format!("[{}]", e.text),
-            None => format!("{:+.1} dB", state.preamp_db(input)),
-        };
-        let style = if focused && self.edit.is_some() {
-            theme.editing()
-        } else if focused {
-            theme.focused()
-        } else {
-            theme.label()
-        };
-        p.buf.set_string(area.x + 2, y, fit_right(&text, 8), style);
-    }
-
-    fn draw_routing(&self, p: &mut Paint, y: u16, grid_w: u16) {
-        let (area, theme, state) = (p.area, p.theme, p.state);
+    /// The ROUTING band. The Console puts its Direct 1:1 and Clear buttons
+    /// here; they are the `d` and `D` keys, on the key line, so the band
+    /// carries only its name.
+    fn draw_routing(&self, p: &mut Paint, y: u16) {
+        let (area, theme) = (p.area, p.theme);
         p.buf.set_string(area.x + 1, y, "ROUTING", theme.section());
-        if !is_8ch(state) {
-            return;
-        }
-        // The Console puts Direct 1:1 and Clear in the ROUTING band, and only
-        // in 8-channel mode: an 8-channel stream is silent until routes exist.
-        let actions = "Direct 1:1   Clear";
-        let w = actions.chars().count() as u16;
-        if grid_w > LABEL_W + w + 2 {
-            p.buf
-                .set_string(area.x + grid_w - w - 1, y, actions, theme.value());
-        }
     }
 }
 
@@ -772,7 +720,7 @@ impl Screen for MatrixPanel {
         for (n, line) in lines.iter().skip(first).take(body_h).enumerate() {
             let y = area.y + 2 + n as u16;
             match line {
-                Line::Routing => self.draw_routing(&mut p, y, grid_w),
+                Line::Routing => self.draw_routing(&mut p, y),
                 Line::Divider => {
                     let w = (grid_w - LABEL_W).min(area.width.saturating_sub(LABEL_W)) as usize;
                     let bar = if theme.glyphs == Glyphs::Ascii {
@@ -796,7 +744,7 @@ impl Screen for MatrixPanel {
                     self.draw_label(&mut p, y, *row, on_row);
                     for (i, &o) in cols.iter().enumerate() {
                         let x = area.x + LABEL_W + i as u16 * self.col_w;
-                        let cell = on_row && !self.trim && o == self.col;
+                        let cell = on_row && o == self.col;
                         match row {
                             Row::Input(input) => self.draw_connect(&mut p, x, y, *input, o, cell),
                             other => self.draw_output_cell(&mut p, x, y, *other, o, cell),
@@ -805,10 +753,9 @@ impl Screen for MatrixPanel {
                 }
                 Line::Gains(input) => {
                     let on_row = focused && Row::Input(*input) == here;
-                    self.draw_trim(&mut p, y, *input, on_row);
                     for (i, &o) in cols.iter().enumerate() {
                         let x = area.x + LABEL_W + i as u16 * self.col_w;
-                        let cell = on_row && !self.trim && o == self.col;
+                        let cell = on_row && o == self.col;
                         self.draw_gain(&mut p, x, y, *input, o, cell);
                     }
                 }
@@ -826,36 +773,24 @@ impl Screen for MatrixPanel {
         match key.code {
             KeyCode::Up => {
                 self.row = self.row.saturating_sub(1);
-                self.trim &= self.trim_available(state);
                 ScreenEvent::Handled
             }
             KeyCode::Down => {
                 self.row = (self.row + 1).min(rows - 1);
-                self.trim &= self.trim_available(state);
                 ScreenEvent::Handled
             }
             KeyCode::Left => {
-                if self.trim {
-                    // Already at the pinned column.
-                } else if self.col > 0 {
-                    self.col -= 1;
-                } else if self.trim_available(state) {
-                    self.trim = true;
-                }
+                self.col = self.col.saturating_sub(1);
                 ScreenEvent::Handled
             }
             KeyCode::Right => {
-                if self.trim {
-                    self.trim = false;
-                } else {
-                    self.col = (self.col + 1).min(outputs.saturating_sub(1));
-                }
+                self.col = (self.col + 1).min(outputs.saturating_sub(1));
                 ScreenEvent::Handled
             }
             KeyCode::Char(' ') => self.activate(state, false),
             KeyCode::Enter => self.activate(state, true),
             KeyCode::Char('i') => match self.row_at(state) {
-                Row::Input(i) if !self.trim => {
+                Row::Input(i) => {
                     let c = state.crosspoint(i, self.col);
                     ScreenEvent::Command(self.mix_command(
                         i,
@@ -962,9 +897,6 @@ impl MatrixPanel {
     /// `Space` and `Enter`: `Enter` always arms a value, `Space` toggles what
     /// can be toggled and arms what cannot.
     fn activate(&mut self, state: &DeviceState, enter: bool) -> ScreenEvent {
-        if self.trim {
-            return self.arm(state);
-        }
         match self.row_at(state) {
             Row::Input(i) if !enter => {
                 let c = state.crosspoint(i, self.col);
@@ -1135,11 +1067,10 @@ mod tests {
                     assert!(f.contains(want), "{w}x{h} has no {want}:\n{f}");
                 }
             }
-            // The Console's two routing actions, which only 8-channel mode has.
-            assert!(
-                f.contains("Direct 1:1") && f.contains("Clear"),
-                "{w}x{h}: {f}"
-            );
+            // The routing actions are the `d` and `D` keys on the key line,
+            // not text in the ROUTING band.
+            let band = f.lines().find(|l| l.contains("ROUTING")).expect("ROUTING");
+            assert!(!band.contains("Direct 1:1"), "{band}");
         }
     }
 
@@ -1204,10 +1135,10 @@ mod tests {
         assert!(!fl.contains("0.0"), "gains are on the next line: {fl}");
         let gains = f.lines().nth(4).expect("the FL gains row");
         assert!(gains.contains("0.0 dB"), "{gains}");
-        // The trim only exists in 8-channel mode; the stereo matrix has none.
-        assert!(gains.contains("+0.0 dB"), "the input trim: {gains}");
-        let stereo_frame = text(&draw(&mut panel(), &stereo(), 120, 20));
-        assert!(!stereo_frame.contains("+0.0 dB"), "{stereo_frame}");
+        assert!(
+            !gains.contains("+0.0 dB") && !f.contains("-5.3 dB"),
+            "no input trim in the matrix; it lives on the input page: {f}"
+        );
     }
 
     /// D52: `DESIGN.md` 7.7 says "Column headers in the output colour". Only
@@ -1288,7 +1219,11 @@ mod tests {
         let dividers = f.lines().filter(|l| l.contains("──")).count();
         assert_eq!(dividers, 1, "one rule above ENABLE:\n{f}");
         let lines: Vec<&str> = f.lines().collect();
-        assert!(lines[3].starts_with("▸FL") && lines[4].starts_with("   +0.0 dB"));
+        assert!(lines[3].starts_with("▸FL") && lines[4].contains("0.0 dB"));
+        assert!(
+            lines[4].trim_start().starts_with('['),
+            "the gains line has no label: {f}"
+        );
         assert!(lines[5].starts_with(" FR"), "no pair divider:\n{f}");
         assert!(lines[7].starts_with(" FC"), "{f}");
         let s = text(&draw(&mut panel(), &stereo(), 120, 24));
@@ -1398,29 +1333,6 @@ mod tests {
             ScreenEvent::Command("mix 0 0 on -6".into())
         );
         assert!(p.edit.is_none());
-    }
-
-    #[test]
-    fn the_input_trim_lives_in_the_pinned_column() {
-        let state = fixture::state();
-        let mut p = panel();
-        p.handle(key(KeyCode::Left), &state);
-        assert!(p.trim, "left of the first column is the trim");
-        p.handle(key(KeyCode::Enter), &state);
-        assert_eq!(
-            p.handle(key(KeyCode::Right), &state),
-            ScreenEvent::Command("pre 0 0.5".into())
-        );
-        // The output rows have no trim, so the reticle leaves it behind.
-        p.handle(key(KeyCode::Esc), &state);
-        for _ in 0..8 {
-            p.handle(key(KeyCode::Down), &state);
-        }
-        assert!(!p.trim);
-        // And the stereo matrix never has one.
-        let mut p = panel();
-        p.handle(key(KeyCode::Left), &stereo());
-        assert!(!p.trim);
     }
 
     #[test]
@@ -1618,14 +1530,13 @@ mod tests {
         for help in KEYS {
             for k in crate::screens::tests::keys_for(help.key) {
                 let mut done = false;
-                for (row, col, trim) in [(0usize, 0usize, false), (0, 0, true), (8, 8, false)] {
+                for (row, col) in [(0usize, 0usize), (8, 8)] {
                     let mut p = panel();
                     p.row = row;
                     p.col = col;
-                    p.trim = trim;
-                    let before = (p.row, p.col, p.trim, p.edit.clone());
+                    let before = (p.row, p.col, p.edit.clone());
                     let ev = p.handle(k, &state);
-                    let after = (p.row, p.col, p.trim, p.edit.clone());
+                    let after = (p.row, p.col, p.edit.clone());
                     if ev != ScreenEvent::Unhandled || before != after {
                         done = true;
                     }
