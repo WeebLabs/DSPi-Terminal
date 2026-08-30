@@ -91,6 +91,15 @@ impl AutoEqPanel {
         }
     }
 
+    /// The panel opened on a search, for the gallery: an empty result list is
+    /// not a design anyone can review.
+    pub fn searching(shared: Shared, query: &str) -> Self {
+        Self {
+            query: query.into(),
+            ..Self::new(shared)
+        }
+    }
+
     /// The same panel with the favourites file left alone.
     #[cfg(test)]
     fn in_memory(shared: Shared) -> Self {
