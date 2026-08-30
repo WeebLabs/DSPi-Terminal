@@ -42,12 +42,12 @@ fn main() -> ExitCode {
                 return ExitCode::from(exit::USAGE);
             }
         },
-        // The config file's `theme`, then the Console's palette.
+        // The config file's `theme`, then the calm palette.
         None => dspi_tui::settings::AppConfig::load()
             .theme
             .as_deref()
             .and_then(dspi_tui::theme::Palette::parse)
-            .unwrap_or(dspi_tui::theme::Palette::Console),
+            .unwrap_or(dspi_tui::theme::Palette::Calm),
     };
 
     // A script beats every other reading of the arguments: `-f` is explicit,
@@ -179,7 +179,7 @@ OPTIONS:
     --json                   machine-readable output
     --no-animation           no connect reveal or easing
     --lite                   reduce redraw rate, for a Pi or a slow link
-    --theme <name>           console (default), amber, dark or mono
+    --theme <name>           calm (default), console, amber, dark or mono
     --dry-run                report what would be written, write nothing
     --quiet                  do not echo each change
     --keep-going             in a script, carry on past a failing line
@@ -715,7 +715,7 @@ fn cmd_screenshot(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
         (session, state)
     };
     let theme = dspi_tui::Theme::new(
-        dspi_tui::theme::Palette::Console,
+        dspi_tui::theme::Palette::Calm,
         if ansi {
             dspi_tui::theme::ColorDepth::detect()
         } else {

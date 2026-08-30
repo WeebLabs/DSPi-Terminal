@@ -70,7 +70,11 @@ fn draw_row(
     let t = theme;
     let pill_w = item.descriptor.len() as u16;
     let meter_w = if area.width >= 22 { 8 } else { 6 };
-    let name_w = area.width.saturating_sub(1 + 1 + meter_w + 1 + 1 + pill_w) as usize;
+    // bar, swatch, name, space, meter + clip, space, descriptor.
+    let name_w = area
+        .width
+        .saturating_sub(1 + 1 + 1 + meter_w + 1 + 1 + pill_w) as usize;
+    let hue = t.hue_for(item.role, selected);
     // Selection bar.
     let bar = if selected {
         if t.glyphs == Glyphs::Ascii {
@@ -82,22 +86,29 @@ fn draw_row(
         " "
     };
     buf.set_string(area.x, area.y, bar, Style::default().fg(t.accent));
+    // The swatch is the one place a channel's hue always shows.
+    let swatch = if t.glyphs == Glyphs::Ascii {
+        "*"
+    } else {
+        "▪"
+    };
+    buf.set_string(area.x + 1, area.y, swatch, Style::default().fg(item.color));
     let name_style = if item.inactive {
         t.label()
     } else if cursor {
         t.focused()
     } else {
-        t.value()
+        Style::default().fg(hue)
     };
-    buf.set_string(area.x + 1, area.y, fit_left(&item.name, name_w), name_style);
-    let mx = area.x + 2 + name_w as u16;
-    LevelMeter::new(item.level, item.color, t)
+    buf.set_string(area.x + 2, area.y, fit_left(&item.name, name_w), name_style);
+    let mx = area.x + 3 + name_w as u16;
+    LevelMeter::new(item.level, hue, t)
         .peak(item.peak)
         .clipped(item.clipped)
         .inactive(item.inactive)
         .render(Rect::new(mx, area.y, meter_w + 1, 1), buf);
     let px = mx + meter_w + 2;
-    let pill_style = if !item.visible {
+    let pill_style = if t.quiet() || !item.visible {
         t.label()
     } else if t.depth == ColorDepth::Mono {
         Style::default().add_modifier(Modifier::REVERSED)

@@ -1,6 +1,6 @@
 //! Render the shell with fixture data, for design review without a device.
 //!
-//!   gallery [width] [height] [console|amber|dark|mono] [rp2350|rp2040]
+//!   gallery [width] [height] [calm|console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
 //!                     |autoeq] [--settings <page>] [--expand n] [--depth truecolor|256|16|mono] [--ansi]

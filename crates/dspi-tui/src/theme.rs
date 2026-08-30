@@ -182,8 +182,12 @@ impl ChannelRole {
 /// Which palette to draw with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Palette {
-    /// The DSPi Console's own colours, so a channel looks the same here as it
-    /// does there. The default.
+    /// The Console's channel colours, spent under the colour budget of
+    /// DESIGN 12: a swatch always, a hue on the selected channel, greys
+    /// everywhere else. The default.
+    Calm,
+    /// The DSPi Console's own colours on every channel element, as the
+    /// Console draws them.
     Console,
     /// Amber phosphor, after the monitors this kind of instrument used to be
     /// driven from.
@@ -197,6 +201,7 @@ pub enum Palette {
 impl Palette {
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
+            "calm" => Some(Self::Calm),
             "console" => Some(Self::Console),
             "amber" => Some(Self::Amber),
             "dark" => Some(Self::Dark),
@@ -205,12 +210,12 @@ impl Palette {
         }
     }
 
-    pub const NAMES: &'static [&'static str] = &["console", "amber", "dark", "mono"];
+    pub const NAMES: &'static [&'static str] = &["calm", "console", "amber", "dark", "mono"];
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::new(Palette::Console, ColorDepth::detect(), Glyphs::Braille)
+        Self::new(Palette::Calm, ColorDepth::detect(), Glyphs::Braille)
     }
 }
 
@@ -280,6 +285,11 @@ const CONSOLE_CHROME_FAINT: Swatch = Swatch::new((0x33, 0x33, 0x33), 236, Color:
 impl Theme {
     pub fn new(palette: Palette, depth: ColorDepth, glyphs: Glyphs) -> Self {
         match palette {
+            Palette::Calm => {
+                let mut t = Self::console(depth, glyphs);
+                t.palette = Palette::Calm;
+                t
+            }
             Palette::Console => Self::console(depth, glyphs),
             Palette::Amber => Self::amber(depth, glyphs),
             Palette::Dark => Self::dark(depth, glyphs),
@@ -582,6 +592,24 @@ impl Theme {
             [fg, chrome, dim, accent, ok, pending, danger],
             channels,
         )
+    }
+
+    /// Whether channel hues are spent only on the selected channel (DESIGN
+    /// 12.3). The Console palette colours every channel element; the others
+    /// keep hues for the swatch and the selection.
+    pub fn quiet(&self) -> bool {
+        !matches!(self.palette, Palette::Console)
+    }
+
+    /// The colour an element of a channel draws in: the channel's hue when
+    /// the theme spends hues freely or the channel is selected, otherwise
+    /// the plain value colour. The swatch always uses [`Theme::role_color`].
+    pub fn hue_for(&self, role: ChannelRole, selected: bool) -> Color {
+        if selected || !self.quiet() {
+            self.role_color(role)
+        } else {
+            self.fg
+        }
     }
 
     /// The colour of a channel by its RP2350-order index. Prefer
@@ -970,8 +998,8 @@ mod amber_tests {
     }
 
     #[test]
-    fn the_console_palette_is_what_you_get_by_default() {
-        assert_eq!(Theme::default().palette, Palette::Console);
+    fn the_calm_palette_is_what_you_get_by_default() {
+        assert_eq!(Theme::default().palette, Palette::Calm);
     }
 
     #[test]
@@ -979,6 +1007,7 @@ mod amber_tests {
         assert_eq!(Palette::parse("amber"), Some(Palette::Amber));
         assert_eq!(Palette::parse("Dark"), Some(Palette::Dark));
         assert_eq!(Palette::parse("console"), Some(Palette::Console));
+        assert_eq!(Palette::parse("calm"), Some(Palette::Calm));
         assert_eq!(Palette::parse("mono"), Some(Palette::Mono));
         assert_eq!(Palette::parse("chartreuse"), None);
     }
@@ -1150,5 +1179,24 @@ mod console_tests {
         let t = Theme::console(ColorDepth::Ansi256, Glyphs::Braille);
         assert!(!t.channels.contains(&t.accent));
         assert!(!t.channels.contains(&t.warning));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn calm_spends_a_hue_only_on_the_selected_channel() {
+        let calm = Theme::new(Palette::Calm, ColorDepth::TrueColor, Glyphs::Braille);
+        assert!(calm.quiet());
+        assert_eq!(calm.hue_for(ChannelRole::Input(0), false), calm.fg);
+        assert_eq!(calm.hue_for(ChannelRole::Input(0), true), calm.inputs[0]);
+        let console = Theme::new(Palette::Console, ColorDepth::TrueColor, Glyphs::Braille);
+        assert!(!console.quiet());
+        assert_eq!(
+            console.hue_for(ChannelRole::Input(0), false),
+            console.inputs[0]
+        );
     }
 }
