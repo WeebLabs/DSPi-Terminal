@@ -2732,6 +2732,20 @@ mod tests {
             .unwrap_or_else(|| panic!("no row for {want:?}"))
     }
 
+    /// Open the nth card and draw it. The cards start collapsed, so a card
+    /// body is only reachable the way a user reaches it.
+    fn opened(nth: usize, w: u16, h: u16) -> String {
+        let st = m::demo::state();
+        let mut s = SettingsScreen::new(&st, m::demo::settings_data(), AppConfig::default())
+            .open(Page::Surfaces, &st);
+        s.handle(key(KeyCode::Tab), &st);
+        for _ in 0..nth {
+            s.handle(key(KeyCode::Down), &st);
+        }
+        s.handle(key(KeyCode::Enter), &st);
+        frame(&mut s, &st, w, h)
+    }
+
     // -------------------------------------------------------- golden frames
 
     #[test]
@@ -2775,6 +2789,98 @@ mod tests {
             f.contains("Control surfaces are stored on the device"),
             "{f}"
         );
+    }
+
+    /// One golden frame per card type, in the Console's row order.
+    #[test]
+    fn an_encoder_card_draws_the_consoles_rows() {
+        let f = opened(0, 120, 40);
+        for want in [
+            "Component",
+            "Rotary Encoder",
+            "Controls",
+            "Volume & Mute / Volume",
+            "GPIO A",
+            "Encoder channel A.",
+            "GPIO B",
+            "Step Size",
+            "Amount added or removed per detent/press.",
+            "Reverse Direction",
+            "Acceleration",
+            "Pull-Down Wiring",
+            "Revert",
+            "Apply",
+        ] {
+            assert!(f.contains(want), "missing {want:?}:\n{f}");
+        }
+        // A pot's flags are not an encoder's.
+        assert!(!f.contains("Repeat While Held"), "{f}");
+    }
+
+    #[test]
+    fn a_button_card_draws_its_gesture_and_press_rows() {
+        let f = opened(1, 120, 40);
+        assert!(f.contains("Push Button"), "{f}");
+        assert!(f.contains("On Press"), "{f}");
+        assert!(f.contains("Gesture"), "{f}");
+        assert!(
+            f.contains("Bind several to one button GPIO for multiple functions."),
+            "{f}"
+        );
+        assert!(f.contains("Active-High Wiring"), "the invert title:\n{f}");
+    }
+
+    #[test]
+    fn a_pot_card_draws_its_target_and_its_span() {
+        let f = opened(2, 120, 40);
+        assert!(f.contains("Potentiometer / Fader"), "{f}");
+        assert!(f.contains("Channel"), "{f}");
+        assert!(f.contains("Limit Range"), "{f}");
+        assert!(f.contains("GPIO 26"), "an ADC pin:\n{f}");
+        assert!(f.contains("Reverse Direction"), "{f}");
+    }
+
+    #[test]
+    fn the_ir_card_nests_its_remote_buttons() {
+        let f = opened(3, 120, 40);
+        assert!(f.contains("Idle-Low Receiver"), "{f}");
+        assert!(f.contains("REMOTE BUTTONS"), "{f}");
+        assert!(f.contains("1/16"), "the n/max count:\n{f}");
+        assert!(f.contains("NEC 0x20DF40BF"), "the code chip:\n{f}");
+        assert!(f.contains("Raise Volume"), "the summary:\n{f}");
+        assert!(f.contains("Learn Button") || f.contains("Re-learn"), "{f}");
+        assert!(f.contains("Add Remote Button"), "{f}");
+    }
+
+    #[test]
+    fn the_display_card_draws_its_wiring_config_and_pages() {
+        // The display's own three sections and its page list run past a
+        // 40-row pane, so this one is drawn tall enough to hold the lot.
+        let f = opened(4, 120, 80);
+        for want in [
+            "WIRING",
+            "OLED 128x64 (SSD1306)",
+            "SDA/SCL Pins",
+            "GPIO 2 / 3",
+            "Address",
+            "Panel State",
+            "BEHAVIOR",
+            "Idle Behavior",
+            "Cycle Every",
+            "Pop-Up Hold",
+            "EDITING",
+            "Arm Before Editing",
+            "APPEARANCE",
+            "Brightness",
+            "Name Alignment",
+            "Value Alignment",
+            "DASHBOARD PAGES",
+            "Large value",
+            "Level bar",
+            "Add Page",
+        ] {
+            assert!(f.contains(want), "missing {want:?}:\n{f}");
+        }
     }
 
     #[test]
