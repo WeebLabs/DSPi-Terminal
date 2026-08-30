@@ -160,6 +160,34 @@ impl SettingsData {
         }
     }
 
+    /// Take on a re-read, leaving what it does not cover.
+    ///
+    /// A `None` field means that read stalled or was not asked for, which is
+    /// not evidence that the device lost the feature: keep what we had.
+    pub fn adopt(&mut self, r: Refresh) {
+        if r.uart.is_some() {
+            self.uart = r.uart;
+        }
+        if r.i2c.is_some() {
+            self.i2c = r.i2c;
+        }
+        if r.iface.is_some() {
+            self.iface = r.iface;
+        }
+        if r.spdif.is_some() {
+            self.spdif = r.spdif;
+        }
+        if r.claims.is_some() {
+            self.claims = r.claims;
+        }
+        if let Some(cs) = r.cs {
+            // The device's own unsaved flag, which is better evidence than the
+            // optimistic one a successful write sets.
+            self.cs_dirty = cs.status.dirty;
+            self.cs = Some(cs);
+        }
+    }
+
     /// 0 independent, 1 with preset. The Console's `presetOutputConfigMode`;
     /// 1 is the firmware's default, so an unread directory reads as 1.
     pub fn output_config_mode(&self) -> u8 {
@@ -213,6 +241,76 @@ impl SettingsData {
             .into_iter()
             .find(|c| c.gpio == gpio && c.owner != excluding)
             .map(|c| c.owner)
+    }
+}
+
+/// What a Settings write can change under the pages' feet.
+///
+/// `survey-firmware.md` 3.14 is explicit: "Binding-config changes do NOT push
+/// notifications; re-read after writing." The same holds for the pin and
+/// interface writes, which answer a `PIN_CONFIG_*` code and change who owns a
+/// GPIO. So every session request this screen makes carries a re-read of these
+/// fields on its way home, and [`SettingsData::adopt`] installs it before the
+/// page that asked hears the reply.
+///
+/// The preset directory and the ten slot names are deliberately absent: no
+/// Settings write touches them, and they cost eleven round trips.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Refresh {
+    pub uart: Option<UartCtrlConfig>,
+    pub i2c: Option<I2cCtrlConfig>,
+    pub iface: Option<CtrlIfaceStatus>,
+    pub spdif: Option<SpdifInputConfig>,
+    pub claims: Option<Vec<PinClaim>>,
+    pub cs: Option<cs_model::CsData>,
+}
+
+impl Refresh {
+    /// The pin map and the two interface configurations: what a hardware page's
+    /// own write can move. About four round trips.
+    pub fn hardware(session: &mut Session) -> Self {
+        use dspi_proto::generated::opcodes as op;
+        let get = |session: &mut Session, opcode: u8, len: u16| -> Option<Vec<u8>> {
+            session
+                .with_transport(|t| t.control_in(opcode, 0, len))
+                .ok()
+        };
+        Self {
+            uart: get(
+                session,
+                op::REQ_GET_UART_CONFIG,
+                UartCtrlConfig::SIZE as u16,
+            )
+            .and_then(|d| UartCtrlConfig::decode(&d).ok()),
+            i2c: get(session, op::REQ_GET_I2C_CONFIG, I2cCtrlConfig::SIZE as u16)
+                .and_then(|d| I2cCtrlConfig::decode(&d).ok()),
+            iface: get(
+                session,
+                op::REQ_GET_CTRL_IFACE_STATUS,
+                CtrlIfaceStatus::SIZE as u16,
+            )
+            .and_then(|d| CtrlIfaceStatus::decode(&d).ok()),
+            spdif: get(
+                session,
+                op::REQ_GET_SPDIF_INPUT_CONFIG,
+                SpdifInputConfig::SIZE as u16,
+            )
+            .and_then(|d| SpdifInputConfig::decode(&d).ok()),
+            claims: dspi_session::PinMap::build(session)
+                .ok()
+                .map(|m| m.claims().to_vec()),
+            cs: None,
+        }
+    }
+
+    /// The same, plus every control-surface record. A Control page's write
+    /// changes its own slot's health and the pin map together, and a pin a new
+    /// control just claimed must not be offered to the next one.
+    pub fn all(session: &mut Session) -> Self {
+        Self {
+            cs: cs_model::CsData::read(session),
+            ..Self::hardware(session)
+        }
     }
 }
 
@@ -1089,6 +1187,10 @@ pub struct SettingsScreen {
     /// Where the app-side settings go. `None` is the platform's own location;
     /// tests point it somewhere disposable so they never touch a real one.
     config_path: Option<std::path::PathBuf>,
+    /// Where a session request leaves the re-read it took on its way home. The
+    /// runner answers a request and then delivers the reply, so this is full
+    /// exactly once, in `session_result`, before the page that asked sees it.
+    refresh: std::rc::Rc<std::cell::RefCell<Option<Refresh>>>,
 }
 
 impl SettingsScreen {
@@ -1123,6 +1225,7 @@ impl SettingsScreen {
             pending: None,
             connected: true,
             config_path: None,
+            refresh: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
         s.select_row_for(state);
         s
@@ -1385,6 +1488,29 @@ impl SettingsScreen {
         };
     }
 
+    /// Wrap a page's session request so it re-reads the device before the
+    /// reply comes home.
+    ///
+    /// Nothing on the control-surface or hardware path pushes a notification
+    /// (`survey-firmware.md` 3.14), so a page that only ever hears "Applied"
+    /// keeps drawing the snapshot Settings opened with: a control that just
+    /// went live still reads Inactive, and a GPIO it just claimed is still
+    /// offered as free to the next one. The re-read happens inside the same
+    /// session call, so there is one round of transfers, not two.
+    fn with_refresh(&self, req: SessionRequest, control: bool) -> SessionRequest {
+        let slot = self.refresh.clone();
+        let inner = req.run.clone();
+        SessionRequest::new(req.tag, move |session| {
+            let reply = (inner)(session);
+            *slot.borrow_mut() = Some(if control {
+                Refresh::all(session)
+            } else {
+                Refresh::hardware(session)
+            });
+            reply
+        })
+    }
+
     fn absorb(&mut self, ev: PageEvent, state: &DeviceState) -> ScreenEvent {
         match ev {
             PageEvent::Handled => ScreenEvent::Handled,
@@ -1403,7 +1529,7 @@ impl SettingsScreen {
                 self.pending = Some(Pending::Page);
                 ScreenEvent::Popup(p)
             }
-            PageEvent::Session(r) => ScreenEvent::Session(r),
+            PageEvent::Session(r) => ScreenEvent::Session(self.with_refresh(r, true)),
             PageEvent::Config(c) => {
                 self.config = *c;
                 self.pages.graphing.adopt(self.config.clone());
@@ -1688,6 +1814,12 @@ impl Screen for SettingsScreen {
         if matches!(reply, SessionReply::Ok(_)) {
             self.data.cs_dirty = true;
         }
+        // The request re-read the device on its way home; take that on before
+        // the page draws or hears anything, so its slot health, its panel
+        // state and the pin claims are the device's and not the snapshot's.
+        if let Some(r) = self.refresh.borrow_mut().take() {
+            self.data.adopt(r);
+        }
         let ev = {
             let global_dirty = self.pages.global.dirty(state, &self.data);
             let cx = Cx {
@@ -1701,6 +1833,10 @@ impl Screen for SettingsScreen {
                 Page::Surfaces => self.pages.surfaces.session_result(tag, reply, &cx),
                 Page::Groups => self.pages.groups.session_result(tag, reply, &cx),
                 Page::Macros => self.pages.macros.session_result(tag, reply, &cx),
+                Page::Interfaces => self.pages.interfaces.session_result(tag, reply, &cx),
+                Page::Inputs => self.pages.inputs.session_result(tag, reply, &cx),
+                Page::Outputs => self.pages.outputs.session_result(tag, reply, &cx),
+                Page::I2s => self.pages.i2s.session_result(tag, reply, &cx),
                 _ => PageEvent::Handled,
             }
         };

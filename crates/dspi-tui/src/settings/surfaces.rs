@@ -203,9 +203,12 @@ impl SurfacesPage {
             self.names = cs.names.clone();
             self.ir_drafts = cs.ir.clone();
         }
-        // The display config and pages apply as they are edited, so the live
-        // copy is the draft: follow the device for them.
+        // Everything the device reports about itself rather than holds for us:
+        // slot health, the panel's own state, and the group and macro tables a
+        // target picker reads. `SettingsData` is re-read after every write on
+        // this page, so these follow the device rather than freezing at open.
         self.live.status = cs.status.clone();
+        self.live.ext = cs.ext.clone();
         self.live.display_status = cs.display_status.clone();
         self.live.groups = cs.groups.clone();
         self.live.macros = cs.macros.clone();
@@ -3173,6 +3176,86 @@ mod tests {
         assert_eq!(
             m::run(&mut session, move |s| s.write_binding(3, &b)),
             SessionReply::Err("A potentiometer needs an analogue-capable pin".into())
+        );
+    }
+
+    /// Nothing on the control-surface path pushes a notification
+    /// (`survey-firmware.md` 3.14), so an apply that only ever hears "Applied"
+    /// used to leave the card drawing the snapshot Settings opened with: a
+    /// control the device had just brought up still read **Not running**.
+    #[test]
+    fn a_card_follows_the_device_after_a_successful_apply() {
+        use dspi_proto::generated::opcodes as op;
+        use dspi_proto::packets::CsStatusPacket;
+        use dspi_transport::MockTransport;
+
+        let status = |active: u16| {
+            CsStatusPacket {
+                last_status: 0,
+                last_slot: 4,
+                max_bindings: 16,
+                dirty: true,
+                active_mask: active,
+                slot_status: vec![0; 16],
+                ir_active_mask: 0b0001,
+                ir_learn_state: 0,
+                ir_cmd_status: vec![0; 16],
+            }
+            .encode()
+        };
+
+        // The device is holding slot 4 but not running it.
+        let mut d = m::demo::settings_data();
+        d.cs.as_mut().expect("cs").status.active_mask = 0b0000_1111;
+        let (mut s, st) = screen(d);
+        s.pages.surfaces.expanded.insert(4);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("Not running:"), "the card starts inactive:\n{f}");
+
+        // Apply it. The device now reports it running; the page has no other
+        // way to hear that.
+        let mut caps = crate::shell::fixture::caps();
+        caps.cs = Some(m::demo::caps());
+        let wired = CsBinding {
+            component: m::ty::BUTTON,
+            gpio: [16, GPIO_UNUSED],
+            ..Default::default()
+        };
+        let t = MockTransport::new()
+            .data(op::REQ_SET_CS_BINDING, vec![])
+            .data(op::REQ_GET_CS_STATUS, status(0b0001_1111))
+            .data(op::REQ_GET_CS_BINDING, wired.encode().to_vec())
+            .window(
+                op::REQ_GET_ALL_PARAMS_CHUNK,
+                crate::shell::fixture::packet(),
+            );
+        let mut session = dspi_session::Session::new(Box::new(t), caps).expect("session");
+        assert!(s.data.claims.is_none(), "nothing has read the pin map yet");
+
+        let ev = s.pages.surfaces.apply(4);
+        let req = match s.absorb(ev, &st) {
+            ScreenEvent::Session(r) => r,
+            other => panic!("{other:?}"),
+        };
+        let reply = (req.run)(&mut session);
+        assert_eq!(reply, SessionReply::Ok("Applied".into()));
+        s.session_result(req.tag, reply, &st);
+
+        assert!(
+            s.data.cs.as_ref().expect("cs").status.is_slot_active(4),
+            "the re-read reached SettingsData"
+        );
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(!f.contains("Not running:"), "the card caught up:\n{f}");
+
+        // And the pin map came with it, so a GPIO this control now holds is
+        // not offered as free to the next one.
+        let claims = s.data.claims.as_ref().expect("the pin map was re-read");
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.gpio == 16 && c.owner.starts_with("Control Surface")),
+            "{claims:?}"
         );
     }
 

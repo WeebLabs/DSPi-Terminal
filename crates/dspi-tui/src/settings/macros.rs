@@ -976,6 +976,38 @@ mod tests {
         assert!(f.contains("Add Macro"), "{f}");
     }
 
+    /// Nothing pushes sequencer progress to the host, so the Running badge and
+    /// the slot health are only as fresh as the last read of the extended
+    /// status. They follow a re-read rather than freezing at the snapshot
+    /// Settings opened with.
+    #[test]
+    fn the_running_badge_and_the_health_follow_a_re_read() {
+        let (mut s, st) = screen(m::demo::settings_data());
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(!f.contains("Running"), "nothing is running yet:\n{f}");
+
+        let adopt = |s: &mut SettingsScreen, f: &dyn Fn(&mut CsData)| {
+            let mut fresh = m::demo::data();
+            f(&mut fresh);
+            s.data.adopt(super::super::Refresh {
+                cs: Some(fresh),
+                ..Default::default()
+            });
+        };
+
+        adopt(&mut s, &|cs| {
+            cs.ext.macro_running = 0;
+            cs.ext.macro_step = 1;
+        });
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("Running"), "the device says macro 1 fired:\n{f}");
+
+        adopt(&mut s, &|cs| cs.ext.macro_status[0] = 0x20);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(!f.contains("Running"), "it stopped:\n{f}");
+        assert!(f.contains("Not running:"), "and its health came too:\n{f}");
+    }
+
     #[test]
     fn expanding_a_macro_shows_its_ordered_steps() {
         let (mut s, st) = screen(m::demo::settings_data());
