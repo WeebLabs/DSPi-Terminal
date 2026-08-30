@@ -65,7 +65,8 @@ fn channels(state: &DeviceState) -> Vec<usize> {
         .collect()
 }
 
-/// The summary line for a channel (DESIGN 12.2).
+/// The summary line for a channel (DESIGN 12.2): what is set, and nothing
+/// that is not, so a cell does not spend its one line on `+0.0 dB`.
 fn summary(state: &DeviceState, channel: usize, flat: bool) -> String {
     let ni = state.caps.num_inputs as usize;
     let active = |p: &dspi_proto::value::EqParamPacket| p.filter_type != FilterType::Flat;
@@ -82,7 +83,7 @@ fn summary(state: &DeviceState, channel: usize, flat: bool) -> String {
             parts.push(format!("{peq} bands"));
         }
         let preamp = state.preamp_db(channel) as f64;
-        if !flat || preamp != 0.0 {
+        if preamp != 0.0 {
             parts.push(format!("preamp {}", db(preamp)));
         }
     } else {
@@ -113,7 +114,7 @@ fn summary(state: &DeviceState, channel: usize, flat: bool) -> String {
             }
         }
         let trim = out.gain_db as f64;
-        if !flat || trim != 0.0 {
+        if trim != 0.0 {
             parts.push(db(trim));
         }
     }
@@ -492,11 +493,52 @@ mod tests {
             "{cells:?}"
         );
         assert!(!cells[0].flat && cells[1].flat && !cells[2].flat);
-        assert_eq!(cells[0].summary, "5 bands · preamp +0.0 dB");
+        assert_eq!(cells[0].summary, "5 bands");
         assert_eq!(cells[1].summary, "no filters");
-        assert_eq!(cells[2].summary, "HP 80 Hz · +0.0 dB");
+        assert_eq!(cells[2].summary, "HP 80 Hz");
         assert_eq!(cells[3].summary, "no filters");
         assert_eq!(cells[4].summary, "LP 80 Hz · -3.0 dB");
+    }
+
+    #[test]
+    fn the_busy_fixture_fills_the_grid_and_draws_its_crossovers() {
+        let state = fixture::busy_state();
+        let cells = Overview::new(shared()).cells(&state);
+        let members: Vec<Vec<usize>> = cells.iter().map(|c| c.channels.clone()).collect();
+        assert_eq!(
+            members,
+            vec![
+                vec![0, 1],
+                vec![2],
+                vec![3],
+                vec![4, 5],
+                vec![6, 7],
+                vec![8, 9],
+                vec![10, 11],
+                vec![13, 14, 15],
+                vec![16],
+            ],
+            "OUT 5 is off and every tuning is its own cell: {members:?}"
+        );
+        let summaries: Vec<&str> = cells.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            vec![
+                "5 bands · preamp -5.3 dB",
+                "3 bands · preamp -5.3 dB",
+                "2 bands · preamp -5.3 dB",
+                "4 bands · preamp -5.3 dB",
+                "no filters · preamp -5.3 dB",
+                "HP 80 Hz LR4 · 2 bands",
+                "HP 100 Hz BW2 · -2.0 dB",
+                "no filters",
+                "LP 80 Hz LR4 · -3.0 dB · 2.5 ms",
+            ]
+        );
+        // A crossover-typed band shapes the curve, so none of those cells
+        // is flat.
+        assert!(!cells[5].flat && !cells[6].flat && !cells[8].flat);
+        assert!(cells[4].flat && cells[7].flat);
     }
 
     #[test]
@@ -541,7 +583,7 @@ mod tests {
         assert!(f.contains("╭ FC LFE BL BR SL SR "), "{f}");
         assert!(f.contains("╭ OUT L OUT R "), "{f}");
         assert!(f.contains("╭ Sub "), "{f}");
-        assert!(f.contains("5 bands · preamp +0.0 dB"), "{f}");
+        assert!(f.contains("5 bands"), "{f}");
         assert!(f.contains("flat"), "{f}");
         assert!(f.contains("LP 80 Hz · -3.0 dB"), "{f}");
         // Three columns of nine-row cells: the second row of cells starts on

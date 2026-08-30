@@ -277,9 +277,11 @@ paints no backgrounds, but the palette is not re-tuned for it.
 - **Section headers** are the Console's uppercase labels (`INPUTS`,
   `OUTPUTS`, `PARAMETERS`, `OUTPUT PAIRS`) in `dim`, as a row of their
   own, preceded by a blank row except at the top of a box.
-- **Panel titles** are the Console's window titles in bold `fg`, with the
-  subtitle after a `·` in `dim`: `Crossfeed · BS2B Bauer
-  Stereophonic-to-Binaural`.
+- **Panel titles** are the Console's window titles, said once, on the
+  pane border; the header row inside carries only the subtitle in `dim`
+  (`BS2B Bauer Stereophonic-to-Binaural`) and the master switch. Nothing
+  is titled twice: the graph pane names the selected channel and the rule
+  beneath it carries no text.
 - **Captions** under parameters are the Console's, in `dim`, wrapped to the
   box width, at most two lines.
 - **Numbers** carry their unit with a space: `2856 Hz`, `-8.6 dB`, `31%`.
@@ -928,9 +930,14 @@ All five steps landed on 2026-08-30.
   border chrome; the focused cell draws all three in its first channel's
   hue. The plot keeps the main graph's window and zoom, which the runner
   mirrors into the shared state each frame.
-- **A flat cell says `no filters`** and adds the preamp or trim only when
-  it is not zero; an output with both a crossover and PEQ bands lists the
-  crossover, then `N bands`, then the trim.
+- **A cell's line names what is set and nothing else**: `no filters` for
+  a flat cell; the preamp, the trim and the delay only when they are not
+  zero; an output with both a crossover and PEQ bands lists the crossover,
+  then `N bands`, then the trim.
+- **Crossover-typed bands (LR, BW, Bessel) had no response** in
+  `dsp::response_at`, which treated them as passthrough, so the main
+  graph never drew an output's crossover; found by the busy fixture. They
+  now cascade `xover::sections`.
 - **The pop-out pins to the channel it opened on** when Graphing says it
   does not follow the selection; the Console's setting kept its meaning
   without the visibility maps.

@@ -243,14 +243,26 @@ fn magnitude_squared(c: &Coeffs, freq: f64) -> f64 {
     (num_r * num_r + num_i * num_i) / den
 }
 
+/// The biquads one band contributes: a single section for a PEQ type, the
+/// Butterworth cascade for a crossover type (`xover.rs`), nothing when the
+/// band is off or bypassed.
+fn sections_of(b: &Band) -> Vec<Coeffs> {
+    if b.bypass || matches!(b.filter_type, FilterType::Flat) {
+        Vec::new()
+    } else if b.filter_type.is_crossover() {
+        crate::xover::sections(b.filter_type.to_raw(), b.freq)
+    } else {
+        vec![coefficients(b)]
+    }
+}
+
 /// Combined response of a cascade at one frequency, in dB.
 pub fn response_at(freq: f64, bands: &[Band]) -> f64 {
     let mut power = 1.0f64;
     for b in bands {
-        if b.bypass || matches!(b.filter_type, FilterType::Flat) {
-            continue;
+        for c in sections_of(b) {
+            power *= magnitude_squared(&c, freq);
         }
-        power *= magnitude_squared(&coefficients(b), freq);
     }
     if power <= 0.0 {
         -200.0
@@ -754,10 +766,9 @@ fn phase_of(c: &Coeffs, freq: f64) -> f64 {
 pub fn phase_at(freq: f64, bands: &[Band]) -> f64 {
     let mut radians = 0.0;
     for b in bands {
-        if b.bypass || matches!(b.filter_type, FilterType::Flat) {
-            continue;
+        for c in sections_of(b) {
+            radians += phase_of(&c, freq);
         }
-        radians += phase_of(&coefficients(b), freq);
     }
     let deg = radians.to_degrees();
     // Wrap into +/-180 so the plot does not run off its axis.
@@ -794,6 +805,31 @@ pub fn unwrap_phase(wrapped: &[f64]) -> Vec<f64> {
         out.push(p + offset);
     }
     out
+}
+
+#[cfg(test)]
+mod crossover_band_tests {
+    use super::*;
+
+    #[test]
+    fn a_crossover_typed_band_shapes_the_curve() {
+        // LR4 high pass (raw 35) at 80 Hz: -6 dB at the corner, flat above,
+        // falling 24 dB per octave below.
+        let b = Band {
+            filter_type: FilterType::from_raw(35),
+            freq: 80.0,
+            q: 0.707,
+            gain_db: 0.0,
+            bypass: false,
+        };
+        assert!((response_at(80.0, &[b]) + 6.0).abs() < 0.3);
+        assert!(response_at(2000.0, &[b]).abs() < 0.1);
+        let octave = response_at(40.0, &[b]) - response_at(20.0, &[b]);
+        assert!((octave - 24.0).abs() < 1.5, "{octave}");
+        assert!(phase_at(80.0, &[b]).abs() > 1.0, "the phase moves too");
+        let off = Band { bypass: true, ..b };
+        assert_eq!(response_at(40.0, &[off]), 0.0);
+    }
 }
 
 #[cfg(test)]

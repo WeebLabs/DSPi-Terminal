@@ -265,8 +265,8 @@ impl Screen for LevellerPanel {
     ) {
         let rows = self.rows(state, theme);
         self.body.clamp(&rows);
-        let header = Header::new("Volume Leveller", "Upward Dynamic Range Compression")
-            .toggle(state.leveller().enabled);
+        let header =
+            Header::new("Upward Dynamic Range Compression").toggle(state.leveller().enabled);
         self.body.draw(area, buf, theme, &header, &rows, focused);
     }
 
@@ -338,10 +338,7 @@ mod tests {
     fn the_panel_has_no_graph_and_carries_every_control() {
         let (mut p, state) = panel();
         let f = testing::draw(&mut p, &state, 100, 40);
-        assert!(
-            f.contains("Volume Leveller · Upward Dynamic Range Compression"),
-            "{f}"
-        );
+        assert!(f.contains("Upward Dynamic Range Compression"), "{f}");
         assert!(
             !f.contains("Disabled"),
             "the Console has no graph here: {f}"

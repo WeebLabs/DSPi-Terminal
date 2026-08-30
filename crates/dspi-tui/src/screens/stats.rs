@@ -728,7 +728,7 @@ impl Screen for StatsPanel {
         }
         let stats = self.shared.borrow().stats.clone();
         let rows = self.rows(state, &stats);
-        let header = Header::new("System Statistics", FOOTER);
+        let header = Header::new(FOOTER);
         panel::draw_header(area, buf, theme, &header, false);
         if area.height < 2 {
             return;

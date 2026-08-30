@@ -3,7 +3,8 @@
 //!   gallery [width] [height] [calm|console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
-//!                     |autoeq] [--settings <page>] [--expand n] [--depth truecolor|256|16|mono] [--ansi]
+//!                     |autoeq] [--settings <page>] [--expand n] [--busy]
+//!           [--depth truecolor|256|16|mono] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
 //! can be looked at by piping to a terminal. `--screen` picks what fills the
@@ -12,7 +13,9 @@
 //! opens Settings on one of its pages, as `,` does: about, advanced, graphing,
 //! overview, inputs, outputs, i2s, global, surfaces, interfaces, groups,
 //! macros. `--expand n` opens the nth card on one of the three Control pages,
-//! whose bodies are otherwise behind a collapsed header.
+//! whose bodies are otherwise behind a collapsed header. `--busy` swaps in
+//! the fixture with every channel tuned, which is what the overview grid
+//! is for.
 
 use dspi_tui::screens::{
     AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
@@ -26,6 +29,7 @@ use dspi_tui::theme::{ColorDepth, Glyphs, Palette, Theme};
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let ansi = raw.iter().any(|a| a == "--ansi");
+    let busy = raw.iter().any(|a| a == "--busy");
     let screen = raw
         .iter()
         .position(|a| a == "--screen")
@@ -49,7 +53,7 @@ fn main() {
     let mut args: Vec<&String> = Vec::new();
     let mut skip = false;
     for a in &raw {
-        if std::mem::take(&mut skip) || a == "--ansi" {
+        if std::mem::take(&mut skip) || a == "--ansi" || a == "--busy" {
             continue;
         }
         if a == "--screen" || a == "--settings" || a == "--expand" {
@@ -99,7 +103,11 @@ fn main() {
             .map(|(_, o, _)| *o)
             .expect("section")
     };
-    let mut state = fixture::state();
+    let mut state = if busy {
+        fixture::busy_state()
+    } else {
+        fixture::state()
+    };
     for name in ["psychoacoustic_bass", "upmixer", "test_signals"] {
         state.caps.features.push(dspi_session::probe::Feature {
             name: name.into(),

@@ -286,8 +286,8 @@ impl Screen for CrossfeedPanel {
     ) {
         let rows = self.rows(state, theme);
         self.body.clamp(&rows);
-        let header = Header::new("Crossfeed", "BS2B Bauer Stereophonic-to-Binaural")
-            .toggle(state.crossfeed().enabled);
+        let header =
+            Header::new("BS2B Bauer Stereophonic-to-Binaural").toggle(state.crossfeed().enabled);
         self.body.draw(area, buf, theme, &header, &rows, focused);
     }
 
@@ -358,10 +358,7 @@ mod tests {
     fn the_panel_carries_every_section_the_console_has() {
         let (mut p, state) = panel();
         let f = testing::draw(&mut p, &state, 100, 40);
-        assert!(
-            f.contains("Crossfeed · BS2B Bauer Stereophonic-to-Binaural"),
-            "{f}"
-        );
+        assert!(f.contains("BS2B Bauer Stereophonic-to-Binaural"), "{f}");
         assert!(f.contains("● On"), "the master toggle: {f}");
         assert!(f.contains("FREQUENCY RESPONSE"), "{f}");
         assert!(f.contains("OUTPUT PAIRS") && f.contains("Presets ▾"), "{f}");

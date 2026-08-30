@@ -205,6 +205,96 @@ pub fn packet() -> Vec<u8> {
     b
 }
 
+/// The same device with every channel tuned differently, for a review of
+/// the overview grid: FL/FR share the headphone tuning, FC, LFE and the
+/// BL/BR pair have their own, SL/SR are flat; OUT L/R carry an LR4 high
+/// pass and two bands, OUT 3/4 a Butterworth high pass at -2 dB, OUT 5 is
+/// off, OUT 6 to 8 are flat, the sub keeps its low pass with 2.5 ms of
+/// delay.
+pub fn busy_packet() -> Vec<u8> {
+    let mut b = packet();
+    let eq = section("eq");
+    let band = |b: &mut Vec<u8>, off: usize, t: FilterType, f: f32, q: f32, g: f32| {
+        b[off] = t.to_raw();
+        b[off + 4..off + 8].copy_from_slice(&f.to_le_bytes());
+        b[off + 8..off + 12].copy_from_slice(&q.to_le_bytes());
+        b[off + 12..off + 16].copy_from_slice(&g.to_le_bytes());
+    };
+    let peq = |b: &mut Vec<u8>, ch: usize, bands: &[(FilterType, f32, f32, f32)]| {
+        for (i, (t, f, q, g)) in bands.iter().enumerate() {
+            band(b, eq + (ch * 12 + i) * 16, *t, *f, *q, *g);
+        }
+    };
+    use FilterType::{HighShelf, LowShelf, Notch, Peaking};
+    peq(
+        &mut b,
+        2,
+        &[
+            (HighShelf, 3200.0, 0.707, -3.0),
+            (Peaking, 250.0, 1.2, 2.5),
+            (Notch, 60.0, 8.0, 0.0),
+        ],
+    );
+    peq(
+        &mut b,
+        3,
+        &[(LowShelf, 60.0, 0.707, 6.0), (Peaking, 45.0, 2.0, -4.0)],
+    );
+    for ch in [4, 5] {
+        peq(
+            &mut b,
+            ch,
+            &[
+                (Peaking, 120.0, 1.0, -2.0),
+                (Peaking, 900.0, 2.5, 1.5),
+                (Peaking, 4500.0, 3.0, -3.5),
+                (HighShelf, 10000.0, 0.707, 2.0),
+            ],
+        );
+    }
+    for ch in [8, 9] {
+        peq(
+            &mut b,
+            ch,
+            &[(Peaking, 180.0, 1.4, -1.5), (Peaking, 2200.0, 2.0, 1.0)],
+        );
+    }
+    let xo = section("crossovers");
+    // LR4 high pass (raw 35) on OUT L/R, BW2 high pass (raw 43) on OUT 3/4,
+    // LR4 low pass (raw 34) on the sub.
+    for (ch, raw, f) in [
+        (8usize, 35u8, 80.0f32),
+        (9, 35, 80.0),
+        (10, 43, 100.0),
+        (11, 43, 100.0),
+        (16, 34, 80.0),
+    ] {
+        let off = xo + ch * 4 * 16;
+        b[off] = raw;
+        b[off + 4..off + 8].copy_from_slice(&f.to_le_bytes());
+        b[off + 8..off + 12].copy_from_slice(&0.707f32.to_le_bytes());
+    }
+    let outs = section("outputs");
+    for o in [2, 3] {
+        b[outs + o * 12 + 4..outs + o * 12 + 8].copy_from_slice(&(-2.0f32).to_le_bytes());
+    }
+    b[outs + 4 * 12] = 0;
+    b[outs + 8 * 12 + 8..outs + 8 * 12 + 12].copy_from_slice(&2.5f32.to_le_bytes());
+    let pre = section("preamp");
+    for i in 0..8 {
+        b[pre + i * 4..pre + i * 4 + 4].copy_from_slice(&(-5.3f32).to_le_bytes());
+    }
+    b
+}
+
+/// [`busy_packet`] as a device state.
+pub fn busy_state() -> DeviceState {
+    DeviceState::new(
+        caps(),
+        BulkPacket::decode(busy_packet()).expect("fixture packet"),
+    )
+}
+
 pub fn caps() -> Capabilities {
     Capabilities {
         serial: "E6614C311B8B4E3A".into(),

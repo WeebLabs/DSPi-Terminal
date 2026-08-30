@@ -682,7 +682,8 @@ pub fn dispatch(body: &mut Body, rows: &[Row], key: KeyEvent) -> Step {
 /// A panel's fixed header: the Console's window title, its subtitle and the
 /// master toggle.
 pub struct Header<'a> {
-    pub title: &'a str,
+    /// The Console's window subtitle. The panel's name is on the pane
+    /// border already, so the header does not say it again.
     pub subtitle: &'a str,
     /// `None` for a panel with no master switch.
     pub toggle: Option<bool>,
@@ -693,9 +694,8 @@ pub struct Header<'a> {
 }
 
 impl<'a> Header<'a> {
-    pub fn new(title: &'a str, subtitle: &'a str) -> Self {
+    pub fn new(subtitle: &'a str) -> Self {
         Self {
-            title,
             subtitle,
             toggle: None,
             enabled: true,
@@ -730,25 +730,24 @@ pub fn draw_header(area: Rect, buf: &mut Buffer, theme: &Theme, h: &Header<'_>, 
             .as_ref()
             .map(|(t, _)| t.chars().count() + 2)
             .unwrap_or(0);
-    let title = format!("{} · {}", h.title, h.subtitle);
-    let title = truncate(&title, (area.width as usize).saturating_sub(reserve + 1));
+    let title = truncate(
+        h.subtitle,
+        (area.width as usize).saturating_sub(reserve + 1),
+    );
     buf.set_string(
         area.x,
         area.y,
         if focused { "▸" } else { " " },
         theme.focused(),
     );
-    // The title is the panel's name; the subtitle after it is chrome.
-    let head = h.title.chars().count().min(title.chars().count());
-    buf.set_string(area.x + 1, area.y, &title, theme.label());
     buf.set_string(
         area.x + 1,
         area.y,
-        title.chars().take(head).collect::<String>(),
+        &title,
         if focused {
             theme.focused()
         } else {
-            theme.title()
+            theme.label()
         },
     );
     if h.toggle.is_some() {

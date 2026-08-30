@@ -85,7 +85,7 @@ impl Screen for MonitorPanel {
             return;
         }
         let (word, tone, count) = self.status();
-        let header = Header::new("Interrupt Monitor", &count).pill(word, tone);
+        let header = Header::new(&count).pill(word, tone);
         panel::draw_header(area, buf, theme, &header, false);
         if area.height < 3 {
             return;
@@ -248,7 +248,7 @@ mod tests {
     fn the_log_is_a_table_of_decoded_events() {
         let (mut p, state, _) = panel();
         let f = testing::draw(&mut p, &state, 120, 20);
-        assert!(f.contains("Interrupt Monitor"), "{f}");
+        assert!(!f.contains("Interrupt Monitor"), "the pane names it: {f}");
         assert!(f.contains("TIME") && f.contains("SEQ"), "the header: {f}");
         assert!(f.contains("FIELD") && f.contains("VALUE"), "{f}");
         assert!(f.contains("param_changed"), "{f}");

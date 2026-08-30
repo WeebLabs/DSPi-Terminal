@@ -278,7 +278,7 @@ impl Screen for AutoEqPanel {
             area.x + 1,
             area.y,
             truncate(
-                &format!("AutoEQ · Browse Profiles · {count} profiles, {origin}"),
+                &format!("Browse Profiles · {count} profiles, {origin}"),
                 area.width.saturating_sub(2) as usize,
             ),
             theme.title(),

@@ -809,6 +809,25 @@ impl Shell {
     }
 
     fn block(&self, title: &str, focused: bool, t: &Theme) -> Block<'static> {
+        let mut b = self.block_titled(ratatui::text::Line::default(), focused, t);
+        if !title.is_empty() {
+            b = b.title(format!(" {title} ")).title_style(if focused {
+                t.focused()
+            } else {
+                t.section()
+            });
+        }
+        b
+    }
+
+    /// A pane border with a title that carries its own styling, for the
+    /// graph's `Filter Response · FL` with the name in the channel's hue.
+    fn block_titled(
+        &self,
+        title: ratatui::text::Line<'static>,
+        focused: bool,
+        t: &Theme,
+    ) -> Block<'static> {
         let style = if focused {
             Style::default().fg(t.accent)
         } else {
@@ -822,12 +841,8 @@ impl Shell {
                 BorderType::Rounded
             })
             .border_style(style);
-        if !title.is_empty() {
-            b = b.title(format!(" {title} ")).title_style(if focused {
-                t.focused()
-            } else {
-                t.section()
-            });
+        if !title.spans.is_empty() {
+            b = b.title(title);
         }
         b
     }
@@ -875,18 +890,36 @@ impl Shell {
             return;
         }
 
-        // The graph names its channel in the title, DESIGN 12.2. Without a
-        // graph the pane is the detail's alone and takes its title.
-        let title = if self.graph_popout || r.graph.height > 0 {
-            match &self.model.graph_channel {
-                Some(name) => format!("Filter Response · {name}"),
-                None => "Filter Response".to_string(),
-            }
+        // The graph names its channel in the title, DESIGN 12.2, the name in
+        // the channel's hue. Without a graph the pane is the detail's alone
+        // and takes its title.
+        let graph_shown = self.graph_popout || r.graph.height > 0;
+        let title = if graph_shown {
+            "Filter Response".to_string()
         } else {
             self.detail.title()
         };
         let focused = screen_focused;
-        let mut block = self.block(&title, focused, t);
+        let mut block = match &self.model.graph_channel {
+            Some(name) if graph_shown => {
+                let hue = self.model.selected_item().map(|c| c.color).unwrap_or(t.fg);
+                self.block_titled(
+                    ratatui::text::Line::from(vec![
+                        ratatui::text::Span::styled(
+                            format!(" {title} · "),
+                            if focused { t.focused() } else { t.section() },
+                        ),
+                        ratatui::text::Span::styled(
+                            format!("{name} "),
+                            Style::default().fg(hue).add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    focused,
+                    t,
+                )
+            }
+            _ => self.block(&title, focused, t),
+        };
         if self.graph_popout || r.graph.height > 0 {
             // The Console's pop-out button; `g` here.
             block = block.title_top(
@@ -912,17 +945,10 @@ impl Shell {
             self.draw_graph(r.graph, buf, t);
         }
         let detail_focused = screen_focused;
-        let title = self.detail.title();
         let mut detail = r.detail;
         if r.graph.height > 0 && detail.height > 1 {
-            // Title row for the detail region, in the selected channel's
-            // colour when a channel is selected.
-            let color = self.model.selected_item().map(|c| c.color).unwrap_or(t.fg);
-            let dot = if t.glyphs == Glyphs::Ascii {
-                "*"
-            } else {
-                "●"
-            };
+            // A rule between the graph and the detail. The pane title names
+            // the channel already, so the rule carries no text.
             let divider = if t.glyphs == Glyphs::Ascii {
                 "-"
             } else {
@@ -933,13 +959,6 @@ impl Shell {
                 detail.y,
                 divider.repeat(detail.width as usize),
                 t.chrome_style(),
-            );
-            let text = format!(" {dot} {title} ");
-            buf.set_string(
-                detail.x + 1,
-                detail.y,
-                &text,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
             );
             detail = Rect::new(detail.x, detail.y + 1, detail.width, detail.height - 1);
         }
@@ -1132,7 +1151,10 @@ mod tests {
             lines[1]
         );
         assert!(!f.contains("● IN1"), "no legend pills: {f}");
-        assert!(f.contains("● FL"), "detail title in the selected channel");
+        assert!(
+            !f.contains("● FL"),
+            "the name is said once, in the title: {f}"
+        );
         assert!(f.contains("Preset ‹3: Living"), "{f}");
         assert!(f.contains("Volume User"), "{f}");
         assert!(f.contains("C0"), "{f}");

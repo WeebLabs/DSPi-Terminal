@@ -224,8 +224,8 @@ impl Screen for LoudnessPanel {
     ) {
         let rows = self.rows(state, theme);
         self.body.clamp(&rows);
-        let header = Header::new("Loudness Compensation", "ISO 226:2003 Fletcher-Munson")
-            .toggle(state.global().loudness_enabled);
+        let header =
+            Header::new("ISO 226:2003 Fletcher-Munson").toggle(state.global().loudness_enabled);
         self.body.draw(area, buf, theme, &header, &rows, focused);
     }
 
@@ -301,10 +301,7 @@ mod tests {
     fn the_panel_carries_the_consoles_sections_and_captions() {
         let (mut p, state) = panel();
         let f = testing::draw(&mut p, &state, 100, 40);
-        assert!(
-            f.contains("Loudness Compensation · ISO 226:2003 Fletcher-Munson"),
-            "{f}"
-        );
+        assert!(f.contains("ISO 226:2003 Fletcher-Munson"), "{f}");
         assert!(f.contains("COMPENSATION CURVE"), "{f}");
         assert!(f.contains("Curve at -40dB"), "the Console's badge: {f}");
         assert!(f.contains("OUTPUTS") && f.contains("Presets ▾"), "{f}");

@@ -963,8 +963,7 @@ impl Screen for SignalsPanel {
         let rows = self.rows(state, theme);
         self.body.clamp(&rows);
         let (_, label, tone) = Self::run_state(state);
-        let header =
-            Header::new("Test Signals", "Onboard measurement signal generator").pill(label, tone);
+        let header = Header::new("Onboard measurement signal generator").pill(label, tone);
         self.body.draw(area, buf, theme, &header, &rows, focused);
     }
 
@@ -1043,10 +1042,7 @@ mod tests {
     fn the_panel_carries_the_grid_and_every_section() {
         let (mut p, state) = panel();
         let f = testing::draw(&mut p, &state, 100, 60);
-        assert!(
-            f.contains("Test Signals · Onboard measurement signal generator"),
-            "{f}"
-        );
+        assert!(f.contains("Onboard measurement signal generator"), "{f}");
         assert!(f.contains("Idle"), "the state pill: {f}");
         assert!(f.contains("SIGNAL"), "{f}");
         for tile in ["Sine", "Pink", "Log Swp", "2-Tone", "Chan ID"] {

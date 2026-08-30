@@ -370,7 +370,7 @@ impl Screen for UpmixerPanel {
     ) {
         let rows = self.rows(state, theme);
         self.body.clamp(&rows);
-        let header = Header::new("Stereo Upmixer", "Derive Centre and Surround from stereo")
+        let header = Header::new("Derive Centre and Surround from stereo")
             .toggle(state.upmix().enabled)
             .enabled(Self::supported(state));
         self.body.draw(area, buf, theme, &header, &rows, focused);
@@ -441,10 +441,7 @@ mod tests {
     fn the_panel_carries_the_status_engines_and_both_parameter_blocks() {
         let (mut p, state) = panel();
         let f = testing::draw(&mut p, &state, 100, 60);
-        assert!(
-            f.contains("Stereo Upmixer · Derive Centre and Surround from stereo"),
-            "{f}"
-        );
+        assert!(f.contains("Derive Centre and Surround from stereo"), "{f}");
         assert!(f.contains("STATUS"), "{f}");
         assert!(f.contains("ENGINES"), "{f}");
         assert!(f.contains("Sinner") && f.contains("Logician"), "{f}");

@@ -584,7 +584,11 @@ pub(crate) mod tests {
             assert!(f.contains("Preamp"), "{w}x{h}: {f}");
             assert!(f.contains("Clear PEQ"), "{w}x{h}: {f}");
             assert!(f.contains("TYPE"), "{w}x{h}: {f}");
-            assert!(f.contains("● FL"), "the title row names the channel: {f}");
+            assert!(
+                f.contains("Filter Response · FL"),
+                "the pane title names the channel, once: {f}"
+            );
+            assert!(!f.contains("● FL"), "{f}");
         }
         // The wider frame has room for the type names in full, and for the
         // whole key line.

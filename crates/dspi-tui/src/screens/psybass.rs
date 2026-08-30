@@ -305,12 +305,9 @@ impl Screen for PsybassPanel {
     ) {
         let rows = self.rows(state, theme);
         self.body.clamp(&rows);
-        let header = Header::new(
-            "Psychoacoustic Bass",
-            "Phantom fundamental bass enhancement",
-        )
-        .toggle(state.psybass().enabled)
-        .enabled(Self::supported(state));
+        let header = Header::new("Phantom fundamental bass enhancement")
+            .toggle(state.psybass().enabled)
+            .enabled(Self::supported(state));
         self.body.draw(area, buf, theme, &header, &rows, focused);
     }
 
@@ -401,10 +398,7 @@ mod tests {
     fn the_panel_carries_the_consoles_sections_and_the_end_labels() {
         let (mut p, state) = panel();
         let f = testing::draw(&mut p, &state, 100, 44);
-        assert!(
-            f.contains("Psychoacoustic Bass · Phantom fundamental bass enhancement"),
-            "{f}"
-        );
+        assert!(f.contains("Phantom fundamental bass enhancement"), "{f}");
         assert!(f.contains("SPECTRUM"), "{f}");
         assert!(f.contains("fc") && f.contains("4fc"), "the marks: {f}");
         assert!(
