@@ -265,13 +265,19 @@ pub fn parse(text: &str) -> Result<FilterFile, FilterFileError> {
 }
 
 /// `Input 3: USB 4` or `Output 0: SPDIF 1 L (Enabled)` or a bare legacy name.
+///
+/// The index is only read from this app's own shape: `Input`/`Output`, a
+/// number, then a colon. Without the colon the header is a name, and reading a
+/// number out of one would place `[SPDIF 1 L]` on input 1 and `[Input 5]` (the
+/// Windows spelling, which counts from one) a channel off.
 fn parse_header(inner: &str) -> ChannelBank {
     let lower = inner.to_ascii_lowercase();
     let is_output = lower.starts_with("output");
 
     let index = inner
-        .split(':')
-        .next()
+        .split_once(':')
+        .map(|(head, _)| head)
+        .filter(|_| is_output || lower.starts_with("input"))
         .and_then(|head| head.split_whitespace().nth(1))
         .and_then(|n| n.parse::<u8>().ok());
 
