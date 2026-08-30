@@ -744,7 +744,7 @@ impl Shell {
             self.draw_title(regions.title, buf, &t);
             self.draw_sidebar(&regions, buf, &t);
             self.draw_pane(&regions, buf, &t, state);
-            self.draw_echo(regions.echo, buf, &t);
+            self.draw_echo(regions.echo, buf, &t, state);
         }
         self.draw_keys(regions.keys, buf, &t);
 
@@ -1042,7 +1042,43 @@ impl Shell {
         }
     }
 
-    fn draw_echo(&self, area: Rect, buf: &mut Buffer, t: &Theme) {
+    fn draw_echo(&mut self, area: Rect, buf: &mut Buffer, t: &Theme, state: &DeviceState) {
+        // The focused screen's actions sit on the right, the Console's
+        // footer strip; the echo text keeps whatever is left.
+        let actions = if self.focus == Focus::Screen {
+            let (s, _) = self.top();
+            s.actions(state)
+        } else {
+            Vec::new()
+        };
+        let strip_w: u16 = actions
+            .iter()
+            .map(|(l, _)| {
+                if l == "|" {
+                    1
+                } else {
+                    l.chars().count() as u16 + 2
+                }
+            })
+            .sum();
+        if strip_w > 0 && area.width > strip_w + 12 {
+            let mut x = area.x + area.width - strip_w - 1;
+            for (label, enabled) in &actions {
+                if label == "|" {
+                    buf.set_string(x, area.y, "│", t.chrome_style());
+                    x += 1;
+                } else {
+                    let text = format!(" {label} ");
+                    buf.set_string(
+                        x,
+                        area.y,
+                        &text,
+                        if *enabled { t.value() } else { t.label() },
+                    );
+                    x += text.chars().count() as u16;
+                }
+            }
+        }
         let text = match &self.model.status {
             Some(s) => s.clone(),
             None => self.model.echo.clone(),
@@ -1052,12 +1088,9 @@ impl Shell {
         } else {
             t.label()
         };
-        buf.set_string(
-            area.x + 1,
-            area.y,
-            truncate(&text, area.width as usize - 2),
-            style,
-        );
+        let room = (area.width as usize)
+            .saturating_sub(2 + if strip_w > 0 { strip_w as usize + 2 } else { 0 });
+        buf.set_string(area.x + 1, area.y, truncate(&text, room), style);
     }
 
     fn draw_keys(&mut self, area: Rect, buf: &mut Buffer, t: &Theme) {

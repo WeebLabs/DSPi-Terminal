@@ -741,3 +741,29 @@ Recorded as they were taken, so the document stays the spec.
   (`showDelay: false`), which section 7.3 had wrong. The Console's exact
   type-menu labels (`Low Shelf 12 dB/oct`) are the ones to use in the
   filter list's TYPE column, not an abbreviation.
+- **Sidebar meters are 8 cells at the reference width**, not the 10 in
+  6.9 and 7.1: a 24-column sidebar holds a 9-column name, an 8-cell meter,
+  the clip cell and a 4-column pill, and the name matters more than two
+  cells of meter. At Roomy and Wide the meter widens with the sidebar.
+- **Every write is followed by one chunked bulk read** (6 transfers, about
+  20 ms) rather than a local patch, because the registry does not carry
+  bulk offsets and a stale shadow is worse than a short wait. The
+  notification path patches locally; the write path re-reads.
+- **Our own writes are recognised by source, not sequence.** The firmware
+  tags a host's write `HOST_SET`; two hosts writing at once (the Console
+  open beside this) are told apart only by which one wrote last, and that
+  case is rare enough on an exclusive interface that sequence bookkeeping
+  is not worth its complexity.
+- **Configuration import shows no progress dialog.** The apply is a
+  synchronous sequence of control transfers on the same thread that draws,
+  so there is no frame in which a bar could move; the options prompt goes
+  straight to the report.
+- **Remote changes print on the echo line**, in the wording of section 9,
+  and a value that changes remotely eases only where it has a slider on
+  screen (the volume row); the label flash is not implemented.
+- **The echo line's right side** carries the focused screen's actions
+  (`Enable All │ Bypass All   Clear All   PEQ │ XO` on the filter list),
+  dimmed when they would be a no-op, which is the Console's footer strip.
+- **The graph pane is titled `Filter Response`** with `⤢ g` at its right
+  as the pop-out affordance; the graph and the detail share one box with a
+  rule between them rather than two boxes, which saves two rows at 80x24.

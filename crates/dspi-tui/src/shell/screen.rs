@@ -100,6 +100,13 @@ pub trait Screen {
     /// Keys for the key line and the help overlay.
     fn keys(&self) -> &'static [KeyHelp];
 
+    /// Contextual actions for the right side of the echo line, as the
+    /// Console's filter-list footer offers them: `(label, enabled)`. A label
+    /// of `|` draws a divider.
+    fn actions(&self, _state: &DeviceState) -> Vec<(String, bool)> {
+        Vec::new()
+    }
+
     /// A popup this screen opened has closed with a choice (or none).
     fn popup_result(&mut self, _choice: Option<usize>, _state: &DeviceState) -> ScreenEvent {
         ScreenEvent::Handled
