@@ -286,6 +286,19 @@ pub enum Row {
 /// brackets, and a space. Eight is the longest name in the signal catalogue.
 const TILE_WIDTH: u16 = 11;
 
+/// The column a one-line radio row's detail starts in, measured from the end
+/// of its disc. `DESIGN.md` 7.8 aligns `Jan Meier` and the three shorter names
+/// on the same edge, and `Jan Meier` is the longest of them.
+const RADIO_LABEL_W: usize = 12;
+
+/// Whether a radio row's detail fits beside its label rather than under it.
+///
+/// Measured against the widest disc, `(*)` in ASCII, so the answer does not
+/// change with the glyph set: `height` has no theme to ask.
+fn radio_on_one_line(width: u16, detail: &str) -> bool {
+    2 + 3 + RADIO_LABEL_W + detail.chars().count() <= width as usize
+}
+
 impl Row {
     /// Can the keyboard land here?
     pub fn focusable(&self) -> bool {
@@ -324,7 +337,13 @@ impl Row {
             }
             Row::Toggle { caption: c, .. } => 1 + if width < 40 { 0 } else { caption(c) },
             Row::Segmented { .. } => 1,
-            Row::Radio { .. } => 2,
+            Row::Radio { detail, .. } => {
+                if radio_on_one_line(width, detail) {
+                    1
+                } else {
+                    2
+                }
+            }
             Row::Chips { .. } => 1,
             Row::Buttons { .. } => 1,
             Row::Graph(_) => GRAPH_ROWS,
@@ -854,7 +873,9 @@ fn draw_row(
                 .enabled(*enabled)
                 .render(area, buf);
         }
-        Row::Radio { label, detail, on } => {
+        Row::Radio {
+            label, detail, on, ..
+        } => {
             let disc = match (*on, theme.glyphs) {
                 (true, Glyphs::Ascii) => "(*)",
                 (false, Glyphs::Ascii) => "( )",
@@ -874,23 +895,26 @@ fn draw_row(
             };
             buf.set_string(area.x + 1, area.y, disc, style);
             let lx = area.x + 2 + disc.chars().count() as u16;
-            buf.set_string(
-                lx,
-                area.y,
-                truncate(label, area.width.saturating_sub(6) as usize),
-                if focused {
-                    theme.focused()
-                } else {
-                    theme.value()
-                },
-            );
-            if area.height > 1 {
+            let label_style = if focused {
+                theme.focused()
+            } else {
+                theme.value()
+            };
+            let room = area.width.saturating_sub(lx - area.x) as usize;
+            if area.height == 1 {
+                // `DESIGN.md` 7.8: `● Default    700 Hz / 4.5 dB - Balanced,
+                // most popular`, on one row, with the details in a column.
+                buf.set_string(lx, area.y, fit_left(label, RADIO_LABEL_W), label_style);
+                let dx = lx + RADIO_LABEL_W as u16;
                 buf.set_string(
-                    lx,
-                    area.y + 1,
-                    truncate(detail, area.width.saturating_sub(6) as usize),
+                    dx,
+                    area.y,
+                    truncate(detail, room.saturating_sub(RADIO_LABEL_W)),
                     theme.label(),
                 );
+            } else {
+                buf.set_string(lx, area.y, truncate(label, room), label_style);
+                buf.set_string(lx, area.y + 1, truncate(detail, room), theme.label());
             }
         }
         Row::Chips {

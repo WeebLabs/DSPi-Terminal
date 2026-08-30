@@ -585,13 +585,6 @@ impl SignalsPanel {
                 title: "Outputs".into(),
                 action: Some("a All   n None".into()),
             },
-            // The Console says "Click to select, click again to invert"; here
-            // Space belongs to the transport, so Enter is the gesture.
-            Row::Caption(
-                "Enter selects, Enter again inverts polarity (ø). Dimmed outputs are disabled \
-                 in the matrix mixer and stay silent."
-                    .into(),
-            ),
         ];
         let chips = (0..Self::outputs(state))
             .map(|o| {
@@ -621,11 +614,19 @@ impl SignalsPanel {
                 }
             })
             .collect();
+        // `DESIGN.md` 7.8's template is header, chips, caption. The Console
+        // says "Click to select, click again to invert"; here Space belongs to
+        // the transport, so Enter is the gesture.
         rows.push(Row::Chips {
             chips,
             cursor: self.chip,
             polarity: true,
         });
+        rows.push(Row::Caption(
+            "Enter selects, Enter again inverts polarity (ø). Dimmed outputs are disabled \
+             in the matrix mixer and stay silent."
+                .into(),
+        ));
 
         rows.push(Row::Blank);
         rows.push(Row::Section {
@@ -1075,6 +1076,21 @@ mod tests {
                 assert_eq!(labels.len(), 15, "siggen.h has 15 types");
                 assert_eq!(*columns, 4);
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// D45: `DESIGN.md` 7.8's template is header, chips, caption.
+    #[test]
+    fn the_outputs_caption_sits_under_the_chip_row() {
+        let (p, state) = panel();
+        let rows = p.rows(&state, panel::key_theme());
+        let chips = rows
+            .iter()
+            .position(|r| matches!(r, Row::Chips { .. }))
+            .expect("a chip row");
+        match rows.get(chips + 1) {
+            Some(Row::Caption(c)) => assert!(c.starts_with("Enter selects"), "{c}"),
             other => panic!("{other:?}"),
         }
     }

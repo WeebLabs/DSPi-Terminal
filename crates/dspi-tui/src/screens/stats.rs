@@ -486,7 +486,9 @@ impl StatsPanel {
         }
 
         rows.push(Row::Blank);
-        rows.push(Row::info("r", "Reset Watermarks"));
+        // The Console's button, with the key that presses it in the value
+        // column where every other row's value is. It read backwards before.
+        rows.push(Row::info("Reset Watermarks", "r"));
         rows
     }
 }
@@ -1034,6 +1036,16 @@ mod tests {
         assert_eq!(
             p.handle(key(KeyCode::Char('r')), &state),
             ScreenEvent::Command("diag.buffers.reset".into())
+        );
+        // D58: the label is the button, the value is the key that presses it,
+        // the way round every other row on the panel reads.
+        let rows = p.rows(&state, &p.shared.borrow().stats);
+        assert_eq!(
+            rows.last(),
+            Some(&Row::Info {
+                label: "Reset Watermarks".into(),
+                value: "r".into(),
+            })
         );
     }
 

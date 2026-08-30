@@ -296,13 +296,8 @@ pub fn read_stats(session: &mut Session, state: &DeviceState, previous: &Stats) 
     s
 }
 
-/// `REQ_RESET_BUFFER_STATS`, the panel's `r`.
-pub fn reset_watermarks(session: &mut Session) -> Result<(), String> {
-    session
-        .write("diag.buffers.reset", &[], dspi_proto::value::Value::Trigger)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
+// The panel's `r` goes through `ScreenEvent::Command("diag.buffers.reset")`
+// like every other write a screen asks for, so there is no second path here.
 
 // ---------------------------------------------------------------------------
 // The notification log

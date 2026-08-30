@@ -140,16 +140,17 @@ impl CrossfeedPanel {
                     dimmed: false,
                 })
                 .collect();
-            rows.push(Row::Caption(
-                "Crossfeed only the stereo output pairs feeding headphones. Speaker pairs stay \
-                 bit-accurate. The mono sub is never crossfed."
-                    .into(),
-            ));
+            // `DESIGN.md` 7.8's template is header, chips, caption.
             rows.push(Row::Chips {
                 chips,
                 cursor: self.chip,
                 polarity: false,
             });
+            rows.push(Row::Caption(
+                "Crossfeed only the stereo output pairs feeding headphones. Speaker pairs stay \
+                 bit-accurate. The mono sub is never crossfed."
+                    .into(),
+            ));
         }
 
         rows.push(Row::Blank);
@@ -431,6 +432,56 @@ mod tests {
         assert_eq!(
             p.handle(key(KeyCode::Right), &state),
             ScreenEvent::Command("cf.preset custom\ncf.freq 710".into())
+        );
+    }
+
+    /// D46: `DESIGN.md` 7.8 draws a PRESET row as one line,
+    /// `● Default    700 Hz / 4.5 dB - Balanced, most popular`. Four rows were
+    /// costing eight, with the width to spare.
+    #[test]
+    fn a_preset_row_is_one_line_where_it_fits_and_two_where_it_does_not() {
+        let (mut p, state) = panel();
+        let f = testing::draw(&mut p, &state, 100, 40);
+        let line = f
+            .lines()
+            .find(|l| l.contains("Default"))
+            .expect("the Default row");
+        assert!(
+            line.contains("700 Hz / 4.5 dB - Balanced, most popular"),
+            "label and detail on one line: {line}"
+        );
+        // The four voicings cost four rows, not eight.
+        for name in ["Default", "Chu Moy", "Jan Meier", "Custom"] {
+            assert_eq!(
+                f.lines().filter(|l| l.contains(name)).count(),
+                1,
+                "{name}:\n{f}"
+            );
+        }
+
+        // Too narrow for both, and the detail goes back under its label.
+        let f = testing::draw(&mut p, &state, 46, 40);
+        let line = f
+            .lines()
+            .find(|l| l.contains("Default"))
+            .expect("the Default row");
+        assert!(!line.contains("Balanced"), "{f}");
+        assert!(f.contains("Balanced"), "but it is still drawn:\n{f}");
+    }
+
+    /// D45: `DESIGN.md` 7.8's template is header, chips, caption. The caption
+    /// was drawn above the chips it describes.
+    #[test]
+    fn the_caption_sits_under_the_chip_row() {
+        let (p, state) = panel();
+        let rows = p.rows(&state, panel::key_theme());
+        let chips = rows
+            .iter()
+            .position(|r| matches!(r, Row::Chips { .. }))
+            .expect("a chip row");
+        assert!(
+            matches!(rows.get(chips + 1), Some(Row::Caption(_))),
+            "{rows:?}"
         );
     }
 
