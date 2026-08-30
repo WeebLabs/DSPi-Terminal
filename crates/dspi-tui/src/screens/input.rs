@@ -634,6 +634,31 @@ mod tests {
         assert_eq!(p.list.mirror, Some(1));
     }
 
+    /// D81 asked whether the alert should be ordered by the pair rather than
+    /// by the page. It should not: `Components.swift:790-817` names
+    /// `pageChannel` first in the title and offers it as the first button,
+    /// "so the default keeps the tuning the user is actually looking at". From
+    /// IN2 the Console reads "Inputs 2 and 1 don't match" too.
+    #[test]
+    fn the_mismatch_alert_is_ordered_by_the_page_it_was_raised_from() {
+        let state = mismatched();
+        let mut p = InputPage::new(1, shared(), &state);
+        p.header = Some(0);
+        match p.handle(key(KeyCode::Enter), &state) {
+            ScreenEvent::Dialog(d) => {
+                assert_eq!(d.title, "Inputs 2 and 1 don't match");
+                assert_eq!(d.buttons[0].label, "Keep IN2");
+                assert_eq!(d.buttons[1].label, "Keep IN1");
+            }
+            other => panic!("{other:?}"),
+        }
+        // And the first button keeps the page you are on.
+        match p.dialog_result(DialogOutcome::Button(0), &state) {
+            ScreenEvent::Command(c) => assert!(c.starts_with("eq in.1 "), "{c}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn a_matching_pair_links_with_no_prompt() {
         // The fixture tunes IN1 and IN2 the same, which is the case that must

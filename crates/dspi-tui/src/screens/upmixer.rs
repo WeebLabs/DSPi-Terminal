@@ -515,6 +515,37 @@ mod tests {
         }
     }
 
+    /// D48 asked whether all four gauges should show whenever the status is
+    /// active. They should not: `UpmixerView.swift:186-197` gates Centre gain
+    /// on `!centreOff` and the two surround gains on `surroundOn`, exactly as
+    /// here. Only Correlation is unconditional.
+    #[test]
+    fn a_gauge_goes_with_the_engine_that_feeds_it() {
+        let (mut p, mut state) = panel();
+        state.upmix_status = Some(UpmixStatus {
+            active: true,
+            parked_reason: 0,
+            corr_q14: 8192,
+            balance_q14: 0,
+            center_gain_q15: 16384,
+            ls_gain_q15: 8192,
+            rs_gain_q15: 24576,
+        });
+        let f = testing::draw(&mut p, &state, 100, 60);
+        for want in ["Correlation", "Centre gain", "Ls gain", "Rs gain"] {
+            assert!(f.contains(want), "{want} with both engines on:\n{f}");
+        }
+
+        // Centre off (wire 2), surround off (wire 0).
+        let u = section("upmix");
+        state.bulk.patch(u + 1, &[2, 0]);
+        let f = testing::draw(&mut p, &state, 100, 60);
+        assert!(f.contains("Correlation"), "always shown: {f}");
+        for gone in ["Centre gain", "Ls gain", "Rs gain"] {
+            assert!(!f.contains(gone), "{gone} has no engine behind it:\n{f}");
+        }
+    }
+
     /// D9: `UpmixerView.swift:204` asks about the connection before anything
     /// else, so a device that has gone away never reads as "Idle" or, worse, as
     /// "Active - processing audio" off a stale reading.
