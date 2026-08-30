@@ -88,6 +88,9 @@ pub struct SharedState {
     pub autoeq: Option<Rc<dspi_session::autoeq::Database>>,
     /// Favourite profile ids, mirrored from the favourites file.
     pub favourites: Vec<String>,
+    /// The main graph's window and zoom, mirrored by the runner each frame so
+    /// the overview's cells draw on the same axes (DESIGN 12.2).
+    pub graph: crate::graph::GraphSettings,
 }
 
 impl SharedState {
@@ -457,7 +460,7 @@ pub(crate) mod tests {
                 "End" => plain(KeyCode::End),
                 "Home" => plain(KeyCode::Home),
                 "PgDn" => plain(KeyCode::PageDown),
-                "1-9,0" => plain(KeyCode::Char('4')),
+                "1-9,0" | "1-9" => plain(KeyCode::Char('4')),
                 other => {
                     let c = other.chars().next().unwrap();
                     assert_eq!(other.chars().count(), 1, "unknown key token {other}");
@@ -549,7 +552,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_overview_draws_the_consoles_card_through_the_shell() {
+    fn the_overview_draws_its_grid_through_the_shell() {
         let state = fixture::state();
         let _ = &state;
         let mut s = shell(
@@ -557,11 +560,15 @@ pub(crate) mod tests {
             crate::shell::Selection::Overview,
         );
         let f = frame(&mut s, 120, 40);
-        assert!(f.contains("STEREO INPUT (USB)"), "{f}");
-        assert!(f.contains("Delay: 0 ms"), "{f}");
-        assert!(f.contains("Move between cards"), "the key line: {f}");
+        assert!(f.contains("╭ FL FR "), "{f}");
+        assert!(f.contains("LP 80 Hz · -3.0 dB"), "{f}");
+        assert!(
+            !f.contains("Filter Response"),
+            "the grid carries the curves: {f}"
+        );
+        assert!(f.contains("Move between cells"), "the key line: {f}");
         let f = frame(&mut s, 80, 24);
-        assert!(f.contains("STEREO INPUT (USB)"), "{f}");
+        assert!(f.contains("╭ FL FR "), "{f}");
     }
 
     #[test]

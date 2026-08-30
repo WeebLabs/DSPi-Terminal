@@ -735,6 +735,7 @@ impl Live {
         }
         m.curves = curves;
         m.graph_channel = graphed.map(|ch| screens::channel_name(s, ch));
+        self.shared.borrow_mut().graph = m.graph.clone();
     }
 
     fn note(&mut self, text: impl Into<String>) {
