@@ -353,7 +353,6 @@ enum AppDialog {
     Unsaved {
         then: PendingAction,
     },
-    SavePreset,
     Rename {
         channel: usize,
     },
@@ -1214,15 +1213,11 @@ impl Live {
             ShellEvent::Palette => self.prompt = Some(Prompt::new(true, &self.ctx)),
             ShellEvent::CommandLine => self.prompt = Some(Prompt::new(false, &self.ctx)),
             ShellEvent::SavePreset => {
-                let slot = self.state.caps.active_preset.map(|p| p + 1).unwrap_or(1);
-                self.dialog = Some((
-                    AppDialog::SavePreset,
-                    Dialog::confirm(
-                        "Save Preset",
-                        format!("Save current parameters to preset slot {slot}?"),
-                        vec![Button::new("Save"), Button::new("Cancel")],
-                    ),
-                ));
+                // Ctrl-S and `:commit` are the Console's one Commit Parameters
+                // action, so they raise one dialog rather than two copies of
+                // the same wording that could drift apart.
+                let slot = self.state.caps.active_preset.unwrap_or(0);
+                self.dialog = Some((AppDialog::Commit, actions::commit_dialog(slot)));
             }
             ShellEvent::DevicePicker => self.open_device_picker(),
             ShellEvent::Undo => self.undo(session, false),
@@ -1359,9 +1354,6 @@ impl Live {
             }
             (AppDialog::Unsaved { then }, DialogOutcome::Button(1)) => {
                 self.run_pending(session, then)
-            }
-            (AppDialog::SavePreset, DialogOutcome::Button(0)) => {
-                self.save_active_preset(session);
             }
             (AppDialog::Rename { channel }, DialogOutcome::Text(name)) => {
                 self.set(session, "ch.name", &[channel as u8], Value::Text(name));
