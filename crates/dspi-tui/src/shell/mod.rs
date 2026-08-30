@@ -25,7 +25,7 @@ pub use model::{
     ChannelItem, GraphHeight, STRIP_GRID, Selection, ShellModel, StripItem, VolumeMode,
     strip_position,
 };
-pub use screen::{Placeholder, Screen, ScreenEvent, SessionReply, SessionRequest};
+pub use screen::{Placeholder, Quick, Screen, ScreenEvent, SessionReply, SessionRequest};
 pub use sidebar::FooterRow;
 
 use crate::graph::Graph;
@@ -177,6 +177,10 @@ pub struct Shell {
     pub settings: Option<Box<dyn Screen>>,
     pub dialog: Option<Dialog>,
     dialog_owner: Owner,
+    /// The `;` command bar: the page's own grammar, two rows at the foot of
+    /// the pane (DESIGN 13).
+    pub quick: Option<QuickBar>,
+    quick_history: Vec<String>,
     pub popup: Option<PopupList>,
     popup_owner: Owner,
     pub help: bool,
@@ -194,6 +198,7 @@ const GLOBAL_KEYS: &[KeyHelp] = &[
     KeyHelp::new("Ctrl-S", "Commit parameters to the preset"),
     KeyHelp::new("Ctrl-D", "Device picker"),
     KeyHelp::new("Ctrl-Z Ctrl-Y", "Undo, redo"),
+    KeyHelp::new(";", "Page commands"),
     KeyHelp::new("= g p . + -", "Graph height, pop-out, phase, partner, zoom"),
     KeyHelp::new("b c", "Bypass master EQ, clear clips"),
     KeyHelp::new("q", "Quit"),
@@ -230,6 +235,8 @@ impl Shell {
             settings: None,
             dialog: None,
             dialog_owner: Owner::Detail,
+            quick: None,
+            quick_history: Vec::new(),
             popup: None,
             popup_owner: Owner::Detail,
             help: false,
@@ -367,6 +374,18 @@ impl Shell {
             _ => {}
         }
 
+        // The `;` command bar swallows every key while it is open, and `;`
+        // opens it from anywhere: it is the page's own command line.
+        if self.quick.is_some() {
+            self.handle_quick(key, state, &mut out);
+            return out;
+        }
+        if key.code == KeyCode::Char(';') {
+            self.quick = Some(QuickBar::default());
+            self.refresh_quick(state);
+            return out;
+        }
+
         // Settings is modal over the main window.
         if self.settings.is_some() {
             if matches!(key.code, KeyCode::Char(',')) {
@@ -462,6 +481,108 @@ impl Shell {
             _ => {}
         }
         out
+    }
+
+    /// Keys while the command bar is open.
+    fn handle_quick(&mut self, key: KeyEvent, state: &DeviceState, out: &mut Vec<ShellEvent>) {
+        match key.code {
+            KeyCode::Esc => {
+                self.quick = None;
+                return;
+            }
+            KeyCode::Enter => {
+                let Some(bar) = self.quick.take() else { return };
+                let line = bar.input.trim().to_string();
+                if line.is_empty() {
+                    return;
+                }
+                let commands = {
+                    let (s, _) = self.top();
+                    s.quick(&line, state)
+                        .map(|q| q.commands)
+                        .unwrap_or_default()
+                };
+                if commands.is_empty() {
+                    // Not the page's grammar: the shared `:` grammar runs the
+                    // line as typed, and says so if it cannot.
+                    out.push(ShellEvent::Command(line.clone()));
+                } else {
+                    out.push(ShellEvent::Command(commands.join("\n")));
+                }
+                self.quick_history.push(line);
+                return;
+            }
+            KeyCode::Tab => {
+                if let Some(bar) = &mut self.quick
+                    && let Some(g) = bar.ghost.take()
+                {
+                    bar.input.push_str(&g);
+                    bar.input.push(' ');
+                }
+            }
+            KeyCode::Up => {
+                if let Some(bar) = &mut self.quick
+                    && !self.quick_history.is_empty()
+                {
+                    let i = bar
+                        .hist
+                        .map(|i| i.saturating_sub(1))
+                        .unwrap_or(self.quick_history.len() - 1);
+                    bar.hist = Some(i);
+                    bar.input = self.quick_history[i].clone();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(bar) = &mut self.quick
+                    && let Some(i) = bar.hist
+                {
+                    if i + 1 < self.quick_history.len() {
+                        bar.hist = Some(i + 1);
+                        bar.input = self.quick_history[i + 1].clone();
+                    } else {
+                        bar.hist = None;
+                        bar.input.clear();
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(bar) = &mut self.quick {
+                    bar.input.pop();
+                    bar.hist = None;
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(bar) = &mut self.quick {
+                    bar.input.push(c);
+                    bar.hist = None;
+                }
+            }
+            _ => {}
+        }
+        self.refresh_quick(state);
+    }
+
+    /// Ask the page what the bar's line means, for the hint and the ghost.
+    fn refresh_quick(&mut self, state: &DeviceState) {
+        let Some(input) = self.quick.as_ref().map(|b| b.input.clone()) else {
+            return;
+        };
+        let reply = {
+            let (s, _) = self.top();
+            s.quick(&input, state)
+        };
+        if let Some(bar) = &mut self.quick {
+            match reply {
+                Some(q) => {
+                    bar.hint = q.hint;
+                    bar.ghost = q.ghost;
+                }
+                None => {
+                    bar.hint = "No page commands here; the : grammar runs as typed".into();
+                    bar.ghost = None;
+                }
+            }
+        }
     }
 
     fn cursor_step(&self, dir: i32) -> ShellEvent {
@@ -737,6 +858,9 @@ impl Shell {
         }
         self.draw_keys(regions.keys, buf, &t);
 
+        if let Some(bar) = &self.quick {
+            bar.draw(layout::inset(regions.pane), buf, &t);
+        }
         if let Some(p) = &self.popup {
             let (w, h) = p.size(area.width.saturating_sub(4), area.height.saturating_sub(4));
             let r = Rect::new(
@@ -1110,6 +1234,57 @@ impl Shell {
     }
 }
 
+/// The `;` command bar: an input row and a hint row at the foot of the
+/// pane. The page's grammar drives the hint and the ghost; a line the page
+/// does not know runs through the shared `:` grammar.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuickBar {
+    pub input: String,
+    pub hint: String,
+    pub ghost: Option<String>,
+    hist: Option<usize>,
+}
+
+impl QuickBar {
+    pub fn draw(&self, pane: Rect, buf: &mut Buffer, t: &Theme) {
+        if pane.height < 3 || pane.width < 10 {
+            return;
+        }
+        let hint_y = pane.y + pane.height - 2;
+        let input_y = pane.y + pane.height - 1;
+        for y in [hint_y, input_y] {
+            buf.set_string(pane.x, y, " ".repeat(pane.width as usize), Style::default());
+        }
+        buf.set_string(
+            pane.x + 1,
+            hint_y,
+            crate::widgets::text::truncate(&self.hint, pane.width.saturating_sub(2) as usize),
+            t.label(),
+        );
+        buf.set_string(pane.x + 1, input_y, ";", Style::default().fg(t.accent));
+        let x = pane.x + 3;
+        buf.set_string(x, input_y, &self.input, t.value());
+        let end = x + self.input.chars().count() as u16;
+        if let Some(g) = &self.ghost {
+            buf.set_string(end, input_y, g, t.label());
+        }
+        let cursor = end
+            + self
+                .ghost
+                .as_ref()
+                .map(|g| g.chars().count() as u16)
+                .unwrap_or(0);
+        if cursor < pane.x + pane.width {
+            buf.set_string(
+                cursor,
+                input_y,
+                " ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1471,6 +1646,29 @@ mod tests {
     }
 
     #[test]
+    fn semicolon_opens_the_command_bar_and_a_line_falls_through_to_the_grammar() {
+        let (mut s, _) = shell(120, 40);
+        s.handle(key(KeyCode::Char(';')), &fixture::state());
+        assert!(s.quick.is_some(), "the bar is open");
+        for c in "vol.user -18".chars() {
+            s.handle(key(KeyCode::Char(c)), &fixture::state());
+        }
+        let out = s.handle(key(KeyCode::Enter), &fixture::state());
+        assert_eq!(out, vec![ShellEvent::Command("vol.user -18".into())]);
+        assert!(s.quick.is_none(), "closed after Enter");
+        // Esc closes without running anything.
+        s.handle(key(KeyCode::Char(';')), &fixture::state());
+        s.handle(key(KeyCode::Char('x')), &fixture::state());
+        assert!(s.handle(key(KeyCode::Esc), &fixture::state()).is_empty());
+        assert!(s.quick.is_none());
+        // Up recalls the line that ran.
+        s.handle(key(KeyCode::Char(';')), &fixture::state());
+        s.handle(key(KeyCode::Up), &fixture::state());
+        assert_eq!(s.quick.as_ref().unwrap().input, "vol.user -18");
+        s.handle(key(KeyCode::Esc), &fixture::state());
+    }
+
+    #[test]
     fn the_strip_is_a_grid_the_arrows_walk_and_leave_from_its_edges() {
         let (mut s, _) = shell(120, 40);
         s.focus = Focus::Footer(FooterRow::Strip);
@@ -1512,9 +1710,9 @@ mod tests {
                     s.sidebar_cursor = 10;
                     s.model.selection = Selection::Output(2);
                     s.strip_cursor = 1;
-                    let before = (s.focus, s.help, s.strip_cursor);
+                    let before = (s.focus, s.help, s.strip_cursor, s.quick.clone());
                     let events = s.handle(k, &fixture::state());
-                    let after = (s.focus, s.help, s.strip_cursor);
+                    let after = (s.focus, s.help, s.strip_cursor, s.quick.clone());
                     assert!(
                         !events.is_empty() || before != after,
                         "{:?} does nothing in {:?} (from {:?})",

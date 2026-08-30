@@ -39,6 +39,11 @@ fn label_width(width: u16) -> u16 {
 const MIN_COL_W: u16 = 9;
 const MAX_COL_W: u16 = 18;
 
+/// A trimmed decimal for the grammar, from an f64.
+fn number_str(v: f64) -> String {
+    number(v as f32)
+}
+
 /// The column width for a pane this wide showing `n_out` outputs.
 fn col_width(width: u16, n_out: usize) -> u16 {
     (width.saturating_sub(label_width(width)) / n_out.max(1) as u16).clamp(MIN_COL_W, MAX_COL_W)
@@ -422,6 +427,221 @@ impl MatrixPanel {
 // ---------------------------------------------------------------------------
 
 impl MatrixPanel {
+    /// The page grammar behind `;` (DESIGN 13). Routing reads as an arrow:
+    /// `1 3 > 5` connects IN1 and IN3 to OUT5, `1 x all` disconnects IN1
+    /// from everything. Lists take singles, ranges and `all` on both sides.
+    fn quick_reply(&self, line: &str, state: &DeviceState) -> crate::shell::Quick {
+        use super::quick::{channel_list, ghost, names, number, verb};
+        use crate::shell::Quick;
+        const VERBS: &[&str] = &["gain", "inv", "out", "direct", "clear"];
+        const SUMMARY: &str = "1 3 > 5 connect · 1 x 3 disconnect · gain 1 3 -6 · inv 1 3 · out 5 mute · direct · clear";
+        let ni = self.inputs(state);
+        let no = self.outputs(state);
+        let lower = line.to_ascii_lowercase();
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        let hint = |h: &str| Quick {
+            hint: h.to_string(),
+            ghost: ghost(&lower, VERBS),
+            commands: Vec::new(),
+        };
+        if tokens.is_empty() {
+            return hint(SUMMARY);
+        }
+
+        // The arrow forms: `<inputs> > <outputs> [gain] [inv]`, `<inputs> x <outputs>`.
+        if let Some(split) = tokens.iter().position(|t| *t == ">" || *t == "x") {
+            let connect = tokens[split] == ">";
+            let Some(ins) = channel_list(&tokens[..split], ni) else {
+                return hint("inputs: 1 · 1 3 · 1-4 · all, then > or x");
+            };
+            let rest = &tokens[split + 1..];
+            let inv = connect && rest.last() == Some(&"inv");
+            let rest = if inv { &rest[..rest.len() - 1] } else { rest };
+            // `1 > 3 4` is two outputs; a gain announces itself with a sign,
+            // a decimal point or a value no output could be: `1 > 3 -6`.
+            let (rest, gain) = match rest.last() {
+                Some(t)
+                    if connect
+                        && rest.len() > 1
+                        && number(t).is_some()
+                        && super::quick::channel_token(t, no).is_none() =>
+                {
+                    (&rest[..rest.len() - 1], number(t))
+                }
+                _ => (rest, None),
+            };
+            let Some(outs) = channel_list(rest, no) else {
+                return hint(if connect {
+                    "outputs, then an optional gain and inv: 5 · 3 4 -6 inv · all"
+                } else {
+                    "outputs to disconnect: 5 · 3 4 · all"
+                });
+            };
+            let mut commands = Vec::new();
+            for &i in &ins {
+                for &o in &outs {
+                    let c = state.crosspoint(i, o);
+                    let g = gain.map(|g| g as f32).unwrap_or(c.gain_db);
+                    let inv = if connect {
+                        inv || c.phase_invert
+                    } else {
+                        c.phase_invert
+                    };
+                    commands.push(self.mix_command(i, o, connect, g, inv));
+                }
+            }
+            let mut h = format!(
+                "{} {} {}",
+                names("IN", &ins),
+                if connect { "→" } else { "×" },
+                names("OUT", &outs)
+            );
+            if let Some(g) = gain {
+                h.push_str(&format!(" at {g:+.1} dB"));
+            }
+            if inv {
+                h.push_str(" inverted");
+            }
+            h.push_str(&format!(
+                " · {} crosspoint{} {}",
+                commands.len(),
+                if commands.len() == 1 { "" } else { "s" },
+                if connect { "on" } else { "off" }
+            ));
+            return Quick {
+                hint: h,
+                ghost: None,
+                commands,
+            };
+        }
+
+        match verb(tokens[0], VERBS) {
+            Some("gain") | Some("inv") => {
+                let toggle = verb(tokens[0], VERBS) == Some("inv");
+                let args = &tokens[1..];
+                let (args, gain) = if toggle {
+                    (args, None)
+                } else {
+                    match args.last().and_then(|t| number(t)) {
+                        Some(g) if args.len() >= 3 => (&args[..args.len() - 1], Some(g)),
+                        _ => (args, None),
+                    }
+                };
+                let mid = args.len() / 2;
+                let (ins, outs) = if args.len() >= 2 && args.len() % 2 == 0 {
+                    (
+                        channel_list(&args[..mid], ni),
+                        channel_list(&args[mid..], no),
+                    )
+                } else {
+                    (None, None)
+                };
+                match (ins, outs) {
+                    (Some(ins), Some(outs)) if toggle || gain.is_some() => {
+                        let g_db = gain.unwrap_or(0.0);
+                        let mut commands = Vec::new();
+                        for &i in &ins {
+                            for &o in &outs {
+                                let c = state.crosspoint(i, o);
+                                commands.push(if toggle {
+                                    self.mix_command(i, o, c.enabled, c.gain_db, !c.phase_invert)
+                                } else {
+                                    self.mix_command(i, o, c.enabled, g_db as f32, c.phase_invert)
+                                });
+                            }
+                        }
+                        let h = if toggle {
+                            format!("invert {} → {}", names("IN", &ins), names("OUT", &outs))
+                        } else {
+                            format!(
+                                "{} → {} gain {g_db:+.1} dB",
+                                names("IN", &ins),
+                                names("OUT", &outs)
+                            )
+                        };
+                        Quick {
+                            hint: h,
+                            ghost: None,
+                            commands,
+                        }
+                    }
+                    _ if toggle => hint("inv <inputs> <outputs> · toggles polarity"),
+                    _ => hint("gain <inputs> <outputs> <dB> · sets crosspoint gain"),
+                }
+            }
+            Some("out") => {
+                const FIELDS: &[&str] = &["gain", "delay", "mute", "unmute", "on", "off"];
+                let args = &tokens[1..];
+                let field_at = args.iter().position(|t| verb(t, FIELDS).is_some());
+                let Some(fi) = field_at else {
+                    return hint("out <outputs> gain <dB> · delay <ms> · mute · unmute · on · off");
+                };
+                let Some(outs) = channel_list(&args[..fi], no) else {
+                    return hint("outputs first: out 3 · out 3-5 mute");
+                };
+                let field = verb(args[fi], FIELDS).unwrap();
+                let value = args.get(fi + 1).and_then(|t| number(t));
+                let mut commands = Vec::new();
+                for &o in &outs {
+                    match (field, value) {
+                        ("gain", Some(v)) => commands
+                            .push(format!("out.gain {o} {}", number_str(v.clamp(-60.0, 10.0)))),
+                        ("delay", Some(v)) => commands.push(format!(
+                            "out.delay {o} {}",
+                            number_str(v.clamp(0.0, max_delay_ms(state)))
+                        )),
+                        ("mute", _) => commands.push(format!("out.mute {o} on")),
+                        ("unmute", _) => commands.push(format!("out.mute {o} off")),
+                        ("on", _) => commands.push(format!("out.enable {o} on")),
+                        ("off", _) => commands.push(format!("out.enable {o} off")),
+                        _ => {}
+                    }
+                }
+                if commands.is_empty() {
+                    return hint(match field {
+                        "gain" => "out … gain <dB>",
+                        _ => "out … delay <ms>",
+                    });
+                }
+                Quick {
+                    hint: format!(
+                        "{} {}{}",
+                        names("OUT", &outs),
+                        field,
+                        value.map(|v| format!(" {v}")).unwrap_or_default()
+                    ),
+                    ghost: None,
+                    commands,
+                }
+            }
+            Some("direct") => {
+                let commands = self.direct_routing(state);
+                if commands.is_empty() {
+                    hint("direct 1:1 needs the 8-channel matrix")
+                } else {
+                    Quick {
+                        hint: "Direct 1:1: INn → OUTn, everything else off".into(),
+                        ghost: None,
+                        commands,
+                    }
+                }
+            }
+            Some("clear") => {
+                let commands = self.clear_routes(state);
+                if commands.is_empty() {
+                    hint("nothing to clear")
+                } else {
+                    Quick {
+                        hint: format!("disconnect every crosspoint ({})", commands.len()),
+                        ghost: None,
+                        commands,
+                    }
+                }
+            }
+            _ => hint(SUMMARY),
+        }
+    }
+
     fn draw_headers(&self, p: &mut Paint, cols: &[usize]) {
         let (area, theme, state) = (p.area, p.theme, p.state);
         for (n, &o) in cols.iter().enumerate() {
@@ -696,6 +916,10 @@ impl MatrixPanel {
 impl Screen for MatrixPanel {
     fn title(&self) -> String {
         "Matrix Mixer".into()
+    }
+
+    fn quick(&self, line: &str, state: &DeviceState) -> Option<crate::shell::Quick> {
+        Some(self.quick_reply(line, state))
     }
 
     fn draw(
@@ -1283,6 +1507,57 @@ mod tests {
         let s = text(&draw(&mut panel(), &stereo(), 120, 36));
         let dividers = s.lines().filter(|l| l.contains("──")).count();
         assert_eq!(dividers, 1, "the same rule in stereo:\n{s}");
+    }
+
+    #[test]
+    fn the_quick_grammar_routes_sets_gains_and_toggles() {
+        let state = fixture::state();
+        let p = panel();
+        let q = |line: &str| p.quick_reply(line, &state);
+
+        let route = q("1 2 > 3 4");
+        assert_eq!(
+            route.commands,
+            vec![
+                "mix 0 2 on 0",
+                "mix 0 3 on 0",
+                "mix 1 2 on 0",
+                "mix 1 3 on 0"
+            ],
+            "{route:?}"
+        );
+        assert!(route.hint.contains("IN1 IN2 → OUT3 OUT4"), "{}", route.hint);
+
+        let gained = q("1 > 3 -6 inv");
+        assert_eq!(gained.commands, vec!["mix 0 2 on -6 inv"]);
+
+        let cut = q("1-4 x all");
+        assert_eq!(cut.commands.len(), 4 * 9);
+        assert!(cut.commands[0].contains(" off "), "{:?}", cut.commands[0]);
+
+        // The fixture connects IN1→OUT1; gain keeps the enable, inv toggles.
+        let g = q("gain 1 1 -6");
+        assert_eq!(g.commands, vec!["mix 0 0 on -6"]);
+        let i = q("inv 1 1");
+        assert_eq!(i.commands, vec!["mix 0 0 on 0 inv"]);
+
+        let m = q("out 3-4 mute");
+        assert_eq!(m.commands, vec!["out.mute 2 on", "out.mute 3 on"]);
+        let e = q("out 5 off");
+        assert_eq!(e.commands, vec!["out.enable 4 off"]);
+        let d = q("out 9 delay 2.5");
+        assert_eq!(d.commands, vec!["out.delay 8 2.5"]);
+
+        assert!(!q("direct").commands.is_empty());
+        assert!(!q("clear").commands.is_empty());
+
+        // Incomplete lines hint and run nothing.
+        for partial in ["", "1 2", "1 >", "gain 1", "out", "out 3 gain"] {
+            let r = q(partial);
+            assert!(r.commands.is_empty(), "{partial:?} ran {:?}", r.commands);
+            assert!(!r.hint.is_empty(), "{partial:?} has no hint");
+        }
+        assert_eq!(q("g").ghost.as_deref(), Some("ain"));
     }
 
     #[test]

@@ -272,6 +272,10 @@ impl CrossfeedPanel {
 }
 
 impl Screen for CrossfeedPanel {
+    fn quick(&self, line: &str, _state: &DeviceState) -> Option<crate::shell::Quick> {
+        Some(super::quick::toggle(line, "cf.on", "Crossfeed"))
+    }
+
     fn title(&self) -> String {
         "Crossfeed".into()
     }

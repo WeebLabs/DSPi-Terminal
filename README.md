@@ -69,6 +69,7 @@ Everywhere:
 | `Tab` | Next region: channels, footer, detail |
 | `↑ ↓` | Select a channel; `Enter` returns to the overview |
 | `Space` | Toggle: a bypass, a feature in the quick strip, mute on the volume row |
+| `;` | Page commands: a small grammar scoped to the current page, with live hints (`1 2 > 3` routes on the matrix, `3 peak 1k -2` sets a band, `gain -3` trims an output) |
 | `Ctrl-P` | Search every parameter, tool and action |
 | `:` | Command line, the same grammar as the shell |
 | `Ctrl-S` | Commit Parameters to the active preset |

@@ -291,8 +291,9 @@ D6, D6b, D8, D11, D12, D14, D15, D16, D17, D18, D20, D32, D33, D34, D39,
 D41, D43, D44, D56, D75, D77, D78. Both Opus fix rounds are merged
 (Settings; screens and panels). The quiet redesign of `DESIGN.md` section
 12 landed on 2026-08-30 (calm palette, one curve per graph, the overview
-grid), 959 tests. Waiting: HW-1 and HW-2 (a device), then Fable's three
-deep audits and HW-3.
+grid), and the sidebar, matrix and page-command-bar rounds that followed
+(DESIGN 13), 972 tests. Waiting: HW-1 and HW-2 (a device), then Fable's
+three deep audits and HW-3.
 
 ## 3. Hardware checkpoints
 

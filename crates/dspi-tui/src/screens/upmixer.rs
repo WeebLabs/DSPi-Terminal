@@ -356,6 +356,10 @@ impl UpmixerPanel {
 }
 
 impl Screen for UpmixerPanel {
+    fn quick(&self, line: &str, _state: &DeviceState) -> Option<crate::shell::Quick> {
+        Some(super::quick::toggle(line, "up.on", "Upmixer"))
+    }
+
     fn title(&self) -> String {
         "Stereo Upmixer".into()
     }

@@ -251,6 +251,10 @@ impl LevellerPanel {
 }
 
 impl Screen for LevellerPanel {
+    fn quick(&self, line: &str, _state: &DeviceState) -> Option<crate::shell::Quick> {
+        Some(super::quick::toggle(line, "lev.on", "Leveller"))
+    }
+
     fn title(&self) -> String {
         "Volume Leveller".into()
     }

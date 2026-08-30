@@ -974,3 +974,30 @@ All five steps landed on 2026-08-30.
   without the visibility maps.
 - **The partner toggle `.` is a global key**, so it works from any region;
   it is a no-op unless the selected input is linked.
+
+## 13. The page command bar (`;`)
+
+*Added 2026-08-30.* `;` opens a two-row bar at the foot of the pane: a
+hint row and an input row. It is the page's own command line: the grammar
+is scoped to what the page shows, so it stays small enough to learn by
+using it. A line the page does not recognise runs through the shared `:`
+grammar as typed, so nothing is unreachable from the bar. `Esc` closes,
+`Enter` runs and closes, `Tab` accepts the ghost completion of a started
+verb, `↑`/`↓` walk the history. The hint row always says what the line
+will do before Enter is pressed, which is the prediction: type `1 2 > 3`
+on the matrix and the hint reads `IN1 IN2 → OUT3 · 2 crosspoints on`.
+
+Three rules make it one language everywhere: channel lists are `1`,
+`1 3`, `1-4`, `all`; numbers take `k` (`1k`, `2.5k`); a verb matches by
+any unambiguous prefix (`ga` is `gain`, `de` is `delay`).
+
+| Page | Grammar |
+|---|---|
+| Matrix | `1 3 > 5` connect (every listed input to every listed output) · `1 x all` disconnect · `1 > 3 -6 inv` connect with gain and polarity (a gain needs a sign, a point or an out-of-range value, so `1 > 3 4` stays two outputs) · `gain 1 3 -6` · `inv 1 3` (toggle) · `out 3-5 mute·unmute·on·off·gain -2·delay 2.5` · `direct` · `clear` |
+| Input page | `pre -5.3` · `3 peak 1k -2 [q]` (types: peak ls hs lp hp notch allpass) · `3 off` · `delay 2.5` · `clear` · `name Front L` — every edit mirrors to a linked partner |
+| Output page | `gain -3` · `delay 2.5` · `mute` `unmute` `on` `off` · `3 peak 1k -2 [q]` · `3 off` · `xo hp 80 [lr4]` `xo lp 120 bw2` `xo off` · `name Sub` |
+| Crossfeed, Loudness, Leveller, Bass, Upmixer | `on` · `off`; everything else falls through |
+| Everywhere else | the `:` grammar as typed |
+
+The bar was asked for as a Super-key feature; terminals do not forward
+Cmd/Win, so the key is `;`, unshifted and one step from `:`.

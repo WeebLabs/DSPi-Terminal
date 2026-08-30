@@ -146,6 +146,183 @@ impl InputPage {
         (state.preamp_db(self.input) as f64 + dir * step).clamp(-60.0, 10.0)
     }
 
+    /// The page grammar behind `;` (DESIGN 13): the preamp, a band in one
+    /// line (`3 peak 1k -2 1.4`), the delay, `clear` and `name`. Edits
+    /// mirror onto a linked partner like every other edit on this page.
+    fn quick_reply(&self, line: &str, state: &DeviceState) -> crate::shell::Quick {
+        use super::quick::{ghost, number as num, verb};
+        use crate::shell::Quick;
+        const VERBS: &[&str] = &["pre", "delay", "clear", "name"];
+        const SUMMARY: &str =
+            "pre -5.3 · 3 peak 1k -2 [q] · 3 off · delay 2.5 · clear · name Front L";
+        let lower = line.to_ascii_lowercase();
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        let hint = |h: &str| Quick {
+            hint: h.to_string(),
+            ghost: ghost(&lower, VERBS),
+            commands: Vec::new(),
+        };
+        let Some(&first) = tokens.first() else {
+            return hint(SUMMARY);
+        };
+        // A band number starts a band edit: `3 peak 1k -2 [1.4]`, `3 off`.
+        if let Ok(band) = first.parse::<usize>() {
+            let max = state.caps.max_bands as usize;
+            if band == 0 || band > max {
+                return hint(&format!("bands are 1 to {max}"));
+            }
+            return self.quick_band(state, band as u8 - 1, &tokens[1..]);
+        }
+        match verb(first, VERBS) {
+            Some("pre") => match tokens.get(1).and_then(|t| num(t)) {
+                Some(db) => {
+                    let db = db.clamp(-60.0, 10.0);
+                    Quick {
+                        hint: format!("preamp {db:+.1} dB{}", self.mirror_note()),
+                        ghost: None,
+                        commands: vec![self.preamp_command(db)],
+                    }
+                }
+                None => hint("pre <dB> · the input preamp"),
+            },
+            Some("delay") => match tokens.get(1).and_then(|t| num(t)) {
+                Some(ms) => {
+                    let ms = ms.clamp(0.0, super::max_delay_ms(state));
+                    let mut commands = vec![format!(
+                        "ch.delay {} {}",
+                        super::channel_token(state, self.input),
+                        number(ms as f32)
+                    )];
+                    if let Some(m) = self.list.mirror {
+                        commands.push(format!(
+                            "ch.delay {} {}",
+                            super::channel_token(state, m),
+                            number(ms as f32)
+                        ));
+                    }
+                    Quick {
+                        hint: format!("delay {ms:.1} ms{}", self.mirror_note()),
+                        ghost: None,
+                        commands,
+                    }
+                }
+                None => hint("delay <ms>"),
+            },
+            Some("clear") => match self.clear_peq(state) {
+                ScreenEvent::Command(c) => Quick {
+                    hint: format!("every band off{}", self.mirror_note()),
+                    ghost: None,
+                    commands: vec![c],
+                },
+                _ => hint("nothing to clear"),
+            },
+            Some("name") => {
+                let name = line
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map(|(_, rest)| rest.trim())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    hint("name <text> · renames this channel")
+                } else {
+                    Quick {
+                        hint: format!("rename to {name}"),
+                        ghost: None,
+                        commands: vec![format!("ch.name {} {name}", self.input)],
+                    }
+                }
+            }
+            _ => hint(SUMMARY),
+        }
+    }
+
+    /// `peak 1k -2 [q]` or `off`, on band `band` (0-based), mirrored.
+    fn quick_band(&self, state: &DeviceState, band: u8, args: &[&str]) -> crate::shell::Quick {
+        use super::quick::{ghost, number as num, verb};
+        use crate::shell::Quick;
+        use dspi_proto::FilterType;
+        const TYPES: &[&str] = &[
+            "peak",
+            "lowshelf",
+            "highshelf",
+            "lowpass",
+            "highpass",
+            "notch",
+            "allpass",
+            "ls",
+            "hs",
+            "lp",
+            "hp",
+            "off",
+        ];
+        let hint = |h: &str| Quick {
+            hint: h.to_string(),
+            ghost: args.first().and_then(|t| ghost(t, TYPES)),
+            commands: Vec::new(),
+        };
+        let Some(ty) = args.first().and_then(|t| verb(t, TYPES)) else {
+            return hint(
+                "peak · ls · hs · lp · hp · notch · allpass · off, then <freq> <gain> [q]",
+            );
+        };
+        let n = super::display_band(band);
+        let write = |p: EqParamPacket, what: String| {
+            let mut commands = super::band_command(state, self.input, band, &p);
+            if let Some(m) = self.list.mirror {
+                commands.extend(super::band_command(state, m, band, &p));
+            }
+            Quick {
+                hint: format!("band {n}: {what}{}", self.mirror_note()),
+                ghost: None,
+                commands,
+            }
+        };
+        if ty == "off" {
+            return write(cleared_band(self.input as u8, band), "off".into());
+        }
+        let (filter_type, needs_gain, default_q) = match ty {
+            "peak" => (FilterType::Peaking, true, 1.0),
+            "lowshelf" | "ls" => (FilterType::LowShelf, true, 0.707),
+            "highshelf" | "hs" => (FilterType::HighShelf, true, 0.707),
+            "lowpass" | "lp" => (FilterType::LowPass, false, 0.707),
+            "highpass" | "hp" => (FilterType::HighPass, false, 0.707),
+            "notch" => (FilterType::Notch, false, 1.0),
+            _ => (FilterType::AllPass, false, 0.707),
+        };
+        let Some(freq) = args.get(1).and_then(|t| num(t)) else {
+            return hint("frequency next: 1k · 80 · 2.5k");
+        };
+        let (gain, q) = if needs_gain {
+            let Some(g) = args.get(2).and_then(|t| num(t)) else {
+                return hint("gain next: -2 · +4.5");
+            };
+            (g, args.get(3).and_then(|t| num(t)).unwrap_or(default_q))
+        } else {
+            (0.0, args.get(2).and_then(|t| num(t)).unwrap_or(default_q))
+        };
+        let p = EqParamPacket {
+            filter_type,
+            freq: freq.clamp(10.0, 20_000.0) as f32,
+            q: q.clamp(0.1, 30.0) as f32,
+            gain_db: gain.clamp(-30.0, 30.0) as f32,
+            ..cleared_band(self.input as u8, band)
+        };
+        let what = if needs_gain {
+            format!("{ty} {freq:.0} Hz {gain:+.1} dB q {q}")
+        } else {
+            format!("{ty} {freq:.0} Hz q {q}")
+        };
+        write(p, what)
+    }
+
+    /// ` · mirrors to INn` when the pair is linked.
+    fn mirror_note(&self) -> String {
+        match self.list.mirror {
+            Some(m) => format!(" · mirrors to IN{}", m + 1),
+            None => String::new(),
+        }
+    }
+
     fn preamp_command(&self, db: f64) -> String {
         let mut lines = vec![format!("pre {} {}", self.input, number(db as f32))];
         if let Some(m) = self.list.mirror {
@@ -305,6 +482,10 @@ impl InputPage {
 }
 
 impl Screen for InputPage {
+    fn quick(&self, line: &str, state: &DeviceState) -> Option<crate::shell::Quick> {
+        Some(self.quick_reply(line, state))
+    }
+
     fn title(&self) -> String {
         self.name.clone()
     }

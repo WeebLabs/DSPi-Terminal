@@ -53,6 +53,7 @@ pub use matrix::MatrixPanel;
 pub use monitor::MonitorPanel;
 pub use output::OutputPage;
 pub use overview::Overview;
+pub mod quick;
 pub use presets::{PresetChoice, PresetMenu};
 pub use psybass::PsybassPanel;
 pub use signals::SignalsPanel;

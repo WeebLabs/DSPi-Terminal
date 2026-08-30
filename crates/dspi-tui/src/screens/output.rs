@@ -317,7 +317,228 @@ fn cell_style(theme: &Theme, focused: bool, armed: bool) -> Style {
     }
 }
 
+impl OutputPage {
+    /// The page grammar behind `;` (DESIGN 13): the output's own gain,
+    /// delay, mute and enable, a PEQ band in one line, and the crossover
+    /// (`xo hp 80 lr4`).
+    fn quick_reply(&self, line: &str, state: &DeviceState) -> crate::shell::Quick {
+        use super::quick::{ghost, number as num, verb};
+        use crate::shell::Quick;
+        const VERBS: &[&str] = &["gain", "delay", "mute", "unmute", "on", "off", "xo", "name"];
+        const SUMMARY: &str = "gain -3 · delay 2.5 · mute · unmute · on · off · 3 peak 1k -2 · xo hp 80 lr4 · name Sub";
+        let o = self.output;
+        let channel = output_channel(state, o);
+        let lower = line.to_ascii_lowercase();
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        let hint = |h: &str| Quick {
+            hint: h.to_string(),
+            ghost: ghost(&lower, VERBS),
+            commands: Vec::new(),
+        };
+        let Some(&first) = tokens.first() else {
+            return hint(SUMMARY);
+        };
+        if let Ok(band) = first.parse::<usize>() {
+            let max = state.caps.max_bands as usize;
+            if band == 0 || band > max {
+                return hint(&format!("bands are 1 to {max}"));
+            }
+            return self.quick_band(state, channel, band as u8 - 1, &tokens[1..]);
+        }
+        let one = |hint: String, command: String| Quick {
+            hint,
+            ghost: None,
+            commands: vec![command],
+        };
+        match verb(first, VERBS) {
+            Some("gain") => match tokens.get(1).and_then(|t| num(t)) {
+                Some(db) => {
+                    let db = db.clamp(-60.0, 10.0);
+                    one(
+                        format!("gain {db:+.1} dB"),
+                        format!("out.gain {o} {}", number(db as f32)),
+                    )
+                }
+                None => hint("gain <dB>"),
+            },
+            Some("delay") => match tokens.get(1).and_then(|t| num(t)) {
+                Some(ms) => {
+                    let ms = ms.clamp(0.0, max_delay_ms(state));
+                    one(
+                        format!("delay {ms:.1} ms"),
+                        format!("out.delay {o} {}", number(ms as f32)),
+                    )
+                }
+                None => hint("delay <ms>"),
+            },
+            Some("mute") => one("muted".into(), format!("out.mute {o} on")),
+            Some("unmute") => one("unmuted".into(), format!("out.mute {o} off")),
+            Some("on") => one("enabled".into(), format!("out.enable {o} on")),
+            Some("off") => one("disabled".into(), format!("out.enable {o} off")),
+            Some("xo") => self.quick_xover(state, channel, &tokens[1..]),
+            Some("name") => {
+                let name = line
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map(|(_, rest)| rest.trim())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    hint("name <text> · renames this channel")
+                } else {
+                    one(
+                        format!("rename to {name}"),
+                        format!("ch.name {channel} {name}"),
+                    )
+                }
+            }
+            _ => hint(SUMMARY),
+        }
+    }
+
+    /// A PEQ band edit, same shape as the input page's.
+    fn quick_band(
+        &self,
+        state: &DeviceState,
+        channel: usize,
+        band: u8,
+        args: &[&str],
+    ) -> crate::shell::Quick {
+        use super::quick::{ghost, number as num, verb};
+        use crate::shell::Quick;
+        use dspi_proto::FilterType;
+        const TYPES: &[&str] = &[
+            "peak",
+            "lowshelf",
+            "highshelf",
+            "lowpass",
+            "highpass",
+            "notch",
+            "ls",
+            "hs",
+            "lp",
+            "hp",
+            "off",
+        ];
+        let hint = |h: &str| Quick {
+            hint: h.to_string(),
+            ghost: args.first().and_then(|t| ghost(t, TYPES)),
+            commands: Vec::new(),
+        };
+        let Some(ty) = args.first().and_then(|t| verb(t, TYPES)) else {
+            return hint("peak · ls · hs · lp · hp · notch · off, then <freq> <gain> [q]");
+        };
+        let n = super::display_band(band);
+        let write = |p: &dspi_proto::value::EqParamPacket, what: String| Quick {
+            hint: format!("band {n}: {what}"),
+            ghost: None,
+            commands: super::band_command(state, channel, band, p),
+        };
+        if ty == "off" {
+            return write(&super::cleared_band(channel as u8, band), "off".into());
+        }
+        let (filter_type, needs_gain, default_q) = match ty {
+            "peak" => (FilterType::Peaking, true, 1.0),
+            "lowshelf" | "ls" => (FilterType::LowShelf, true, 0.707),
+            "highshelf" | "hs" => (FilterType::HighShelf, true, 0.707),
+            "lowpass" | "lp" => (FilterType::LowPass, false, 0.707),
+            "highpass" | "hp" => (FilterType::HighPass, false, 0.707),
+            _ => (FilterType::Notch, false, 1.0),
+        };
+        let Some(freq) = args.get(1).and_then(|t| num(t)) else {
+            return hint("frequency next: 1k · 80 · 2.5k");
+        };
+        let (gain, q) = if needs_gain {
+            let Some(g) = args.get(2).and_then(|t| num(t)) else {
+                return hint("gain next: -2 · +4.5");
+            };
+            (g, args.get(3).and_then(|t| num(t)).unwrap_or(default_q))
+        } else {
+            (0.0, args.get(2).and_then(|t| num(t)).unwrap_or(default_q))
+        };
+        let p = dspi_proto::value::EqParamPacket {
+            filter_type,
+            freq: freq.clamp(10.0, 20_000.0) as f32,
+            q: q.clamp(0.1, 30.0) as f32,
+            gain_db: gain.clamp(-30.0, 30.0) as f32,
+            ..super::cleared_band(channel as u8, band)
+        };
+        let what = if needs_gain {
+            format!("{ty} {freq:.0} Hz {gain:+.1} dB q {q}")
+        } else {
+            format!("{ty} {freq:.0} Hz q {q}")
+        };
+        write(&p, what)
+    }
+
+    /// `xo hp 80 [lr4]` writes the first crossover slot; `xo off` clears
+    /// all four. Families: lr2 lr4 lr8 · bw1..bw8 · bes2..bes8.
+    fn quick_xover(
+        &self,
+        state: &DeviceState,
+        channel: usize,
+        args: &[&str],
+    ) -> crate::shell::Quick {
+        use super::quick::number as num;
+        use crate::shell::Quick;
+        if !supports_crossover(state) {
+            return Quick {
+                hint: "this firmware has no crossover bank".into(),
+                ghost: None,
+                commands: Vec::new(),
+            };
+        }
+        let hint = |h: &str| Quick {
+            hint: h.to_string(),
+            ghost: None,
+            commands: Vec::new(),
+        };
+        match args.first().copied() {
+            Some("off") => {
+                let mut commands = Vec::new();
+                for band in 20..24u8 {
+                    commands.extend(super::band_command(
+                        state,
+                        channel,
+                        band,
+                        &super::cleared_band(channel as u8, band),
+                    ));
+                }
+                Quick {
+                    hint: "crossover off".into(),
+                    ghost: None,
+                    commands,
+                }
+            }
+            Some(side @ ("hp" | "lp")) => {
+                let Some(freq) = args.get(1).and_then(|t| num(t)) else {
+                    return hint("corner next: xo hp 80 · xo lp 80 lr4");
+                };
+                let family = args.get(2).copied().unwrap_or("lr4");
+                let token = format!("{family}{side}");
+                Quick {
+                    hint: format!(
+                        "{} {freq:.0} Hz {}",
+                        side.to_uppercase(),
+                        family.to_uppercase()
+                    ),
+                    ghost: None,
+                    commands: vec![format!(
+                        "eq {} 20 {token} {} 0.707 0",
+                        super::channel_token(state, channel),
+                        number(freq.clamp(10.0, 20_000.0) as f32)
+                    )],
+                }
+            }
+            _ => hint("xo hp <freq> [lr2|lr4|lr8|bw2|bes4…] · xo lp <freq> · xo off"),
+        }
+    }
+}
+
 impl Screen for OutputPage {
+    fn quick(&self, line: &str, state: &DeviceState) -> Option<crate::shell::Quick> {
+        Some(self.quick_reply(line, state))
+    }
+
     fn title(&self) -> String {
         self.name.clone()
     }

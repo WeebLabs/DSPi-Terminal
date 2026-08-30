@@ -291,6 +291,10 @@ impl PsybassPanel {
 }
 
 impl Screen for PsybassPanel {
+    fn quick(&self, line: &str, _state: &DeviceState) -> Option<crate::shell::Quick> {
+        Some(super::quick::toggle(line, "bass.on", "Bass"))
+    }
+
     fn title(&self) -> String {
         "Psychoacoustic Bass".into()
     }

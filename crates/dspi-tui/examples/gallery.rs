@@ -42,6 +42,12 @@ fn main() {
         .position(|a| a == "--settings")
         .and_then(|i| raw.get(i + 1))
         .cloned();
+    // `--quick "1 2 > 3"` opens the `;` bar prefilled, for review.
+    let quick = raw
+        .iter()
+        .position(|a| a == "--quick")
+        .and_then(|i| raw.get(i + 1))
+        .cloned();
     // The Control pages are lists of collapsed cards, so a card body is only
     // reachable by opening one. `--expand n` puts the cursor on the nth
     // focusable row and activates it, which is what a reviewer would do.
@@ -57,7 +63,7 @@ fn main() {
         if std::mem::take(&mut skip) || a == "--ansi" || a == "--busy" || a == "--full" {
             continue;
         }
-        if a == "--screen" || a == "--settings" || a == "--expand" {
+        if a == "--screen" || a == "--settings" || a == "--expand" || a == "--quick" {
             skip = true;
             continue;
         }
@@ -373,6 +379,14 @@ fn main() {
     shell.focus = Focus::Screen;
     if let Some((tool, panel)) = tool {
         shell.open_tool(tool, panel);
+    }
+    if let Some(line) = &quick {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+        shell.handle(key(KeyCode::Char(';')), &state);
+        for c in line.chars() {
+            shell.handle(key(KeyCode::Char(c)), &state);
+        }
     }
     if let Some(name) = &settings {
         let page = SettingsScreen::page_from_name(name).unwrap_or_else(|| {

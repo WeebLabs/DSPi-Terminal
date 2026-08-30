@@ -13,6 +13,21 @@ use super::model::Selection;
 use crate::theme::Theme;
 use crate::widgets::{Dialog, KeyHelp, PopupList};
 
+/// A page grammar's answer to the command bar (DESIGN 13): what the line
+/// would do, the rest of a verb the person has started, and the commands to
+/// run when they press Enter. Empty `commands` with a hint means the line is
+/// not complete yet.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Quick {
+    /// One line saying what the input means, or what could come next.
+    pub hint: String,
+    /// The rest of the verb the input starts, offered as a ghost; `Tab`
+    /// accepts it.
+    pub ghost: Option<String>,
+    /// The shared-grammar commands the line runs, when it is complete.
+    pub commands: Vec<String>,
+}
+
 /// What a session request answered, back to the screen that asked.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionReply {
@@ -138,6 +153,13 @@ pub trait Screen {
     /// session, for screens that show device status the notification
     /// stream does not carry (control-surface display and macro state).
     fn poll(&mut self, _session: &mut Session, _state: &DeviceState) {}
+
+    /// The page grammar behind the `;` command bar, called on every edit.
+    /// `None` means this page has no grammar of its own; the bar then says
+    /// so and runs the line through the shared `:` grammar as typed.
+    fn quick(&self, _line: &str, _state: &DeviceState) -> Option<Quick> {
+        None
+    }
 }
 
 /// A screen with nothing in it yet: names the selection and its keys.

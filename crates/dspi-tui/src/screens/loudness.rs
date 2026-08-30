@@ -210,6 +210,10 @@ impl LoudnessPanel {
 }
 
 impl Screen for LoudnessPanel {
+    fn quick(&self, line: &str, _state: &DeviceState) -> Option<crate::shell::Quick> {
+        Some(super::quick::toggle(line, "loud.on", "Loudness"))
+    }
+
     fn title(&self) -> String {
         "Loudness Compensation".into()
     }
