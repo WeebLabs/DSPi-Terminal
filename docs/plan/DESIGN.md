@@ -544,11 +544,16 @@ Replaces the detail pane:
  DELAY           0.0 ms   0.0 ms   0.0 ms    0.0 ms    2.5 ms
  MUTE            ○        ○        ○         ○         ●
 ```
-Column headers in the output colour; input labels in the input colour;
-the input trim column only in 8-channel mode. A cell shows `●`/`○` and
-the gain; `INV` in `warning` when inverted. Cells of a disabled output in
-`dim`. A cell that would conflict with Core 1 has a `warning` outline
-marker `!`. Keys: arrows move the reticle; `Space` connects / disconnects;
+Column headers in the output colour (section 12: the focused column's);
+input labels in the input colour; the input trim column only in
+8-channel mode. Every input has a row of its own: the Console's stereo
+pair dividers are not drawn, and one rule parts the inputs from the
+ENABLE, GAIN, DELAY and MUTE rows. Columns are at least 13 cells and
+widen to 18 as the pane allows, so nine outputs sit uncrowded at 200
+columns and scroll at 120. A cell shows `●`/`○` and the gain; `INV` in
+`warning` when inverted. Cells of a disabled output in `dim`. A column
+that would conflict with Core 1 carries a `warning` `!` after its
+descriptor in the header, once, rather than in every cell. Keys: arrows move the reticle; `Space` connects / disconnects;
 `Enter` edits the gain; `i` inverts; `←`/`→` on a gain nudges by 0.5 dB;
 in the ENABLE row `Space` toggles with the conflict confirms; `d` Direct
 1:1; `D` Clear (confirm); `r` rename the column's output; `y`/`Y` copy /

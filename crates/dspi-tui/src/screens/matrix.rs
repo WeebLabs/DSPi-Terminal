@@ -25,11 +25,19 @@ use crate::theme::{ChannelRole, Glyphs, Theme};
 use crate::widgets::text::{fit_centre, fit_left, fit_right};
 use crate::widgets::{Button, Dialog, DialogOutcome, KeyHelp, NumberEdit};
 
-/// The pinned input-label column, wide enough for a name and its trim.
-const LABEL_W: u16 = 16;
-/// One output column: the connect dot, the conflict mark, the gain, `INV`,
-/// and a gutter that doubles as the focus bracket of the next column.
-const COL_W: u16 = 12;
+/// The pinned input-label column: a name, its trim, and air between them.
+const LABEL_W: u16 = 18;
+/// The narrowest output column: the connect dot, the gain, `INV`, and a
+/// gutter that doubles as the focus bracket of the next column. Columns
+/// grow up to [`MAX_COL_W`] when the pane has the room, so the grid is
+/// never more crowded than it has to be.
+const MIN_COL_W: u16 = 13;
+const MAX_COL_W: u16 = 18;
+
+/// The column width for a pane this wide showing `n_out` outputs.
+fn col_width(width: u16, n_out: usize) -> u16 {
+    (width.saturating_sub(LABEL_W) / n_out.max(1) as u16).clamp(MIN_COL_W, MAX_COL_W)
+}
 /// The Console's `CompactGainField` range, which is also the crosspoint's.
 const GAIN_MIN: f64 = -60.0;
 const GAIN_MAX: f64 = 12.0;
@@ -82,6 +90,8 @@ pub struct MatrixPanel {
     trim: bool,
     /// The leftmost visible output column.
     scroll: usize,
+    /// The column width of the last frame, from [`col_width`].
+    col_w: u16,
     edit: Option<NumberEdit>,
     pending: Option<Pending>,
 }
@@ -171,6 +181,7 @@ impl MatrixPanel {
             col: 0,
             trim: false,
             scroll: 0,
+            col_w: MIN_COL_W,
             edit: None,
             pending: None,
         }
@@ -195,24 +206,17 @@ impl MatrixPanel {
         rows[self.row.min(rows.len() - 1)]
     }
 
-    /// Every line the body draws, in order: the ROUTING band, the input rows
-    /// with a divider between stereo pairs, then the output rows.
+    /// Every line the body draws, in order: the ROUTING band, one row per
+    /// input, a rule, then the output rows. The Console divides the inputs
+    /// into stereo pairs; here every input stands on its own, since the
+    /// pairing said nothing the names do not.
     fn lines(&self, state: &DeviceState) -> Vec<Line> {
         let n = self.inputs(state);
         let mut v = vec![Line::Routing];
         for i in 0..n {
             v.push(Line::Row(Row::Input(i)));
-            // `MatrixMixerView.rowNeedsDivider`: stereo pairs in 8-channel
-            // mode, one L/R separator otherwise.
-            let divider = if is_8ch(state) {
-                i % 2 == 1 && i + 1 < n
-            } else {
-                i == 0
-            };
-            if divider {
-                v.push(Line::Divider);
-            }
         }
+        v.push(Line::Divider);
         v.extend([
             Line::Row(Row::Enable),
             Line::Row(Row::Gain),
@@ -223,8 +227,8 @@ impl MatrixPanel {
     }
 
     /// How many output columns fit beside the pinned label column.
-    fn visible_columns(&self, width: u16) -> usize {
-        (width.saturating_sub(LABEL_W) / COL_W).max(1) as usize
+    fn visible_columns(&self, width: u16, n_out: usize) -> usize {
+        (width.saturating_sub(LABEL_W) / col_width(width, n_out)).max(1) as usize
     }
 
     /// Is the trim field reachable from where the reticle is?
@@ -425,7 +429,7 @@ impl MatrixPanel {
     fn draw_headers(&self, p: &mut Paint, cols: &[usize]) {
         let (area, theme, state) = (p.area, p.theme, p.state);
         for (n, &o) in cols.iter().enumerate() {
-            let x = area.x + LABEL_W + n as u16 * COL_W;
+            let x = area.x + LABEL_W + n as u16 * self.col_w;
             let name = channel_name(state, output_channel(state, o));
             // `DESIGN.md` 7.7: "Column headers in the output colour". Both
             // header rows name the same column, so both take it.
@@ -433,15 +437,28 @@ impl MatrixPanel {
             p.buf.set_string(
                 x,
                 area.y,
-                fit_centre(&name, COL_W as usize - 1),
+                fit_centre(&name, self.col_w as usize - 1),
                 Style::default().fg(color),
             );
+            let desc = descriptor(state, o);
             p.buf.set_string(
                 x,
                 area.y + 1,
-                fit_centre(&descriptor(state, o), COL_W as usize - 1),
+                fit_centre(&desc, self.col_w as usize - 1),
                 Style::default().fg(color),
             );
+            // The Console outlines a column that would collide on Core 1 in
+            // orange; the mark sits by the descriptor, once per column, rather
+            // than in every cell beneath it.
+            if would_conflict(state, o) {
+                let start = x + (self.col_w - 1 - desc.chars().count() as u16) / 2;
+                p.buf.set_string(
+                    start + desc.chars().count() as u16 + 1,
+                    area.y + 1,
+                    "!",
+                    theme.warning_style(),
+                );
+            }
         }
         // Which way the grid still has columns, since the label column is
         // pinned and the rest slides under it.
@@ -455,7 +472,7 @@ impl MatrixPanel {
             );
         }
         if self.scroll + cols.len() < state.caps.num_outputs as usize {
-            let x = area.x + LABEL_W + cols.len() as u16 * COL_W - 1;
+            let x = area.x + LABEL_W + cols.len() as u16 * self.col_w - 1;
             if x < area.x + area.width {
                 p.buf.set_string(
                     x,
@@ -474,8 +491,9 @@ impl MatrixPanel {
         if x > area.x {
             p.buf.set_string(x - 1, y, "[", theme.focused());
         }
-        if x + COL_W - 1 < area.x + area.width {
-            p.buf.set_string(x + COL_W - 1, y, "]", theme.focused());
+        if x + self.col_w - 1 < area.x + area.width {
+            p.buf
+                .set_string(x + self.col_w - 1, y, "]", theme.focused());
         }
     }
 
@@ -505,14 +523,6 @@ impl MatrixPanel {
             theme.label()
         };
         p.buf.set_string(x, y, dot, dot_style);
-
-        // The Console outlines a conflicting column in orange; a terminal
-        // marks the cell instead. `would_conflict` is symmetric, and the
-        // ENABLE row already colours both sides, so the marker does too:
-        // marking only PDM said the interlock ran one way.
-        if would_conflict(state, output) {
-            p.buf.set_string(x + 1, y, "!", theme.warning_style());
-        }
 
         match self.edit.as_ref().filter(|_| focused) {
             Some(e) => {
@@ -563,7 +573,7 @@ impl MatrixPanel {
         let out = state.output(output);
         let live = out.enabled;
         let ascii = theme.glyphs == Glyphs::Ascii;
-        let w = COL_W as usize - 1;
+        let w = self.col_w as usize - 1;
         match row {
             Row::Enable => {
                 let text = match (out.enabled, ascii) {
@@ -618,7 +628,7 @@ impl MatrixPanel {
                     theme.label()
                 };
                 p.buf.set_string(x, y, " ".repeat(w), theme.value());
-                p.buf.set_string(x + (COL_W - 1) / 2, y, glyph, style);
+                p.buf.set_string(x + (self.col_w - 1) / 2, y, glyph, style);
             }
             Row::Input(_) => {}
         }
@@ -640,7 +650,7 @@ impl MatrixPanel {
                     return;
                 }
                 p.buf
-                    .set_string(x + 1, y, fit_left(&name, 5), Style::default().fg(color));
+                    .set_string(x + 1, y, fit_left(&name, 7), Style::default().fg(color));
                 // The Console's per-input trim, bound to `preampDB[input]`.
                 let focused = here && self.trim;
                 let text = match self.edit.as_ref().filter(|_| focused) {
@@ -654,7 +664,7 @@ impl MatrixPanel {
                 } else {
                     theme.value()
                 };
-                p.buf.set_string(x + 6, y, fit_right(&text, 9), style);
+                p.buf.set_string(x + 8, y, fit_right(&text, 8), style);
             }
             Row::Enable => p.buf.set_string(x + 1, y, "ENABLE", theme.section()),
             Row::Gain => p.buf.set_string(x + 1, y, "GAIN", theme.section()),
@@ -693,11 +703,12 @@ impl Screen for MatrixPanel {
         state: &DeviceState,
         focused: bool,
     ) {
-        if area.height < 4 || area.width < LABEL_W + COL_W {
+        if area.height < 4 || area.width < LABEL_W + MIN_COL_W {
             return;
         }
         let n_out = self.outputs(state);
-        let per_screen = self.visible_columns(area.width).min(n_out.max(1));
+        self.col_w = col_width(area.width, n_out);
+        let per_screen = self.visible_columns(area.width, n_out).min(n_out.max(1));
         self.col = self.col.min(n_out.saturating_sub(1));
         // Keep the reticle's column on screen; the label column is pinned and
         // the rest slides under it.
@@ -707,7 +718,7 @@ impl Screen for MatrixPanel {
             .min(self.col)
             .max((self.col + 1).saturating_sub(per_screen));
         let cols: Vec<usize> = (self.scroll..(self.scroll + per_screen).min(n_out)).collect();
-        let grid_w = LABEL_W + cols.len() as u16 * COL_W;
+        let grid_w = LABEL_W + cols.len() as u16 * self.col_w;
 
         let here = self.row_at(state);
         let lines = self.lines(state);
@@ -758,7 +769,7 @@ impl Screen for MatrixPanel {
                     }
                     self.draw_label(&mut p, y, *row, on_row);
                     for (i, &o) in cols.iter().enumerate() {
-                        let x = area.x + LABEL_W + i as u16 * COL_W;
+                        let x = area.x + LABEL_W + i as u16 * self.col_w;
                         let cell = on_row && !self.trim && o == self.col;
                         match row {
                             Row::Input(input) => {
@@ -1163,8 +1174,9 @@ mod tests {
     fn both_header_rows_are_in_the_columns_output_colour() {
         let t = theme();
         let f = draw(&mut panel(), &fixture::state(), 200, 20);
+        let col_w = col_width(200, 9);
         for (col, channel) in [(0usize, 8u8), (2, 10), (8, 16)] {
-            let x = LABEL_W + col as u16 * COL_W + 2;
+            let x = LABEL_W + col as u16 * col_w + 2;
             let want = t.channel_of(channel, 8, 9);
             assert_eq!(f[(x, 0)].fg, want, "the name row of column {col}");
             assert_eq!(f[(x, 1)].fg, want, "the descriptor row of column {col}");
@@ -1175,8 +1187,9 @@ mod tests {
     fn a_disabled_outputs_cells_draw_dim() {
         let t = theme();
         // The fixture connects input 2 to output 2, so the cell has a colour to
-        // lose. Row order: headers, ROUTING, FL, FR, divider, FC.
-        let (x, y) = (LABEL_W + 2 * COL_W, 6u16);
+        // lose. Row order: headers, ROUTING, FL, FR, FC.
+        let col_w = col_width(120, 9);
+        let (x, y) = (LABEL_W + 2 * col_w, 5u16);
         let live = draw(&mut panel(), &fixture::state(), 120, 20);
         assert_eq!(live[(x, y)].symbol(), "●");
         assert_eq!(
@@ -1189,7 +1202,7 @@ mod tests {
         assert_eq!(off[(x, y)].symbol(), "●", "still connected");
         assert_eq!(off[(x, y)].fg, t.dim, "but the whole column is dim");
         // And so is the output's own strip beneath it.
-        let gain: Vec<_> = (0..COL_W - 1).map(|dx| off[(x + dx, 15)].fg).collect();
+        let gain: Vec<_> = (0..col_w - 1).map(|dx| off[(x + dx, 13)].fg).collect();
         assert!(gain.iter().all(|c| *c == t.dim), "the GAIN row: {gain:?}");
     }
 
@@ -1198,20 +1211,25 @@ mod tests {
     /// when the ENABLE row was already colouring both sides orange.
     #[test]
     fn a_core_one_collision_marks_both_sides_of_the_interlock() {
-        let count = |f: &str| f.matches("○!").count() + f.matches("●!").count();
+        // The mark sits in the descriptor row, once per column.
+        let count = |f: &str| {
+            f.lines()
+                .nth(1)
+                .map(|l| l.matches(" !").count())
+                .unwrap_or(0)
+        };
 
         // Every output is on in the fixture, so every column on both sides of
         // the interlock is in collision: PDM and the six EQ workers.
         let f = text(&draw(&mut panel(), &fixture::state(), 200, 20));
-        let per_row = count(f.lines().find(|l| l.starts_with("▸FL")).expect("FL row"));
-        assert_eq!(per_row, 7, "PDM plus outputs 3 to 8:\n{f}");
+        assert_eq!(count(&f), 7, "PDM plus outputs 3 to 8:\n{f}");
+        assert!(!f.contains("○!"), "no marks in the cells:\n{f}");
 
         // With the EQ workers off, PDM is free, but each of them would still
         // collide with the PDM output that is still running.
         let clear = outputs_off(&[2, 3, 4, 5, 6, 7]);
         let f = text(&draw(&mut panel(), &clear, 200, 20));
-        let row = f.lines().find(|l| l.starts_with("▸FL")).expect("FL row");
-        assert_eq!(count(row), 6, "the six EQ workers, not PDM:\n{f}");
+        assert_eq!(count(&f), 6, "the six EQ workers, not PDM:\n{f}");
 
         // With PDM off as well, nothing is in collision with anything.
         let clear = outputs_off(&[2, 3, 4, 5, 6, 7, 8]);
@@ -1220,13 +1238,28 @@ mod tests {
     }
 
     #[test]
-    fn stereo_pairs_are_divided_and_the_stereo_matrix_splits_once() {
+    fn inputs_stand_alone_and_one_rule_parts_them_from_the_outputs() {
         let f = text(&draw(&mut panel(), &fixture::state(), 120, 24));
         let dividers = f.lines().filter(|l| l.contains("──")).count();
-        assert_eq!(dividers, 3, "three pair dividers:\n{f}");
+        assert_eq!(dividers, 1, "one rule above ENABLE:\n{f}");
+        let lines: Vec<&str> = f.lines().collect();
+        assert!(lines[3].starts_with("▸FL") && lines[4].starts_with(" FR"));
+        assert!(lines[5].starts_with(" FC"), "no pair divider:\n{f}");
         let s = text(&draw(&mut panel(), &stereo(), 120, 24));
         let dividers = s.lines().filter(|l| l.contains("──")).count();
-        assert_eq!(dividers, 1, "one L/R separator:\n{s}");
+        assert_eq!(dividers, 1, "the same rule in stereo:\n{s}");
+    }
+
+    #[test]
+    fn columns_widen_with_the_pane() {
+        assert_eq!(col_width(90, 9), MIN_COL_W, "120x40's pane: the minimum");
+        assert_eq!(
+            col_width(166, 9),
+            16,
+            "200x60's pane: sixteen, all nine fit"
+        );
+        assert_eq!(col_width(400, 9), MAX_COL_W, "capped");
+        assert_eq!(col_width(90, 5), 14, "five outputs get wider columns");
     }
 
     // -- Routing -----------------------------------------------------------
