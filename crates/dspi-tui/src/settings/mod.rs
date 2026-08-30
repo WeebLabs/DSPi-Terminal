@@ -89,6 +89,10 @@ pub struct SettingsData {
     /// Every control-surface record the three Control pages show. `None` on a
     /// firmware without them, and while the device has not been read.
     pub cs: Option<cs_model::CsData>,
+    /// The rate the device is actually running at (`REQ_GET_STATUS`
+    /// `SAMPLE_RATE`), which is what the Console's 128x lock reads. The
+    /// configured rate in the bulk packet is what it will run at next time.
+    pub sample_rate_hz: Option<u32>,
 }
 
 impl SettingsData {
@@ -146,7 +150,9 @@ impl SettingsData {
             })
             .collect();
         let cs = cs_model::CsData::read(session);
+        let sample_rate_hz = read_sample_rate(session);
         Self {
+            sample_rate_hz,
             directory,
             startup,
             uart,
@@ -179,6 +185,9 @@ impl SettingsData {
         }
         if r.claims.is_some() {
             self.claims = r.claims;
+        }
+        if r.sample_rate_hz.is_some() {
+            self.sample_rate_hz = r.sample_rate_hz;
         }
         if let Some(cs) = r.cs {
             // The device's own unsaved flag, which is better evidence than the
@@ -263,6 +272,21 @@ pub struct Refresh {
     pub spdif: Option<SpdifInputConfig>,
     pub claims: Option<Vec<PinClaim>>,
     pub cs: Option<cs_model::CsData>,
+    pub sample_rate_hz: Option<u32>,
+}
+
+/// The rate the pipeline is running at, index `SAMPLE_RATE` of the status
+/// table (`REQ_GET_STATUS`, config.h:193).
+fn read_sample_rate(session: &mut Session) -> Option<u32> {
+    let b = session
+        .with_transport(|t| t.control_in(dspi_proto::generated::opcodes::REQ_GET_STATUS, 15, 4))
+        .ok()?;
+    Some(u32::from_le_bytes([
+        *b.first()?,
+        *b.get(1)?,
+        *b.get(2)?,
+        *b.get(3)?,
+    ]))
 }
 
 impl Refresh {
@@ -300,6 +324,7 @@ impl Refresh {
                 .ok()
                 .map(|m| m.claims().to_vec()),
             cs: None,
+            sample_rate_hz: read_sample_rate(session),
         }
     }
 
@@ -520,6 +545,14 @@ pub(crate) enum Row {
     },
 }
 
+/// A note wraps to as many lines as it needs.
+///
+/// Section footers are the Console's own prose, and clipping them loses whole
+/// sentences: the Groups footer defines "Match Members Exactly", the Surfaces
+/// and Macros footers explain Save against Revert, and Control Interfaces ends
+/// on the I2C pull-ups. The page scrolls, so there is room.
+const NOTE_LINES: usize = usize::MAX;
+
 impl Row {
     pub fn note(text: impl Into<String>) -> Self {
         Self::Note(text.into())
@@ -556,7 +589,7 @@ impl Row {
         match self {
             Row::Blank => 1,
             Row::Section(_) => 1,
-            Row::Note(t) => wrap(t, width.saturating_sub(2) as usize, 4).len() as u16,
+            Row::Note(t) => wrap(t, width.saturating_sub(2) as usize, NOTE_LINES).len() as u16,
             Row::Banner(_, _, body) => {
                 1 + wrap(body, width.saturating_sub(3) as usize, 3).len() as u16
             }
@@ -576,7 +609,7 @@ impl Row {
             Row::Blank => {}
             Row::Section(t) => SectionHeader::new(t, theme).render(area, buf),
             Row::Note(t) => {
-                for (i, line) in wrap(t, area.width.saturating_sub(2) as usize, 4)
+                for (i, line) in wrap(t, area.width.saturating_sub(2) as usize, NOTE_LINES)
                     .iter()
                     .enumerate()
                 {
@@ -976,17 +1009,20 @@ pub fn available(page: Page, state: &DeviceState, connected: bool) -> bool {
         // The I2S clock pins are an RP mux concern; a platform we do not know
         // is assumed not to have them, which is the Console's STM32 rule.
         Page::I2s => matches!(state.caps.platform, Platform::Rp2040 | Platform::Rp2350),
-        Page::Inputs => {
-            feature("spdif_multi_input")
-                || feature("i2s_input_channels")
-                || feature("adat_input")
-                || feature("lg_sound_sync")
-        }
+        // The Console's rule is `inputSourceSupported` alone: a firmware with a
+        // selectable input source has an Inputs page even when it has none of
+        // the optional receivers.
+        Page::Inputs => feature("input_source"),
         Page::Interfaces => feature("uart_control") || feature("i2c_control"),
         // Shown while disconnected too: the page carries its own placeholder.
         Page::Surfaces => state.caps.cs.is_some() || !connected,
         Page::Groups => state.caps.cs.as_ref().is_some_and(|c| c.max_groups > 0),
-        Page::Macros => state.caps.cs.as_ref().is_some_and(|c| c.max_macros > 0),
+        // A macro with no room for a step is not a macro (`csMacrosSupported`).
+        Page::Macros => state
+            .caps
+            .cs
+            .as_ref()
+            .is_some_and(|c| c.max_macros > 0 && c.max_macro_steps > 0),
         _ => true,
     }
 }
@@ -2237,6 +2273,7 @@ pub mod demo {
             ],
             cs_dirty: false,
             cs: None,
+            sample_rate_hz: Some(48_000),
         }
     }
 }
@@ -2381,6 +2418,42 @@ pub(crate) mod tests {
         assert!(!f.contains("Channel Groups"), "{f}");
     }
 
+    /// The two availability rules the Console states and this did not: the
+    /// Inputs page hangs off `inputSourceSupported`, and a macro with no room
+    /// for a step is not a macro.
+    #[test]
+    fn availability_follows_the_consoles_two_compound_rules() {
+        let feature = |name: &str, present: bool| dspi_session::probe::Feature {
+            name: name.into(),
+            present,
+            evidence: "probe".into(),
+        };
+
+        // Input source present, every optional receiver absent: the Console
+        // still shows the page, and this used to lose it.
+        let mut st = state();
+        st.caps.features = vec![
+            feature("input_source", true),
+            feature("spdif_multi_input", false),
+            feature("i2s_input_channels", false),
+            feature("adat_input", false),
+            feature("lg_sound_sync", false),
+        ];
+        assert!(available(Page::Inputs, &st, true));
+        st.caps.features = vec![feature("input_source", false)];
+        assert!(!available(Page::Inputs, &st, true));
+
+        // `maxMacros > 0 && maxMacroSteps > 0`.
+        let mut st = state();
+        let mut caps = cs_model::demo::caps();
+        caps.max_macro_steps = 0;
+        st.caps.cs = Some(caps);
+        assert!(!available(Page::Macros, &st, true));
+        assert!(available(Page::Groups, &st, true), "groups are unaffected");
+        st.caps.cs = Some(cs_model::demo::caps());
+        assert!(available(Page::Macros, &st, true));
+    }
+
     #[test]
     fn the_sidebar_walks_pages_and_skips_the_group_headers() {
         let (mut s, st) = screen(Page::About);
@@ -2513,6 +2586,60 @@ pub(crate) mod tests {
             f.contains("Your controls are live now; saving keeps them across a reboot."),
             "{f}"
         );
+    }
+
+    /// A section footer is the Console's own prose. Clipped at four wrapped
+    /// lines, every one of them lost its last sentence, including the one the
+    /// survey names: the Groups footer is where "Match Members Exactly" is
+    /// defined.
+    #[test]
+    fn a_footer_note_is_not_clipped() {
+        for (page, tail) in [
+            (
+                Page::Groups,
+                "Groups are stored on the device alongside the controls and share their Save and \
+                 Revert.",
+            ),
+            (
+                Page::Surfaces,
+                "use Save to keep them across a reboot, or Revert to discard them.",
+            ),
+            (
+                Page::Interfaces,
+                "Fit external pull-ups (2.2k - 4.7k) on the I2C bus.",
+            ),
+        ] {
+            let st = crate::settings::cs_model::demo::state();
+            let s = SettingsScreen::new(
+                &st,
+                crate::settings::cs_model::demo::settings_data(),
+                AppConfig::default(),
+            )
+            .config_path(scratch("footer"))
+            .open(page, &st);
+            let cx = s.cx(&st);
+            let rows = s.current_ref().rows(&cx);
+            let note = rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::Note(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .find(|t| t.len() > 200)
+                .unwrap_or_else(|| panic!("{page:?} has no footer"));
+            let width = 100u16;
+            let drawn = wrap(&note, width.saturating_sub(2) as usize, NOTE_LINES).join(" ");
+            let want: String = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                drawn.contains(&want),
+                "{page:?} lost its last sentence:\n{drawn}"
+            );
+            assert!(!drawn.contains('…'), "{page:?} was ellipsised:\n{drawn}");
+            // And the row asks for the height that takes.
+            let lines = wrap(&note, width.saturating_sub(2) as usize, NOTE_LINES).len() as u16;
+            assert_eq!(Row::Note(note).height(width), lines);
+            assert!(lines > 4, "{page:?} needs more than the old cap");
+        }
     }
 
     #[test]

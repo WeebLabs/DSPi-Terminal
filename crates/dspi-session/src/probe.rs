@@ -256,6 +256,9 @@ fn channel_names(bulk: &BulkPacket, count: u8) -> Vec<String> {
 /// instance, only exists from wire V19, and older firmware stalls on it.
 fn probe_features(t: &mut dyn Transport) -> Vec<Feature> {
     let probes: &[(&str, u8, u16)] = &[
+        // The Console's `inputSourceSupported`, which gates its whole input
+        // page: firmware without a selectable source stalls 0xE1.
+        ("input_source", op::REQ_GET_INPUT_SOURCE, 1),
         ("loudness_output_mask", op::REQ_GET_LOUDNESS_MASK, 2),
         ("crossfeed_output_mask", op::REQ_GET_CROSSFEED_OUTPUTS, 1),
         ("leveller_masks", op::REQ_GET_LEVELLER_MASKS, 2),

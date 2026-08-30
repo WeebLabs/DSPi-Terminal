@@ -52,12 +52,23 @@ fn rate_label(hz: u32) -> String {
 }
 
 impl I2sPage {
-    /// The live sample rate, from the input configuration's rate code.
+    /// The configured input rate, from the bulk packet's rate code: what the
+    /// device will clock at when it is the authority.
     fn rate_hz(cx: &Cx<'_>) -> u32 {
         cx.state
             .input_config()
             .and_then(|c| INPUT_RATES_HZ.get(c.i2s_input_rate as usize).copied())
             .unwrap_or(48_000)
+    }
+
+    /// The rate the pipeline is actually running at, which is what the
+    /// Console's `mck256UnsupportedAtCurrentRate` reads. Falls back to the
+    /// configured rate until the status read has happened.
+    fn running_rate_hz(cx: &Cx<'_>) -> u32 {
+        match cx.data.sample_rate_hz {
+            Some(hz) if hz > 0 => hz,
+            _ => Self::rate_hz(cx),
+        }
     }
 
     /// Whether the device is actually clocking as an I2S slave: the mode says
@@ -183,14 +194,16 @@ impl I2sPage {
                 enabled: !i2s.mck_enabled && !slave && !mck.is_empty() && cx.connected,
             },
         ));
-        let locked_128 = rate >= 96_000;
+        // The Console locks on the running rate, not the configured one.
+        let running = Self::running_rate_hz(cx);
+        let locked_128 = running >= 96_000;
         rows.push((
             Some(Item::MckMult),
             Row::Pick {
                 label: "MCK Multiplier".into(),
                 choices: vec!["128x".into(), "256x".into()],
                 selected: usize::from(i2s.mck_multiplier == 1),
-                caption: locked_128.then(|| format!("Locked to 128x at {}", rate_label(rate))),
+                caption: locked_128.then(|| format!("Locked to 128x at {}", rate_label(running))),
                 enabled: !locked_128 && !slave && cx.connected,
             },
         ));
@@ -671,17 +684,37 @@ mod tests {
         assert!(!pins.contains(&9), "GPIO 10 is the sub");
     }
 
+    /// The Console locks on the rate the pipeline is running at, not the one
+    /// the bulk packet says it will use next time it is the clock authority.
     #[test]
     fn the_multiplier_is_locked_to_128x_above_48_khz() {
-        let mut st = state();
+        let mut d = data();
+        d.sample_rate_hz = Some(96_000);
+        let st = state();
+        let mut s = SettingsScreen::new(&st, d, AppConfig::default()).open(Page::I2s, &st);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(f.contains("Locked to 128x at 96 kHz"), "{f}");
+
+        // The configured rate on its own does not lock it: a device clocked by
+        // an external master is running at whatever that master says.
         let sec = dspi_proto::generated::SECTIONS
             .iter()
             .find(|(n, _, _)| *n == "input_config")
             .map(|(_, o, _)| *o)
             .unwrap();
+        let mut st = state();
         // Rate code 2 is 96 kHz.
         st.bulk.patch(sec + 3, &[2]);
-        let mut s = SettingsScreen::new(&st, data(), AppConfig::default()).open(Page::I2s, &st);
+        let mut d = data();
+        d.sample_rate_hz = Some(48_000);
+        let mut s = SettingsScreen::new(&st, d, AppConfig::default()).open(Page::I2s, &st);
+        let f = frame(&mut s, &st, 120, 40);
+        assert!(!f.contains("Locked to 128x"), "{f}");
+
+        // Until the status read has happened, the configured rate stands in.
+        let mut d = data();
+        d.sample_rate_hz = None;
+        let mut s = SettingsScreen::new(&st, d, AppConfig::default()).open(Page::I2s, &st);
         let f = frame(&mut s, &st, 120, 40);
         assert!(f.contains("Locked to 128x at 96 kHz"), "{f}");
     }

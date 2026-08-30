@@ -102,6 +102,27 @@ impl InputsPage {
         }
     }
 
+    /// How many S/PDIF receivers this device has, from the inventory count
+    /// `REQ_GET_SPDIF_INPUT_CONFIG` answers (the Console's `spdifInputCount`).
+    /// A firmware that predates the fourth input reports three and the extra
+    /// choice never appears.
+    fn spdif_inventory(cx: &Cx<'_>) -> usize {
+        cx.data
+            .spdif
+            .as_ref()
+            .map(|c| (c.count as usize).clamp(1, 4))
+            .unwrap_or(4)
+    }
+
+    /// The most I2S input channels this part can take: one stereo pair on an
+    /// RP2040, four on an RP2350 (the Console's `i2sMaxPairs * 2`).
+    fn max_i2s_channels(cx: &Cx<'_>) -> usize {
+        match cx.platform() {
+            dspi_proto::Platform::Rp2350 => 8,
+            _ => 2,
+        }
+    }
+
     fn i2s_owner(pair: usize, pairs: usize) -> String {
         if pairs > 1 {
             format!("I2S RX {}", pair + 1)
@@ -123,7 +144,9 @@ impl InputsPage {
                 Some(Item::Instances),
                 Row::Pick {
                     label: "Instances".into(),
-                    choices: (1..=4).map(|n| n.to_string()).collect(),
+                    choices: (1..=Self::spdif_inventory(cx))
+                        .map(|n| n.to_string())
+                        .collect(),
                     selected: count.saturating_sub(1),
                     caption: Some(format!(
                         "{count} selectable input{} sharing one receiver",
@@ -237,13 +260,17 @@ impl InputsPage {
                 Some(Item::I2sChannels),
                 Row::Pick {
                     label: "Channels".into(),
-                    choices: vec!["2".into(), "4".into(), "6".into(), "8".into()],
-                    selected: (pairs.max(1) - 1).min(3),
+                    choices: (1..=Self::max_i2s_channels(cx) / 2)
+                        .map(|p| (p * 2).to_string())
+                        .collect(),
+                    selected: (pairs.max(1) - 1).min(Self::max_i2s_channels(cx) / 2 - 1),
                     caption: Some(format!(
                         "{pairs} stereo pair{} of 24-bit audio, sample-aligned",
                         if pairs == 1 { "" } else { "s" }
                     )),
-                    enabled: cx.connected,
+                    // A stereo-only part has one choice, which the Console
+                    // draws as a plain "2" rather than a picker.
+                    enabled: cx.connected && Self::max_i2s_channels(cx) > 2,
                 },
             ));
             let pins = Self::i2s_pins(cx);
@@ -265,6 +292,18 @@ impl InputsPage {
                     },
                 ));
             }
+            rows.push((
+                None,
+                Row::note(if Self::max_i2s_channels(cx) > 2 {
+                    "Wire one ADC serial-data line per stereo pair to the GPIOs above; the shared \
+                     bit clock and sample rate live in I2S Configuration. DSPi is the clock \
+                     master and the pairs are sample-aligned. Save a preset to keep this wiring."
+                } else {
+                    "Wire the ADC's serial-data line to the GPIO above. The bit clock and sample \
+                     rate live in I2S Configuration; DSPi is the clock master, so the source must \
+                     follow."
+                }),
+            ));
         }
 
         // ---- ADAT Input ---------------------------------------------------
@@ -778,8 +817,8 @@ pub const RATES: [u32; 3] = INPUT_RATES_HZ;
 
 #[cfg(test)]
 mod tests {
-    use super::super::Page;
-    use super::super::tests::{frame, key, screen};
+    use super::super::tests::{data, frame, key, screen, state};
+    use super::super::{AppConfig, Page, SettingsScreen};
     use super::*;
     use crate::shell::{Screen, ScreenEvent};
     use crossterm::event::KeyCode;
@@ -890,7 +929,7 @@ mod tests {
             SessionReply::Err("Can't enable S/PDIF 3: GPIO 22 is unavailable".into())
         );
         s.session_result(req.tag, reply, &st);
-        let f = frame(&mut s, &st, 120, 40);
+        let f = frame(&mut s, &st, 120, 120);
         assert!(f.contains("Can't enable S/PDIF 3"), "{f}");
         assert!(
             !f.contains("S/PDIF inputs set to"),
@@ -922,7 +961,7 @@ mod tests {
             "{sent:?}"
         );
         s.session_result(req.tag, reply, &st);
-        let f = frame(&mut s, &st, 120, 40);
+        let f = frame(&mut s, &st, 120, 120);
         assert!(f.contains("S/PDIF 1 RX pin set to GPIO"), "{f}");
 
         // The same move refused: the device kept its pin, and says so.
@@ -933,9 +972,87 @@ mod tests {
         let req = request(s.popup_result(Some(0), &st));
         let (reply, _) = answered(&req, st::INVALID_PIN);
         s.session_result(req.tag, reply, &st);
-        let f = frame(&mut s, &st, 120, 40);
+        let f = frame(&mut s, &st, 120, 120);
         assert!(f.contains("is not available on this platform"), "{f}");
         assert!(!f.contains("RX pin set to GPIO"), "{f}");
+    }
+
+    /// The two lists the Console reads from the device: the S/PDIF inventory
+    /// count and the platform's I2S pair limit. Offering counts the device
+    /// will refuse is the working agreement's "nothing about device shape
+    /// compiled in" the wrong way round.
+    #[test]
+    fn the_two_count_lists_come_from_the_device() {
+        let st = state();
+        let mut d = data();
+        // A three-input firmware: the fourth choice never appears.
+        d.spdif.as_mut().expect("spdif").count = 3;
+        let cx = Cx {
+            state: &st,
+            data: &d,
+            config: &AppConfig::default(),
+            connected: true,
+            global_dirty: false,
+        };
+        assert_eq!(InputsPage::spdif_inventory(&cx), 3);
+        let mut s =
+            SettingsScreen::new(&st, d.clone(), AppConfig::default()).open(Page::Inputs, &st);
+        s.handle(key(KeyCode::Tab), &st);
+        match s.handle(key(KeyCode::Enter), &st) {
+            ScreenEvent::Popup(p) => assert_eq!(p.items, vec!["1", "2", "3"]),
+            other => panic!("{other:?}"),
+        }
+
+        // Channels stride by two up to the part's own limit; a stereo-only
+        // part gets one choice and no picker.
+        assert_eq!(InputsPage::max_i2s_channels(&cx), 8, "RP2350");
+        let mut small = st.clone();
+        small.caps.platform = dspi_proto::Platform::Rp2040;
+        let cx = Cx {
+            state: &small,
+            data: &d,
+            config: &AppConfig::default(),
+            connected: true,
+            global_dirty: false,
+        };
+        assert_eq!(InputsPage::max_i2s_channels(&cx), 2, "RP2040");
+        let rows = InputsPage::default().build(&cx);
+        let channels = rows
+            .iter()
+            .find(|(i, _)| *i == Some(Item::I2sChannels))
+            .map(|(_, r)| r.clone())
+            .expect("a channels row");
+        match channels {
+            Row::Pick {
+                choices, enabled, ..
+            } => {
+                assert_eq!(choices, vec!["2"]);
+                assert!(!enabled, "one choice is not a picker");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The Console's I2S Input footer, in both its wordings.
+    #[test]
+    fn the_i2s_input_section_carries_its_footer() {
+        let (mut s, st) = screen(Page::Inputs);
+        let f = frame(&mut s, &st, 120, 120);
+        assert!(
+            f.contains("Wire one ADC serial-data line per stereo pair"),
+            "{f}"
+        );
+        assert!(f.contains("Save a preset to keep this wiring."), "{f}");
+
+        let mut small = state();
+        small.caps.platform = dspi_proto::Platform::Rp2040;
+        let mut s =
+            SettingsScreen::new(&small, data(), AppConfig::default()).open(Page::Inputs, &small);
+        let f = frame(&mut s, &small, 120, 120);
+        assert!(
+            f.contains("Wire the ADC's serial-data line to the GPIO above."),
+            "{f}"
+        );
     }
 
     #[test]

@@ -48,6 +48,25 @@ const POLARITY: [&str; 2] = ["Active Low", "Active High"];
 const HOLD_MS: [u16; 5] = [5, 10, 20, 50, 100];
 const RELEASE_MS: [u16; 6] = [0, 5, 10, 20, 50, 100];
 
+/// The offered times, plus whatever the device is actually holding.
+///
+/// The list is the Console's `globalMsPicker` menu; a device carrying a value
+/// that is not on it (7 ms, say) gets that value appended rather than being
+/// misreported as the first entry.
+fn ms_values(list: &[u16], current: u16) -> Vec<u16> {
+    let mut out = list.to_vec();
+    if !out.contains(&current) {
+        out.push(current);
+    }
+    out
+}
+
+fn ms_choices(list: &[u16], current: u16) -> (Vec<String>, usize) {
+    let values = ms_values(list, current);
+    let at = values.iter().position(|m| *m == current).unwrap_or(0);
+    (values.iter().map(|m| format!("{m} ms")).collect(), at)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Item {
     StartupMode,
@@ -258,28 +277,24 @@ impl GlobalPage {
                         enabled: !pins.is_empty(),
                     },
                 ));
+                let (hold, hold_at) = ms_choices(&HOLD_MS, d.dac.hold_ms);
                 rows.push((
                     Some(Item::Hold),
                     Row::Pick {
                         label: "Hold Time".into(),
-                        choices: HOLD_MS.iter().map(|m| format!("{m} ms")).collect(),
-                        selected: HOLD_MS
-                            .iter()
-                            .position(|m| *m == d.dac.hold_ms)
-                            .unwrap_or(0),
+                        choices: hold,
+                        selected: hold_at,
                         caption: None,
                         enabled: true,
                     },
                 ));
+                let (release, release_at) = ms_choices(&RELEASE_MS, d.dac.release_ms);
                 rows.push((
                     Some(Item::Release),
                     Row::Pick {
                         label: "Release Time".into(),
-                        choices: RELEASE_MS.iter().map(|m| format!("{m} ms")).collect(),
-                        selected: RELEASE_MS
-                            .iter()
-                            .position(|m| *m == d.dac.release_ms)
-                            .unwrap_or(0),
+                        choices: release,
+                        selected: release_at,
                         caption: None,
                         enabled: true,
                     },
@@ -379,12 +394,12 @@ impl GlobalPage {
                 }
             }
             Item::Hold => {
-                if let Some(m) = HOLD_MS.get(choice) {
+                if let Some(m) = ms_values(&HOLD_MS, d.dac.hold_ms).get(choice) {
                     d.dac.hold_ms = *m;
                 }
             }
             Item::Release => {
-                if let Some(m) = RELEASE_MS.get(choice) {
+                if let Some(m) = ms_values(&RELEASE_MS, d.dac.release_ms).get(choice) {
                     d.dac.release_ms = *m;
                 }
             }
@@ -481,6 +496,25 @@ impl SettingsPage for GlobalPage {
 
 #[cfg(test)]
 mod tests {
+    /// The Console appends an out-of-list value rather than snapping to the
+    /// head of the menu: a device holding 7 ms must not read as 5 ms.
+    #[test]
+    fn an_off_list_hold_time_is_offered_as_itself() {
+        let (choices, at) = super::ms_choices(&super::HOLD_MS, 7);
+        assert_eq!(choices.last().map(String::as_str), Some("7 ms"));
+        assert_eq!(at, choices.len() - 1);
+        assert_eq!(super::ms_values(&super::HOLD_MS, 7)[at], 7);
+
+        // A value that is on the list is not duplicated.
+        let (choices, at) = super::ms_choices(&super::HOLD_MS, 20);
+        assert_eq!(choices.len(), super::HOLD_MS.len());
+        assert_eq!(choices[at], "20 ms");
+
+        // Release keeps its zero, which is a real setting and not a fallback.
+        let (choices, at) = super::ms_choices(&super::RELEASE_MS, 0);
+        assert_eq!(choices[at], "0 ms");
+    }
+
     use super::super::Page;
     use super::super::tests::{data, frame, key, screen, state};
     use super::*;

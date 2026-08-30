@@ -2566,8 +2566,9 @@ impl SettingsPage for SurfacesPage {
             && let Some(d) = c.to_digit(10)
             && d >= 1
         {
-            let slot = d as usize - 1;
-            if slot < self.slot_count() && self.configured(slot) {
+            // The nth card on screen, the way a digit jumps to the nth band:
+            // with controls in slots 1 and 6, `2` opens the second card.
+            if let Some(slot) = self.visible().get(d as usize - 1).copied() {
                 self.expanded.insert(slot);
                 return PageEvent::Handled;
             }
@@ -3257,6 +3258,28 @@ mod tests {
                 .any(|c| c.gpio == 16 && c.owner.starts_with("Control Surface")),
             "{claims:?}"
         );
+    }
+
+    /// A digit counts the cards on screen. The demo device has controls in
+    /// slots 1 to 5, so this also pins the 1-based convention.
+    #[test]
+    fn a_digit_opens_the_nth_card_not_the_nth_slot() {
+        let mut d = m::demo::settings_data();
+        let cs = d.cs.as_mut().expect("cs");
+        // Leave only slots 2 and 5 configured.
+        for slot in [0usize, 2, 3] {
+            cs.bindings[slot] = CsBinding::default();
+            cs.names[slot] = String::new();
+        }
+        let mut p = SurfacesPage::new(&d);
+        assert_eq!(p.visible(), vec![1, 4]);
+        let (st, cfg) = (m::demo::state(), AppConfig::default());
+        let c = cx(&d, &st, &cfg);
+        assert_eq!(p.key(key(KeyCode::Char('1')), &c), PageEvent::Handled);
+        assert!(p.expanded.contains(&1), "the first card, in slot 2");
+        assert_eq!(p.key(key(KeyCode::Char('2')), &c), PageEvent::Handled);
+        assert!(p.expanded.contains(&4), "the second card, in slot 5");
+        assert_eq!(p.key(key(KeyCode::Char('3')), &c), PageEvent::Unhandled);
     }
 
     /// Arming a learn is a write with an answer: `CS_STATUS_NO_IR` when no

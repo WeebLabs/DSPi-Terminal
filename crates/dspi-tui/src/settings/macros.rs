@@ -121,6 +121,13 @@ impl MacrosPage {
         }
     }
 
+    /// Slot health, which the status packet carries eight of whatever
+    /// `max_macros` says (control_surfaces.h): a device reporting more than
+    /// eight has no health to report for the rest, not a panic.
+    fn health(&self, i: usize) -> u8 {
+        self.health.get(i).copied().unwrap_or(0)
+    }
+
     fn adopt(&mut self, cs: &CsData) {
         if self.drafts.len() != cs.macros.len() {
             self.max_steps = cs.caps.max_macro_steps.max(1) as usize;
@@ -396,7 +403,7 @@ impl MacrosPage {
             ("Pending", StatusTone::Warning)
         } else if running {
             ("Running", StatusTone::Ok)
-        } else if self.health[i] != 0 && self.live[i].step_count > 0 {
+        } else if self.health(i) != 0 && self.live[i].step_count > 0 {
             ("Inactive", StatusTone::Warning)
         } else if self.live[i].step_count > 0 {
             ("Active", StatusTone::Ok)
@@ -430,8 +437,8 @@ impl MacrosPage {
                 enabled: true,
             },
         ));
-        if self.health[i] != 0 && self.live[i].step_count > 0 && !dirty {
-            rows.push((None, Row::Status(m::inactive_reason(self.health[i]), true)));
+        if self.health(i) != 0 && self.live[i].step_count > 0 && !dirty {
+            rows.push((None, Row::Status(m::inactive_reason(self.health(i)), true)));
         }
         if expanded {
             for s in 0..draft.step_count as usize {
@@ -860,8 +867,8 @@ impl SettingsPage for MacrosPage {
             && let Some(d) = c.to_digit(10)
             && d >= 1
         {
-            let i = d as usize - 1;
-            if i < self.drafts.len() && self.in_use(i) {
+            // The nth card on screen, not the nth macro slot.
+            if let Some(i) = self.visible().get(d as usize - 1).copied() {
                 self.expanded.insert(i);
                 return PageEvent::Handled;
             }
