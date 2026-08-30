@@ -285,9 +285,12 @@ and legend. Then HW-3.
 
 ### Progress (2026-08-28)
 
-Merged on `console-parity`: every implementation phase, 0 through 9.
-Running: Phase 10 (the Opus audit). Waiting: HW-1 and HW-2 (a device), then
-Fable's three deep audits and HW-3.
+Merged on `console-parity`: every implementation phase, 0 through 9, and
+the Opus audit (`audit.md`, 81 defects). Fixed by Fable: D1, D2, D2b, D5,
+D6, D6b, D8, D11, D12, D14, D15, D16, D17, D18, D20, D32, D33, D34, D39,
+D41, D43, D44, D56, D75, D77, D78. Running: two Opus fix rounds (Settings;
+screens and panels). Waiting: HW-1 and HW-2 (a device), then Fable's three
+deep audits and HW-3.
 
 ## 3. Hardware checkpoints
 
