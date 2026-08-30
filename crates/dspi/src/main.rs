@@ -42,7 +42,12 @@ fn main() -> ExitCode {
                 return ExitCode::from(exit::USAGE);
             }
         },
-        None => dspi_tui::theme::Palette::Console,
+        // The config file's `theme`, then the Console's palette.
+        None => dspi_tui::settings::AppConfig::load()
+            .theme
+            .as_deref()
+            .and_then(dspi_tui::theme::Palette::parse)
+            .unwrap_or(dspi_tui::theme::Palette::Console),
     };
 
     // A script beats every other reading of the arguments: `-f` is explicit,

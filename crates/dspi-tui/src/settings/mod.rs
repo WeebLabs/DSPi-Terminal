@@ -1809,6 +1809,12 @@ impl SettingsScreen {
 }
 
 impl Screen for SettingsScreen {
+    fn poll(&mut self, session: &mut Session, _state: &DeviceState) {
+        // The display status, ext status and slot health move on their
+        // own (a knob, a running macro); nothing pushes them.
+        self.data.adopt(Refresh::all(session));
+    }
+
     fn title(&self) -> String {
         self.page.title().to_string()
     }

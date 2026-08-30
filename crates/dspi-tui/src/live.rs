@@ -484,6 +484,7 @@ pub struct Live {
     clip_since: Option<Instant>,
     /// The notification reader, re-armed on every device switch.
     notes: Option<Notifications>,
+    last_screen_poll: Instant,
     /// A hazardous command has been confirmed and may go through once.
     hazard_confirmed: bool,
     /// The pop-out graph's own visibility map, when it does not follow the
@@ -554,6 +555,7 @@ impl Live {
             ease_from: None,
             clip_since: None,
             notes: None,
+            last_screen_poll: Instant::now(),
             hazard_confirmed: false,
             popout_visible: None,
             devices_checked: None,
@@ -2031,6 +2033,19 @@ impl Live {
     /// None of it is in the bulk packet and none of it is notified, so it can
     /// only be asked for; two dozen control transfers every two seconds is
     /// worth it for a panel someone is reading and worth nothing otherwise.
+    /// The screen on top gets its once-a-second poll.
+    fn poll_screen(&mut self, session: &mut Session, now: Instant) {
+        if now.duration_since(self.last_screen_poll) < Duration::from_secs(1) {
+            return;
+        }
+        self.last_screen_poll = now;
+        if let Some(s) = self.shell.settings.as_deref_mut() {
+            s.poll(session, &self.state);
+        } else if let Some((_, s)) = self.shell.tool.as_mut() {
+            s.poll(session, &self.state);
+        }
+    }
+
     fn poll_stats(&mut self, session: &mut Session, now: Instant) {
         if !matches!(self.shell.tool, Some((Tool::Stats, _)))
             || now.duration_since(self.last_stats_poll) < Duration::from_secs(2)
@@ -2081,6 +2096,7 @@ impl Live {
         }
         self.poll_upmix_status(session, now);
         self.poll_stats(session, now);
+        self.poll_screen(session, now);
 
         let mut reread = false;
         let mut loaded_elsewhere = false;

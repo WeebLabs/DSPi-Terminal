@@ -133,6 +133,11 @@ pub trait Screen {
 
     /// Called every tick with the elapsed time, for screens with motion.
     fn tick(&mut self, _dt_ms: u32) {}
+
+    /// Called about once a second while the screen is on top, with the
+    /// session, for screens that show device status the notification
+    /// stream does not carry (control-surface display and macro state).
+    fn poll(&mut self, _session: &mut Session, _state: &DeviceState) {}
 }
 
 /// A screen with nothing in it yet: names the selection and its keys.

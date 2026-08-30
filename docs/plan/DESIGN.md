@@ -782,3 +782,18 @@ Recorded as they were taken, so the document stays the spec.
 - **The Preset menu offers `Clear` only for a stored slot and `Clear All`
   only when something is stored**, as the Console does, and the popup
   carries what each row means so nothing counts rows.
+- **Graphing keeps a Volume section** (the user / master slider choice),
+  which the Console keeps in its sidebar volume menu; the terminal's
+  volume row has no menu, so the choice needs a page, and it persists in
+  the config file with the graph settings.
+- **Settings Revert and Advanced Reset confirm** although the Console's
+  do not: Revert rolls live device wiring back and Reset renames every
+  channel, and a key press is easier to misfire than a click.
+- **Reset channel names derives the factory names from the live slot
+  types** (`I2S 2 L` for an I2S slot), where the Console always writes
+  `SPDIF n L/R` whatever the slot carries.
+- **Settings polls the device once a second while open**, refreshing the
+  control-surface display status, ext status and slot health, which the
+  notification stream does not carry; the Console polls the same way.
+- **`theme` in the config file** selects the palette; `--theme` overrides
+  it for one run.

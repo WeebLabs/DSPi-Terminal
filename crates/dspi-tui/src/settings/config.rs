@@ -104,6 +104,9 @@ pub struct AppConfig {
     pub graphing: Graphing,
     pub volume: Volume,
     pub advanced: Advanced,
+    /// `console`, `amber`, `dark` or `mono`; `--theme` overrides it.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 impl AppConfig {
