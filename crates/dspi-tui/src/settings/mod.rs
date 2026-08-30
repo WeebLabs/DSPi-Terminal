@@ -1670,7 +1670,12 @@ impl SettingsScreen {
                 self.pending = Some(Pending::Page);
                 ScreenEvent::Popup(p)
             }
-            PageEvent::Session(r) => ScreenEvent::Session(self.with_refresh(r, true)),
+            // Only the three Control pages can change a control-surface
+            // record, and reading them all back is about seventy transfers.
+            PageEvent::Session(r) => {
+                let cs = matches!(self.page, Page::Surfaces | Page::Groups | Page::Macros);
+                ScreenEvent::Session(self.with_refresh(r, cs))
+            }
             PageEvent::IoSession(r) => {
                 self.begin_output_edit(state);
                 ScreenEvent::Session(self.with_refresh(r, false))
@@ -2328,24 +2333,35 @@ pub(crate) mod tests {
             .join("\n")
     }
 
-    const EVERY_PAGE: [Page; 12] = [
-        Page::About,
-        Page::Advanced,
-        Page::Graphing,
-        Page::Overview,
-        Page::Inputs,
-        Page::Outputs,
-        Page::I2s,
-        Page::Global,
-        Page::Surfaces,
-        Page::Interfaces,
-        Page::Groups,
-        Page::Macros,
-    ];
+    /// Every page there is, taken from the sidebar's own groups so a page
+    /// added there cannot be silently skipped by the tests below.
+    fn every_page() -> Vec<Page> {
+        GROUPS
+            .iter()
+            .flat_map(|(_, pages)| *pages)
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn every_page_is_in_a_sidebar_group() {
+        // `Page` has no reflection, so the count is the guard: a variant added
+        // without a group would leave this stale.
+        assert_eq!(every_page().len(), 12);
+        for page in every_page() {
+            assert!(!page.title().is_empty());
+            assert!(!page.short().is_empty());
+            assert_eq!(
+                SettingsScreen::page_from_name(page.title()),
+                Some(page),
+                "{page:?} is not reachable by name"
+            );
+        }
+    }
 
     #[test]
     fn every_page_fills_the_screen_at_both_sizes() {
-        for page in EVERY_PAGE {
+        for page in every_page() {
             let (mut s, st) = screen(page);
             for (w, h) in [(120u16, 40u16), (80, 24)] {
                 let f = frame(&mut s, &st, w, h);
@@ -2715,7 +2731,7 @@ pub(crate) mod tests {
     /// the key is offered at every focusable row and only has to land on one.
     #[test]
     fn every_advertised_key_is_handled_on_every_page() {
-        for page in EVERY_PAGE {
+        for page in every_page() {
             let advertised = screen(page).0.keys();
             let controls = {
                 let (s, st) = screen(page);
@@ -2745,6 +2761,58 @@ pub(crate) mod tests {
                     assert!(
                         landed,
                         "{:?} does nothing anywhere on {page:?} (from {})",
+                        k.code, help.key
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same, inside an expanded card.
+    ///
+    /// The three Control pages are lists of cards, and most of their rows only
+    /// exist once one is open; the fixture the test above uses has no
+    /// control-surface data at all, so it never reached them.
+    #[test]
+    fn every_advertised_key_is_handled_inside_an_expanded_card() {
+        let open = |page: Page| {
+            let st = cs_model::demo::state();
+            let mut s =
+                SettingsScreen::new(&st, cs_model::demo::settings_data(), AppConfig::default())
+                    .config_path(scratch("cards"))
+                    .open(page, &st);
+            s.focus = Focus::Page;
+            // The card list's first Expand button.
+            s.current().set_cursor(0);
+            s.handle(key(KeyCode::Enter), &st);
+            (s, st)
+        };
+        for page in [Page::Surfaces, Page::Groups, Page::Macros] {
+            let (s, st) = open(page);
+            let cx = s.cx(&st);
+            let controls = s
+                .current_ref()
+                .rows(&cx)
+                .iter()
+                .filter(|r| r.focusable())
+                .count();
+            assert!(controls > 3, "{page:?} did not open a card: {controls}");
+            for help in s.keys() {
+                for k in keys_for(help.key) {
+                    if matches!(k.code, KeyCode::Esc) {
+                        continue;
+                    }
+                    let landed = (0..controls).any(|row| {
+                        let (mut s, st) = open(page);
+                        s.current().set_cursor(row);
+                        let before = (s.page, s.focus, s.current_ref().cursor(), s.page_scroll);
+                        let ev = s.handle(k, &st);
+                        let after = (s.page, s.focus, s.current_ref().cursor(), s.page_scroll);
+                        ev != ScreenEvent::Unhandled || before != after
+                    });
+                    assert!(
+                        landed,
+                        "{:?} does nothing inside an open card on {page:?} (from {})",
                         k.code, help.key
                     );
                 }
