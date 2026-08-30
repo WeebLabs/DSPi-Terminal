@@ -608,18 +608,31 @@ impl SettingsPage for InterfacesPage {
     /// The draft only becomes "what the device holds" when the device says it
     /// took it; a refusal leaves the old configuration running, so the section
     /// stays dirty and the row says why.
-    fn session_result(&mut self, tag: u32, reply: SessionReply, _cx: &Cx<'_>) -> PageEvent {
+    fn session_result(&mut self, tag: u32, reply: SessionReply, cx: &Cx<'_>) -> PageEvent {
         let (uart, status) = match (tag, reply) {
             (TAG_UART, SessionReply::Ok(m)) => {
                 self.uart_device = self.uart.clone();
                 (true, (m, false))
             }
-            (TAG_UART, SessionReply::Err(m)) => (true, (m, true)),
+            (TAG_UART, SessionReply::Err(m)) => {
+                // Refused: the device kept what it had, and the request read
+                // that back on its way home. Follow it, as the Console's
+                // re-fetch on every rejection does.
+                if let Some(live) = cx.data.uart.clone() {
+                    self.uart_device = live;
+                }
+                (true, (m, true))
+            }
             (TAG_I2C, SessionReply::Ok(m)) => {
                 self.i2c_device = self.i2c.clone();
                 (false, (m, false))
             }
-            (TAG_I2C, SessionReply::Err(m)) => (false, (m, true)),
+            (TAG_I2C, SessionReply::Err(m)) => {
+                if let Some(live) = cx.data.i2c.clone() {
+                    self.i2c_device = live;
+                }
+                (false, (m, true))
+            }
             _ => return PageEvent::Handled,
         };
         let text = status.0.clone();
@@ -704,7 +717,9 @@ mod tests {
                 .data(
                     op::REQ_GET_UART_CONFIG,
                     UartCtrlConfig {
-                        enabled: true,
+                        // What the device holds afterwards: the new config
+                        // when it took the write, the old one when it refused.
+                        enabled: last == 0,
                         ..UartCtrlConfig::default()
                     }
                     .encode()
@@ -785,6 +800,10 @@ mod tests {
         assert!(
             f.contains("Unapplied changes"),
             "still to be corrected: {f}"
+        );
+        assert!(
+            !s.pages.interfaces.uart_device.enabled,
+            "the page follows the device, which kept what it had"
         );
     }
 
