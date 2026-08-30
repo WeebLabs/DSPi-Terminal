@@ -837,10 +837,15 @@ channel order; a cell for one channel shows its name alone.
   in the filter-file short form and the trim (`HP 80 Hz LR4 · -3.0 dB`),
   or `N bands` when there is no crossover; the sub the same as an output.
   Delay is shown only when non-zero (`· 2.5 ms`).
-- Cell size by density: Compact 2 columns of cells 6 rows high (plot 3
-  rows); Normal 3 columns, 9 rows (plot 5); Roomy 3 columns, 11 rows
-  (plot 7); Wide 4 columns, 13 rows (plot 9). Cells that do not fit scroll
-  as rows, with the `▲`/`▼` hints in the border column.
+- Cell size follows the count: the grid takes the largest cells (at most
+  13 rows) that put every cell on screen at once, at least 20 columns by
+  6 rows each, so a whole device is seen at a glance wherever the pane has
+  room: seventeen distinct channels are four columns of seven-row cells at
+  120x40 and five columns of thirteen-row cells at 200x60. When even the
+  smallest cells will not fit (80x24 holds six) the grid scrolls as rows,
+  with the `▲`/`▼` hints in the border column. A summary that will not
+  fit a narrow cell wraps at its ` · ` onto a second line, taking one row
+  from the plot.
 - `↑ ↓ ← →` move between cells, `Enter` selects the cell's first channel,
   digits select the nth cell.
 - The plot in a cell draws one curve, in grey, on a 0 dB rule with no
@@ -920,10 +925,9 @@ All five steps landed on 2026-08-30.
   identical, because their summary lines say different things. Disabled
   outputs are left out of the grid, as they were left off the old cards.
 - **A cell is the plot plus three rows** (title border, summary, bottom
-  border): plots of 3, 6, 8 and 10 rows give the 6, 9, 11 and 13 of 12.2.
-  The grid reads its own rectangle: three columns from 80 cells wide, four
-  from 150; nine-row cells from 27 rows tall, eleven from 42, thirteen
-  from 50.
+  border), or four when the summary wraps. The grid reads its own
+  rectangle and the cell count, not the terminal's density, and tries one
+  to eight columns for the tallest cells that fit them all (12.2).
 - **The main graph is hidden in the overview** and the pane takes the
   detail's title. `=` still cycles the height a channel page will use.
 - **An unfocused cell's curve is `dim`**, its title `section` style, its
