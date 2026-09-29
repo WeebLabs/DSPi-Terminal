@@ -240,23 +240,29 @@ pub fn type_name(t: FilterType) -> String {
     }
 }
 
-/// The dashboard's compact code, `DashboardRow.typeCode`. The Console draws an
-/// em-dash for an unset band; we draw `OFF`, which is what its own switch says.
+/// The dashboard's compact code, `DashboardRow.typeCode`
+/// (`DashboardView.swift:370-384`), which reads `OFF` for an unset band.
+///
+/// PEQ passes read as cuts, as their full names do: a low pass is a high cut
+/// (`HC`) and a high pass a low cut (`LC`), after `FilterType.shortLabel`
+/// (`DSPMath.swift:168-179`). Crossovers keep `LP` and `HP`, and filter files
+/// keep REW's pass codes (`fileCode`, `DSPMath.swift:285-297`), which is why
+/// `dspi_session::filterfile` keeps a table of its own.
 pub fn type_code(t: FilterType) -> String {
     match t {
         FilterType::Flat => "OFF".into(),
         FilterType::Peaking => "PK".into(),
         FilterType::LowShelf => "LS".into(),
         FilterType::HighShelf => "HS".into(),
-        FilterType::LowPass => "LP".into(),
-        FilterType::HighPass => "HP".into(),
+        FilterType::LowPass => "HC".into(),
+        FilterType::HighPass => "LC".into(),
         FilterType::Notch => "NO".into(),
         FilterType::AllPass => "AP".into(),
         FilterType::AllPass1 => "AP1".into(),
         FilterType::LowShelf1 => "LS1".into(),
         FilterType::HighShelf1 => "HS1".into(),
-        FilterType::LowPass1 => "LP1".into(),
-        FilterType::HighPass1 => "HP1".into(),
+        FilterType::LowPass1 => "HC1".into(),
+        FilterType::HighPass1 => "LC1".into(),
         FilterType::LinkwitzTransform => "LT".into(),
         other => match xover::meta(other.to_raw()) {
             Some(m) => format!(
@@ -675,6 +681,41 @@ pub(crate) mod tests {
         assert_eq!(type_token(FilterType::Peaking), "peak");
         assert_eq!(type_token(FilterType::from_raw(35)), "lr4hp");
         assert_eq!(type_token(FilterType::from_raw(56)), "bes2lp");
+    }
+
+    /// PEQ passes read as cuts in the interface; crossovers keep LP and HP,
+    /// and a filter file keeps REW's pass codes (DSPMath.swift:168-179,
+    /// 285-297).
+    #[test]
+    fn peq_passes_read_as_cuts_and_crossovers_and_files_keep_passes() {
+        let codes: Vec<String> = [
+            FilterType::LowPass,
+            FilterType::HighPass,
+            FilterType::LowPass1,
+            FilterType::HighPass1,
+        ]
+        .into_iter()
+        .map(type_code)
+        .collect();
+        assert_eq!(codes, ["HC", "LC", "HC1", "LC1"]);
+        assert_eq!(type_name(FilterType::LowPass), "High Cut 12 dB/oct");
+        assert_eq!(type_name(FilterType::HighPass1), "Low Cut 6 dB/oct");
+        // An LR4 low pass and high pass.
+        assert_eq!(type_code(FilterType::from_raw(34)), "LR4LP");
+        assert_eq!(type_code(FilterType::from_raw(35)), "LR4HP");
+        assert_eq!(type_name(FilterType::from_raw(35)), "LR4 High Pass");
+        use dspi_session::filterfile::{Bank, format_band};
+        let band = |t: FilterType| dspi_proto::dsp::Band {
+            filter_type: t,
+            freq: 80.0,
+            q: 0.707,
+            gain_db: 0.0,
+            bypass: false,
+        };
+        let line = format_band(Bank::Peq, 1, &band(FilterType::LowPass), None);
+        assert!(line.contains(" LP "), "{line}");
+        let line = format_band(Bank::Peq, 1, &band(FilterType::HighPass1), None);
+        assert!(line.contains(" HP1 "), "{line}");
     }
 
     #[test]

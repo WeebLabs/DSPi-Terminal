@@ -1028,13 +1028,14 @@ pub(crate) fn enum_value_label(cx: &Cx<'_>, cs: &CsData, n: u8, value: i32) -> S
             .get(value.max(0) as usize)
             .map(|s| (*s).to_string())
             .unwrap_or_else(|| format!("Mode {value}")),
+        // PEQ passes read as cuts (`DSPi_ConsoleApp.swift:7426-7428`).
         noun::FILTER_TYPE => [
             "Flat",
             "Peaking",
             "Low Shelf",
             "High Shelf",
-            "Low Pass",
-            "High Pass",
+            "High Cut",
+            "Low Cut",
             "Notch",
             "All Pass",
             "All Pass (1st)",
@@ -2590,6 +2591,28 @@ mod tests {
         assert_eq!(noun_name(noun::MACRO, ty::BUTTON), "Macro");
         // Test Signal was renamed (`DSPi_ConsoleApp.swift:7134`).
         assert_eq!(noun_name(noun::SIGGEN, ty::BUTTON), "Signal Generator");
+        // And the filter types read as cuts (`DSPi_ConsoleApp.swift:7426-7428`).
+        let state = demo::state();
+        let data = demo::settings_data();
+        let config = crate::settings::AppConfig::default();
+        let cx = Cx {
+            state: &state,
+            data: &data,
+            config: &config,
+            connected: true,
+            global_dirty: false,
+        };
+        let cs = data.cs.as_ref().expect("demo control surfaces");
+        let types: Vec<String> = (0..11)
+            .map(|v| enum_value_label(&cx, cs, noun::FILTER_TYPE, v))
+            .collect();
+        assert_eq!(types[4], "High Cut");
+        assert_eq!(types[5], "Low Cut");
+        assert!(
+            !types
+                .iter()
+                .any(|t| t.contains("Pass") && !t.starts_with("All"))
+        );
         assert_eq!(action_name(act::INC, noun::PRESET, true), "Next");
         assert_eq!(action_name(act::INC, noun::USER_VOLUME, false), "Increase");
         assert_eq!(action_name(act::INC, noun::PAGE_VALUE, true), "Up");

@@ -109,7 +109,15 @@ fn summary(state: &DeviceState, channel: usize, flat: bool) -> String {
                         m.family.short().to_uppercase(),
                         m.order
                     ),
-                    None => format!("{} {f}", type_code(p.filter_type)),
+                    // A plain pass in a crossover slot keeps the crossover's
+                    // LP / HP: only PEQ bands read as cuts (DSPMath.swift:170-172).
+                    None => match p.filter_type {
+                        FilterType::LowPass => format!("LP {f}"),
+                        FilterType::HighPass => format!("HP {f}"),
+                        FilterType::LowPass1 => format!("LP1 {f}"),
+                        FilterType::HighPass1 => format!("HP1 {f}"),
+                        other => format!("{} {f}", type_code(other)),
+                    },
                 }
             })
             .collect();
