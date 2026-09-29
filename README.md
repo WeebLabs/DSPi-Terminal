@@ -137,11 +137,11 @@ See [`docs/platforms.md`](docs/platforms.md) for what has been verified where.
 ## Protocol source of truth
 
 The firmware headers in `crates/dspi-proto/firmware/` are vendored from
-`WeebLabs/DSPi` at `release/v1.1.6` @ `112f35b` (wire format V28, 202 vendor
-opcodes, control-surface caps v13) and parsed at build time to generate every
-opcode, constant and struct offset. Nothing is transcribed by hand; a
-coverage test refuses to build if an opcode has no registry row. To move to
-a newer firmware, follow [`docs/firmware-bump.md`](docs/firmware-bump.md).
+`WeebLabs/DSPi` at `release/v1.1.6` @ `557bce7` (firmware 1.1.6 beta 4, wire
+format V32, 244 vendor opcodes, control-surface caps v20) and parsed at build
+time to generate every opcode, constant and struct offset. Nothing is
+transcribed by hand; a coverage test refuses to build if an opcode has no
+registry row. To move to a newer firmware, follow [`docs/firmware-bump.md`](docs/firmware-bump.md).
 
 The device pushes its own changes over a notification endpoint, so a knob on
 a control surface, a remote, or the operating system's volume slider shows up

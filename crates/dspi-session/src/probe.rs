@@ -479,7 +479,7 @@ mod tests {
     ///
     /// The shared mock keys its replies on the opcode alone, but band validity
     /// is carried in `wValue`, so it cannot express "answers for band 9, stalls
-    /// for band 10" — which is the whole of what the probe reads.
+    /// for band 10", which is the whole of what the probe reads.
     struct BandLimited {
         live: u8,
         descriptor: dspi_transport::DeviceDescriptor,

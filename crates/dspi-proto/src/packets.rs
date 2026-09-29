@@ -3190,32 +3190,39 @@ pub const CS_NOUNS: &[(&str, u8)] = &[
     ("display_page", 54),
     ("display_edit", 55),
     ("page_value", 56),
-    // Caps v14 and v15: the subharmonic synthesizer.
-    ("subharm", 57),
-    ("subharm_low", 58),
-    ("subharm_high", 59),
-    ("subharm_boost", 60),
-    ("subharm_top", 61),
-    ("subharm_select", 62),
-    ("subharm_depth", 63),
-    ("subharm_hold", 64),
-    ("subharm_ceiling", 65),
-    ("subharm_link", 66),
-    ("subharm_solo", 67),
-    // Caps v18: auxiliary outputs, targeting a binding slot.
-    ("aux", 68),
-    ("aux_level", 69),
-    // Caps v19: the tube preamp.
-    ("tube", 70),
-    ("tube_drive", 71),
-    ("tube_type", 72),
-    ("tube_mix", 73),
-    // Caps v20: the output limiter, targeting an output.
-    ("limiter", 74),
-    ("limiter_threshold", 75),
-    ("limiter_release", 76),
-    ("limiter_link", 77),
-    ("limiter_gr", 78),
+    // Caps v14 to v20 (control_surfaces.h:223-250). What each one is, as the
+    // header's comments give it; the device's caps are what the host uses,
+    // since the ranges are reported per noun at run time. Units: dB, % and
+    // ms are 8.8, MS_LOG is plain ms (control_surfaces.h:259-269). Noun 64's
+    // header comment says 50..400 ms, but it is an 8.8 CS_UNIT_MS noun and
+    // its caps stop at 127 (control_surfaces_nouns.c:107, 255-257).
+    //
+    // Subharmonic synthesizer, caps v14 (57-60) and v15 (61-67), no target.
+    ("subharm", 57),         // bool
+    ("subharm_low", 58),     // continuous dB -30..+12 (24-36 Hz band)
+    ("subharm_high", 59),    // continuous dB -30..+12 (36-56 Hz band)
+    ("subharm_boost", 60),   // continuous dB 0..+6 (LF boost bell)
+    ("subharm_top", 61),     // continuous dB -30..+12 (56-80 Hz band)
+    ("subharm_select", 62),  // enum 0..2 (all / percussive / sustained)
+    ("subharm_depth", 63),   // continuous % 0..100
+    ("subharm_hold", 64),    // continuous ms; header says 50..400, caps report 50..127
+    ("subharm_ceiling", 65), // continuous dB -40..0 (0 = off)
+    ("subharm_link", 66),    // bool
+    ("subharm_solo", 67),    // bool
+    // Auxiliary outputs, caps v18, target AUX (a binding slot, index 0).
+    ("aux", 68),       // bool
+    ("aux_level", 69), // continuous % 0..100, AUX_PWM slots only
+    // Tube preamp, caps v19, no target.
+    ("tube", 70),       // bool
+    ("tube_drive", 71), // continuous dB -30..24
+    ("tube_type", 72),  // enum 0..TUBE_TYPE_MAX (0 = Custom)
+    ("tube_mix", 73),   // continuous % 0..100
+    // Output limiter, caps v20, target OUTPUT_CH.
+    ("limiter", 74),           // bool
+    ("limiter_threshold", 75), // continuous dB -30..0
+    ("limiter_release", 76),   // continuous MS_LOG 10..1000
+    ("limiter_link", 77),      // enum 0..LIMITER_LINK_GROUP_MAX (0 = unlinked)
+    ("limiter_gr", 78),        // continuous dB 0..30, read-only
 ];
 
 /// Actions (control_surfaces.h:227-241).
