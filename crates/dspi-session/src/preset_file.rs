@@ -62,6 +62,14 @@ pub struct PresetDocument {
     /// Absent when the source device had no upmixer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upmix: Option<UpmixBlock>,
+    /// Absent when the source device had no subharmonic synthesizer
+    /// (PresetDocument.swift:45).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subharm: Option<SubharmBlock>,
+    /// Absent when the source device had no tube modeller
+    /// (PresetDocument.swift:47).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tube: Option<TubeBlock>,
     #[serde(default)]
     pub channels: Vec<ChannelBlock>,
     #[serde(default)]
@@ -187,6 +195,123 @@ pub struct UpmixBlock {
     pub presence_db: f32,
 }
 
+/// The subharmonic synthesizer, as the Console's `SubharmBlock`
+/// (PresetDocument.swift:235-268). A missing key takes the firmware's
+/// default (subharm.h:85-94), so a document from an older writer restores a
+/// two-band setup rather than an arbitrary one. Solo is absent by design: it
+/// is runtime only, and no saved configuration may switch the program off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SubharmBlock {
+    pub enabled: bool,
+    pub low_db: f32,
+    pub high_db: f32,
+    pub top_db: f32,
+    pub boost_db: f32,
+    pub output_mask: i32,
+    /// `SUBHARM_SELECT_*` (subharm.h:71-73), as the wire number.
+    pub select_mode: i32,
+    pub select_depth_pct: f32,
+    pub select_hold_ms: f32,
+    pub ceiling_db: f32,
+    pub link_pairs: bool,
+}
+
+impl Default for SubharmBlock {
+    fn default() -> Self {
+        use dspi_proto::generated::{ranges as r, subharm as s};
+        Self {
+            enabled: false,
+            low_db: r::SUBHARM_DEFAULT_LOW,
+            high_db: r::SUBHARM_DEFAULT_HIGH,
+            // SUBHARM_DEFAULT_TOP is SUBHARM_LEVEL_MIN: the band ships off.
+            top_db: r::SUBHARM_LEVEL_MIN,
+            boost_db: r::SUBHARM_DEFAULT_BOOST,
+            output_mask: s::SUBHARM_DEFAULT_OUTPUT_MASK as i32,
+            select_mode: s::SUBHARM_SELECT_ALL as i32,
+            select_depth_pct: r::SUBHARM_DEFAULT_DEPTH,
+            select_hold_ms: r::SUBHARM_DEFAULT_HOLD_MS,
+            ceiling_db: r::SUBHARM_DEFAULT_CEILING,
+            // SUBHARM_DEFAULT_LINK_PAIRS (subharm.h:94).
+            link_pairs: true,
+        }
+    }
+}
+
+/// The tube modeller, as the Console's `TubeBlock` (PresetDocument.swift:
+/// 270-309). Every value is stored as the firmware holds it, the four
+/// character values included, so a file saved on a tube type restores that
+/// exact sound even if a later firmware retunes the row. Defaults are the
+/// firmware's (tube.h:60-73).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TubeBlock {
+    pub enabled: bool,
+    pub output_mask: i32,
+    /// 0 Custom, 1..=`TUBE_TYPE_MAX`.
+    pub tube_type: i32,
+    pub drive_db: f32,
+    pub bias_pct: f32,
+    pub asym_db: f32,
+    pub hardness_pct: f32,
+    pub sag_pct: f32,
+    /// 0..=`TUBE_RECT_MAX`.
+    pub rectifier: i32,
+    pub xfmr_enabled: bool,
+    pub xfmr_damping: f32,
+    pub xfmr_res_hz: f32,
+    pub mix_pct: f32,
+    pub trim_db: f32,
+}
+
+impl Default for TubeBlock {
+    fn default() -> Self {
+        use dspi_proto::generated::{ranges as r, tube as t};
+        Self {
+            enabled: false,
+            output_mask: t::TUBE_DEFAULT_OUTPUT_MASK as i32,
+            tube_type: t::TUBE_DEFAULT_TUBE_TYPE as i32,
+            drive_db: r::TUBE_DEFAULT_DRIVE,
+            bias_pct: r::TUBE_DEFAULT_BIAS,
+            asym_db: r::TUBE_DEFAULT_ASYM,
+            hardness_pct: r::TUBE_DEFAULT_HARDNESS,
+            sag_pct: r::TUBE_DEFAULT_SAG,
+            rectifier: t::TUBE_DEFAULT_RECTIFIER as i32,
+            // TUBE_DEFAULT_XFMR_ENABLED (tube.h:68).
+            xfmr_enabled: true,
+            xfmr_damping: r::TUBE_DEFAULT_XFMR_DAMPING,
+            xfmr_res_hz: r::TUBE_DEFAULT_XFMR_RES,
+            mix_pct: r::TUBE_DEFAULT_MIX,
+            trim_db: r::TUBE_DEFAULT_TRIM,
+        }
+    }
+}
+
+/// One output's limiter, as the Console's `LimiterBlock`
+/// (PresetDocument.swift:406-432). Defaults are the firmware's
+/// (limiter.h:32-33).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LimiterBlock {
+    pub enabled: bool,
+    pub threshold_db: f32,
+    pub release_ms: f32,
+    /// 0 unlinked, 1..=`LIMITER_LINK_GROUP_MAX`.
+    pub link_group: i32,
+}
+
+impl Default for LimiterBlock {
+    fn default() -> Self {
+        use dspi_proto::generated::ranges as r;
+        Self {
+            enabled: false,
+            threshold_db: r::LIMITER_DEFAULT_THRESHOLD,
+            release_ms: r::LIMITER_DEFAULT_RELEASE,
+            link_group: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChannelBlock {
@@ -203,6 +328,17 @@ pub struct ChannelBlock {
     /// Empty for inputs.
     #[serde(default)]
     pub crossover: Vec<BandBlock>,
+    /// The Console's own output index (PresetDocument.swift:360-363), which
+    /// it reads in preference to `channelId`. Read here only to place a
+    /// limiter; this build writes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_index: Option<i32>,
+    /// This output's limiter (PresetDocument.swift:375-379). Absent on inputs
+    /// and when the source device had no limiter, which leaves the device's
+    /// own alone. Applied only with the hardware I/O option, because the
+    /// firmware keeps it with the output configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limiter: Option<LimiterBlock>,
 }
 
 impl Default for ChannelBlock {
@@ -219,6 +355,8 @@ impl Default for ChannelBlock {
             enabled: true,
             eq: Vec::new(),
             crossover: Vec::new(),
+            output_index: None,
+            limiter: None,
         }
     }
 }
@@ -634,6 +772,7 @@ pub fn apply(session: &mut Session, doc: &PresetDocument, options: ApplyOptions)
 
     if options.hardware_io {
         apply_io(session, &doc.io, &mut report);
+        apply_limiters(session, doc, &mut report);
     } else {
         report.skip("hardware I/O (not requested)");
     }
@@ -793,6 +932,123 @@ fn apply_features(session: &mut Session, doc: &PresetDocument, report: &mut Appl
         "EQ bypass",
         report,
     );
+
+    apply_subharm_and_tube(session, doc, report);
+}
+
+/// The subharmonic synthesizer and the tube modeller, in the Console's order
+/// (PresetDocumentTransfer.swift:600-644): every parameter first and the
+/// switch last, so a block never plays half-applied, and the tube type
+/// before the four values it loads. A stored value that differs from the
+/// type's row then drops the type to Custom on the device (tube.c:122-212),
+/// so a file matching its row keeps its type and one that does not still
+/// restores its exact sound.
+fn apply_subharm_and_tube(session: &mut Session, doc: &PresetDocument, report: &mut ApplyReport) {
+    let caps = session.capabilities().clone();
+    let has = |name: &str| caps.features.iter().any(|f| f.name == name && f.present);
+    // A refused value is left to the re-read to show; the Console does not
+    // report one either.
+    let mut set = |path: &str, v: Value| {
+        let _ = session.write(path, &[], v);
+    };
+
+    if let Some(b) = &doc.subharm {
+        if has("subharmonic_synth") {
+            set("sub.low", Value::Float(b.low_db));
+            set("sub.high", Value::Float(b.high_db));
+            set("sub.boost", Value::Float(b.boost_db));
+            set("sub.mask", Value::Mask(b.output_mask as u16 as u32));
+            set("sub.top", Value::Float(b.top_db));
+            set(
+                "sub.select",
+                Value::Choice(b.select_mode.clamp(0, 255) as u8),
+            );
+            set("sub.depth", Value::Float(b.select_depth_pct));
+            set("sub.hold", Value::Float(b.select_hold_ms));
+            set("sub.ceiling", Value::Float(b.ceiling_db));
+            set("sub.link", Value::Bool(b.link_pairs));
+            set("sub.on", Value::Bool(b.enabled));
+        } else {
+            report.skip("Subharmonic synthesizer (not supported by this firmware)");
+        }
+    }
+
+    if let Some(b) = &doc.tube {
+        if has("tube_preamp") {
+            set("tube.type", Value::Int(b.tube_type as i64));
+            set("tube.bias", Value::Float(b.bias_pct));
+            set("tube.asym", Value::Float(b.asym_db));
+            set("tube.hardness", Value::Float(b.hardness_pct));
+            set("tube.sag", Value::Float(b.sag_pct));
+            set("tube.drive", Value::Float(b.drive_db));
+            set(
+                "tube.rectifier",
+                Value::Choice(b.rectifier.clamp(0, 255) as u8),
+            );
+            set("tube.damping", Value::Float(b.xfmr_damping));
+            set("tube.resonance", Value::Float(b.xfmr_res_hz));
+            set("tube.xfmr", Value::Bool(b.xfmr_enabled));
+            set("tube.mix", Value::Float(b.mix_pct));
+            set("tube.trim", Value::Float(b.trim_db));
+            set("tube.mask", Value::Mask(b.output_mask as u16 as u32));
+            set("tube.on", Value::Bool(b.enabled));
+        } else {
+            report.skip("Tube preamp (not supported by this firmware)");
+        }
+    }
+}
+
+/// The output limiters, from each output's block, in the Console's order
+/// (`applyLimiterSettings`, Commands.swift:1658-1672).
+///
+/// They travel with the hardware I/O option, not with the audio, because
+/// the firmware keeps them with the output configuration
+/// (PresetDocumentTransfer.swift:422-445). A write to one member of a link
+/// group moves the whole group (limiter.c:143-194), so every output about to
+/// change is unlinked first, then given its values, and the groups are set
+/// again last in ascending order, each joining output adopting the settings
+/// its lowest member already holds. An output with no block is left alone.
+fn apply_limiters(session: &mut Session, doc: &PresetDocument, report: &mut ApplyReport) {
+    let caps = session.capabilities().clone();
+    // The Console's own output index wins where the file has one; otherwise
+    // the channel id, as the rest of this apply reads it. A duplicated
+    // output takes the last block, as a duplicated channel does.
+    let mut blocks: std::collections::BTreeMap<u8, &LimiterBlock> = Default::default();
+    for c in doc.channels.iter().filter(|c| c.is_output) {
+        let Some(l) = &c.limiter else { continue };
+        let out = c
+            .output_index
+            .unwrap_or(c.channel_id - caps.num_inputs as i32);
+        if (0..caps.num_outputs as i32).contains(&out) {
+            blocks.insert(out as u8, l);
+        }
+    }
+    if blocks.is_empty() {
+        return;
+    }
+    if !caps
+        .features
+        .iter()
+        .any(|f| f.name == "output_limiter" && f.present)
+    {
+        report.skip("Output limiter (not supported by this firmware)");
+        return;
+    }
+    for &o in blocks.keys() {
+        if current_u8(session, "limit.link", &[o]).is_some_and(|g| g != 0) {
+            let _ = session.write("limit.link", &[o], Value::Int(0));
+        }
+    }
+    for (&o, l) in &blocks {
+        let _ = session.write("limit.threshold", &[o], Value::Float(l.threshold_db));
+        let _ = session.write("limit.release", &[o], Value::Float(l.release_ms));
+        let _ = session.write("limit.on", &[o], Value::Bool(l.enabled));
+    }
+    for (&o, l) in &blocks {
+        if l.link_group != 0 {
+            let _ = session.write("limit.link", &[o], Value::Int(l.link_group as i64));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1398,6 +1654,13 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
     let read_u8 = |s: &mut Session, path: &str| -> u8 {
         s.read(path, &[]).ok().and_then(|v| v.as_u8()).unwrap_or(0)
     };
+    let read_mask = |s: &mut Session, path: &str| -> i32 {
+        match s.read(path, &[]) {
+            Ok(Value::Mask(m)) => m as i32,
+            _ => 0xFFFF,
+        }
+    };
+    let has = |name: &str| caps.features.iter().any(|f| f.name == name && f.present);
 
     let mut channels = Vec::new();
     for c in &caps.channels {
@@ -1421,6 +1684,22 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
                 .ok()
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            if has("output_limiter") {
+                let on = session
+                    .read("limit.on", &[out])
+                    .ok()
+                    .and_then(|v| v.as_bool());
+                block.limiter = on.map(|enabled| LimiterBlock {
+                    enabled,
+                    threshold_db: read_f32(session, "limit.threshold", &[out]),
+                    release_ms: read_f32(session, "limit.release", &[out]),
+                    link_group: session
+                        .read("limit.link", &[out])
+                        .ok()
+                        .and_then(|v| v.as_u8())
+                        .unwrap_or(0) as i32,
+                });
+            }
         }
         for b in 0..caps.max_bands {
             if let Ok(p) = session.read_band(c.index, b) {
@@ -1462,8 +1741,6 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
 
     // Before the document is built, because it needs the transport too.
     let io = capture_io(session);
-
-    let has = |name: &str| caps.features.iter().any(|f| f.name == name && f.present);
 
     PresetDocument {
         schema_version: CURRENT_SCHEMA_VERSION,
@@ -1528,6 +1805,37 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
             presence_db: read_f32(session, "up.presence", &[]),
             ..Default::default()
         }),
+        // Every field, as the Console exports them (PresetDocumentTransfer.
+        // swift:100-137).
+        subharm: has("subharmonic_synth").then(|| SubharmBlock {
+            enabled: read_bool(session, "sub.on"),
+            low_db: read_f32(session, "sub.low", &[]),
+            high_db: read_f32(session, "sub.high", &[]),
+            top_db: read_f32(session, "sub.top", &[]),
+            boost_db: read_f32(session, "sub.boost", &[]),
+            output_mask: read_mask(session, "sub.mask"),
+            select_mode: read_u8(session, "sub.select") as i32,
+            select_depth_pct: read_f32(session, "sub.depth", &[]),
+            select_hold_ms: read_f32(session, "sub.hold", &[]),
+            ceiling_db: read_f32(session, "sub.ceiling", &[]),
+            link_pairs: read_bool(session, "sub.link"),
+        }),
+        tube: has("tube_preamp").then(|| TubeBlock {
+            enabled: read_bool(session, "tube.on"),
+            output_mask: read_mask(session, "tube.mask"),
+            tube_type: read_u8(session, "tube.type") as i32,
+            drive_db: read_f32(session, "tube.drive", &[]),
+            bias_pct: read_f32(session, "tube.bias", &[]),
+            asym_db: read_f32(session, "tube.asym", &[]),
+            hardness_pct: read_f32(session, "tube.hardness", &[]),
+            sag_pct: read_f32(session, "tube.sag", &[]),
+            rectifier: read_u8(session, "tube.rectifier") as i32,
+            xfmr_enabled: read_bool(session, "tube.xfmr"),
+            xfmr_damping: read_f32(session, "tube.damping", &[]),
+            xfmr_res_hz: read_f32(session, "tube.resonance", &[]),
+            mix_pct: read_f32(session, "tube.mix", &[]),
+            trim_db: read_f32(session, "tube.trim", &[]),
+        }),
         channels,
         matrix,
         io,
@@ -1566,6 +1874,8 @@ mod tests {
             leveller: LevellerBlock::default(),
             psybass: None,
             upmix: None,
+            subharm: None,
+            tube: None,
             channels: vec![ChannelBlock {
                 channel_id: 0,
                 name: "USB 1".into(),
@@ -1834,6 +2144,8 @@ mod io_tests {
             leveller: LevellerBlock::default(),
             psybass: None,
             upmix: None,
+            subharm: None,
+            tube: None,
             channels: vec![ChannelBlock::default()],
             matrix: Vec::new(),
             io,
@@ -2242,5 +2554,622 @@ mod io_tests {
         let text = write(&doc);
         assert_eq!(parse(&text).unwrap().io, captured);
         assert!(!text.contains("i2sBckPinSlave"), "absent keys are omitted");
+    }
+}
+
+/// The beta4 blocks: subharm and tube at the top level, and a limiter inside
+/// each output's channel entry (PresetDocument.swift:45-47, 235-432).
+#[cfg(test)]
+mod beta4_tests {
+    use super::*;
+    use crate::probe::{Capabilities, ChannelInfo, Feature};
+    use dspi_proto::Platform;
+    use dspi_proto::generated::opcodes as op;
+    use dspi_transport::MockTransport;
+    use dspi_transport::mock::{Direction, LogHandle};
+
+    fn caps(features: &[&str]) -> Capabilities {
+        Capabilities {
+            serial: "TEST".into(),
+            platform: Platform::Rp2350,
+            firmware: "1.1.6 beta 4".into(),
+            firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 6, 4),
+            build_info: None,
+            wire_format: dspi_proto::generated::wire::WIRE_FORMAT_VERSION as u8,
+            num_channels: 17,
+            num_inputs: 8,
+            num_outputs: 9,
+            max_bands: 10,
+            band_storage: 12,
+            channels: (0..17)
+                .map(|i| ChannelInfo {
+                    index: i,
+                    name: format!("Ch {i}"),
+                    slug: format!("ch.{i}"),
+                    is_output: i >= 8,
+                })
+                .collect(),
+            features: features
+                .iter()
+                .map(|n| Feature {
+                    name: (*n).into(),
+                    present: true,
+                    evidence: "test".into(),
+                })
+                .collect(),
+            cs: None,
+            siggen: None,
+            active_preset: None,
+        }
+    }
+
+    const ALL: &[&str] = &["subharmonic_synth", "tube_preamp", "output_limiter"];
+
+    /// A device that answers everything, so the apply's readbacks never wait
+    /// out a stall.
+    fn rig(features: &[&str]) -> (Session, LogHandle) {
+        let t = MockTransport::new().answering_everything(vec![0; 64]);
+        let log = t.log_handle();
+        (Session::new(Box::new(t), caps(features)).unwrap(), log)
+    }
+
+    /// `(opcode, wValue, payload)` of every write, in order.
+    fn writes(log: &LogHandle, opcodes: &[u8]) -> Vec<(u8, u16, Vec<u8>)> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.direction == Direction::Out && opcodes.contains(&e.opcode))
+            .map(|e| (e.opcode, e.value, e.payload.clone()))
+            .collect()
+    }
+
+    fn doc() -> PresetDocument {
+        let mut d = parse(r#"{"schemaVersion":1,"channels":[{"channelId":0}]}"#).unwrap();
+        d.subharm = Some(SubharmBlock {
+            enabled: true,
+            low_db: -6.0,
+            high_db: -6.0,
+            top_db: 0.0,
+            boost_db: 3.0,
+            output_mask: 0x0100,
+            select_mode: 1,
+            select_depth_pct: 80.0,
+            select_hold_ms: 200.0,
+            ceiling_db: -10.0,
+            link_pairs: false,
+        });
+        d.tube = Some(TubeBlock {
+            enabled: true,
+            tube_type: 0,
+            bias_pct: 20.0,
+            ..Default::default()
+        });
+        d.channels.push(ChannelBlock {
+            channel_id: 8,
+            name: "Main L".into(),
+            is_output: true,
+            limiter: Some(LimiterBlock {
+                enabled: true,
+                threshold_db: -3.0,
+                release_ms: 200.0,
+                link_group: 1,
+            }),
+            ..Default::default()
+        });
+        d
+    }
+
+    #[test]
+    fn the_new_blocks_round_trip() {
+        let original = doc();
+        let text = write(&original);
+        assert_eq!(parse(&text).unwrap(), original);
+    }
+
+    /// Exactly the Console's key names; anything else is a file the Console
+    /// reads as defaults.
+    #[test]
+    fn the_new_blocks_use_the_consoles_keys() {
+        let text = write(&doc());
+        for key in [
+            "\"subharm\"",
+            "\"lowDb\"",
+            "\"highDb\"",
+            "\"topDb\"",
+            "\"boostDb\"",
+            "\"selectMode\"",
+            "\"selectDepthPct\"",
+            "\"selectHoldMs\"",
+            "\"ceilingDb\"",
+            "\"linkPairs\"",
+            "\"tube\"",
+            "\"tubeType\"",
+            "\"driveDb\"",
+            "\"biasPct\"",
+            "\"asymDb\"",
+            "\"hardnessPct\"",
+            "\"sagPct\"",
+            "\"rectifier\"",
+            "\"xfmrEnabled\"",
+            "\"xfmrDamping\"",
+            "\"xfmrResHz\"",
+            "\"mixPct\"",
+            "\"trimDb\"",
+            "\"limiter\"",
+            "\"thresholdDb\"",
+            "\"releaseMs\"",
+            "\"linkGroup\"",
+        ] {
+            assert!(text.contains(key), "missing {key} in:\n{text}");
+        }
+        assert!(!text.contains("outputIndex"), "this build writes none");
+        // Masks and enums are raw numbers (PresetDocument.swift:245-246, 279).
+        assert!(text.contains("\"outputMask\": 256"), "{text}");
+        assert!(text.contains("\"selectMode\": 1"), "{text}");
+    }
+
+    /// Absent means the source device lacked the feature, and an input never
+    /// carries a limiter.
+    #[test]
+    fn absent_blocks_stay_absent() {
+        let d = parse(r#"{"schemaVersion":1,"channels":[{"channelId":0}]}"#).unwrap();
+        assert!(d.subharm.is_none() && d.tube.is_none());
+        assert!(d.channels[0].limiter.is_none());
+        let text = write(&d);
+        assert!(!text.contains("subharm") && !text.contains("tube"));
+        assert!(!text.contains("limiter"));
+    }
+
+    /// A document as the Console writes one: JSONEncoder, pretty printed with
+    /// sorted keys (PresetDocument.swift:705-711), from `capture`
+    /// (PresetDocumentTransfer.swift:20-163), on an RP2350 at wire V32. The
+    /// shape was built by hand from the Swift encoder, since no exported
+    /// sample is checked in.
+    const CONSOLE_DOCUMENT: &str = r#"{
+  "channels" : [
+    {
+      "channelId" : 0,
+      "crossover" : [
+
+      ],
+      "delayMs" : 0,
+      "enabled" : true,
+      "eq" : [
+        {
+          "bypass" : false,
+          "freqHz" : 105,
+          "gain" : 6.5,
+          "q" : 0.707,
+          "qp" : 0.707,
+          "type" : 2
+        }
+      ],
+      "eqChannel" : 0,
+      "gainDb" : 0,
+      "inputIndex" : 0,
+      "isOutput" : false,
+      "muted" : false,
+      "name" : "USB L"
+    },
+    {
+      "channelId" : 3,
+      "crossover" : [
+
+      ],
+      "delayMs" : 0,
+      "enabled" : true,
+      "eq" : [
+
+      ],
+      "eqChannel" : 9,
+      "gainDb" : -3,
+      "isOutput" : true,
+      "limiter" : {
+        "enabled" : true,
+        "linkGroup" : 2,
+        "releaseMs" : 250,
+        "thresholdDb" : -4.5
+      },
+      "muted" : false,
+      "name" : "SPDIF 1 R",
+      "outputDelayMs" : 1.5,
+      "outputIndex" : 1
+    }
+  ],
+  "crossfeed" : {
+    "enabled" : false,
+    "feedDb" : 4.5,
+    "freqHz" : 700,
+    "itd" : true,
+    "outputPairMask" : 1,
+    "preset" : 0
+  },
+  "global" : {
+    "bypass" : false,
+    "inputPairLinked" : [
+      false,
+      false,
+      false,
+      false
+    ],
+    "inputPreampsDb" : [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "inputSource" : 0,
+    "lgSoundSyncEnabled" : false,
+    "masterVolumeDb" : -20,
+    "userVolumeDb" : -12
+  },
+  "io" : {
+    "adatEnabled" : false,
+    "adatInputClockMode" : 0,
+    "adatInputEnabled" : false,
+    "adatInputPin" : 255,
+    "adatPin" : 12,
+    "i2sBckPin" : 14,
+    "i2sBckPinSlave" : 26,
+    "i2sClockMode" : 0,
+    "i2sClockPinMode" : 0,
+    "i2sInputChannels" : 2,
+    "i2sInputRateHz" : 48000,
+    "i2sRxPins" : [
+      1,
+      2,
+      3,
+      4
+    ],
+    "mckEnabled" : false,
+    "mckMultiplier" : 128,
+    "mckPin" : 13,
+    "outputPins" : [
+      6,
+      7,
+      8,
+      9,
+      10
+    ],
+    "outputSlotTypes" : [
+      0,
+      0,
+      0,
+      0
+    ],
+    "spdifEnabledExt" : 0,
+    "spdifRxPins" : [
+      5,
+      20,
+      21
+    ]
+  },
+  "leveller" : {
+    "amountPct" : 50,
+    "applyMask" : 255,
+    "detectorMask" : 255,
+    "enabled" : false,
+    "gateDb" : -96,
+    "lookahead" : true,
+    "maxGainDb" : 15,
+    "speed" : 0
+  },
+  "loudness" : {
+    "enabled" : false,
+    "intensityPct" : 100,
+    "outputMask" : 65535,
+    "refSpl" : 83
+  },
+  "matrix" : [
+    {
+      "enabled" : true,
+      "gainDb" : 0,
+      "input" : 0,
+      "invert" : false,
+      "output" : 0
+    }
+  ],
+  "meta" : {
+    "appVersion" : "1.1.6-beta4",
+    "firmwareVersion" : "1.1.6 beta 4",
+    "inputChannelCount" : 8,
+    "masterVolumeMode" : 0,
+    "name" : "Living Room",
+    "outputChannelCount" : 9,
+    "outputConfigMode" : 1,
+    "platform" : "RP2350",
+    "savedUtc" : "2026-09-29T10:00:00Z",
+    "wireFormatVersion" : 32
+  },
+  "psybass" : {
+    "characterPct" : 50,
+    "cutoffHz" : 80,
+    "driveDb" : 6,
+    "enabled" : false,
+    "harmonicsDb" : 0,
+    "originalDb" : 0,
+    "outputMask" : 65535
+  },
+  "schemaVersion" : 1,
+  "subharm" : {
+    "boostDb" : 3,
+    "ceilingDb" : -12,
+    "enabled" : true,
+    "highDb" : -6,
+    "linkPairs" : true,
+    "lowDb" : -6,
+    "outputMask" : 256,
+    "selectDepthPct" : 100,
+    "selectHoldMs" : 150,
+    "selectMode" : 2,
+    "topDb" : -30
+  },
+  "tube" : {
+    "asymDb" : 2,
+    "biasPct" : 5,
+    "driveDb" : -6,
+    "enabled" : true,
+    "hardnessPct" : 55,
+    "mixPct" : 80,
+    "outputMask" : 255,
+    "rectifier" : 2,
+    "sagPct" : 10,
+    "trimDb" : -1.5,
+    "tubeType" : 3,
+    "xfmrDamping" : 4,
+    "xfmrEnabled" : false,
+    "xfmrResHz" : 80
+  },
+  "upmix" : {
+    "attackMs" : 10,
+    "centerMode" : 1,
+    "centerWidthPct" : 25,
+    "decorrPct" : 90,
+    "detectorHpfHz" : 200,
+    "enabled" : false,
+    "presenceDb" : 0,
+    "releaseMs" : 100,
+    "strengthPct" : 100,
+    "surroundDelayMs" : 12,
+    "surroundHpfHz" : 300,
+    "surroundLpfHz" : 7000,
+    "surroundMode" : 1,
+    "thresholdPct" : 30
+  }
+}"#;
+
+    #[test]
+    fn a_document_in_the_consoles_format_parses() {
+        let d = parse(CONSOLE_DOCUMENT).unwrap();
+        assert_eq!(d.meta.wire_format_version, 32);
+        assert_eq!(
+            d.subharm,
+            Some(SubharmBlock {
+                enabled: true,
+                low_db: -6.0,
+                high_db: -6.0,
+                top_db: -30.0,
+                boost_db: 3.0,
+                output_mask: 0x0100,
+                select_mode: 2,
+                select_depth_pct: 100.0,
+                select_hold_ms: 150.0,
+                ceiling_db: -12.0,
+                link_pairs: true,
+            })
+        );
+        assert_eq!(
+            d.tube,
+            Some(TubeBlock {
+                enabled: true,
+                output_mask: 0xFF,
+                tube_type: 3,
+                drive_db: -6.0,
+                bias_pct: 5.0,
+                asym_db: 2.0,
+                hardness_pct: 55.0,
+                sag_pct: 10.0,
+                rectifier: 2,
+                xfmr_enabled: false,
+                xfmr_damping: 4.0,
+                xfmr_res_hz: 80.0,
+                mix_pct: 80.0,
+                trim_db: -1.5,
+            })
+        );
+        assert!(d.channels[0].limiter.is_none(), "inputs carry none");
+        let out = &d.channels[1];
+        assert_eq!(out.output_index, Some(1));
+        assert_eq!(
+            out.limiter,
+            Some(LimiterBlock {
+                enabled: true,
+                threshold_db: -4.5,
+                release_ms: 250.0,
+                link_group: 2,
+            })
+        );
+    }
+
+    /// A Console before V30 wrote a two-band subharm block, and a hand-edited
+    /// file may drop any key: the rest take the firmware's defaults, as the
+    /// Console's lenient decoder gives them (PresetDocument.swift:252-266).
+    #[test]
+    fn a_partial_block_takes_the_firmware_defaults() {
+        let d = parse(
+            r#"{"schemaVersion":1,
+                "subharm":{"enabled":true,"lowDb":-3,"highDb":0,"boostDb":2,"outputMask":256},
+                "tube":{"enabled":true},
+                "channels":[{"channelId":8,"isOutput":true,"limiter":{"enabled":true}}]}"#,
+        )
+        .unwrap();
+        let s = d.subharm.unwrap();
+        assert_eq!(s.top_db, -30.0, "the third band ships off");
+        assert_eq!(
+            (s.select_mode, s.select_depth_pct, s.select_hold_ms),
+            (0, 100.0, 150.0)
+        );
+        assert_eq!(s.ceiling_db, 0.0);
+        assert!(s.link_pairs);
+        let t = d.tube.unwrap();
+        assert_eq!(
+            t,
+            TubeBlock {
+                enabled: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!((t.tube_type, t.drive_db, t.xfmr_res_hz), (1, -12.0, 95.0));
+        assert!(t.xfmr_enabled);
+        let l = d.channels[0].limiter.clone().unwrap();
+        assert_eq!(
+            (l.threshold_db, l.release_ms, l.link_group),
+            (-1.0, 100.0, 0)
+        );
+    }
+
+    /// Every value first and the switch last, and the tube type before the
+    /// four values it loads (PresetDocumentTransfer.swift:600-644).
+    #[test]
+    fn subharm_and_tube_apply_in_the_consoles_order() {
+        let (mut s, log) = rig(ALL);
+        let report = apply(&mut s, &doc(), ApplyOptions::default());
+        let subharm = [
+            op::REQ_SET_SUBHARM_LOW,
+            op::REQ_SET_SUBHARM_HIGH,
+            op::REQ_SET_SUBHARM_BOOST,
+            op::REQ_SET_SUBHARM_MASK,
+            op::REQ_SET_SUBHARM_TOP,
+            op::REQ_SET_SUBHARM_SELECT,
+            op::REQ_SET_SUBHARM_DEPTH,
+            op::REQ_SET_SUBHARM_HOLD,
+            op::REQ_SET_SUBHARM_CEILING,
+            op::REQ_SET_SUBHARM_LINK,
+            op::REQ_SET_SUBHARM,
+        ];
+        let sent: Vec<u8> = writes(&log, &subharm).iter().map(|w| w.0).collect();
+        assert_eq!(sent, subharm.to_vec());
+        let tube: Vec<u16> = writes(&log, &[op::REQ_SET_TUBE_PARAM])
+            .iter()
+            .map(|w| w.1)
+            .collect();
+        // TUBE_PARAM_* (tube.h:17-30): type, bias, asym, hardness, sag,
+        // drive, rectifier, damping, resonance, output stage, mix, trim,
+        // mask, enable.
+        assert_eq!(tube, vec![2, 4, 5, 6, 7, 3, 8, 10, 11, 9, 12, 13, 1, 0]);
+        // Every tube value is a float on the wire, the mask included.
+        let mask = writes(&log, &[op::REQ_SET_TUBE_PARAM])[12].2.clone();
+        assert_eq!(mask, 65535.0f32.to_le_bytes().to_vec());
+        assert!(
+            !report.skipped.iter().any(|r| r.contains("not supported")),
+            "{:?}",
+            report.skipped
+        );
+    }
+
+    /// The Console's skip reasons (PresetDocumentTransfer.swift:435, 618,
+    /// 643), and nothing written for a feature the device lacks.
+    #[test]
+    fn a_missing_feature_is_skipped_with_the_consoles_reason() {
+        let (mut s, log) = rig(&[]);
+        let report = apply(
+            &mut s,
+            &doc(),
+            ApplyOptions {
+                hardware_io: true,
+                ..Default::default()
+            },
+        );
+        for reason in [
+            "Subharmonic synthesizer (not supported by this firmware)",
+            "Tube preamp (not supported by this firmware)",
+            "Output limiter (not supported by this firmware)",
+        ] {
+            assert!(
+                report.skipped.iter().any(|r| r == reason),
+                "{reason} not in {:?}",
+                report.skipped
+            );
+        }
+        let touched = writes(
+            &log,
+            &[op::REQ_SET_SUBHARM, op::REQ_SET_TUBE_PARAM, op::REQ_LIMITER],
+        );
+        assert!(touched.is_empty(), "{touched:?}");
+    }
+
+    /// Limiters are output configuration: only the hardware I/O option brings
+    /// them in (PresetDocumentTransfer.swift:246-250, 323-326).
+    #[test]
+    fn limiters_apply_only_with_the_hardware_option() {
+        let (mut s, log) = rig(ALL);
+        apply(&mut s, &doc(), ApplyOptions::default());
+        assert!(writes(&log, &[op::REQ_LIMITER]).is_empty());
+
+        let (mut s, log) = rig(ALL);
+        apply(
+            &mut s,
+            &doc(),
+            ApplyOptions {
+                hardware_io: true,
+                ..Default::default()
+            },
+        );
+        let w = writes(&log, &[op::REQ_LIMITER]);
+        // Output 0 (channel 8): threshold, release, enable, then the group.
+        let values: Vec<u16> = w.iter().map(|w| w.1).collect();
+        assert_eq!(values, vec![0x0001, 0x0002, 0x0000, 0x0003]);
+        assert_eq!(w[0].2, (-3.0f32).to_le_bytes().to_vec());
+        assert_eq!(w[3].2, 1.0f32.to_le_bytes().to_vec());
+    }
+
+    /// A linked output is unlinked before its values go out, so one write
+    /// does not move its whole group (limiter.c:143-194), and relinked last.
+    /// The Console's own output index places the block.
+    #[test]
+    fn a_linked_output_is_unlinked_first_and_relinked_last() {
+        let t = MockTransport::new()
+            .answering_everything(vec![0; 64])
+            // Every output reads as linked to group 2.
+            .data(op::REQ_LIMITER, 2.0f32.to_le_bytes().to_vec());
+        let log = t.log_handle();
+        let mut s = Session::new(Box::new(t), caps(ALL)).unwrap();
+        let d = parse(CONSOLE_DOCUMENT).unwrap();
+        apply(
+            &mut s,
+            &d,
+            ApplyOptions {
+                hardware_io: true,
+                ..Default::default()
+            },
+        );
+        let w = writes(&log, &[op::REQ_LIMITER]);
+        let values: Vec<u16> = w.iter().map(|w| w.1).collect();
+        // Output 1, from `outputIndex` rather than `channelId` 3.
+        assert_eq!(values, vec![0x0103, 0x0101, 0x0102, 0x0100, 0x0103]);
+        assert_eq!(w[0].2, 0.0f32.to_le_bytes().to_vec(), "unlinked");
+        assert_eq!(w[4].2, 2.0f32.to_le_bytes().to_vec(), "relinked");
+    }
+
+    /// An export carries the blocks the device has, and reads back as the
+    /// same document.
+    #[test]
+    fn an_export_carries_the_new_blocks_and_round_trips() {
+        let (mut s, _) = rig(ALL);
+        let d = capture(&mut s, Some("Test".into()));
+        assert!(d.subharm.is_some() && d.tube.is_some());
+        for c in &d.channels {
+            assert_eq!(c.limiter.is_some(), c.is_output, "channel {}", c.channel_id);
+        }
+        assert_eq!(parse(&write(&d)).unwrap(), d);
+
+        let (mut s, _) = rig(&[]);
+        let d = capture(&mut s, None);
+        assert!(d.subharm.is_none() && d.tube.is_none());
+        assert!(d.channels.iter().all(|c| c.limiter.is_none()));
     }
 }

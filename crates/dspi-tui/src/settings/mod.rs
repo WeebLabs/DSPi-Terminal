@@ -1516,14 +1516,28 @@ impl SettingsScreen {
         self.data.cs_dirty
     }
 
+    /// Limiter edits made anywhere since the output configuration was last
+    /// saved, which count with the wiring in INDEPENDENT mode. The state
+    /// keeps them, because they are made on the output page, not here.
+    fn limiter_dirty(&self, state: &DeviceState) -> bool {
+        state.limiter_unsaved()
+    }
+
     pub fn dirty(&self, state: &DeviceState) -> bool {
-        self.global_dirty(state) || self.output_dirty() || self.cs_dirty()
+        self.global_dirty(state)
+            || self.output_dirty()
+            || self.limiter_dirty(state)
+            || self.cs_dirty()
     }
 
     /// The bar's subtitle: the Console says so when the only pending change is
     /// already live on the device.
     fn save_subtitle(&self, state: &DeviceState) -> &'static str {
-        if self.cs_dirty() && !self.global_dirty(state) && !self.output_dirty() {
+        if self.cs_dirty()
+            && !self.global_dirty(state)
+            && !self.output_dirty()
+            && !self.limiter_dirty(state)
+        {
             SaveBar::CS_ONLY
         } else {
             SaveBar::FLASH
@@ -1549,7 +1563,7 @@ impl SettingsScreen {
         if self.global_dirty(state) {
             lines.extend(self.pages.global.save_commands(state, &self.data));
         }
-        if self.output_dirty() {
+        if self.output_dirty() || self.limiter_dirty(state) {
             lines.push("dev.save.io".to_string());
         }
         if self.cs_dirty() {
@@ -1573,6 +1587,11 @@ impl SettingsScreen {
             && let Some(base) = self.io_baseline.take()
         {
             lines.extend(base.restore_commands(&IoSnapshot::capture(state)));
+        }
+        // The limiters last, as the Console restores them
+        // (DSPi_ConsoleApp.swift:1248-1258).
+        if self.limiter_dirty(state) {
+            lines.extend(state.limiter_restore_commands());
         }
         if self.cs_dirty() {
             lines.push("cs.revert".to_string());
@@ -2595,6 +2614,39 @@ pub(crate) mod tests {
         );
         s2.begin_output_edit(&st);
         assert!(!s2.output_dirty(), "with-preset mode saves with the preset");
+    }
+
+    /// A limiter edit made on the output page counts with the wiring in
+    /// INDEPENDENT mode: Save flashes it with 0x52 and Revert writes the old
+    /// values back, the limiter part of the Console's output-config category.
+    #[test]
+    fn limiter_edits_join_the_output_config_category() {
+        let (mut s, mut st) = screen(Page::About);
+        st.output_config_mode = 0;
+        st.mark_saved();
+        st.begin_limiter_edit();
+        let (_, l, _) = *dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "limiter")
+            .unwrap();
+        st.bulk.patch(l, &[1]);
+        st.bulk.patch(l + 4, &(-6.0f32).to_le_bytes());
+        assert!(s.dirty(&st) && !st.has_unsaved_changes());
+        assert_eq!(s.save_subtitle(&st), SaveBar::FLASH);
+        match s.revert(&st) {
+            ScreenEvent::Command(c) => assert_eq!(
+                c, "limit.threshold 0 0\nlimit.release 0 0\nlimit.on 0 off",
+                "the fixture's limiters are all zero"
+            ),
+            other => panic!("{other:?}"),
+        }
+        match s.save(&st) {
+            ScreenEvent::Command(c) => assert_eq!(c, "dev.save.io"),
+            other => panic!("{other:?}"),
+        }
+        // In WITH_PRESET mode the same edit is a preset change instead.
+        st.output_config_mode = 1;
+        assert!(!s.dirty(&st) && st.has_unsaved_changes());
     }
 
     #[test]
