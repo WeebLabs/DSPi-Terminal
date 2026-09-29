@@ -1065,6 +1065,8 @@ mod tests {
             assert_eq!(f.lines().count(), h as usize, "{w}x{h}");
             assert!(f.contains("System Statistics"), "{w}x{h}:\n{f}");
             assert!(f.contains("T closes"), "{w}x{h}:\n{f}");
+            // The Console's firmware row reads "v1.1.6 beta 4".
+            assert!(f.contains("v1.1.6 beta 4"), "{w}x{h}:\n{f}");
             assert!(f.contains("Reset watermarks"), "the key line: {w}x{h}\n{f}");
         }
     }

@@ -1374,7 +1374,7 @@ mod tests {
         let f = frame(&mut s, &mut term);
         let lines: Vec<&str> = f.lines().collect();
         assert!(
-            lines[0].starts_with(" DSPi  RP2350 · fw 1.1.6 · A1B2C3D4"),
+            lines[0].starts_with(" DSPi  RP2350 · fw 1.1.6 beta 4 · A1B2C3D4"),
             "{:?}",
             lines[0]
         );
