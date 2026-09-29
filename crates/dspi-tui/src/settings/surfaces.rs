@@ -20,6 +20,15 @@
 //! Every write here is a deferred, live-only preview: the device applies it a
 //! tick later and reports the outcome through `REQ_GET_CS_STATUS`, and nothing
 //! reaches flash until the save bar's Save. [`cs_model::run`] does the waiting.
+//!
+//! The same card list, filtered to the two auxiliary output types, is
+//! Settings > Control > Auxiliary Outputs, as the Console builds it
+//! (`visibleSlots`, DSPi_ConsoleApp.swift:2979-2985): an aux output is a
+//! binding slot too, under the same Apply, Save and Revert, so each slot
+//! appears on exactly one of the two pages. [`aux_outputs`] holds that page's
+//! own rows.
+
+mod aux_outputs;
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -72,7 +81,17 @@ const TAG_DISPLAY_PAGE: u32 = 0x200;
 const TAG_LEARN: u32 = 0x300;
 const TAG_LEARN_CANCEL: u32 = 0x400;
 const TAG_IR_CLEAR: u32 = 0x500;
+/// An aux output's live switch and level: immediate writes that are neither a
+/// preview nor unsaved (config.h:136-142), so the save bar must not count them.
+const TAG_AUX_STATE: u32 = 0x600;
+const TAG_AUX_LEVEL: u32 = 0x700;
 const TAG_MASK: u32 = 0xF00;
+
+/// Whether a session tag is an aux output's live switch or level, which never
+/// makes the configuration unsaved.
+pub(crate) fn is_live_aux_tag(tag: u32) -> bool {
+    matches!(tag & TAG_MASK, TAG_AUX_STATE | TAG_AUX_LEVEL)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Item {
@@ -130,6 +149,15 @@ enum Item {
     PageLarge(usize),
     PageBar(usize),
     PageRemove(usize),
+
+    // An auxiliary output's card.
+    AuxLive(usize),
+    AuxLevel(usize),
+    AuxLimit(usize),
+    AuxLinear(usize),
+    AuxBoot(usize),
+    AuxStartsOn(usize),
+    AuxStartLevel(usize),
 }
 
 /// Which remote button is listening, and what `DeviceState::ir_learn` held when
@@ -159,6 +187,21 @@ pub struct SurfacesPage {
     display_status: Option<String>,
     popup: Option<Item>,
     dialog: Option<Item>,
+    /// True on Auxiliary Outputs, which shows the aux slots and nothing else;
+    /// false on Control Surfaces, which shows everything but them.
+    aux_page: bool,
+    /// The live switch and level each aux output shows: the last read, then
+    /// every notification and every write of ours since.
+    aux: dspi_session::surfaces::CsAuxStates,
+    /// The last block read from the device, so a poll that brought nothing new
+    /// does not undo a newer notification.
+    aux_read: Option<dspi_session::surfaces::CsAuxStates>,
+    /// The last `NOTIFY_EVT_CS_AUX` taken on, and whether the page has looked
+    /// at all yet: the event standing when it first looks predates it.
+    aux_event: Option<(u8, u8, u16)>,
+    aux_seen: bool,
+    /// A refused live switch or level, per slot.
+    aux_messages: BTreeMap<usize, String>,
 }
 
 const KEYS: &[KeyHelp] = &[
@@ -194,6 +237,25 @@ impl SurfacesPage {
             display_status: None,
             popup: None,
             dialog: None,
+            aux_page: false,
+            aux: data
+                .cs
+                .as_ref()
+                .and_then(|c| c.aux.clone())
+                .unwrap_or_default(),
+            aux_read: data.cs.as_ref().and_then(|c| c.aux.clone()),
+            aux_event: None,
+            aux_seen: false,
+            aux_messages: BTreeMap::new(),
+        }
+    }
+
+    /// Settings > Control > Auxiliary Outputs: the same cards, filtered to
+    /// the two aux types.
+    pub fn aux(data: &SettingsData) -> Self {
+        Self {
+            aux_page: true,
+            ..Self::new(data)
         }
     }
 
@@ -202,6 +264,50 @@ impl SurfacesPage {
             self.drafts = cs.bindings.clone();
             self.names = cs.names.clone();
             self.ir_drafts = cs.ir.clone();
+        }
+        // The records themselves follow the device wherever this page holds
+        // no edit of its own. The other page of the pair (Control Surfaces
+        // and Auxiliary Outputs share the slots) and the Console beside this
+        // can both change a slot, and a card that kept its snapshot would
+        // offer that slot as free or re-apply the old record over the new.
+        // A staged edit is kept: it is the user's, and Apply is how it goes.
+        // The slot being applied is left to the apply's own answer.
+        let same_shape = self.live.bindings.len() == cs.bindings.len()
+            && self.live.names.len() == cs.names.len();
+        for slot in 0..self.drafts.len().min(cs.bindings.len()) {
+            if self.applying == Some(slot) {
+                continue;
+            }
+            if self.drafts[slot] == self.live.binding(slot) {
+                self.drafts[slot] = cs.bindings[slot].clone();
+            }
+            if self.names[slot] == self.live.name(slot) {
+                self.names[slot] = cs.name(slot);
+            }
+            if same_shape {
+                self.live.bindings[slot] = cs.bindings[slot].clone();
+                self.live.names[slot] = cs.name(slot);
+            }
+        }
+        if !same_shape {
+            self.live.bindings = cs.bindings.clone();
+            self.live.names = cs.names.clone();
+        }
+        for sub in 0..self.ir_drafts.len().min(cs.ir.len()) {
+            if self.live.ir.get(sub) == Some(&self.ir_drafts[sub]) {
+                self.ir_drafts[sub] = cs.ir[sub].clone();
+            }
+        }
+        // Remote buttons are applied with the receiver's slot.
+        if self.applying.is_none() {
+            self.live.ir = cs.ir.clone();
+        }
+        // A fresh read of the live aux values wins over what the page last
+        // showed; the same read again does not, so a notification that came
+        // in after it stands.
+        if cs.aux.is_some() && cs.aux != self.aux_read {
+            self.aux_read = cs.aux.clone();
+            self.aux = cs.aux.clone().unwrap_or_default();
         }
         // Everything the device reports about itself rather than holds for us:
         // slot health, the panel's own state, and the group and macro tables a
@@ -269,9 +375,15 @@ impl SurfacesPage {
         !self.drafts[slot].is_empty() || !self.live.binding(slot).is_empty()
     }
 
+    /// True when the slot holds an aux output, staged or live, which puts it
+    /// on the Auxiliary Outputs page and off this one's twin.
+    fn is_aux_slot(&self, slot: usize) -> bool {
+        m::is_aux(self.drafts[slot].component) || m::is_aux(self.live.binding(slot).component)
+    }
+
     fn visible(&self) -> Vec<usize> {
         (0..self.slot_count())
-            .filter(|s| self.configured(*s))
+            .filter(|s| self.configured(*s) && self.is_aux_slot(*s) == self.aux_page)
             .collect()
     }
 
@@ -299,11 +411,14 @@ impl SurfacesPage {
     }
 
     /// Types offerable when adding a control: the IR receiver and the display
-    /// are one per device, so each drops out once it exists.
+    /// are one per device, so each drops out once it exists. The aux outputs
+    /// are added from their own page and nowhere else (the Console's
+    /// `addableTypes`, DSPi_ConsoleApp.swift:6110-6119).
     fn addable_types(&self) -> Vec<u8> {
         self.live
             .real_types()
             .into_iter()
+            .filter(|t| m::is_aux(*t) == self.aux_page)
             .filter(|t| match *t {
                 m::ty::IR => m::container_slot(&self.drafts, &self.live, m::ty::IR).is_none(),
                 m::ty::DISPLAY => {
@@ -315,11 +430,15 @@ impl SurfacesPage {
     }
 
     /// Types a slot may become: every type, minus a container another slot
-    /// already holds.
+    /// already holds. An aux slot stays an aux output (of either kind) and a
+    /// control never becomes one, because the two live on different pages
+    /// (`typeMenuTypes`, DSPi_ConsoleApp.swift:3079-3084).
     fn type_options(&self, slot: usize) -> Vec<u8> {
+        let aux = self.is_aux_slot(slot);
         self.live
             .real_types()
             .into_iter()
+            .filter(|t| m::is_aux(*t) == aux)
             .filter(|t| match *t {
                 m::ty::IR => {
                     m::container_slot(&self.drafts, &self.live, m::ty::IR).is_none_or(|s| s == slot)
@@ -686,48 +805,7 @@ impl SurfacesPage {
         // Condition timing rides alongside whichever operand row the indicator
         // action drew: a brightness meter has no edge to time.
         if m::delays_allowed(b.component, b.action) {
-            let cap = format!(
-                "Up to {} min {} s.",
-                m::DELAY_MAX_SECONDS / 60,
-                m::DELAY_MAX_SECONDS % 60
-            );
-            rows.push((
-                Some(Item::OnDelay(slot)),
-                Row::Number {
-                    label: "Turn-On Delay".into(),
-                    value: m::decode_delay(b.on_delay) as f64,
-                    min: 0.0,
-                    max: m::DELAY_MAX_SECONDS as f64,
-                    step: 1.0,
-                    unit: "s".into(),
-                    decimals: 0,
-                    caption: Some(format!(
-                        "Hold off until the condition has been true this long. Any interruption \
-                         restarts the wait. {cap}"
-                    )),
-                    enabled: true,
-                },
-            ));
-            rows.push((
-                Some(Item::OffDelay(slot)),
-                Row::Number {
-                    label: "Turn-Off Delay".into(),
-                    value: m::decode_delay(b.off_delay) as f64,
-                    min: 0.0,
-                    max: m::DELAY_MAX_SECONDS as f64,
-                    step: 1.0,
-                    unit: "s".into(),
-                    decimals: 0,
-                    caption: Some(format!(
-                        "Stay lit until the condition has been false this long - long enough to \
-                         hold an amplifier trigger on through quiet passages. {cap}"
-                    )),
-                    enabled: true,
-                },
-            ));
-            if b.on_delay != 0 || b.off_delay != 0 {
-                rows.push((None, Row::note(DELAY_WARNING)));
-            }
+            rows.extend(self.delay_rows(slot));
         }
 
         // The ceiling scales whatever duty the action worked out, so it belongs
@@ -755,6 +833,56 @@ impl SurfacesPage {
                     enabled: true,
                 },
             ));
+        }
+        rows
+    }
+
+    /// The turn-on and turn-off delays, the TON/TOF filter on an indicator's
+    /// condition or an aux output's switch, and the warning a delay carries.
+    fn delay_rows(&self, slot: usize) -> Vec<(Option<Item>, Row)> {
+        let b = &self.drafts[slot];
+        let mut rows: Vec<(Option<Item>, Row)> = Vec::new();
+        let cap = format!(
+            "Up to {} min {} s.",
+            m::DELAY_MAX_SECONDS / 60,
+            m::DELAY_MAX_SECONDS % 60
+        );
+        rows.push((
+            Some(Item::OnDelay(slot)),
+            Row::Number {
+                label: "Turn-On Delay".into(),
+                value: m::decode_delay(b.on_delay) as f64,
+                min: 0.0,
+                max: m::DELAY_MAX_SECONDS as f64,
+                step: 1.0,
+                unit: "s".into(),
+                decimals: 0,
+                caption: Some(format!(
+                    "Hold off until the condition has been true this long. Any interruption \
+                         restarts the wait. {cap}"
+                )),
+                enabled: true,
+            },
+        ));
+        rows.push((
+            Some(Item::OffDelay(slot)),
+            Row::Number {
+                label: "Turn-Off Delay".into(),
+                value: m::decode_delay(b.off_delay) as f64,
+                min: 0.0,
+                max: m::DELAY_MAX_SECONDS as f64,
+                step: 1.0,
+                unit: "s".into(),
+                decimals: 0,
+                caption: Some(format!(
+                    "Stay lit until the condition has been false this long - long enough to \
+                         hold an amplifier trigger on through quiet passages. {cap}"
+                )),
+                enabled: true,
+            },
+        ));
+        if b.on_delay != 0 || b.off_delay != 0 {
+            rows.push((None, Row::note(DELAY_WARNING)));
         }
         rows
     }
@@ -858,25 +986,29 @@ impl SurfacesPage {
         } else {
             m::compatible_groups(cs, b.noun)
         };
-        let (choices, selected) = target_choices(cx, cs, &nd, &usable, b.target, grouped);
+        let (choices, selected) =
+            target_choices(cx, cs, b.noun, Some(slot), &usable, b.target, grouped);
+        // An aux noun is not choosing a channel, so the row stops saying so
+        // (`targetRows`, DSPi_ConsoleApp.swift:4690-4693).
+        let alone = usable.is_empty() && !grouped;
         rows.push((
             Some(Item::Target(slot)),
             Row::Pick {
-                label: if usable.is_empty() && !grouped {
-                    "Channel".into()
+                label: if alone {
+                    m::target_noun(&nd).into()
                 } else {
                     "Channel or Group".into()
                 },
                 choices,
                 selected,
-                caption: Some(
-                    if usable.is_empty() && !grouped {
-                        "Which channel this control affects."
-                    } else {
-                        "Which channel, or named set of channels, this control affects."
-                    }
-                    .into(),
-                ),
+                caption: Some(if alone {
+                    format!(
+                        "Which {} this control affects.",
+                        m::target_noun(&nd).to_lowercase()
+                    )
+                } else {
+                    "Which channel, or named set of channels, this control affects.".into()
+                }),
                 enabled: true,
             },
         ));
@@ -979,7 +1111,7 @@ impl SurfacesPage {
                 label: "Controls".into(),
                 choices: nouns
                     .iter()
-                    .map(|(cat, n)| format!("{cat} / {}", m::noun_name(*n, m::ty::IR)))
+                    .map(|(cat, n)| m::noun_choice_label(cat, *n, m::ty::IR))
                     .collect(),
                 selected: nouns.iter().position(|(_, n)| *n == c.noun).unwrap_or(0),
                 caption: Some("The device function this remote button drives.".into()),
@@ -992,12 +1124,13 @@ impl SurfacesPage {
         {
             let grouped = c.flags & m::flag::GROUP != 0;
             let usable = m::compatible_groups(cs, c.noun);
-            let (choices, selected) = target_choices(cx, cs, &nd, &usable, c.target, grouped);
+            let (choices, selected) =
+                target_choices(cx, cs, c.noun, None, &usable, c.target, grouped);
             rows.push((
                 Some(Item::IrTarget(sub)),
                 Row::Pick {
                     label: if usable.is_empty() && !grouped {
-                        "Channel".into()
+                        m::target_noun(&nd).into()
                     } else {
                         "Channel or Group".into()
                     },
@@ -1533,7 +1666,8 @@ impl SurfacesPage {
             {
                 let grouped = p.flags & page_flags::GROUP != 0;
                 let usable = m::compatible_groups(cs, p.noun);
-                let (choices, selected) = target_choices(cx, cs, &nd, &usable, p.target, grouped);
+                let (choices, selected) =
+                    target_choices(cx, cs, p.noun, None, &usable, p.target, grouped);
                 rows.push((
                     Some(Item::PageTarget(i)),
                     Row::Pick {
@@ -1689,6 +1823,8 @@ impl SurfacesPage {
                 rows.extend(self.ir_section(cx, slot));
             } else if b.component == m::ty::DISPLAY {
                 rows.extend(self.display_rows(cx, slot));
+            } else if m::is_aux(b.component) {
+                rows.extend(self.aux_rows(cx, slot));
             } else {
                 let nouns = m::noun_choices(cs, b.component);
                 rows.push((
@@ -1697,7 +1833,7 @@ impl SurfacesPage {
                         label: "Controls".into(),
                         choices: nouns
                             .iter()
-                            .map(|(cat, n)| format!("{cat} / {}", m::noun_name(*n, b.component)))
+                            .map(|(cat, n)| m::noun_choice_label(cat, *n, b.component))
                             .collect(),
                         selected: nouns.iter().position(|(_, n)| *n == b.noun).unwrap_or(0),
                         caption: Some("The device function this control drives.".into()),
@@ -1782,7 +1918,14 @@ impl SurfacesPage {
         let mut rows: Vec<(Option<Item>, Row)> = Vec::new();
         let visible = self.visible();
         if visible.is_empty() {
-            rows.push((None, m::empty_state(EMPTY_TITLE, EMPTY_BODY)));
+            rows.push((
+                None,
+                if self.aux_page {
+                    m::empty_state(aux_outputs::EMPTY_TITLE, aux_outputs::EMPTY_BODY)
+                } else {
+                    m::empty_state(EMPTY_TITLE, EMPTY_BODY)
+                },
+            ));
             rows.push((None, Row::Blank));
         } else {
             for slot in visible {
@@ -1798,7 +1941,14 @@ impl SurfacesPage {
                     String::new()
                 },
                 caption: None,
-                buttons: vec!["Add Control".into()],
+                buttons: vec![
+                    if self.aux_page {
+                        aux_outputs::ADD
+                    } else {
+                        "Add Control"
+                    }
+                    .into(),
+                ],
                 cursor: self.add_button,
                 enabled: self.first_free().is_some()
                     && cx.connected
@@ -1806,7 +1956,16 @@ impl SurfacesPage {
             },
         ));
         rows.push((None, Row::Blank));
-        rows.push((None, Row::note(FOOTER)));
+        if self.aux_page {
+            rows.extend(
+                aux_outputs::FOOTER
+                    .iter()
+                    .flat_map(|p| [(None, Row::note(*p)), (None, Row::Blank)]),
+            );
+            rows.pop();
+        } else {
+            rows.push((None, Row::note(FOOTER)));
+        }
         if self.live.caps.caps_version != 0 {
             rows.push((
                 None,
@@ -1832,7 +1991,13 @@ impl SurfacesPage {
     /// The receiver's Apply pushes the binding, the staged name and every dirty
     /// remote button, stopping at the first refusal.
     fn apply(&mut self, slot: usize) -> PageEvent {
-        let binding = self.drafts[slot].clone();
+        let mut binding = self.drafts[slot].clone();
+        // Byte 22 is an aux output's power-on flags and must be 0 on every
+        // other type (control_surfaces.h:468-469). It rides along untouched
+        // on an aux slot, whichever page edited it.
+        if !m::is_aux(binding.component) {
+            binding.extras = 0;
+        }
         let binding_changed = binding != self.live.binding(slot);
         let name = (self.names[slot] != self.live.name(slot)).then(|| self.names[slot].clone());
         let ir: Vec<(u8, IrCommand)> = if binding.component == m::ty::IR {
@@ -1938,12 +2103,16 @@ impl SettingsPage for SurfacesPage {
             self.adopt(cs);
         }
         self.observe_learn(cx);
+        self.observe_aux(cx);
     }
 
     fn act(&mut self, index: usize, action: Action, cx: &Cx<'_>) -> PageEvent {
         let Some(item) = self.item(index, cx) else {
             return PageEvent::Handled;
         };
+        if let Some(ev) = self.act_aux(item, &action) {
+            return ev;
+        }
         match (item, action) {
             // -------------------------------------------------- the card list
             (Item::Add, Action::Open) => {
@@ -1953,7 +2122,11 @@ impl SettingsPage for SurfacesPage {
                 }
                 self.popup = Some(Item::Add);
                 PageEvent::Popup(PopupList::new(
-                    "Add Control",
+                    if self.aux_page {
+                        aux_outputs::ADD
+                    } else {
+                        "Add Control"
+                    },
                     types.iter().map(|t| m::type_name(*t)).collect(),
                     0,
                 ))
@@ -1972,9 +2145,20 @@ impl SettingsPage for SurfacesPage {
                     }
                     1 => {
                         self.dialog = Some(item);
+                        let (title, body) = if self.aux_page {
+                            (
+                                "Rename Output",
+                                "A label for this output, stored on the device.",
+                            )
+                        } else {
+                            (
+                                "Rename Control",
+                                "A label for this control, stored on the device.",
+                            )
+                        };
                         PageEvent::Dialog(Dialog::text(
-                            "Rename Control",
-                            "A label for this control, stored on the device.",
+                            title,
+                            body,
                             self.names[slot].clone(),
                             m::type_name(self.drafts[slot].component),
                         ))
@@ -1982,7 +2166,11 @@ impl SettingsPage for SurfacesPage {
                     _ => {
                         self.dialog = Some(item);
                         PageEvent::Dialog(Dialog::confirm(
-                            "Remove Control?",
+                            if self.aux_page {
+                                "Remove Output?"
+                            } else {
+                                "Remove Control?"
+                            },
                             "The slot is cleared on the device and its GPIOs are released.",
                             vec![Button::destructive("Remove"), Button::new("Cancel")],
                         ))
@@ -2002,7 +2190,14 @@ impl SettingsPage for SurfacesPage {
                         self.ir_messages.clear();
                     }
                     self.messages.remove(&slot);
-                    return PageEvent::Status("Control changes reverted".into());
+                    return PageEvent::Status(
+                        if self.aux_page {
+                            "Output changes reverted"
+                        } else {
+                            "Control changes reverted"
+                        }
+                        .into(),
+                    );
                 }
                 self.apply(slot)
             }
@@ -2013,7 +2208,14 @@ impl SettingsPage for SurfacesPage {
                 if let Some(t) = types.get(c).copied()
                     && t != self.drafts[slot].component
                 {
-                    self.drafts[slot] = m::make_binding(cx, &self.live, &self.drafts, slot, t);
+                    let old = &self.drafts[slot];
+                    self.drafts[slot] = if m::is_aux(old.component) && m::is_aux(t) {
+                        // The other kind of aux output keeps its wiring and
+                        // its power-on switch.
+                        m::switch_aux_kind(old, t)
+                    } else {
+                        m::make_binding(cx, &self.live, &self.drafts, slot, t)
+                    };
                 }
                 PageEvent::Handled
             }
@@ -2022,7 +2224,8 @@ impl SettingsPage for SurfacesPage {
                 if let Some((_, n)) = nouns.get(c).copied()
                     && n != self.drafts[slot].noun
                 {
-                    self.drafts[slot] = m::set_noun(&self.live, &self.drafts[slot], n);
+                    self.drafts[slot] =
+                        m::set_noun_in(&self.live, &self.drafts[slot], n, Some(slot));
                 }
                 PageEvent::Handled
             }
@@ -2053,7 +2256,15 @@ impl SettingsPage for SurfacesPage {
                 } else {
                     m::compatible_groups(&self.live, b.noun)
                 };
-                let (is_group, t) = target_choice(&nd, &usable, b.target, grouped, c);
+                let (is_group, t) = target_choice(
+                    &self.live,
+                    b.noun,
+                    Some(slot),
+                    &usable,
+                    b.target,
+                    grouped,
+                    c,
+                );
                 let mut nb = b;
                 if is_group {
                     nb.flags |= m::flag::GROUP;
@@ -2273,6 +2484,19 @@ impl SettingsPage for SurfacesPage {
                     cmd.noun = n;
                     cmd.target = 0;
                     cmd.index = 0;
+                    // An aux noun needs an aux output, never slot 0 by default,
+                    // and takes no group.
+                    if self
+                        .live
+                        .noun_desc(n)
+                        .is_some_and(|d| d.target_kind == m::target::AUX)
+                    {
+                        cmd.flags &= !m::flag::GROUP;
+                        cmd.target = m::target_addresses(&self.live, n, None)
+                            .first()
+                            .copied()
+                            .unwrap_or(0);
+                    }
                     let acts = m::valid_actions(&self.live, m::ty::IR, n);
                     if !acts.contains(&cmd.action) {
                         cmd.action = m::default_action(&self.live, m::ty::IR, n);
@@ -2299,7 +2523,8 @@ impl SettingsPage for SurfacesPage {
                 };
                 let grouped = cmd.flags & m::flag::GROUP != 0;
                 let usable = m::compatible_groups(&self.live, cmd.noun);
-                let (is_group, t) = target_choice(&nd, &usable, cmd.target, grouped, c);
+                let (is_group, t) =
+                    target_choice(&self.live, cmd.noun, None, &usable, cmd.target, grouped, c);
                 let mut cmd = cmd;
                 if is_group {
                     cmd.flags |= m::flag::GROUP;
@@ -2492,12 +2717,13 @@ impl SettingsPage for SurfacesPage {
             }
             (Item::PageTarget(i), Action::Selected(c)) => {
                 let p = self.live.pages[i].clone();
-                let Some(nd) = self.live.noun_desc(p.noun).copied() else {
+                if self.live.noun_desc(p.noun).is_none() {
                     return PageEvent::Handled;
-                };
+                }
                 let grouped = p.flags & page_flags::GROUP != 0;
                 let usable = m::compatible_groups(&self.live, p.noun);
-                let (is_group, t) = target_choice(&nd, &usable, p.target, grouped, c);
+                let (is_group, t) =
+                    target_choice(&self.live, p.noun, None, &usable, p.target, grouped, c);
                 let mut p = p;
                 set_flag(&mut p.flags, page_flags::GROUP, is_group);
                 p.target = t;
@@ -2613,7 +2839,10 @@ impl SettingsPage for SurfacesPage {
         }
     }
 
-    fn session_result(&mut self, tag: u32, reply: SessionReply, _cx: &Cx<'_>) -> PageEvent {
+    fn session_result(&mut self, tag: u32, reply: SessionReply, cx: &Cx<'_>) -> PageEvent {
+        if is_live_aux_tag(tag) {
+            return self.aux_result(tag, reply, cx);
+        }
         match tag & TAG_MASK {
             TAG_DISPLAY_CFG | TAG_DISPLAY_PAGE => {
                 return match reply {
@@ -2662,7 +2891,11 @@ impl SettingsPage for SurfacesPage {
                     self.ir_messages.clear();
                 }
                 self.messages.remove(&slot);
-                PageEvent::Status(format!("Control {} applied", slot + 1))
+                PageEvent::Status(if self.aux_page {
+                    format!("{} applied", self.live.aux_name(slot))
+                } else {
+                    format!("Control {} applied", slot + 1)
+                })
             }
             SessionReply::Err(why) => {
                 // The rejected draft stays put. Re-seeding from the device
@@ -2909,7 +3142,7 @@ mod tests {
             s.handle(key(KeyCode::Down), &st);
         }
         let f = frame(&mut s, &st, 120, 40);
-        assert!(f.contains("Control-surface capability version 13."), "{f}");
+        assert!(f.contains("Control-surface capability version 20."), "{f}");
     }
 
     // ------------------------------------------------ the caps-driven lists
@@ -3273,14 +3506,16 @@ mod tests {
             cs.names[slot] = String::new();
         }
         let mut p = SurfacesPage::new(&d);
-        assert_eq!(p.visible(), vec![1, 4]);
+        // Slot 13 holds the button on the aux output; the outputs themselves
+        // are on the other page.
+        assert_eq!(p.visible(), vec![1, 4, 12]);
         let (st, cfg) = (m::demo::state(), AppConfig::default());
         let c = cx(&d, &st, &cfg);
         assert_eq!(p.key(key(KeyCode::Char('1')), &c), PageEvent::Handled);
         assert!(p.expanded.contains(&1), "the first card, in slot 2");
         assert_eq!(p.key(key(KeyCode::Char('2')), &c), PageEvent::Handled);
         assert!(p.expanded.contains(&4), "the second card, in slot 5");
-        assert_eq!(p.key(key(KeyCode::Char('3')), &c), PageEvent::Unhandled);
+        assert_eq!(p.key(key(KeyCode::Char('4')), &c), PageEvent::Unhandled);
     }
 
     /// Arming a learn is a write with an answer: `CS_STATUS_NO_IR` when no
@@ -3570,5 +3805,166 @@ mod tests {
         p.drafts[1] = m::make_binding(&c, &p.live, &p.drafts, 1, m::ty::LED);
         let rows = p.build(&c);
         assert!(!rows.iter().any(|(i, _)| *i == Some(Item::Bright(1))));
+    }
+
+    /// The row a card draws for an item, as the page built it.
+    fn row_for(p: &SurfacesPage, c: &Cx<'_>, want: Item) -> Row {
+        p.build(c)
+            .into_iter()
+            .find(|(i, _)| *i == Some(want))
+            .map(|(_, r)| r)
+            .unwrap_or_else(|| panic!("no row for {want:?}"))
+    }
+
+    /// A control on an aux noun picks an auxiliary output, not a channel:
+    /// only the aux slots (only the dimmable one for the level), named as the
+    /// device names them, with no groups, and the choice lands on the slot.
+    #[test]
+    fn the_aux_target_picker_offers_only_aux_outputs() {
+        let (mut p, d, st) = page();
+        let cfg = AppConfig::default();
+        let c = cx(&d, &st, &cfg);
+        p.expanded.insert(12); // the button on Aux Switch
+        let Row::Pick {
+            label,
+            choices,
+            selected,
+            caption,
+            ..
+        } = row_for(&p, &c, Item::Target(12))
+        else {
+            panic!("not a picker");
+        };
+        assert_eq!(label, "Auxiliary Output");
+        assert_eq!(choices, vec!["Amp Trigger", "Aux 12"]);
+        assert_eq!(selected, 0, "slot 10");
+        assert_eq!(
+            caption.as_deref(),
+            Some("Which auxiliary output this control affects.")
+        );
+        p.act(index_of(&p, &c, Item::Target(12)), Action::Selected(1), &c);
+        assert_eq!(p.drafts[12].target, 11);
+        assert_eq!(p.drafts[12].flags & m::flag::GROUP, 0);
+
+        // The level noun reaches only the dimmable output.
+        p.drafts[12] = m::set_noun_in(&p.live, &p.drafts[12], m::noun::AUX_LEVEL, Some(12));
+        let Row::Pick { choices, .. } = row_for(&p, &c, Item::Target(12)) else {
+            panic!("not a picker");
+        };
+        assert_eq!(choices, vec!["Aux 12"]);
+        assert_eq!(p.drafts[12].target, 11);
+
+        // The Controls picker files both nouns under the Console's category.
+        let Row::Pick { choices, .. } = row_for(&p, &c, Item::Noun(12)) else {
+            panic!("not a picker");
+        };
+        assert!(
+            choices
+                .iter()
+                .any(|x| x == "Auxiliary Outputs / Enable/Disable"),
+            "{choices:?}"
+        );
+        assert!(
+            choices.iter().any(|x| x == "Auxiliary Outputs / Level"),
+            "{choices:?}"
+        );
+    }
+
+    /// Limiter Release is `CS_UNIT_MS_LOG` (control_surfaces.h:268-269):
+    /// plain whole milliseconds in `value` and the span, octaves in `step`.
+    /// Written as 8.8 it would overflow at 127 ms.
+    #[test]
+    fn the_noun_editor_writes_ms_log_as_plain_milliseconds() {
+        let (mut p, d, st) = page();
+        let cfg = AppConfig::default();
+        let c = cx(&d, &st, &cfg);
+
+        // A button that sets it: 250 ms is 250 on the wire.
+        p.drafts[1] = m::set_noun(&p.live, &p.drafts[1], m::noun::LIMITER_RELEASE);
+        p.drafts[1].action = m::act::SET;
+        p.drafts[1] = m::default_operands(&p.live, &p.drafts[1]);
+        assert_eq!(
+            p.drafts[1].value, 1000,
+            "the default is the range top, in ms"
+        );
+        p.expanded.insert(1);
+        let Row::Number {
+            min,
+            max,
+            unit,
+            decimals,
+            ..
+        } = row_for(&p, &c, Item::Value(1))
+        else {
+            panic!("not a number");
+        };
+        assert_eq!((min, max), (10.0, 1000.0));
+        assert_eq!((unit.as_str(), decimals), ("ms", 0));
+        p.act(
+            index_of(&p, &c, Item::Value(1)),
+            Action::Committed(250.0),
+            &c,
+        );
+        assert_eq!(p.drafts[1].value, 250);
+        assert_eq!(&p.drafts[1].encode()[10..12], &250i16.to_le_bytes());
+
+        // An encoder steps it in octaves, 8.8.
+        p.drafts[0] = m::set_noun(&p.live, &p.drafts[0], m::noun::LIMITER_RELEASE);
+        p.expanded.insert(0);
+        let Row::Number { unit, .. } = row_for(&p, &c, Item::StepSize(0)) else {
+            panic!("not a number");
+        };
+        assert_eq!(unit, "oct");
+        p.act(
+            index_of(&p, &c, Item::StepSize(0)),
+            Action::Committed(0.5),
+            &c,
+        );
+        assert_eq!(p.drafts[0].step, 128, "half an octave in 8.8");
+
+        // A pot's span is plain ms too.
+        p.drafts[2] = m::set_noun(&p.live, &p.drafts[2], m::noun::LIMITER_RELEASE);
+        p.expanded.insert(2);
+        p.act(index_of(&p, &c, Item::SpanOn(2)), Action::Toggled(true), &c);
+        assert_eq!((p.drafts[2].range_min, p.drafts[2].range_max), (10, 1000));
+        p.act(
+            index_of(&p, &c, Item::SpanMax(2)),
+            Action::Committed(500.0),
+            &c,
+        );
+        assert_eq!(p.drafts[2].range_max, 500);
+    }
+
+    /// Byte 22 is 0 on every type but an aux output (control_surfaces.h:
+    /// 468-469), so Apply sends it as 0 whatever a draft carries.
+    #[test]
+    fn a_control_is_applied_with_extras_zero() {
+        use dspi_proto::generated::opcodes as op;
+        use dspi_transport::MockTransport;
+
+        let (mut p, _, _) = page();
+        p.drafts[1].event = 1;
+        p.drafts[1].extras = 0x05;
+        let PageEvent::Session(req) = p.apply(1) else {
+            panic!("no apply");
+        };
+        let mut caps = crate::shell::fixture::caps();
+        caps.cs = Some(m::demo::caps());
+        let mut ok = p.live.status.clone();
+        ok.last_slot = 1;
+        let t = MockTransport::new()
+            .data(op::REQ_SET_CS_BINDING, vec![])
+            .data(op::REQ_GET_CS_STATUS, ok.encode());
+        let log = t.log_handle();
+        let mut session = dspi_session::Session::new(Box::new(t), caps).expect("session");
+        assert_eq!((req.run)(&mut session), SessionReply::Ok("Applied".into()));
+        let sent = log
+            .lock()
+            .expect("log")
+            .iter()
+            .find(|e| e.opcode == op::REQ_SET_CS_BINDING)
+            .cloned()
+            .expect("the SET");
+        assert_eq!(sent.payload[22], 0);
     }
 }
