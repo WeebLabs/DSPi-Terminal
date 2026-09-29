@@ -56,6 +56,11 @@ pub enum TransportError {
 
     #[error("usb error: {0}")]
     Usb(String),
+
+    /// The device answered, but speaks a protocol this build does not. The
+    /// message names both sides and what to update; it is shown as is.
+    #[error("{0}")]
+    Incompatible(String),
 }
 
 /// Platform-specific advice for a permission failure.
@@ -113,6 +118,20 @@ pub trait Transport: Send {
     /// mutate state while being dispatched on the IN path.
     fn control_in(&mut self, opcode: u8, value: u16, len: u16) -> Result<Vec<u8>>;
 
+    /// IN transfer whose reply may legitimately be shorter than asked.
+    ///
+    /// A few replies are sized by the device rather than the request:
+    /// `GET_PLATFORM` answers 4, 6 or 7 bytes depending on the firmware's age,
+    /// the subharm and limiter meters one entry per output, and the analyser's
+    /// all-channel read one frame per live channel. For those, a short reply is
+    /// the answer, not an error; everything else goes through
+    /// [`Transport::control_in`], which refuses one.
+    ///
+    /// The default is for scripted test transports that always answer in full.
+    fn control_in_upto(&mut self, opcode: u8, value: u16, max_len: u16) -> Result<Vec<u8>> {
+        self.control_in(opcode, value, max_len)
+    }
+
     /// OUT transfer carrying a payload.
     fn control_out(&mut self, opcode: u8, value: u16, data: &[u8]) -> Result<()>;
 
@@ -120,7 +139,7 @@ pub trait Transport: Send {
 
     /// Largest single control transfer this backend can perform.
     ///
-    /// WinUSB caps transfers at 4 KB, and the bulk params packet is 5944 bytes,
+    /// WinUSB caps transfers at 4 KB, and the bulk params packet is 6136 bytes,
     /// so on Windows the chunked opcodes are mandatory rather than an
     /// optimisation. Callers consult this instead of testing the platform.
     fn max_transfer(&self) -> usize {
@@ -136,8 +155,10 @@ pub trait Transport: Send {
 }
 
 /// The firmware's notification stream: bulk IN endpoint `0x83`, 64-byte
-/// packets, always armed. When the device has nothing to say it answers a
-/// one-byte idle packet, so a read returns quickly either way.
+/// packets. Events are sent at once. When the device has nothing to say the
+/// endpoint NAKs, and a one-byte idle packet goes out only after 100 ms of
+/// quiet (`NOTIFY_IDLE_KEEPALIVE_US`, usb_audio.c:1064-1080 at 557bce7), so a
+/// read may block for about 100 ms before anything arrives.
 pub trait NotificationSource: Send {
     /// One packet, sized by what actually arrived. A timeout is `Ok(vec![])`
     /// rather than an error: silence is normal.

@@ -597,6 +597,10 @@ pub struct DeviceState {
     pub i2s_slave_state: Option<(u8, u32)>,
     pub adat_input_state: Option<(u8, u32, u8)>,
     pub ir_learn: Option<(u8, u8, u32)>,
+    /// The last auxiliary output change, `(slot, state, level_q8)`
+    /// (`NOTIFY_EVT_CS_AUX`, notify.h:78-83). A per-slot view of the aux
+    /// outputs is phase B2; this keeps the event rather than dropping it.
+    pub cs_aux: Option<(u8, u8, u16)>,
     /// The upmixer's telemetry (`REQ_UPMIX_GET_STATUS`, config.h:187-191).
     ///
     /// The notification endpoint does not carry it, so unlike the sub-states
@@ -631,6 +635,7 @@ impl DeviceState {
             i2s_slave_state: None,
             adat_input_state: None,
             ir_learn: None,
+            cs_aux: None,
             upmix_status: None,
             stale: false,
             connected: true,
@@ -764,6 +769,15 @@ impl DeviceState {
                 code,
             } => {
                 self.ir_learn = Some((*state, *protocol, *code));
+                Applied::Status(n.event.clone())
+            }
+            Event::CsAux {
+                slot,
+                state,
+                level_q8,
+                ..
+            } => {
+                self.cs_aux = Some((*slot, *state, *level_q8));
                 Applied::Status(n.event.clone())
             }
             Event::MasterVolume(_) | Event::Idle => Applied::Nothing,
@@ -975,6 +989,8 @@ mod tests {
             serial: "TEST".into(),
             platform: Platform::Rp2350,
             firmware: "1.1.6".into(),
+            firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 6, 0),
+            build_info: None,
             wire_format: WIRE_FORMAT_VERSION as u8,
             num_channels: 17,
             num_inputs: 8,
@@ -1112,6 +1128,23 @@ mod tests {
             lost: false,
         });
         assert_eq!(s.ir_learn, Some((2, 1, 0x1234_5678)));
+    }
+
+    /// An aux change is kept for the status views, like the other runtime
+    /// events, and never touches the bulk shadow.
+    #[test]
+    fn an_aux_output_change_is_kept_not_patched() {
+        let mut s = state();
+        let before = s.bulk.as_bytes().to_vec();
+        let (_, e) = crate::notify::decode(&[2, evt::CS_AUX, 0, 7, 4, 1, 0x80, 0x0C, 5]).unwrap();
+        let applied = s.apply(&Notification {
+            seq: 7,
+            event: e,
+            lost: false,
+        });
+        assert!(matches!(applied, Applied::Status(Event::CsAux { .. })));
+        assert_eq!(s.cs_aux, Some((4, 1, 0x0C80)));
+        assert_eq!(s.bulk.as_bytes(), &before[..]);
     }
 
     #[test]

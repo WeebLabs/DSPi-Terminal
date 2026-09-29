@@ -1753,6 +1753,8 @@ mod io_tests {
             serial: "TEST".into(),
             platform: Platform::Rp2350,
             firmware: "1.1.6".into(),
+            firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 6, 0),
+            build_info: None,
             wire_format: dspi_proto::generated::wire::WIRE_FORMAT_VERSION as u8,
             num_channels: 17,
             num_inputs: 8,

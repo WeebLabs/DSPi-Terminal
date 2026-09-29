@@ -119,9 +119,10 @@ fn version() {
         dspi_proto::generated::provenance::SHORT,
     );
     println!(
-        "wire format V{}, {} vendor opcodes",
+        "wire format V{}, {} vendor opcodes, for firmware {}",
         dspi_proto::generated::wire::WIRE_FORMAT_VERSION,
         dspi_proto::generated::ALL_OPCODES.len(),
+        dspi_proto::packets::FirmwareVersion::expected(),
     );
 }
 
@@ -258,6 +259,9 @@ fn cmd_dump(serial: Option<&str>, json: bool) -> u8 {
         "{} channels: {} in, {} out, {} bands each",
         caps.num_channels, caps.num_inputs, caps.num_outputs, caps.max_bands
     );
+    if let Some(b) = &caps.build_info {
+        println!("build {}  {}", b.describe, b.date);
+    }
     if let Some(p) = caps.active_preset {
         println!("active preset: {p}");
     }
@@ -914,6 +918,20 @@ fn describe_event(e: &dspi_session::Event) -> (&'static str, String) {
         } => (
             "adat_input_state",
             format!("state {state} {rate_hz} Hz clock {clock_mode}"),
+        ),
+        Event::CsAux {
+            slot,
+            state,
+            level_q8,
+            source,
+        } => (
+            "cs_aux",
+            format!(
+                "slot {slot} {} level {:.1}% [{}]",
+                if *state != 0 { "on" } else { "off" },
+                *level_q8 as f32 / 256.0,
+                source.describe()
+            ),
         ),
         Event::Unknown { id, bytes } => ("unknown", format!("0x{id:02X} {}", hex_string(bytes))),
     }

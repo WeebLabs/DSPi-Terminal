@@ -293,10 +293,13 @@ impl Session {
     ///
     /// Everything the bulk packet covers can be decoded from here instead of
     /// asked for one scalar at a time. Prefer this whenever more than a couple
-    /// of values are wanted: it is six transfers for all 5944 bytes, against
+    /// of values are wanted: it is six transfers for all 6136 bytes, against
     /// five transfers per EQ band alone.
     pub fn snapshot(&mut self) -> Result<BulkPacket, WriteError> {
-        Ok(crate::probe::read_bulk(&mut *self.transport)?)
+        Ok(crate::probe::read_bulk_from(
+            &mut *self.transport,
+            Some(&self.caps.firmware_version),
+        )?)
     }
 
     /// Read a whole EQ band.
@@ -802,6 +805,8 @@ mod tests {
             serial: "TEST".into(),
             platform,
             firmware: "1.1.5".into(),
+            firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 5, 0),
+            build_info: None,
             wire_format: 26,
             num_channels: 17,
             num_inputs: 8,
@@ -1739,6 +1744,8 @@ mod matrix_tests {
             serial: "T".into(),
             platform: Platform::Rp2350,
             firmware: "1.1.5".into(),
+            firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 5, 0),
+            build_info: None,
             wire_format: 26,
             num_channels: 17,
             num_inputs: 8,

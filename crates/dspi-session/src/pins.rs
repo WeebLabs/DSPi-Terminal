@@ -409,6 +409,8 @@ mod tests {
             serial: "MOCK".into(),
             platform,
             firmware: "1.1.6".into(),
+            firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 6, 0),
+            build_info: None,
             wire_format: dspi_proto::generated::wire::WIRE_FORMAT_VERSION as u8,
             num_channels: num_inputs + num_outputs,
             num_inputs,

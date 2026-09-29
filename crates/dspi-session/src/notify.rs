@@ -20,29 +20,34 @@ use std::time::Duration;
 
 use dspi_transport::NotificationSource;
 
-/// `NOTIFY_PROTOCOL_VERSION` (notify.h).
-pub const PROTOCOL_VERSION: u8 = 2;
+use dspi_proto::generated::notify as n;
 
-/// The largest field a `PARAM_CHANGED` can carry (notify.h); anything bigger
-/// arrives as `BULK_INVALIDATED` instead.
+/// `NOTIFY_V2_VERSION` (notify.h:86): the first byte of every v2 packet.
+pub const PROTOCOL_VERSION: u8 = n::NOTIFY_V2_VERSION as u8;
+
+/// The largest field a `PARAM_CHANGED` can carry (notify.h:132); anything
+/// bigger arrives as `BULK_INVALIDATED` instead.
 pub const MAX_NOTIFIED_FIELD: usize = 52;
 
-/// Event identifiers, `NOTIFY_EVT_*` (notify.h:25-79).
+/// Event identifiers, `NOTIFY_EVT_*` (notify.h:25-83), generated from the
+/// vendored header rather than typed here.
 pub mod evt {
-    pub const IDLE: u8 = 0x00;
-    pub const MASTER_VOLUME: u8 = 0x01;
-    pub const PARAM_CHANGED: u8 = 0x02;
-    pub const BULK_INVALIDATED: u8 = 0x03;
-    pub const PRESET_LOADED: u8 = 0x04;
-    pub const INPUT_FORMAT: u8 = 0x05;
-    pub const SIGGEN_STATE: u8 = 0x07;
-    pub const ADAT_STATE: u8 = 0x08;
-    pub const I2S_SLAVE_STATE: u8 = 0x09;
-    pub const CS_IR_LEARN: u8 = 0x0A;
-    pub const ADAT_INPUT_STATE: u8 = 0x0B;
+    use super::n;
+    pub const IDLE: u8 = n::NOTIFY_EVT_IDLE as u8;
+    pub const MASTER_VOLUME: u8 = n::NOTIFY_EVT_MASTER_VOLUME as u8;
+    pub const PARAM_CHANGED: u8 = n::NOTIFY_EVT_PARAM_CHANGED as u8;
+    pub const BULK_INVALIDATED: u8 = n::NOTIFY_EVT_BULK_INVALIDATED as u8;
+    pub const PRESET_LOADED: u8 = n::NOTIFY_EVT_PRESET_LOADED as u8;
+    pub const INPUT_FORMAT: u8 = n::NOTIFY_EVT_INPUT_FORMAT as u8;
+    pub const SIGGEN_STATE: u8 = n::NOTIFY_EVT_SIGGEN_STATE as u8;
+    pub const ADAT_STATE: u8 = n::NOTIFY_EVT_ADAT_STATE as u8;
+    pub const I2S_SLAVE_STATE: u8 = n::NOTIFY_EVT_I2S_SLAVE_STATE as u8;
+    pub const CS_IR_LEARN: u8 = n::NOTIFY_EVT_CS_IR_LEARN as u8;
+    pub const ADAT_INPUT_STATE: u8 = n::NOTIFY_EVT_ADAT_INPUT_STATE as u8;
+    pub const CS_AUX: u8 = n::NOTIFY_EVT_CS_AUX as u8;
 }
 
-/// Who made the change, `ParamSource` (notify.h:85-96). Unknown values are
+/// Who made the change, `ParamSource` (notify.h:92-103). Unknown values are
 /// kept rather than mapped, because the range grows with new transports and
 /// "someone else changed it" is the right reading for all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,18 +69,18 @@ pub enum Source {
 
 impl Source {
     pub fn from_raw(b: u8) -> Self {
-        match b {
-            0 => Self::Unknown,
-            1 => Self::HostSet,
-            2 => Self::BulkSet,
-            3 => Self::Preset,
-            4 => Self::Factory,
-            5 => Self::Gpio,
-            6 => Self::Internal,
-            7 => Self::Uac1,
-            8 => Self::Uart,
-            9 => Self::I2c,
-            other => Self::Other(other),
+        match b as u16 {
+            n::PARAM_SRC_UNKNOWN => Self::Unknown,
+            n::PARAM_SRC_HOST_SET => Self::HostSet,
+            n::PARAM_SRC_BULK_SET => Self::BulkSet,
+            n::PARAM_SRC_PRESET => Self::Preset,
+            n::PARAM_SRC_FACTORY => Self::Factory,
+            n::PARAM_SRC_GPIO => Self::Gpio,
+            n::PARAM_SRC_INTERNAL => Self::Internal,
+            n::PARAM_SRC_UAC1 => Self::Uac1,
+            n::PARAM_SRC_UART => Self::Uart,
+            n::PARAM_SRC_I2C => Self::I2c,
+            _ => Self::Other(b),
         }
     }
 
@@ -148,6 +153,18 @@ pub enum Event {
         state: u8,
         rate_hz: u32,
         clock_mode: u8,
+    },
+    /// An auxiliary output changed, from any source (notify.h:78-83). Sent
+    /// only on a real change, with both values so a host refreshes the slot
+    /// in one step.
+    CsAux {
+        /// The binding slot holding the aux component.
+        slot: u8,
+        /// Non-zero is on.
+        state: u8,
+        /// 8.8 percent; 0 on an on/off output.
+        level_q8: u16,
+        source: Source,
     },
     /// An event id this build does not know; kept so it can be shown in the
     /// monitor rather than silently dropped.
@@ -270,6 +287,16 @@ pub fn decode(p: &[u8]) -> Result<(u8, Event), DecodeError> {
                 clock_mode: p[9],
             }
         }
+        // `[ver, 0x0C, flags, seq, slot, state, level_q8 LE, src]`, 9 bytes.
+        evt::CS_AUX => {
+            need(9)?;
+            Event::CsAux {
+                slot: p[4],
+                state: p[5],
+                level_q8: u16::from_le_bytes([p[6], p[7]]),
+                source: Source::from_raw(p[8]),
+            }
+        }
         other => Event::Unknown {
             id: other,
             bytes: p[4..].to_vec(),
@@ -315,9 +342,19 @@ pub struct Notifications {
 }
 
 impl Notifications {
-    /// How long one read waits before checking whether to stop. The device
-    /// answers idle packets immediately, so this only matters on shutdown.
+    /// How long one read waits before checking whether to stop.
+    ///
+    /// From beta4 the endpoint NAKs while idle and sends a keep-alive only
+    /// after [`Self::KEEP_ALIVE`] of quiet (usb_audio.c:1064-1080), so an idle
+    /// read blocks for about that long. The timeout is longer than the
+    /// keep-alive, so a quiet read normally ends on the idle packet rather than
+    /// on a cancelled transfer, and short enough that dropping the reader stops
+    /// its thread within a quarter of a second.
     pub const READ_TIMEOUT: Duration = Duration::from_millis(250);
+
+    /// `NOTIFY_IDLE_KEEPALIVE_US` (usb_audio.c:1066): the longest a quiet
+    /// endpoint holds a read before it answers the idle packet.
+    pub const KEEP_ALIVE: Duration = Duration::from_millis(100);
 
     /// Start reading. Idle packets are dropped here; everything else is
     /// delivered with its sequence number and the loss flag.
@@ -511,6 +548,45 @@ mod tests {
         );
     }
 
+    /// `NOTIFY_EVT_CS_AUX`, 9 bytes: slot, state, the level as 8.8 percent
+    /// and the source (notify.h:78-83).
+    #[test]
+    fn an_aux_output_change_decodes_slot_state_level_and_source() {
+        let p = [2, 0x0C, 0, 21, 5, 1, 0x00, 0x4B, 5];
+        assert_eq!(
+            decode(&p).unwrap(),
+            (
+                21,
+                Event::CsAux {
+                    slot: 5,
+                    state: 1,
+                    level_q8: 75 * 256,
+                    source: Source::Gpio
+                }
+            )
+        );
+        assert!(matches!(
+            decode(&p[..8]).unwrap_err(),
+            DecodeError::Short {
+                id: 0x0C,
+                need: 9,
+                ..
+            }
+        ));
+    }
+
+    /// The ids and source tags are the generated ones: `notify.h` is vendored
+    /// and read by the generator, so these are the header's numbers.
+    #[test]
+    fn event_ids_and_sources_are_the_headers() {
+        assert_eq!(evt::CS_AUX, 0x0C);
+        assert_eq!(evt::ADAT_INPUT_STATE, 0x0B);
+        assert_eq!(evt::SIGGEN_STATE, 0x07);
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(Source::from_raw(9), Source::I2c);
+        assert_eq!(Source::from_raw(10), Source::Other(10));
+    }
+
     #[test]
     fn idle_and_legacy_packets_are_recognised_by_shape() {
         assert_eq!(decode(&[0]).unwrap().1, Event::Idle);
@@ -559,6 +635,43 @@ mod tests {
         assert!(matches!(second.event, Event::BulkInvalidated { .. }));
         assert!(n.next(Duration::from_millis(50)).is_none());
         assert!(!n.is_disconnected());
+    }
+
+    /// Beta4 paces the endpoint: an idle read blocks for the 100 ms
+    /// keep-alive, then answers the idle packet. The reader must deliver
+    /// events that arrive between keep-alives, drop the idles, and still stop
+    /// promptly when it is dropped.
+    #[test]
+    fn a_paced_endpoint_delivers_events_and_stops_promptly() {
+        assert!(Notifications::READ_TIMEOUT > Notifications::KEEP_ALIVE);
+        let mock = MockTransport::new().with_notification_pace(Notifications::KEEP_ALIVE);
+        let n = Notifications::start(mock.notifications().unwrap());
+
+        // Nothing but keep-alives: nothing is delivered.
+        assert!(n.next(Duration::from_millis(250)).is_none());
+
+        mock.push_notification(param(1, 5980, 5, &[1]));
+        let got = n.next(Duration::from_secs(2)).expect("the tube change");
+        assert!(matches!(
+            got.event,
+            Event::ParamChanged { offset: 5980, .. }
+        ));
+        assert!(!got.lost);
+
+        mock.push_notification(vec![2, 0x0C, 0, 2, 3, 0, 0, 0, 1]);
+        let got = n.next(Duration::from_secs(2)).expect("the aux change");
+        assert!(matches!(got.event, Event::CsAux { slot: 3, .. }));
+        assert!(!got.lost, "idle packets carry no sequence number");
+        assert!(!n.is_disconnected());
+
+        // Dropping joins the thread; a blocked read must not hold it for long.
+        let start = std::time::Instant::now();
+        drop(n);
+        assert!(
+            start.elapsed() < Notifications::READ_TIMEOUT + Duration::from_millis(250),
+            "shutdown took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

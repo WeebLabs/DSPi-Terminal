@@ -517,6 +517,21 @@ pub fn describe(e: &dspi_session::Event) -> (&'static str, String, String, Strin
             "ir learn".into(),
             format!("state={state} protocol={protocol} code=0x{code:08X}"),
         ),
+        Event::CsAux {
+            slot,
+            state,
+            level_q8,
+            source,
+        } => (
+            "cs_aux",
+            source_word(*source),
+            format!("aux slot {slot}"),
+            format!(
+                "{} level={:.0}%",
+                if *state != 0 { "on" } else { "off" },
+                *level_q8 as f32 / 256.0
+            ),
+        ),
         Event::Unknown { id, bytes } => (
             "unknown",
             none,

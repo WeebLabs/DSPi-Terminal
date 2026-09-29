@@ -21,6 +21,11 @@ pub type NotifyQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
 /// the sentinel `MockNotifications::DISCONNECT`.
 pub struct MockNotifications {
     queue: NotifyQueue,
+    /// The beta4 firmware's keep-alive pacing: with nothing queued the
+    /// endpoint NAKs, and an idle packet goes out only after this long
+    /// (usb_audio.c:1064-1080). `None` models the old endpoint, which a
+    /// read leaves empty-handed almost at once.
+    pace: Option<Duration>,
 }
 
 impl MockNotifications {
@@ -29,16 +34,30 @@ impl MockNotifications {
 }
 
 impl NotificationSource for MockNotifications {
-    fn read(&mut self, _timeout: Duration) -> Result<Vec<u8>> {
-        match self.queue.lock().unwrap().pop_front() {
+    fn read(&mut self, timeout: Duration) -> Result<Vec<u8>> {
+        let next = self.queue.lock().unwrap().pop_front();
+        match next {
             Some(p) if p == Self::DISCONNECT => Err(TransportError::Disconnected),
             Some(p) => Ok(p),
-            None => {
+            None => match self.pace {
+                // Paced: the read blocks until the keep-alive is due, and
+                // returns the one-byte idle packet, unless the caller's
+                // timeout runs out first, which reads as silence.
+                Some(pace) => {
+                    std::thread::sleep(pace.min(timeout));
+                    if pace <= timeout {
+                        Ok(vec![0])
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
                 // A real endpoint blocks for the timeout; give the reader
                 // thread the same pause so tests do not spin a core.
-                std::thread::sleep(Duration::from_millis(5));
-                Ok(Vec::new())
-            }
+                None => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    Ok(Vec::new())
+                }
+            },
         }
     }
 }
@@ -50,7 +69,7 @@ pub enum Reply {
     Data(Vec<u8>),
     /// A window into a larger buffer, sliced at the byte offset carried in
     /// `wValue`. Models the chunked bulk opcodes (`0xA2` / `0xA3`), where the
-    /// host walks a 5944-byte packet in transfer-sized pieces. Without this the
+    /// host walks a 6136-byte packet in transfer-sized pieces. Without this the
     /// mock would hand back the same prefix every time and a chunking bug would
     /// sail through the tests.
     Window(Vec<u8>),
@@ -102,6 +121,7 @@ pub struct MockTransport {
     descriptor: Option<DeviceDescriptor>,
     max_transfer: Option<usize>,
     notify: NotifyQueue,
+    notify_pace: Option<Duration>,
 }
 
 impl MockTransport {
@@ -137,6 +157,14 @@ impl MockTransport {
 
     /// Constrain the transfer size, to exercise the chunked path that Windows
     /// forces on us without needing Windows.
+    /// Pace the notification endpoint as beta4 firmware does: an idle
+    /// packet only after `pace` without anything else to send, so an idle
+    /// read blocks that long (usb_audio.c:1064-1080).
+    pub fn with_notification_pace(mut self, pace: Duration) -> Self {
+        self.notify_pace = Some(pace);
+        self
+    }
+
     pub fn with_max_transfer(mut self, max: usize) -> Self {
         self.max_transfer = Some(max);
         self
@@ -249,6 +277,18 @@ impl Transport for MockTransport {
         Ok(data)
     }
 
+    fn control_in_upto(&mut self, opcode: u8, value: u16, max_len: u16) -> Result<Vec<u8>> {
+        self.log.lock().unwrap().push(Exchange {
+            direction: Direction::In,
+            opcode,
+            value,
+            payload: Vec::new(),
+        });
+        let mut data = self.resolve(opcode, value)?;
+        data.truncate(max_len as usize);
+        Ok(data)
+    }
+
     fn control_out(&mut self, opcode: u8, value: u16, data: &[u8]) -> Result<()> {
         self.log.lock().unwrap().push(Exchange {
             direction: Direction::Out,
@@ -281,6 +321,7 @@ impl Transport for MockTransport {
     fn notifications(&self) -> Option<Box<dyn NotificationSource>> {
         Some(Box::new(MockNotifications {
             queue: Arc::clone(&self.notify),
+            pace: self.notify_pace,
         }))
     }
 }
@@ -330,6 +371,39 @@ mod tests {
                 payload: vec![1, 2, 3],
             }
         );
+    }
+
+    /// A reply sized by the device, such as GET_PLATFORM from older firmware,
+    /// arrives short and is not an error on the path that expects it.
+    #[test]
+    fn a_short_answer_is_accepted_where_the_device_sizes_it() {
+        let mut t = MockTransport::new().data(0x7F, vec![1, 1, 0x16, 9]);
+        assert_eq!(t.control_in_upto(0x7F, 0, 7).unwrap(), vec![1, 1, 0x16, 9]);
+        let mut t = MockTransport::new().data(0x7F, vec![1, 1, 0x16, 9, 1, 6, 4, 0xEE]);
+        assert_eq!(t.control_in_upto(0x7F, 0, 7).unwrap().len(), 7);
+        assert!(
+            t.control_in_upto(0x7E, 0, 7).is_err(),
+            "a stall is still a stall"
+        );
+    }
+
+    /// A paced endpoint holds an idle read for the keep-alive interval and
+    /// then answers the one-byte idle packet; a queued event is immediate.
+    #[test]
+    fn a_paced_endpoint_blocks_until_the_keep_alive() {
+        let t = MockTransport::new().with_notification_pace(Duration::from_millis(100));
+        let mut n = t.notifications().unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(n.read(Duration::from_millis(250)).unwrap(), vec![0]);
+        assert!(start.elapsed() >= Duration::from_millis(100));
+
+        t.push_notification(vec![2, 3, 0, 1, 1, 0, 0, 0]);
+        let start = std::time::Instant::now();
+        assert_eq!(n.read(Duration::from_millis(250)).unwrap().len(), 8);
+        assert!(start.elapsed() < Duration::from_millis(50));
+
+        // A read shorter than the pace times out empty-handed.
+        assert!(n.read(Duration::from_millis(20)).unwrap().is_empty());
     }
 
     #[test]
