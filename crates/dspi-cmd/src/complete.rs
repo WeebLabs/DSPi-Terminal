@@ -99,6 +99,11 @@ pub fn complete(tokens: &[&str], partial: &str, ctx: &Context) -> Vec<Candidate>
             (Target::Channel, 0) | (Target::ChannelBand, 0) => channel_candidates(ctx),
             (Target::ChannelBand, 1) => band_candidates(ctx),
             (Target::Output, 0) => index_candidates(ctx.num_outputs, "output"),
+            (Target::OutputOrAll, 0) => {
+                let mut v = index_candidates(ctx.num_outputs, "output");
+                v.push(Candidate::new("all", "every output", CandidateKind::Band));
+                v
+            }
             (Target::Input, 0) => index_candidates(ctx.num_inputs, "input"),
             (Target::Crosspoint, 0) => index_candidates(ctx.num_inputs, "input"),
             (Target::Crosspoint, 1) => index_candidates(ctx.num_outputs, "output"),

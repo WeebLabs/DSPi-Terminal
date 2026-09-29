@@ -89,6 +89,31 @@
  * panels invert the pixels behind the value instead.  No structure sizes
  * change.  See Documentation/Features/control_surfaces_display_spec.md.
  *
+ * Caps v14 adds the subharmonic synthesizer nouns (57-60) and caps v15 the
+ * rest of its parameters (61-67: third band, selectivity mode/depth/hold, sub
+ * ceiling, pair link, solo).  Caps v16 widens the band-level nouns to +12 dB.
+ * Noun additions and range changes only; no structure sizes change.
+ *
+ * Caps v17 (never shipped) modelled auxiliary outputs as a separate table of
+ * eight pinless values that an LED binding had to follow.  Caps v18 replaces
+ * it: an auxiliary output is a component in a binding slot (CS_TYPE_AUX_OUT
+ * on/off, CS_TYPE_AUX_PWM dimmable) that owns its GPIO, name, invert sense,
+ * delays and boot values.  Nouns 68-69 keep their numbers but target the
+ * slot; commands 0x04-0x07 carry the slot and an 8.8 level; NOTIFY_EVT_CS_AUX
+ * grows to 9 bytes.  Directory V21 drops the V20 table.
+ * See Documentation/Features/control_surfaces_aux_spec.md.
+ *
+ * Caps v19 appends the tube preamp nouns (70-73: TUBE, TUBE_DRIVE,
+ * TUBE_TYPE, TUBE_MIX).  All four dispatch through the indexed
+ * REQ_SET_TUBE_PARAM, whose payload is a float32 for every parameter kind,
+ * the bool and the enum included.  No structure sizes change.
+ * See Documentation/Features/tube_preamp_spec.md.
+ *
+ * Caps v20 appends the output limiter nouns (74-78: LIMITER, _THRESHOLD,
+ * _RELEASE, _LINK, _GR), all targeting an output, and the CS_UNIT_MS_LOG
+ * unit the release noun needs.  No structure sizes change.
+ * See Documentation/Features/output_limiter_spec.md.
+ *
  * See Documentation/Features/control_surfaces_spec.md.
  */
 
@@ -113,6 +138,10 @@ typedef enum {
                            // whose commands live in the IrCommand table
     CS_TYPE_DISPLAY = 8,   // I2C character/OLED display (2 GPIOs: SDA, SCL);
                            // a container slot, content configured via 0x27-0x2A
+    CS_TYPE_AUX_OUT = 9,   // auxiliary on/off output (1 GPIO, output); owns the
+                           // pin a control switches through CS_NOUN_AUX
+    CS_TYPE_AUX_PWM = 10,  // auxiliary dimmable output (1 GPIO, PWM slice);
+                           // CS_NOUN_AUX gates it, CS_NOUN_AUX_LEVEL dims it
     CS_TYPE_COUNT
 } CsType;
 
@@ -191,6 +220,34 @@ typedef enum {
                                  // the configured edit_timeout)
     CS_NOUN_PAGE_VALUE     = 56, // virtual: STEP/INC/DEC/TOGGLE the shown
                                  // page's item, resolved at event time
+    // --- caps v14 additions ---
+    CS_NOUN_SUBHARM        = 57, // bool (subharmonic synthesizer enable)
+    CS_NOUN_SUBHARM_LOW    = 58, // continuous dB -30..+12 (24-36 Hz band level)
+    CS_NOUN_SUBHARM_HIGH   = 59, // continuous dB -30..+12 (36-56 Hz band level)
+    CS_NOUN_SUBHARM_BOOST  = 60, // continuous dB 0..+6 (LF boost bell)
+    // --- caps v15 additions ---
+    CS_NOUN_SUBHARM_TOP    = 61, // continuous dB -30..+12 (56-80 Hz band level)
+    CS_NOUN_SUBHARM_SELECT = 62, // enum 0..2 (all / percussive / sustained)
+    CS_NOUN_SUBHARM_DEPTH  = 63, // continuous percent 0..100 (selectivity depth)
+    CS_NOUN_SUBHARM_HOLD   = 64, // continuous ms 50..400 (selectivity hold)
+    CS_NOUN_SUBHARM_CEILING = 65, // continuous dB -40..0 (sub ceiling; 0 = off)
+    CS_NOUN_SUBHARM_LINK   = 66, // bool (synthesize each pair from its mono sum)
+    CS_NOUN_SUBHARM_SOLO   = 67, // bool (monitor the synthesized sub only)
+    // --- caps v17/v18 additions ---
+    CS_NOUN_AUX            = 68, // bool; target = binding slot holding an aux output
+    CS_NOUN_AUX_LEVEL      = 69, // continuous percent 0..100; target = slot holding
+                                 // a CS_TYPE_AUX_PWM output
+    // --- caps v19 additions ---
+    CS_NOUN_TUBE           = 70, // bool (tube preamp enable)
+    CS_NOUN_TUBE_DRIVE     = 71, // continuous dB -30..24
+    CS_NOUN_TUBE_TYPE      = 72, // enum 0..TUBE_TYPE_MAX (0 = Custom)
+    CS_NOUN_TUBE_MIX       = 73, // continuous percent 0..100 (dry/wet)
+    // --- caps v20 additions (target = output channel) ---
+    CS_NOUN_LIMITER        = 74, // bool (output limiter enable)
+    CS_NOUN_LIMITER_THRESHOLD = 75, // continuous dB -30..0
+    CS_NOUN_LIMITER_RELEASE = 76, // continuous ms 10..1000 (CS_UNIT_MS_LOG)
+    CS_NOUN_LIMITER_LINK   = 77, // enum 0..LIMITER_LINK_GROUP_MAX (0 = unlinked)
+    CS_NOUN_LIMITER_GR     = 78, // continuous dB 0..30, read-only (gain reduction)
     CS_NOUN_COUNT
 } CsNoun;
 
@@ -208,6 +265,8 @@ typedef enum {
 #define CS_UNIT_PERCENT  4   // 8.8 fixed point percent; linear stepping
 #define CS_UNIT_MS       5   // 8.8 fixed point milliseconds; linear stepping,
                              // default step 0.1 ms (caps v4+)
+#define CS_UNIT_MS_LOG   6   // plain integer ms; log stepping (step = 8.8
+                             // octaves); spans past 8.8's 127 ms (caps v20+)
 
 // Target kinds (CsNounDesc.target_kind); what CsBinding.target addresses.
 #define CS_TARGET_NONE      0   // target/index ignored
@@ -215,6 +274,8 @@ typedef enum {
 #define CS_TARGET_OUTPUT_CH 2   // target = output channel (0..target_count-1)
 #define CS_TARGET_DSP_CH    3   // target = DSP channel (inputs then outputs)
 #define CS_TARGET_DSP_BAND  4   // target = DSP channel, index = filter band
+#define CS_TARGET_AUX       5   // target = binding slot (0..CS_MAX_BINDINGS-1) whose
+                                // type is CS_TYPE_AUX_*; index must be 0
 
 // Noun descriptor flags (CsNounDesc.dflags)
 #define CS_NDF_DEFERRED  0x01   // apply is deferred; engine steps from a target shadow
@@ -361,12 +422,26 @@ typedef enum {
 // Wire / flash structures
 // ---------------------------------------------------------------------------
 
+// Auxiliary outputs (caps v18).  A CS_TYPE_AUX_OUT / CS_TYPE_AUX_PWM binding
+// is a container like the IR slot: gpio[0] is the pin, INVERT the sense,
+// on/off_delay the TON/TOF filter on the on/off flag, base_bright the PWM
+// ceiling, value the boot level (8.8 percent, AUX_PWM only) and `extras`
+// the flags below.  noun / action / event / target / index / step / range
+// must be 0.  The live on/off flag and level are runtime values in RAM.
+#define CS_AUX_X_BOOT_ON    0x01  // boot with the output on (else off)
+#define CS_AUX_X_BOOT_SAVED 0x02  // REQ_CS_SAVE folds the live on/off flag and
+                                  // level into BOOT_ON / value before writing
+#define CS_AUX_X_LINEAR     0x04  // AUX_PWM: linear duty instead of the squared
+                                  // perceptual curve (fans, heaters)
+#define CS_AUX_X_MASK       0x07
+
 // One binding; 24 bytes, identical on the wire (REQ_SET/GET_CS_BINDING
 // payload) and in flash.  value/step/range encoding follows the noun's unit
 // (CS_UNIT_*); bool/enum values are plain integers.
 // A CS_TYPE_IR binding is a container: gpio[0] is the receiver pin, INVERT
 // selects an idle-low receiver (default is idle-high, e.g. TSOP38xx), and
 // every other field must be 0.  Its commands live in the IrCommand table.
+// A CS_TYPE_AUX_* binding is a container too; see the CS_AUX_X_* block.
 typedef struct __attribute__((packed)) {
     uint8_t type;          // CsType
     uint8_t noun;          // CsNoun
@@ -380,7 +455,8 @@ typedef struct __attribute__((packed)) {
     // meter keeps its full sweep and only its top end moves.  Percent 1-100,
     // 0 = unset = full; LED_PWM only, every other type writes 0.
     uint8_t base_bright;
-    int16_t value;         // SET/MOMENTARY target, IND_EQUALS/IND_ABOVE comparand
+    int16_t value;         // SET/MOMENTARY target, IND_EQUALS/IND_ABOVE comparand,
+                           // AUX_PWM boot level (8.8 percent)
     int16_t step;          // STEP/INC/DEC size; 0 = per-unit default
     int16_t range_min;     // pot/IND_LEVEL span; both 0 = the noun's full range
     int16_t range_max;
@@ -389,9 +465,9 @@ typedef struct __attribute__((packed)) {
     // (PLC TON/TOF).  0.1 s units, 0 = immediate; LED types only.
     uint16_t on_delay;
     uint16_t off_delay;
-    uint8_t reserved2[2];  // write 0; earmarked for an LED-extras flags byte
-                           // (a future global Panel Brightness opt-in), since
-                           // CsBinding.flags has no free bit left
+    uint8_t extras;        // type-extras flags: CS_AUX_X_* on aux slots; every
+                           // other type writes 0 (room for a future LED byte)
+    uint8_t reserved2;     // write 0
 } CsBinding;
 
 // One IR remote command; 16 bytes, identical on the wire (REQ_SET/GET_CS_IR_CMD
@@ -559,7 +635,7 @@ typedef struct __attribute__((packed)) {
 } CsTypeDesc;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  caps_version; // capability format version (13); see the file
+    uint8_t  caps_version; // capability format version (20); see the file
                            // header for what each version added
     uint8_t  max_bindings; // CS_MAX_BINDINGS
     uint8_t  type_count;   // CS_TYPE_COUNT (table follows, index = CsType)
@@ -573,7 +649,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  max_groups;       // CS_MAX_GROUPS
     uint8_t  max_macros;       // CS_MAX_MACROS
     uint8_t  max_macro_steps;  // CS_MAX_MACRO_STEPS
-} CsCapsHeader;            // 4 + 4*CS_TYPE_COUNT + 4 = 44 bytes at v10
+} CsCapsHeader;            // 4 + 4*CS_TYPE_COUNT + 4 = 52 bytes at v18
 
 typedef struct __attribute__((packed)) {
     uint8_t  kind;         // CS_KIND_*
@@ -635,6 +711,8 @@ typedef struct __attribute__((packed)) {
 #define CS_STATUS_I2C_IN_USE      0x24  // instance occupied by the I2C control
                                         // interface (target mode)
 #define CS_STATUS_INVALID_PAGE    0x25  // display cfg/page record invalid
+#define CS_STATUS_INVALID_AUX     0x26  // target slot is not an aux output, or the
+                                        // level noun targets a non-PWM aux slot
 
 // ---------------------------------------------------------------------------
 // Public API (all main-loop context)
@@ -725,6 +803,22 @@ const CsGroup *control_surfaces_get_group(uint8_t idx);   // NULL if bad index
 const CsMacro *control_surfaces_get_macro(uint8_t idx);   // NULL if bad index
 void control_surfaces_get_ext_status(CsExtStatusPacket *out);
 
+// Auxiliary outputs (caps v18).  Slot-indexed runtime values of the aux
+// component in that slot; never dirty, and carried across revert and a
+// same-type re-apply so neither clicks a relay.  Getters read 0 and setters
+// return false unless the slot is an aux output that is UP (the level setter
+// also needs AUX_PWM).  Any dispatch context; the tick reads without a lock.
+uint8_t  control_surfaces_slot_type(uint8_t slot);        // CS_TYPE_NONE if bad slot
+bool     control_surfaces_slot_is_aux(uint8_t slot);      // either aux type (configured)
+bool     control_surfaces_aux_up(uint8_t slot);           // aux type AND the slot is active
+uint8_t  control_surfaces_aux_state(uint8_t slot);        // 0 if not an aux
+uint16_t control_surfaces_aux_level(uint8_t slot);        // 8.8 percent; 0 if not an aux
+bool     control_surfaces_set_aux_state(uint8_t slot, uint8_t state);
+bool     control_surfaces_set_aux_level(uint8_t slot, uint16_t level_q8);  // clamps to 100 %
+// Call immediately before REQ_CS_SAVE persists: folds the live on/off flag
+// and level into the boot fields of every CS_AUX_X_BOOT_SAVED slot.
+void control_surfaces_aux_prepare_save(void);
+
 // Re-apply the persisted config (bindings + IR commands + slot names) from
 // the directory cache, discarding the live preview.  Per-slot failures land
 // in slot_status exactly as at boot.  Main-loop only (releases and reclaims
@@ -788,8 +882,8 @@ extern CsDisplayPage    cs_set_disp_page_val;
 
 // Deferred save / revert (REQ_CS_SAVE / REQ_CS_REVERT).  Save persists the
 // whole live CS config (bindings + IR commands + slot names + groups +
-// macros + display) in one directory write; revert re-applies the stored
-// config.  Results land in cs_last_status (cs_last_slot = 0xFF).
+// macros + display) in one directory write; revert re-applies the
+// stored config.  Results land in cs_last_status (cs_last_slot = 0xFF).
 extern volatile bool    cs_save_pending;
 extern volatile bool    cs_revert_pending;
 
@@ -827,6 +921,10 @@ uint8_t cs_noun_validate_target_ch(uint8_t noun, uint8_t ch, uint8_t index);
 // Grouped-reference check against the live group table (engine-owned);
 // exported for the display module's page validation.
 uint8_t cs_validate_grouped_target(const CsBinding *b);
+
+// True for units that step and map in octaves (Hz, Q, log ms); shared by
+// the engine and the display bar so the two never disagree.
+bool cs_unit_is_log(uint8_t unit);
 
 // A continuous noun's full range in natural units, decoded from min_q/max_q;
 // exported for the display module's level bars.  Returns false for nouns

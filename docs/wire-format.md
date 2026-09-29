@@ -1,13 +1,13 @@
-# `WireBulkParams` V28 wire format
+# `WireBulkParams` V32 wire format
 
 *Derived from `crates/dspi-proto/firmware/bulk_params.h`, vendored from
-`WeebLabs/DSPi` `release/v1.1.6` @ `112f35b`.*
+`WeebLabs/DSPi` `release/v1.1.6` @ `557bce7` (v1.1.6 beta 4).*
 
 This document exists because **no released documentation describes this layout**.
 `DSPi/Documentation/commands.md` §13 documents wire format **V14 at 3664 bytes**
 with a "Master L / Master R" channel model, which the firmware abandoned at V16.
-It is fourteen versions stale. This file is derived from the header and is
-regenerated-checked by `dspi-proto`'s offset test, so it cannot silently drift.
+It is eighteen versions stale. This file is derived from the header and is
+checked by `dspi-proto`'s offset tests, so it cannot silently drift.
 
 Writing style note: this doc avoids em-dashes, per project convention.
 
@@ -26,7 +26,7 @@ Writing style note: this doc avoids em-dashes, per project convention.
 Consequences for a host, and they are strict:
 
 - **`SET_ALL_PARAMS` (0xA1) is all-or-nothing.** You may only bulk-write a packet
-  that is exactly V28 and exactly 5944 bytes. There is no "send a prefix and let
+  that is exactly V32 and exactly 6136 bytes. There is no "send a prefix and let
   older fields default" path, and no forward compatibility on write.
 - **Never bulk-write to a device whose `format_version` you do not implement.**
   Fall back to individual `SET_*` opcodes, which are version-independent, or
@@ -35,10 +35,13 @@ Consequences for a host, and they are strict:
   `payload_length` before interpreting a single offset. A device reporting an
   unknown version must not be parsed against this table.
 
-This inverts the tolerance strategy a host would normally use. The
-`FieldDesc` table still earns its place for notification-offset dispatch, for
-readable field definitions, and for the next format change, but it does **not**
-buy us cross-version bulk writes. Those do not exist.
+This inverts the tolerance strategy a host would normally use. The generated
+section table (`SECTIONS` in `dspi-proto`) and the per-section field tables in
+`wire.rs` still earn their place for notification-offset dispatch, for readable
+field definitions, and for the next format change, but they do **not** buy us
+cross-version bulk writes. Those do not exist. The Terminal checks the version
+in the first chunk of a bulk read and refuses any other, naming the device's
+firmware and the version to update to.
 
 ## 2. Sizing constants
 
@@ -52,8 +55,8 @@ buy us cross-version bulk writes. Those do not exist.
 | `WIRE_MAX_PIN_OUTPUTS` | 5 | 4 S/PDIF + 1 PDM |
 | `WIRE_MAX_SPDIF_INSTANCES` | 4 | |
 | `WIRE_NAME_LEN` | 32 | channel and preset names |
-| `WIRE_FORMAT_VERSION` | **28** | |
-| `sizeof(WireBulkParams)` | **5944** | |
+| `WIRE_FORMAT_VERSION` | **32** | |
+| `sizeof(WireBulkParams)` | **6136** | asserted at bulk_params.c:50-66 |
 
 Channel index space is `[inputs 0..7][outputs 8..16]` on RP2350 and
 `[inputs 0..1][outputs 2..6]` on RP2040. **The first output index is
@@ -89,7 +92,13 @@ throughout; floats are IEEE 754 single-precision at 4-byte-aligned offsets.
 | 20 | 5868 | 8 | `adat_config` | u8 enabled; u8 pin (0 = platform default); u8 rsv[6] |
 | 21 | 5876 | 24 | `psybass` | see §5.3 (V23+) |
 | 22 | 5900 | 44 | `upmix` | see §5.4 (V25+) |
-| | **5944** | | **total** | |
+| 23 | 5944 | 36 | `subharm` | see §5.5 (V29+, 36 bytes from V30) |
+| 24 | 5980 | 48 | `tube` | see §5.6 (V31+) |
+| 25 | 6028 | 108 | `limiter` | see §5.7 (V32+) |
+| | **6136** | | **total** | |
+
+V29 to V32 only appended sections; no offset before 5944 moved. The sizes on the
+way were V29 5960, V30 5980, V31 6028 and V32 6136.
 
 ### 3.1 `WireBandParams` (16 B, used by `eq` and `crossovers`)
 
@@ -113,7 +122,7 @@ Band index is implicit in array position: row = channel, column = band.
 
 | Offset | Type | Field |
 |---:|---|---|
-| 0 | u8 | `format_version` (28) |
+| 0 | u8 | `format_version` (32) |
 | 1 | u8 | `platform_id` (0 = RP2040, 1 = RP2350) |
 | 2 | u8 | `num_channels` (7 or 17) |
 | 3 | u8 | `num_output_channels` (5 or 9) |
@@ -164,8 +173,8 @@ whereas the vendor command `0xC9` returns an encoded 0 or 1. Do not confuse them
 
 ### 5.2 `input_config` (16 B @ 4716) - changed at V28
 
-**This is the V28 change, and it is the dangerous kind: the section is still 16
-bytes and the packet is still 5944, so no size check can see it.** V28 added a
+**This is the V28 change, and it is the dangerous kind: the section stayed 16
+bytes and the packet stayed 5944, so no size check can see it.** V28 added a
 fourth selectable S/PDIF input, growing `spdif_rx_pin_ext` from two entries to
 three. Every field below it moved down one byte and the section's last reserved
 byte was consumed; there are no reserved bytes left.
@@ -205,6 +214,71 @@ surround_hpf_hz, surround_lpf_hz, decorr_pct.
 
 RP2040 zeroes this section on collect and ignores it on apply.
 
+### 5.5 `subharm` (36 B @ 5944, V29+; bulk_params.h:378-400)
+
+| Offset | Type | Field |
+|---:|---|---|
+| 0 | u8 | `enabled` |
+| 1 | u8 | reserved |
+| 2 | u16 | `output_mask` |
+| 4 | f32 | `low_db` (24-36 Hz sub) |
+| 8 | f32 | `high_db` (36-56 Hz sub) |
+| 12 | f32 | `boost_db` (70 Hz bell, 0..+6) |
+| 16 | f32 | `top_db` (56-80 Hz sub; V30+) |
+| 20 | f32 | `select_depth` (0..100 %) |
+| 24 | f32 | `select_hold_ms` (50..400) |
+| 28 | f32 | `ceiling_db` (-40..0 dBFS, 0 = off) |
+| 32 | u8 | `select_mode` (0 all, 1 percussive, 2 sustained) |
+| 33 | u8 | `link_pairs` |
+| 34 | u8[2] | reserved |
+
+A band level of -30 dB turns that band off. The header's comments say the band
+levels run to +6 dB; the firmware limit is `SUBHARM_LEVEL_MAX`, +12
+(subharm.h:64-65). Solo is runtime only and never on the wire. Bulk apply
+clamps only `select_mode`; the floats are clamped later, so a GET straight
+after a bulk apply can show unclamped values.
+
+### 5.6 `tube` (48 B @ 5980, V31+; bulk_params.h:403-427)
+
+| Offset | Type | Field |
+|---:|---|---|
+| 0 | u8 | `enabled` |
+| 1 | u8 | `tube_type` (0 custom, 1..16) |
+| 2 | u8 | `rectifier` (0..3) |
+| 3 | u8 | `xfmr_enabled` (output stage) |
+| 4 | u16 | `output_mask` |
+| 6 | u8[2] | reserved |
+| 8 | f32 | `drive_db` (-30..24) |
+| 12 | f32 | `bias_pct` (-100..100) |
+| 16 | f32 | `asym_db` (-12..12) |
+| 20 | f32 | `hardness_pct` (0..100) |
+| 24 | f32 | `sag_pct` (0..100) |
+| 28 | f32 | `xfmr_damping` (1..20) |
+| 32 | f32 | `xfmr_res_hz` (30..150) |
+| 36 | f32 | `mix_pct` (0..100) |
+| 40 | f32 | `trim_db` (-12..12) |
+| 44 | f32 | reserved |
+
+Apply copies the character fields verbatim and does not run the tube-type row
+lookup, so a saved Custom voicing survives.
+
+### 5.7 `limiter` (108 B @ 6028, V32+; bulk_params.h:430-446)
+
+Nine 12-byte `WireLimiterOutput` records, output `k` at `6028 + 12k`:
+
+| Offset | Type | Field |
+|---:|---|---|
+| 0 | u8 | `enabled` |
+| 1 | u8 | `link_group` (0 unlinked, 1..4) |
+| 2 | u8[2] | reserved |
+| 4 | f32 | `threshold_db` (-30..0 dBFS) |
+| 8 | f32 | `release_ms` (10..1000) |
+
+Records past the device's output count read zero and are ignored on a write.
+**The section is applied only in `OUTPUT_CONFIG_MODE` WITH_PRESET**
+(bulk_params.h:497-499, bulk_params.c:1005-1008); in INDEPENDENT mode a bulk write ignores it, yet
+`BULK_INVALIDATED` still fires.
+
 ## 6. Read-only fields
 
 On bulk SET the firmware ignores these; they are produced by the device:
@@ -215,7 +289,7 @@ On bulk SET the firmware ignores these; they are produced by the device:
 
 ## 7. Practical notes
 
-- **Transfer size.** At 5944 bytes this exceeds the 4 KB WinUSB cap, so on
+- **Transfer size.** At 6136 bytes this exceeds the 4 KB WinUSB cap, so on
   Windows the chunked opcodes `GET_ALL_PARAMS_CHUNK` (0xA2) and
   `SET_ALL_PARAMS_CHUNK` (0xA3) are mandatory rather than optional. `0xA2` at
   offset 0 snapshots under the bulk lock; read sequentially from there.
@@ -225,4 +299,8 @@ On bulk SET the firmware ignores these; they are produced by the device:
   apply.** Storage symmetry with `eq` is a convenience, not a usable slot.
 - **Notification dispatch.** `PARAM_CHANGED` on the bulk IN endpoint carries the
   byte offset into this packet, so this table doubles as the notification
-  routing table.
+  routing table. Subharm (except solo), tube and limiter writes are notified at
+  their offsets here; a limiter write to output 0xFF sends one per output.
+- **The analyser shares the bulk buffer.** `REQ_RTA_GET_BANDS_ALL` (0x0F) builds
+  its reply in the same buffer, so it stalls while a chunked bulk transfer holds
+  it (vendor_commands.c:4334-4355).

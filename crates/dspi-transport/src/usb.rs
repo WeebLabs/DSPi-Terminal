@@ -172,6 +172,23 @@ impl Transport for UsbTransport {
         Ok(data)
     }
 
+    fn control_in_upto(&mut self, opcode: u8, value: u16, max_len: u16) -> Result<Vec<u8>> {
+        self.interface
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Interface,
+                    request: opcode,
+                    value,
+                    index: VENDOR_INTERFACE,
+                    length: max_len,
+                },
+                self.timeout,
+            )
+            .wait()
+            .map_err(|e| map_transfer_error(e, opcode))
+    }
+
     fn control_out(&mut self, opcode: u8, value: u16, data: &[u8]) -> Result<()> {
         debug_assert_eq!(REQ_TYPE_OUT, 0x41, "OUT is vendor|interface|host-to-device");
 

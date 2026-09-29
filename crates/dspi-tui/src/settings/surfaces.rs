@@ -2999,6 +2999,7 @@ mod tests {
             range_max: 0,
             on_delay: 0,
             off_delay: 0,
+            extras: 0,
         };
         let w = b.encode();
         assert_eq!(w.len(), 24);

@@ -400,6 +400,8 @@ pub fn caps() -> Capabilities {
         serial: "E6614C311B8B4E3A".into(),
         platform: Platform::Rp2350,
         firmware: "1.1.6".into(),
+        firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 6, 0),
+        build_info: None,
         wire_format: WIRE_FORMAT_VERSION as u8,
         num_channels: 17,
         num_inputs: 8,

@@ -32,7 +32,7 @@ WinUSB to the vendor interface automatically; there is no Zadig step.
 Two constraints shaped the code:
 
 - **WinUSB caps a control transfer at 4 KB**, and the bulk parameter packet is
-  5944 bytes, so the chunked opcodes are used **on every platform**, not just
+  6136 bytes, so the chunked opcodes are used **on every platform**, not just
   Windows. One code path, exercised everywhere, rather than a Windows-only path
   that nobody tests.
 - **`nusb` cannot do device-level control transfers on Windows**, and WinUSB

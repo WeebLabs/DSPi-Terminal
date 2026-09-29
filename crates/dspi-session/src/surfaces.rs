@@ -126,6 +126,11 @@ pub fn explain_status(code: u8) -> String {
         0x23 => "those two pins are not a valid I2C pair".into(),
         0x24 => "the I2C control interface already has that instance".into(),
         0x25 => "that display page or setting is not valid".into(),
+        // Caps v18, control_surfaces.h:714-715, in the Console's words
+        // (`statusMessage`, DSPi_ConsoleApp.swift:7593).
+        0x26 => {
+            "the target isn't an auxiliary output, or a level control needs a dimmable one".into()
+        }
         other => format!("refused with status 0x{other:02X}"),
     }
 }
@@ -1271,7 +1276,7 @@ mod tests {
     fn every_status_code_explains_itself() {
         for code in [
             0x00u8, 0x02, 0x05, 0x13, 0x15, 0x1A, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24,
-            0x25,
+            0x25, 0x26,
         ] {
             let msg = explain_status(code);
             // The bar is "reads as English", not a length: "applied" is a

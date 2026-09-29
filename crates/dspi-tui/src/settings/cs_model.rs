@@ -133,6 +133,30 @@ pub mod noun {
     pub const DISPLAY_PAGE: u8 = 54;
     pub const DISPLAY_EDIT: u8 = 55;
     pub const PAGE_VALUE: u8 = 56;
+    // Caps v14 to v20 (control_surfaces.h:223-250). Named here so the picker
+    // shows the Console's words; their categories and rules are phase B7.
+    pub const SUBHARM: u8 = 57;
+    pub const SUBHARM_LOW: u8 = 58;
+    pub const SUBHARM_HIGH: u8 = 59;
+    pub const SUBHARM_BOOST: u8 = 60;
+    pub const SUBHARM_TOP: u8 = 61;
+    pub const SUBHARM_SELECT: u8 = 62;
+    pub const SUBHARM_DEPTH: u8 = 63;
+    pub const SUBHARM_HOLD: u8 = 64;
+    pub const SUBHARM_CEILING: u8 = 65;
+    pub const SUBHARM_LINK: u8 = 66;
+    pub const SUBHARM_SOLO: u8 = 67;
+    pub const AUX: u8 = 68;
+    pub const AUX_LEVEL: u8 = 69;
+    pub const TUBE: u8 = 70;
+    pub const TUBE_DRIVE: u8 = 71;
+    pub const TUBE_TYPE: u8 = 72;
+    pub const TUBE_MIX: u8 = 73;
+    pub const LIMITER: u8 = 74;
+    pub const LIMITER_THRESHOLD: u8 = 75;
+    pub const LIMITER_RELEASE: u8 = 76;
+    pub const LIMITER_LINK: u8 = 77;
+    pub const LIMITER_GR: u8 = 78;
 }
 
 /// `CsBinding.flags` (control_surfaces.h:255-266). The byte is full.
@@ -157,14 +181,9 @@ pub mod kind {
     pub const NONE: u8 = 255;
 }
 
-/// `CsNounDesc.unit`.
+/// `CsNounDesc.unit`, from the protocol crate (control_surfaces.h:259-269).
 pub mod unit {
-    pub const NONE: u8 = 0;
-    pub const DB: u8 = 1;
-    pub const HZ: u8 = 2;
-    pub const Q: u8 = 3;
-    pub const PERCENT: u8 = 4;
-    pub const MS: u8 = 5;
+    pub use dspi_proto::packets::cs_unit::*;
 }
 
 /// `CsNounDesc.target_kind`.
@@ -307,6 +326,30 @@ pub fn noun_name(n: u8, for_type: u8) -> String {
         noun::DISPLAY_PAGE => "Show Page".into(),
         noun::DISPLAY_EDIT => "Allow Editing".into(),
         noun::PAGE_VALUE => "Browse/Adjust".into(),
+        noun::SUBHARM => "Subharmonic Synthesizer".into(),
+        noun::SUBHARM_LOW => "Subharm 24-36 Hz Level".into(),
+        noun::SUBHARM_HIGH => "Subharm 36-56 Hz Level".into(),
+        noun::SUBHARM_TOP => "Subharm 56-80 Hz Level".into(),
+        noun::SUBHARM_BOOST => "Subharm LF Boost".into(),
+        noun::SUBHARM_SELECT => "Subharm Selectivity".into(),
+        noun::SUBHARM_DEPTH => "Subharm Selectivity Depth".into(),
+        noun::SUBHARM_HOLD => "Subharm Selectivity Hold".into(),
+        noun::SUBHARM_CEILING => "Subharm Sub Ceiling".into(),
+        noun::SUBHARM_LINK => "Subharm Pair Link".into(),
+        noun::SUBHARM_SOLO => "Subharm Solo".into(),
+        noun::AUX => "Aux Switch".into(),
+        noun::AUX_LEVEL => "Aux Level".into(),
+        noun::TUBE => "Tube Modeller".into(),
+        noun::TUBE_DRIVE => "Tube Drive".into(),
+        noun::TUBE_TYPE => "Tube Type".into(),
+        noun::TUBE_MIX => "Tube Mix".into(),
+        // The Console has no limiter nouns yet; these follow its pattern
+        // (PLAN-beta4 decision 6).
+        noun::LIMITER => "Limiter".into(),
+        noun::LIMITER_THRESHOLD => "Limiter Threshold".into(),
+        noun::LIMITER_RELEASE => "Limiter Release".into(),
+        noun::LIMITER_LINK => "Limiter Link".into(),
+        noun::LIMITER_GR => "Limiter Gain Reduction".into(),
         other => format!("Parameter {other}"),
     }
 }
@@ -474,12 +517,13 @@ pub fn band_name(band: u8) -> String {
 
 /// True when a unit encodes value and range as signed 8.8 fixed point.
 pub fn unit_is_fixed_point(u: u8) -> bool {
-    matches!(u, unit::DB | unit::Q | unit::PERCENT | unit::MS)
+    dspi_proto::packets::cs_unit_is_fixed_point(u)
 }
 
 /// True when a unit steps multiplicatively, so its step operand is in octaves.
+/// `MS_LOG` (caps v20) is one: plain integer ms stepped in octaves.
 pub fn unit_is_log(u: u8) -> bool {
-    u == unit::HZ || u == unit::Q
+    dspi_proto::packets::cs_unit_is_log(u)
 }
 
 pub fn unit_symbol(u: u8) -> &'static str {
@@ -488,7 +532,7 @@ pub fn unit_symbol(u: u8) -> &'static str {
         unit::HZ => "Hz",
         unit::Q => "Q",
         unit::PERCENT => "%",
-        unit::MS => "ms",
+        unit::MS | unit::MS_LOG => "ms",
         _ => "",
     }
 }
@@ -496,7 +540,7 @@ pub fn unit_symbol(u: u8) -> &'static str {
 /// Decimals a unit's field shows: Hz and percent whole, Q and ms fine.
 pub fn unit_decimals(u: u8) -> usize {
     match u {
-        unit::HZ | unit::PERCENT => 0,
+        unit::HZ | unit::PERCENT | unit::MS_LOG => 0,
         unit::Q | unit::MS => 2,
         _ => 1,
     }
@@ -505,7 +549,7 @@ pub fn unit_decimals(u: u8) -> usize {
 /// One nudge of a unit's field (the Console's `unitScrollStep`).
 pub fn unit_scroll_step(u: u8) -> f64 {
     match u {
-        unit::HZ => 10.0,
+        unit::HZ | unit::MS_LOG => 10.0,
         unit::Q => 0.1,
         unit::PERCENT => 1.0,
         unit::MS => 0.1,
@@ -522,7 +566,7 @@ pub fn unit_min_step(u: u8) -> f64 {
 /// units, 1/12 octave for the log ones, 0.1 ms for delay.
 pub fn default_step(u: u8) -> f64 {
     match u {
-        unit::HZ | unit::Q => 1.0 / 12.0,
+        unit::HZ | unit::Q | unit::MS_LOG => 1.0 / 12.0,
         unit::MS => 0.1,
         _ => 1.0,
     }
@@ -566,6 +610,7 @@ pub fn fmt_unit(v: f64, u: u8) -> String {
         unit::PERCENT => format!("{v:.0} %"),
         unit::DB => format!("{v:.1} dB"),
         unit::MS => format!("{v:.2} ms"),
+        unit::MS_LOG => format!("{v:.0} ms"),
         _ => format!("{v:.0}"),
     }
 }
@@ -2577,6 +2622,13 @@ mod tests {
         assert!(!unit_is_log(unit::DB) && !unit_is_log(unit::MS));
         assert_eq!(default_step(unit::HZ), 1.0 / 12.0);
         assert_eq!(default_step(unit::MS), 0.1);
+        // Caps v20's MS_LOG: plain ms like Hz, octave steps like Hz
+        // (control_surfaces.h:268-269), so 1000 ms fits where 8.8 stops at 127.
+        assert_eq!(encode_value(1000.0, unit::MS_LOG), 1000);
+        assert_eq!(decode_value(10, unit::MS_LOG), 10.0);
+        assert!(unit_is_log(unit::MS_LOG));
+        assert_eq!(decode_step(256, unit::MS_LOG), 1.0, "one octave");
+        assert_eq!(fmt_unit(200.0, unit::MS_LOG), "200 ms");
         assert_eq!(default_step(unit::DB), 1.0);
         // Saturating, not wrapping.
         assert_eq!(encode_value(1e6, unit::DB), i16::MAX);

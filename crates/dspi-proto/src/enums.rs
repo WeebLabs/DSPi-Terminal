@@ -217,7 +217,7 @@ open_enum! {
 }
 
 open_enum! {
-    /// Control-surface component types, `control_surfaces.h:103-116`.
+    /// Control-surface component types, `control_surfaces.h:128-146`.
     ///
     /// The device reports how many of these it knows in the caps header's
     /// `type_count`, so this table is for labelling, never for gating: a
@@ -234,12 +234,15 @@ open_enum! {
         Ir      = 7, "IR receiver";
         // Caps v10: a container slot taking two GPIOs, SDA then SCL.
         Display = 8, "I2C display";
+        // Caps v18: containers that own one GPIO (control_surfaces.h:141-144).
+        AuxOut  = 9, "Auxiliary output";
+        AuxPwm  = 10, "Dimmable auxiliary output";
     }
 }
 
 open_enum! {
-    /// Control-surface nouns, `control_surfaces.h:122-195`. `CS_NOUN_COUNT` is
-    /// 57 at caps v13, so the last defined noun is 56.
+    /// Control-surface nouns, `control_surfaces.h:152-252`. `CS_NOUN_COUNT` is
+    /// 79 at caps v20, so the last defined noun is 78.
     ///
     /// Labels here are short identifiers for diagnostics. Screens take their
     /// wording from the registry row or the Console, not from this table.
@@ -305,6 +308,32 @@ open_enum! {
         DisplayPage         = 54, "Display page";
         DisplayEdit         = 55, "Display edit mode";
         PageValue           = 56, "Shown page's value";
+        // Caps v14 and v15.
+        Subharm             = 57, "Subharmonic synthesizer";
+        SubharmLow          = 58, "Subharm 24-36 Hz level";
+        SubharmHigh         = 59, "Subharm 36-56 Hz level";
+        SubharmBoost        = 60, "Subharm LF boost";
+        SubharmTop          = 61, "Subharm 56-80 Hz level";
+        SubharmSelect       = 62, "Subharm selectivity";
+        SubharmDepth        = 63, "Subharm selectivity depth";
+        SubharmHold         = 64, "Subharm selectivity hold";
+        SubharmCeiling      = 65, "Subharm sub ceiling";
+        SubharmLink         = 66, "Subharm pair link";
+        SubharmSolo         = 67, "Subharm solo";
+        // Caps v18.
+        Aux                 = 68, "Auxiliary output";
+        AuxLevel            = 69, "Auxiliary output level";
+        // Caps v19.
+        Tube                = 70, "Tube preamp";
+        TubeDrive           = 71, "Tube drive";
+        TubeType            = 72, "Tube type";
+        TubeMix             = 73, "Tube mix";
+        // Caps v20.
+        Limiter             = 74, "Output limiter";
+        LimiterThreshold    = 75, "Limiter threshold";
+        LimiterRelease      = 76, "Limiter release";
+        LimiterLink         = 77, "Limiter link group";
+        LimiterGr           = 78, "Limiter gain reduction";
     }
 }
 
@@ -459,21 +488,31 @@ mod tests {
         }
     }
 
-    /// `CS_TYPE_COUNT` is 9 at caps v13 (control_surfaces.h:115), which is what
-    /// grows the caps header from 40 bytes to 44.
+    /// `CS_TYPE_COUNT` is 11 at caps v20 (control_surfaces.h:145), which is
+    /// what grows the caps header from 44 bytes to 52.
     #[test]
-    fn the_display_component_type_is_known() {
+    fn the_aux_component_types_are_known() {
+        use crate::generated::cs;
         assert_eq!(CsType::from_raw(8), CsType::Display);
-        assert!(!CsType::from_raw(9).is_known(), "CS_TYPE_COUNT is 9");
+        assert_eq!(CsType::from_raw(9), CsType::AuxOut);
+        assert_eq!(CsType::from_raw(10), CsType::AuxPwm);
+        assert!(!CsType::from_raw(cs::CS_TYPE_COUNT as u8).is_known());
     }
 
-    /// `CS_NOUN_COUNT` is 57 (control_surfaces.h:194), so 56 is the last one.
+    /// `CS_NOUN_COUNT` is 79 (control_surfaces.h:251), so 78 is the last one.
     #[test]
     fn the_noun_table_ends_where_the_firmware_says() {
+        use crate::generated::cs;
         assert_eq!(CsNoun::from_raw(48), CsNoun::PresetReload);
-        assert_eq!(CsNoun::from_raw(52), CsNoun::Macro);
         assert_eq!(CsNoun::from_raw(56), CsNoun::PageValue);
-        assert!(!CsNoun::from_raw(57).is_known(), "CS_NOUN_COUNT is 57");
+        assert_eq!(CsNoun::from_raw(57), CsNoun::Subharm);
+        assert_eq!(CsNoun::from_raw(68), CsNoun::Aux);
+        assert_eq!(CsNoun::from_raw(72), CsNoun::TubeType);
+        assert_eq!(CsNoun::from_raw(78), CsNoun::LimiterGr);
+        assert!(!CsNoun::from_raw(cs::CS_NOUN_COUNT as u8).is_known());
+        for n in 0..cs::CS_NOUN_COUNT as u8 {
+            assert!(CsNoun::from_raw(n).is_known(), "noun {n} has no variant");
+        }
     }
 
     /// ADAT arrived as input source 3 after the released docs were written.

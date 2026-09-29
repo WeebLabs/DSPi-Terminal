@@ -18,7 +18,9 @@
 
 use dspi_proto::FilterType;
 use dspi_proto::generated::opcodes as op;
-use dspi_proto::registry::{Hazard, Kind, ParamDesc, Requires, Target, WValue, by_path};
+use dspi_proto::registry::{
+    ALL_OUTPUTS, Hazard, Kind, ParamDesc, Requires, Target, WValue, by_path,
+};
 use dspi_proto::value::{EqParamPacket, Repr, Value, ValueError, decode_qp};
 use dspi_proto::wire::BulkPacket;
 use dspi_proto::{ChannelMap, Dir, Platform};
@@ -259,7 +261,7 @@ impl Session {
         }
 
         let wvalue = self.build_wvalue(d, indices, &value)?;
-        let repr = d.kind.repr();
+        let repr = d.repr();
 
         match d.dir {
             Dir::Out => {
@@ -291,10 +293,13 @@ impl Session {
     ///
     /// Everything the bulk packet covers can be decoded from here instead of
     /// asked for one scalar at a time. Prefer this whenever more than a couple
-    /// of values are wanted: it is six transfers for all 5944 bytes, against
+    /// of values are wanted: it is six transfers for all 6136 bytes, against
     /// five transfers per EQ band alone.
     pub fn snapshot(&mut self) -> Result<BulkPacket, WriteError> {
-        Ok(crate::probe::read_bulk(&mut *self.transport)?)
+        Ok(crate::probe::read_bulk_from(
+            &mut *self.transport,
+            Some(&self.caps.firmware_version),
+        )?)
     }
 
     /// Read a whole EQ band.
@@ -403,8 +408,13 @@ impl Session {
             .ok_or_else(|| WriteError::ReadOnly { path: path.into() })?;
 
         self.check_indices(d, indices)?;
+        // "Every output" exists only for a write; the device stalls a read of
+        // it (limiter.h:21).
+        if d.target == Target::OutputOrAll && indices.first() == Some(&ALL_OUTPUTS) {
+            return Err(WriteError::BadTarget(ALL_OUTPUTS, "single output"));
+        }
         let wvalue = self.build_read_wvalue(d, indices);
-        let repr = d.kind.repr();
+        let repr = d.repr();
         // EQ scalars always answer four bytes regardless of the field's
         // width; a crosspoint answers its whole 8-byte MatrixRoutePacket
         // (config.h:845-851).
@@ -553,6 +563,9 @@ impl Session {
             Target::Channel => indices[0] < self.map.num_channels(),
             Target::Input => indices[0] < self.map.num_inputs(),
             Target::Output => indices[0] < self.map.num_outputs(),
+            // The limiter numbers outputs from 0 like every other output
+            // command, and 0xFF writes them all (limiter.h:11-21).
+            Target::OutputOrAll => indices[0] < self.map.num_outputs() || indices[0] == ALL_OUTPUTS,
             Target::ChannelBand => {
                 indices[0] < self.map.num_channels()
                     && is_valid_band(indices[1], self.caps.max_bands)
@@ -617,6 +630,10 @@ pub(crate) fn wvalue_for(d: &ParamDesc, indices: &[u8], value: &Value) -> u16 {
         match d.wvalue {
             WValue::Zero => 0,
             WValue::Fixed(v) => v,
+            // `(output << 8) | index` (limiter.h:11, config.h:233-236).
+            WValue::OutputIndex(index) => {
+                ((indices.first().copied().unwrap_or(0) as u16) << 8) | index as u16
+            }
             WValue::Target => indices.first().copied().unwrap_or(0) as u16,
             WValue::ChannelBand => ((indices[0] as u16) << 8) | indices[1] as u16,
             WValue::Crosspoint => ((indices[0] as u16) << 8) | indices[1] as u16,
@@ -649,6 +666,9 @@ pub(crate) fn read_wvalue_for(d: &ParamDesc, indices: &[u8]) -> u16 {
     {
         match d.wvalue {
             WValue::Fixed(v) => v,
+            WValue::OutputIndex(index) => {
+                ((indices.first().copied().unwrap_or(0) as u16) << 8) | index as u16
+            }
             WValue::ChannelBand | WValue::Crosspoint => {
                 ((indices[0] as u16) << 8) | indices[1] as u16
             }
@@ -678,7 +698,8 @@ fn target_name(t: Target) -> &'static str {
     match t {
         Target::Channel => "channel",
         Target::Input => "input",
-        Target::Output => "output",
+        Target::Output | Target::OutputOrAll => "output",
+        Target::TapChannel => "analyser channel",
         Target::ChannelBand => "channel or band",
         Target::Crosspoint => "crosspoint",
         Target::PresetSlot => "preset slot",
@@ -697,7 +718,7 @@ fn target_name(t: Target) -> &'static str {
 
 /// Interpret a read according to the parameter's kind.
 fn decode_read(d: &ParamDesc, bytes: &[u8]) -> Value {
-    let repr = d.kind.repr();
+    let repr = d.repr();
 
     // EQ scalars always answer four bytes: an f32 for freq/Q/gain, and a small
     // integer in the low byte for type and bypass.
@@ -705,6 +726,22 @@ fn decode_read(d: &ParamDesc, bytes: &[u8]) -> Value {
         return match param {
             1..=3 => Repr::F32.decode(bytes).unwrap_or(Value::Float(0.0)),
             _ => Value::Int(bytes.first().copied().unwrap_or(0) as i64),
+        };
+    }
+
+    // The indexed opcodes answer a float whatever the parameter is; the
+    // firmware rounds enums and masks to the nearest integer on the way in
+    // (tube.c:122-212), so round them back the same way here.
+    if repr == Repr::F32 && !matches!(d.kind, Kind::Float { .. }) {
+        let f = Repr::F32
+            .decode(bytes)
+            .and_then(|v| v.as_f32())
+            .unwrap_or(0.0);
+        return match d.kind {
+            Kind::Bool => Value::Bool(f != 0.0),
+            Kind::Choice(_) => Value::Choice(f.round().clamp(0.0, 255.0) as u8),
+            Kind::Mask => Value::Mask(f.round().max(0.0) as u32),
+            _ => Value::Int(f.round() as i64),
         };
     }
 
@@ -768,6 +805,8 @@ mod tests {
             serial: "TEST".into(),
             platform,
             firmware: "1.1.5".into(),
+            firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 5, 0),
+            build_info: None,
             wire_format: 26,
             num_channels: 17,
             num_inputs: 8,
@@ -988,6 +1027,110 @@ mod tests {
         assert_eq!(wvalue_for(slave, &[], &Value::Int(26)), 0x011A);
         assert_eq!(read_wvalue_for(master, &[]), 0);
         assert_eq!(read_wvalue_for(slave, &[]), 1);
+    }
+
+    /// The limiter packs `(output << 8) | index` both ways (limiter.h:11), and
+    /// output 0xFF is every output (limiter.h:21).
+    #[test]
+    fn the_limiter_packs_output_then_index() {
+        let threshold = by_path("limit.threshold").unwrap();
+        assert_eq!(wvalue_for(threshold, &[3], &Value::Float(-3.0)), 0x0301);
+        assert_eq!(read_wvalue_for(threshold, &[3]), 0x0301);
+        let link = by_path("limit.link").unwrap();
+        assert_eq!(wvalue_for(link, &[0xFF], &Value::Int(2)), 0xFF03);
+        assert_eq!(
+            read_wvalue_for(by_path("limit.meter").unwrap(), &[]),
+            0x0080
+        );
+    }
+
+    /// A tube or limiter boolean is still a float on the wire: a one-byte
+    /// payload is a short payload, which the firmware ignores (tube.c:122-212).
+    #[test]
+    fn indexed_booleans_are_sent_as_floats_and_read_back_as_booleans() {
+        let t = MockTransport::new().data(op::REQ_GET_TUBE_PARAM, 1.0f32.to_le_bytes().to_vec());
+        let log = t.log_handle();
+        let mut s = session(t, &[("tube_preamp", true)]);
+
+        let out = s.write("tube.on", &[], Value::Bool(true)).unwrap();
+        assert_eq!(out, Outcome::Confirmed(Value::Bool(true)));
+        let sent = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.opcode == op::REQ_SET_TUBE_PARAM)
+            .cloned()
+            .unwrap();
+        assert_eq!(sent.value, 0, "TUBE_PARAM_ENABLED");
+        assert_eq!(sent.payload, 1.0f32.to_le_bytes().to_vec());
+
+        // A mask rounds back from the float the device answers.
+        let t = MockTransport::new().data(op::REQ_GET_TUBE_PARAM, 3.0f32.to_le_bytes().to_vec());
+        let mut s = session(t, &[("tube_preamp", true)]);
+        assert_eq!(s.read("tube.mask", &[]).unwrap(), Value::Mask(3));
+        assert_eq!(s.read("tube.rectifier", &[]).unwrap(), Value::Choice(3));
+    }
+
+    /// The upmixer's indexed opcode takes a float for its switches too, and
+    /// stalls on anything shorter (upmix.h:185-186, vendor_commands.c:1829).
+    #[test]
+    fn the_upmixer_switch_is_sent_as_a_float() {
+        let t = MockTransport::new().data(op::REQ_UPMIX_GET_PARAM, 0.0f32.to_le_bytes().to_vec());
+        let log = t.log_handle();
+        let mut s = session(t, &[]);
+        s.write("up.on", &[], Value::Bool(false)).unwrap();
+        let sent = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.opcode == op::REQ_UPMIX_SET_PARAM)
+            .cloned()
+            .unwrap();
+        assert_eq!(sent.payload.len(), 4);
+    }
+
+    /// Every output at once is a write, never a read: the device stalls a
+    /// limiter GET of output 0xFF (limiter.h:21).
+    #[test]
+    fn every_output_is_writable_but_not_readable() {
+        let t = MockTransport::new().data(op::REQ_LIMITER, (-6.0f32).to_le_bytes().to_vec());
+        let log = t.log_handle();
+        let mut s = session(t, &[("output_limiter", true)]);
+
+        s.write("limit.threshold", &[0xFF], Value::Float(-6.0))
+            .unwrap();
+        let wrote = log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.opcode == op::REQ_LIMITER && e.value == 0xFF01 && !e.payload.is_empty());
+        assert!(wrote, "the all-outputs write went out as 0xFF01");
+
+        assert!(matches!(
+            s.read("limit.threshold", &[0xFF]),
+            Err(WriteError::BadTarget(0xFF, _))
+        ));
+        // One past the last output is still refused on either path.
+        assert!(s.write("limit.on", &[9], Value::Bool(true)).is_err());
+        assert!(s.read("limit.threshold", &[8]).is_ok());
+    }
+
+    /// The aux level is an 8.8 percentage (config.h:141-145).
+    #[test]
+    fn the_aux_level_travels_as_eight_dot_eight() {
+        let t = MockTransport::new().data(op::REQ_GET_CS_AUX_LEVEL, vec![0x00, 0x32]);
+        let log = t.log_handle();
+        let mut s = session(t, &[]);
+        let out = s.write("cs.aux.level", &[2], Value::Float(50.0)).unwrap();
+        assert_eq!(out, Outcome::Confirmed(Value::Float(50.0)));
+        let sent = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.opcode == op::REQ_SET_CS_AUX_LEVEL)
+            .cloned()
+            .unwrap();
+        assert_eq!((sent.value, sent.payload), (2, vec![0x00, 0x32]));
     }
 
     /// A read addresses the parameter but must never smuggle a value into wValue.
@@ -1601,6 +1744,8 @@ mod matrix_tests {
             serial: "T".into(),
             platform: Platform::Rp2350,
             firmware: "1.1.5".into(),
+            firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 5, 0),
+            build_info: None,
             wire_format: 26,
             num_channels: 17,
             num_inputs: 8,

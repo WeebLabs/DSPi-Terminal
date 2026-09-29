@@ -266,7 +266,7 @@ const WIRE_BAND_SIZE: usize = 16;
 /// This section is the one place where the packet changed shape at V28 without
 /// changing size: `spdif_rx_pin_ext` grew from two entries to three, so every
 /// field below it moved down one byte and the section's last reserved byte was
-/// consumed (bulk_params.h:203-233). `BULK_SIZE` is unchanged at 5944, so no
+/// consumed (bulk_params.h:203-233). `BULK_SIZE` stayed at 5944 across V28, so no
 /// size check can catch this: only these offsets can. A host that version-gates
 /// on packet size alone reads `i2s_clock_mode` where `spdif_rx_enabled_ext_p1`
 /// now lives and silently disables the extra S/PDIF inputs.
@@ -287,6 +287,69 @@ pub const INPUT_CONFIG_FIELDS: [(&str, usize, usize); 12] = [
     ("adat_input_enabled_p1", 14, 1),
     ("adat_clock_mode_p1", 15, 1),
 ];
+
+/// Byte offsets inside section 23, `WireSubharmParams`, 36 bytes at V30 and
+/// later (bulk_params.h:378-400). V29 carried only the first 16 bytes; V30
+/// appended the rest without moving anything.
+///
+/// The level comments in the header still say "-30..+6"; the firmware limit
+/// is `SUBHARM_LEVEL_MAX`, +12 dB (subharm.h:64-65). Solo is deliberately not
+/// on the wire (bulk_params.h:382-383).
+///
+/// `(name, offset from the section start, length)`.
+pub const SUBHARM_FIELDS: [(&str, usize, usize); 13] = [
+    ("enabled", 0, 1),
+    ("reserved0", 1, 1),
+    ("output_mask", 2, 2),
+    ("low_db", 4, 4),
+    ("high_db", 8, 4),
+    ("boost_db", 12, 4),
+    // V30 additions.
+    ("top_db", 16, 4),
+    ("select_depth", 20, 4),
+    ("select_hold_ms", 24, 4),
+    ("ceiling_db", 28, 4),
+    ("select_mode", 32, 1),
+    ("link_pairs", 33, 1),
+    ("reserved1", 34, 2),
+];
+
+/// Byte offsets inside section 24, `WireTubeParams`, 48 bytes from V31
+/// (bulk_params.h:403-427). The four bytes come first, then the mask, then
+/// ten floats of which the last is reserved.
+pub const TUBE_FIELDS: [(&str, usize, usize); 16] = [
+    ("enabled", 0, 1),
+    ("tube_type", 1, 1),
+    ("rectifier", 2, 1),
+    ("xfmr_enabled", 3, 1),
+    ("output_mask", 4, 2),
+    ("reserved", 6, 2),
+    ("drive_db", 8, 4),
+    ("bias_pct", 12, 4),
+    ("asym_db", 16, 4),
+    ("hardness_pct", 20, 4),
+    ("sag_pct", 24, 4),
+    ("xfmr_damping", 28, 4),
+    ("xfmr_res_hz", 32, 4),
+    ("mix_pct", 36, 4),
+    ("trim_db", 40, 4),
+    ("reserved_f", 44, 4),
+];
+
+/// Byte offsets inside one `WireLimiterOutput`, 12 bytes (bulk_params.h:
+/// 436-442). Section 25 is `WIRE_MAX_OUTPUT_CHANNELS` of these back to back
+/// (bulk_params.h:444-446), so output `k` starts at `12 * k`. Records past the
+/// device's output count read zero and are ignored on a write.
+pub const LIMITER_OUTPUT_FIELDS: [(&str, usize, usize); 5] = [
+    ("enabled", 0, 1),
+    ("link_group", 1, 1),
+    ("reserved", 2, 2),
+    ("threshold_db", 4, 4),
+    ("release_ms", 8, 4),
+];
+
+/// Size of one `WireLimiterOutput` record (bulk_params.h:442).
+pub const LIMITER_OUTPUT_LEN: usize = 12;
 
 /// Section 15 decoded, with every `+1` sentinel resolved.
 ///
@@ -396,8 +459,11 @@ mod tests {
         b
     }
 
+    /// The version this build implements (bulk_params.h:34).
+    const V: u8 = WIRE_FORMAT_VERSION as u8;
+
     fn valid() -> Vec<u8> {
-        header_bytes(28, 8, 9, 17, generated::BULK_SIZE as u16)
+        header_bytes(V, 8, 9, 17, generated::BULK_SIZE as u16)
     }
 
     /// One `WireBandParams`: type, bypass, the reserved pair, then the floats.
@@ -531,15 +597,132 @@ mod tests {
             BulkPacket::decode(older),
             Err(WireError::UnsupportedVersion {
                 got: 14,
-                expected: 28
+                expected: 32
             })
         );
 
-        let newer = header_bytes(29, 8, 9, 17, generated::BULK_SIZE as u16);
+        let newer = header_bytes(33, 8, 9, 17, generated::BULK_SIZE as u16);
         assert!(matches!(
             BulkPacket::decode(newer),
-            Err(WireError::UnsupportedVersion { got: 29, .. })
+            Err(WireError::UnsupportedVersion { got: 33, .. })
         ));
+    }
+
+    /// A beta2 or beta3 device (V28 to V31) is the likeliest mismatch in the
+    /// field. Its header alone is enough to refuse it, before any offset past
+    /// the header is read: the V32 sections do not exist in its packet.
+    #[test]
+    fn a_v28_header_is_refused_on_its_own() {
+        for old in [28u8, 29, 30, 31] {
+            let mut b = header_bytes(old, 8, 9, 17, 5944);
+            b.truncate(WireHeader::LEN);
+            assert_eq!(
+                WireHeader::decode(&b),
+                Err(WireError::UnsupportedVersion {
+                    got: old,
+                    expected: 32
+                })
+            );
+        }
+        let mut current = valid();
+        current.truncate(WireHeader::LEN);
+        assert_eq!(WireHeader::decode(&current).unwrap().format_version, 32);
+    }
+
+    fn assert_contiguous(name: &str, fields: &[(&str, usize, usize)], len: usize) {
+        let mut at = 0;
+        for (field, off, n) in fields {
+            assert_eq!(
+                *off, at,
+                "{name}.{field} is not where the previous field ends"
+            );
+            at += n;
+        }
+        assert_eq!(at, len, "{name} fields do not fill the section");
+    }
+
+    fn at(fields: &[(&'static str, usize, usize)], name: &str) -> usize {
+        fields.iter().find(|(n, _, _)| *n == name).unwrap().1
+    }
+
+    /// `WireSubharmParams` at 5944 (bulk_params.h:378-400): the V29 fields
+    /// first, then the V30 tail, 36 bytes in all.
+    #[test]
+    fn the_subharm_fields_are_where_the_header_puts_them() {
+        assert_contiguous("subharm", &SUBHARM_FIELDS, generated::LEN_SUBHARM);
+        let abs = |f: &str| generated::OFF_SUBHARM + at(&SUBHARM_FIELDS, f);
+        assert_eq!(abs("enabled"), 5944);
+        assert_eq!(abs("output_mask"), 5946);
+        assert_eq!(abs("low_db"), 5948);
+        assert_eq!(abs("high_db"), 5952);
+        assert_eq!(abs("boost_db"), 5956);
+        assert_eq!(abs("top_db"), 5960);
+        assert_eq!(abs("select_depth"), 5964);
+        assert_eq!(abs("select_hold_ms"), 5968);
+        assert_eq!(abs("ceiling_db"), 5972);
+        assert_eq!(abs("select_mode"), 5976);
+        assert_eq!(abs("link_pairs"), 5977);
+        assert_eq!(abs("reserved1"), 5978);
+    }
+
+    /// `WireTubeParams` at 5980 (bulk_params.h:403-427).
+    #[test]
+    fn the_tube_fields_are_where_the_header_puts_them() {
+        assert_contiguous("tube", &TUBE_FIELDS, generated::LEN_TUBE);
+        let abs = |f: &str| generated::OFF_TUBE + at(&TUBE_FIELDS, f);
+        assert_eq!(abs("enabled"), 5980);
+        assert_eq!(abs("tube_type"), 5981);
+        assert_eq!(abs("rectifier"), 5982);
+        assert_eq!(abs("xfmr_enabled"), 5983);
+        assert_eq!(abs("output_mask"), 5984);
+        assert_eq!(abs("drive_db"), 5988);
+        assert_eq!(abs("bias_pct"), 5992);
+        assert_eq!(abs("asym_db"), 5996);
+        assert_eq!(abs("hardness_pct"), 6000);
+        assert_eq!(abs("sag_pct"), 6004);
+        assert_eq!(abs("xfmr_damping"), 6008);
+        assert_eq!(abs("xfmr_res_hz"), 6012);
+        assert_eq!(abs("mix_pct"), 6016);
+        assert_eq!(abs("trim_db"), 6020);
+        assert_eq!(abs("reserved_f"), 6024);
+    }
+
+    /// `WireLimiterParams` at 6028: nine 12-byte records, output `k` at
+    /// `6028 + 12k` (bulk_params.h:430-446).
+    #[test]
+    fn the_limiter_records_are_where_the_header_puts_them() {
+        assert_contiguous("limiter output", &LIMITER_OUTPUT_FIELDS, LIMITER_OUTPUT_LEN);
+        assert_eq!(
+            generated::LEN_LIMITER,
+            LIMITER_OUTPUT_LEN * generated::wire::WIRE_MAX_OUTPUT_CHANNELS as usize
+        );
+        let abs = |k: usize, f: &str| {
+            generated::OFF_LIMITER + LIMITER_OUTPUT_LEN * k + at(&LIMITER_OUTPUT_FIELDS, f)
+        };
+        assert_eq!(abs(0, "enabled"), 6028);
+        assert_eq!(abs(0, "link_group"), 6029);
+        assert_eq!(abs(0, "threshold_db"), 6032);
+        assert_eq!(abs(0, "release_ms"), 6036);
+        assert_eq!(abs(1, "enabled"), 6040);
+        assert_eq!(abs(8, "release_ms"), 6132);
+        assert_eq!(abs(8, "release_ms") + 4, generated::BULK_SIZE);
+    }
+
+    /// A notification into one of the new sections routes by offset like any
+    /// other: this is how a tube or limiter change from a control surface lands.
+    #[test]
+    fn notifications_route_into_the_v32_sections() {
+        assert_eq!(BulkPacket::section_at(5944), Some("subharm"));
+        assert_eq!(BulkPacket::section_at(5979), Some("subharm"));
+        assert_eq!(BulkPacket::section_at(5980), Some("tube"));
+        assert_eq!(BulkPacket::section_at(6028), Some("limiter"));
+        assert_eq!(BulkPacket::section_at(6135), Some("limiter"));
+        let mut p = BulkPacket::decode(valid()).unwrap();
+        assert_eq!(p.patch(6032, &(-3.0f32).to_le_bytes()), Some("limiter"));
+        assert_eq!(
+            &p.section("limiter").unwrap()[4..8],
+            &(-3.0f32).to_le_bytes()
+        );
     }
 
     #[test]
@@ -554,7 +737,7 @@ mod tests {
 
     #[test]
     fn rejects_an_inconsistent_header() {
-        let bad = header_bytes(28, 8, 9, 11, generated::BULK_SIZE as u16);
+        let bad = header_bytes(V, 8, 9, 11, generated::BULK_SIZE as u16);
         assert_eq!(
             BulkPacket::decode(bad),
             Err(WireError::InconsistentHeader {
@@ -567,12 +750,12 @@ mod tests {
 
     #[test]
     fn detects_a_torn_read_via_payload_length() {
-        let bad = header_bytes(28, 8, 9, 17, 3664);
+        let bad = header_bytes(V, 8, 9, 17, 3664);
         assert_eq!(
             BulkPacket::decode(bad),
             Err(WireError::LengthMismatch {
                 stated: 3664,
-                actual: 5944
+                actual: generated::BULK_SIZE
             })
         );
     }
@@ -625,7 +808,7 @@ mod tests {
     }
 
     /// V28 is the change no size check can catch: the section is still 16 bytes
-    /// and `BULK_SIZE` is still 5944, but `spdif_rx_pin_ext` grew from two
+    /// and `BULK_SIZE` stayed at 5944, but `spdif_rx_pin_ext` grew from two
     /// entries to three and pushed the five fields below it down one byte
     /// (bulk_params.h:203-233). Every offset is pinned by name here, because
     /// getting one wrong reads a GPIO as a clock mode and looks plausible.
@@ -713,7 +896,7 @@ mod tests {
     /// S/PDIF enable mask as a clock mode and vice versa.
     #[test]
     fn the_v28_shift_would_be_invisible_to_a_size_check() {
-        assert_eq!(generated::BULK_SIZE, 5944, "unchanged from V26");
+        assert_eq!(generated::OFF_INPUT_CONFIG, 4716, "unchanged from V26");
         assert_eq!(generated::LEN_INPUT_CONFIG, 16, "unchanged from V26");
 
         let field = |name: &str| {
