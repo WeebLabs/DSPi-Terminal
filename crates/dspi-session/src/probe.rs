@@ -466,7 +466,7 @@ mod tests {
 
     fn bulk_bytes() -> Vec<u8> {
         let mut b = vec![0u8; generated::BULK_SIZE];
-        b[0] = 28; // wire V28
+        b[0] = generated::wire::WIRE_FORMAT_VERSION as u8;
         b[1] = 1; // RP2350
         b[2] = 17; // channels
         b[3] = 9; // outputs
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(caps.num_inputs, 8);
         assert_eq!(caps.num_outputs, 9);
         assert_eq!(caps.firmware, "1.1.6");
-        assert_eq!(caps.wire_format, 28);
+        assert_eq!(caps.wire_format, 32);
         assert_eq!(caps.active_preset, Some(3));
     }
 

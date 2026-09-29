@@ -409,7 +409,7 @@ mod tests {
             serial: "MOCK".into(),
             platform,
             firmware: "1.1.6".into(),
-            wire_format: 28,
+            wire_format: dspi_proto::generated::wire::WIRE_FORMAT_VERSION as u8,
             num_channels: num_inputs + num_outputs,
             num_inputs,
             num_outputs,
@@ -450,7 +450,7 @@ mod tests {
     impl Device {
         fn new() -> Self {
             let mut bytes = vec![0u8; generated::BULK_SIZE];
-            bytes[0] = 28; // wire V28
+            bytes[0] = generated::wire::WIRE_FORMAT_VERSION as u8;
             bytes[1] = 1; // RP2350
             bytes[2] = 17;
             bytes[3] = 9;

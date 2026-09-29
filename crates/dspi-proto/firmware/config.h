@@ -128,10 +128,34 @@ extern volatile uint32_t nominal_feedback_10_14;
 // tud_vendor_control_xfer_cb in vendor_commands.c.
 #define MS_VENDOR_CODE      0x01
 
+// Control Surfaces auxiliary outputs (caps v18); see control_surfaces.h and
+// Documentation/Features/control_surfaces_aux_spec.md.  wValue is the binding
+// slot holding the aux component.  0x01 is MS_VENDOR_CODE above, intercepted
+// in tud_vendor_control_xfer_cb before the application dispatcher sees it;
+// 0x00, 0x02 and 0x03 stay unallocated.
+#define REQ_SET_CS_AUX_STATE        0x04  // wValue = slot, 1 byte 0/1; immediate, runtime
+                                          // only; STALL unless the slot is an aux output
+#define REQ_GET_CS_AUX_STATE        0x05  // wValue = slot: 1 byte (STALL if not an aux);
+                                          // wValue = 0xFFFF: 48 bytes {state[16],
+                                          // level_q8[16] LE}, zeros on non-aux slots
+#define REQ_SET_CS_AUX_LEVEL        0x06  // wValue = slot, 2 bytes 8.8 percent LE, clamped
+                                          // to 100 %; STALL unless a CS_TYPE_AUX_PWM slot
+#define REQ_GET_CS_AUX_LEVEL        0x07  // wValue = slot; 2 bytes 8.8 percent LE (0 on
+                                          // AUX_OUT; STALL if not an aux)
+
+// Spectrum analyser (RTA / FFT).  Documentation/Features/spectrum_analyser_spec.md
+#define REQ_RTA_SET_CONFIG          0x08  // 12-byte RtaConfig; STALL on invalid
+#define REQ_RTA_GET_CONFIG          0x09  // returns RtaConfig (12 B)
+#define REQ_RTA_GET_CAPS            0x0A  // wValue 0 = RtaCaps (16 B); 1.. = band centre chunks
+#define REQ_RTA_GET_BANDS           0x0B  // wValue = channel; returns RtaBandFrame (82 B)
+#define REQ_RTA_GET_BINS            0x0C  // wValue = byte offset into the bin frame
+#define REQ_RTA_GET_STATUS          0x0D  // returns RtaStatus (24 B)
+#define REQ_RTA_CONTROL             0x0E  // wValue = RTA_CTL_*; returns 1 byte
+#define REQ_RTA_GET_BANDS_ALL       0x0F  // USB only: every live channel's RtaBandFrame
+
 // Control Surfaces target groups and macros (caps v9); see control_surfaces.h
-// and Documentation/Features/control_surfaces_groups_macros_spec.md.  The rest
-// of 0x00-0x1F stays unallocated; 0x01 is MS_VENDOR_CODE above, intercepted in
-// tud_vendor_control_xfer_cb before the application dispatcher sees it.
+// and Documentation/Features/control_surfaces_groups_macros_spec.md.  0x10-0x1F
+// and 0x2C-0x2F hold the subharmonic synthesizer (below).
 #define REQ_SET_CS_GROUP            0x20  // wValue = group (0-7), payload = 40-byte CsGroup;
                                           // all-zero record clears the slot
 #define REQ_GET_CS_GROUP            0x21  // wValue = group (0-7); returns 40-byte CsGroup
@@ -155,6 +179,36 @@ extern volatile uint32_t nominal_feedback_10_14;
                                           // CsDisplayPage
 #define REQ_GET_CS_DISPLAY_STATUS   0x2B  // returns 8-byte CsDisplayStatus
 
+// Subharmonic synthesizer (dbx-style octave divider; subharm.h).  First
+// application block allocated inside 0x00-0x1F.
+#define REQ_SET_SUBHARM             0x10  // 1 byte 0/1
+#define REQ_GET_SUBHARM             0x11
+#define REQ_SET_SUBHARM_LOW         0x12  // float dB, 24-36 Hz band level
+#define REQ_GET_SUBHARM_LOW         0x13
+#define REQ_SET_SUBHARM_HIGH        0x14  // float dB, 36-56 Hz band level
+#define REQ_GET_SUBHARM_HIGH        0x15
+#define REQ_SET_SUBHARM_BOOST       0x16  // float dB, LF boost bell
+#define REQ_GET_SUBHARM_BOOST       0x17
+#define REQ_SET_SUBHARM_MASK        0x18  // uint16 LE output mask
+#define REQ_GET_SUBHARM_MASK        0x19
+#define REQ_GET_SUBHARM_HEADROOM    0x1A  // float dB: preamp headroom to free
+// The block continues in the free ranges 0x1B-0x1F, 0x2C-0x2F and 0xA9-0xAE.
+#define REQ_SET_SUBHARM_TOP         0x1B  // float dB, 56-80 Hz band level
+#define REQ_GET_SUBHARM_TOP         0x1C
+#define REQ_SET_SUBHARM_SELECT      0x1D  // 1 byte SUBHARM_SELECT_* mode
+#define REQ_GET_SUBHARM_SELECT      0x1E
+#define REQ_GET_SUBHARM_METER       0x1F  // NUM_OUTPUT_CHANNELS x uint16 LE sub peaks
+#define REQ_SET_SUBHARM_SOLO        0x2C  // 1 byte 0/1; runtime only, never persisted
+#define REQ_GET_SUBHARM_SOLO        0x2D
+#define REQ_SET_SUBHARM_LINK        0x2E  // 1 byte 0/1, pair-linked synthesis
+#define REQ_GET_SUBHARM_LINK        0x2F
+#define REQ_SET_SUBHARM_DEPTH       0xA9  // float %, selectivity depth
+#define REQ_GET_SUBHARM_DEPTH       0xAA
+#define REQ_SET_SUBHARM_HOLD        0xAB  // float ms, selectivity hold time
+#define REQ_GET_SUBHARM_HOLD        0xAC
+#define REQ_SET_SUBHARM_CEILING     0xAD  // float dBFS sub ceiling (0 = off)
+#define REQ_GET_SUBHARM_CEILING     0xAE
+
 // Psychoacoustic bass enhancement (missing-fundamental harmonics; psybass.h)
 #define REQ_SET_PSYBASS             0x30
 #define REQ_GET_PSYBASS             0x31
@@ -170,6 +224,16 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_PSYBASS_ORIGINAL    0x3B
 #define REQ_SET_PSYBASS_MASK        0x3C
 #define REQ_GET_PSYBASS_MASK        0x3D
+
+// Tube preamp emulation (indexed parameter access; tube.h).  One SET/GET pair
+// covers every parameter, so adding one must not add an opcode here.
+#define REQ_SET_TUBE_PARAM          0x3E  // wValue low byte = index (tube.h TUBE_PARAM_*), 4-byte float32 LE
+#define REQ_GET_TUBE_PARAM          0x3F  // wValue low byte = index, returns 4-byte float32 LE
+
+// Output limiter (limiter.h).  One opcode for everything: OUT sets, IN gets.
+// wValue = (output << 8) | index; SET payload and GET reply are float32 LE,
+// except the read-only GET blocks LIMITER_GET_METER / LIMITER_GET_STATUS.
+#define REQ_LIMITER                 0x81
 
 // Vendor Request Commands (EP0 control transfers)
 #define REQ_SET_EQ_PARAM    0x42
@@ -193,10 +257,10 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_STATUS      0x50
 #define REQ_SAVE_PARAMS     0x51
 // REQ_SAVE_OUTPUT_CONFIG (0x52): persist the live physical IO/output configuration
-// (output pins, output types, I2S MCK/BCK, SPDIF RX pin) into the directory's
-// device-global block.  Used in OUTPUT_CONFIG_MODE_INDEPENDENT (the "stored
-// independently, like master volume" mode); accepted but dormant in WITH_PRESET
-// mode.  No payload.
+// (output pins, output types, I2S MCK/BCK, SPDIF RX pin) and the output limiter
+// settings into the directory's device-global blocks.  Used in
+// OUTPUT_CONFIG_MODE_INDEPENDENT (the "stored independently, like master
+// volume" mode); accepted but dormant in WITH_PRESET mode.  No payload.
 //
 // Reassigned from the former REQ_LOAD_PARAMS — a deprecated synchronous "revert
 // to saved" that ran flash_load_params()->preset_load() in the USB control/IRQ
@@ -259,6 +323,8 @@ extern volatile uint32_t nominal_feedback_10_14;
 // Device Identification Commands
 #define REQ_GET_SERIAL              0x7E
 #define REQ_GET_PLATFORM            0x7F
+#define REQ_GET_BUILD_INFO          0x80  // 64-byte git-describe/date blob; provenance for
+                                          // humans only, no software may gate on it
 
 // Clip Detection Commands
 #define REQ_CLEAR_CLIPS             0x83
@@ -586,11 +652,19 @@ typedef struct __attribute__((packed)) {
 #define PLATFORM_RP2040             0
 #define PLATFORM_RP2350             1
 
-// Firmware version (BCD encoded: major in high byte, minor.patch in low byte)
+// Firmware version.  The packed form squeezes minor and patch into one nibble
+// each (plain nibble packing, not BCD; no carry), so each caps at 15.  It only
+// feeds the legacy bytes of REQ_GET_PLATFORM; see
+// Documentation/Features/firmware_versioning_spec.md.
 #define FW_VERSION_MAJOR            1
 #define FW_VERSION_MINOR            1
 #define FW_VERSION_PATCH            6
-#define FW_VERSION_BCD              ((FW_VERSION_MAJOR << 8) | (FW_VERSION_MINOR << 4) | FW_VERSION_PATCH)
+#define FW_VERSION_PACKED           ((FW_VERSION_MAJOR << 8) | (FW_VERSION_MINOR << 4) | FW_VERSION_PATCH)
+
+// Pre-release ordinal: 0 = final release, 1..255 = beta N of this patch.  Betas
+// share their patch number, so this byte is the only thing telling two of them
+// apart; it must be zeroed in the same commit that tags the final release.
+#define FW_VERSION_BETA             4
 
 // Universal "reset to default" escape hatch for every single-pin SET command
 // (REQ_SET_OUTPUT_PIN, REQ_SET_I2S_BCK_PIN, REQ_SET_MCK_PIN, REQ_SET_ADAT_PIN,
@@ -809,6 +883,14 @@ typedef struct {
     // Psychoacoustic bass snapshot for THIS packet; same single-view rationale.
     const void       *psybass_coeffs;  // PsybassCoeffs or NULL = off
     uint16_t          psybass_mask;    // Bit k = process output k
+    // Subharmonic synthesizer snapshot for THIS packet; same single-view rationale.
+    const void       *subharm_coeffs;  // SubharmCoeffs or NULL = off
+    uint16_t          subharm_mask;    // Bit k = process output k
+    uint8_t           subharm_flags;   // SUBHARM_FLAG_* (link pairs, solo)
+    uint8_t           subharm_phase;   // decimation phase at packet start
+    // Tube preamp snapshot for THIS packet; same single-view rationale.
+    const void       *tube_coeffs;     // TubeCoeffs or NULL = off
+    uint16_t          tube_mask;       // Bit k = process output k
 } Core1EqWork;
 
 // ----------------------------------------------------------------------------

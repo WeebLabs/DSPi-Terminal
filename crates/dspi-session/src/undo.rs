@@ -190,7 +190,7 @@ mod tests {
             serial: "TEST".into(),
             platform: Platform::Rp2350,
             firmware: "1.1.6".into(),
-            wire_format: 28,
+            wire_format: dspi_proto::generated::wire::WIRE_FORMAT_VERSION as u8,
             num_channels: 17,
             num_inputs: 8,
             num_outputs: 9,

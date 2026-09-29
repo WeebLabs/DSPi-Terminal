@@ -13,7 +13,7 @@ pub mod complete;
 pub mod shell;
 
 use dspi_proto::packets::{FieldKind, PacketSpec, spec_for_path};
-use dspi_proto::registry::{Kind, ParamDesc, Target, by_path};
+use dspi_proto::registry::{ALL_OUTPUTS, Kind, ParamDesc, Target, by_path};
 use dspi_proto::value::Value;
 
 pub use complete::{Candidate, complete};
@@ -496,6 +496,8 @@ fn parse_indices(d: &ParamDesc, tokens: &[&str], ctx: &Context) -> Result<Vec<u8
                 .channel(tok)
                 .ok_or_else(|| ParseError::UnknownChannel((*tok).into()))?,
             (Target::ChannelBand, 1) => parse_band(tok, ctx)?,
+            // The limiter's every-output address (limiter.h:21).
+            (Target::OutputOrAll, 0) if tok.eq_ignore_ascii_case("all") => ALL_OUTPUTS,
             _ => tok.parse::<u8>().map_err(|_| ParseError::BadValue {
                 path: d.path.into(),
                 value: (*tok).into(),
@@ -674,6 +676,7 @@ fn format_index(path: &str, position: usize, index: u8, ctx: &Context) -> String
             .cloned()
             .unwrap_or_else(|| index.to_string()),
         (Target::ChannelBand, 1) => display_band(index),
+        (Target::OutputOrAll, 0) if index == ALL_OUTPUTS => "all".to_string(),
         _ => index.to_string(),
     }
 }
@@ -853,6 +856,27 @@ mod tests {
             "the codes are case-insensitive"
         );
         assert!(p("eq pdm 20 lr3lp 80").is_err(), "LR has no third order");
+    }
+
+    /// The limiter can address every output at once (limiter.h:21), and the
+    /// word for that round-trips through the echo line.
+    #[test]
+    fn a_limiter_write_can_name_every_output() {
+        let cmd = p("limit.threshold all -3").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Set {
+                path: "limit.threshold",
+                indices: vec![0xFF],
+                value: Value::Float(-3.0)
+            }
+        );
+        assert_eq!(format(&cmd, &ctx()), "limit.threshold all -3");
+        assert!(matches!(
+            p("limit.on 4 on"),
+            Ok(Command::Set { indices, .. }) if indices == vec![4]
+        ));
+        assert!(p("out.gain all -3").is_err(), "only the limiter has an all");
     }
 
     #[test]
