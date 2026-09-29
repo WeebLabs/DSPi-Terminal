@@ -41,6 +41,18 @@ pub enum PacketError {
         value: String,
         expected: String,
     },
+
+    #[error("{what} is protocol version {got}; this build reads version {want}")]
+    Version {
+        what: &'static str,
+        got: u8,
+        want: u8,
+    },
+
+    /// A record read in pieces changed between the pieces: its head and tail
+    /// sequence numbers disagree. Read it again.
+    #[error("the frame changed while it was read (head {head}, tail {tail})")]
+    Torn { head: u8, tail: u8 },
 }
 
 // ---------------------------------------------------------------- primitives
@@ -111,7 +123,7 @@ fn put_name(b: &mut [u8], o: usize, len: usize, name: &str) {
 pub const GPIO_UNUSED: u8 = 0xFF;
 
 /// One binding, 24 bytes, identical on the wire and in flash
-/// (control_surfaces.h:370-395).
+/// (control_surfaces.h:445-471).
 ///
 /// The header calls byte 0 `type`, which is a Rust keyword; it is `component`
 /// here, the word the app already shows in its own column header.
@@ -139,6 +151,10 @@ pub struct CsBinding {
     /// Indicator condition timing, 0.1 s units, 0 = immediate.
     pub on_delay: u16,
     pub off_delay: u16,
+    /// Type-specific flags, claimed from the reserved pair at caps v18
+    /// (control_surfaces.h:468-470): the `aux_extras` bits on an auxiliary
+    /// output, and 0 on every other type. Byte 23 stays reserved and zero.
+    pub extras: u8,
 }
 
 impl CsBinding {
@@ -166,7 +182,8 @@ impl CsBinding {
         put_i16(&mut b, 16, self.range_max);
         put_u16(&mut b, 18, self.on_delay);
         put_u16(&mut b, 20, self.off_delay);
-        // 22-23 reserved2, written as zero.
+        b[22] = self.extras;
+        // 23 reserved2, written as zero.
         b
     }
 
@@ -188,6 +205,7 @@ impl CsBinding {
             range_max: i16at(b, 16),
             on_delay: u16at(b, 18),
             off_delay: u16at(b, 20),
+            extras: b[22],
         })
     }
 
@@ -796,7 +814,7 @@ impl CsStatusPacket {
 }
 
 /// One entry of the capability type table, 4 bytes
-/// (control_surfaces.h:555-559).
+/// (control_surfaces.h:631-635).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CsTypeDesc {
     /// `CS_ACT_BIT` mask of the actions this component can drive.
@@ -828,9 +846,11 @@ impl CsTypeDesc {
     }
 }
 
-/// `REQ_GET_CS_CAPS` with `wValue = 0xFFFF` (control_surfaces.h:561-576).
+/// `REQ_GET_CS_CAPS` with `wValue = 0xFFFF` (control_surfaces.h:637-652).
 ///
-/// 44 bytes at caps v10 and later, but the size is not a constant: the four
+/// 44 bytes at caps v10 to v17 and 52 from v18, when the two auxiliary output
+/// types took `type_count` to 11 (control_surfaces.h:141-145, 652). The size
+/// is not a constant: the four
 /// maxima sit at `4 + 4*type_count`, after a table that is meant to grow. A
 /// host that hardcodes the offset reads the display type's descriptor as
 /// `max_ir_commands` and gets a plausible small number.
@@ -854,6 +874,8 @@ impl CsCapsHeader {
     pub const MIN_SIZE: usize = 4;
     /// What v1.1.6 answers: 4 + 4*9 types + 4 maxima.
     pub const SIZE_AT_V13: usize = 44;
+    /// What beta4 answers: 4 + 4*11 types + 4 maxima (control_surfaces.h:652).
+    pub const SIZE_AT_V20: usize = 52;
 
     pub fn wire_len(type_count: u8) -> usize {
         Self::MIN_SIZE + CsTypeDesc::SIZE * type_count as usize + 4
@@ -909,7 +931,7 @@ impl CsCapsHeader {
     }
 }
 
-/// One noun descriptor, 12 bytes (control_surfaces.h:578-589).
+/// One noun descriptor, 12 bytes (control_surfaces.h:654-665).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CsNounDesc {
     /// `CS_KIND_CONTINUOUS` / `_BOOL` / `_ENUM`.
@@ -2287,48 +2309,762 @@ impl SystemStatus {
     }
 }
 
-/// `REQ_GET_PLATFORM`, 4 bytes (config.h:264).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+// ------------------------------------------------------------ identification
+
+/// The pre-release part of a firmware version (config.h:664-667).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum Prerelease {
+    /// A final release: the beta byte is 0.
+    Final,
+    /// Beta N of its patch, 1 to 255.
+    Beta(u8),
+    /// A beta built before the ordinal existed. It answers GET_PLATFORM short
+    /// and so claims to be a final release it cannot be (the Console's
+    /// `FirmwareVersion.earlyBeta`). 1.1.6 beta 1 and beta 2 are the ones.
+    EarlyBeta,
+}
+
+/// A firmware release: three plain numbers and a pre-release ordinal
+/// (config.h:655-667, `Documentation/Features/firmware_versioning_spec.md`).
+///
+/// Ordered by `(major, minor, patch, beta == 0 ? 256 : beta)`, because a beta
+/// comes before the final release of its patch although final is encoded as
+/// 0 (firmware_versioning_spec.md:111). An early beta sorts below every
+/// numbered beta, as the Console sorts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FirmwareVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+    pub pre: Prerelease,
+}
+
+impl FirmwareVersion {
+    /// The first release whose every build reports the beta ordinal; a short
+    /// GET_PLATFORM reply claiming this or later is an early beta, not a final
+    /// release (the Console's `FirmwareVersion.firstWithOrdinal`).
+    pub const FIRST_WITH_ORDINAL: (u8, u8, u8) = (1, 1, 6);
+
+    /// `beta` as the wire carries it: 0 is final.
+    pub fn new(major: u8, minor: u8, patch: u8, beta: u8) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            pre: match beta {
+                0 => Prerelease::Final,
+                n => Prerelease::Beta(n),
+            },
+        }
+    }
+
+    /// The release the vendored headers describe (config.h:659-667): what this
+    /// build speaks, and what a refused device is told to update to.
+    pub fn expected() -> Self {
+        use crate::generated::firmware::*;
+        Self::new(
+            FW_VERSION_MAJOR as u8,
+            FW_VERSION_MINOR as u8,
+            FW_VERSION_PATCH as u8,
+            FW_VERSION_BETA as u8,
+        )
+    }
+
+    /// The beta ordinal as the wire carries it; an early beta has none.
+    pub fn beta(&self) -> Option<u8> {
+        match self.pre {
+            Prerelease::Final => Some(0),
+            Prerelease::Beta(n) => Some(n),
+            Prerelease::EarlyBeta => None,
+        }
+    }
+
+    fn sort_key(&self) -> (u8, u8, u8, u16) {
+        let rank = match self.pre {
+            Prerelease::Final => 256,
+            Prerelease::Beta(n) => n as u16,
+            Prerelease::EarlyBeta => 0,
+        };
+        (self.major, self.minor, self.patch, rank)
+    }
+}
+
+impl PartialOrd for FirmwareVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FirmwareVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key().cmp(&other.sort_key())
+    }
+}
+
+/// "1.1.6", "1.1.6 beta 4" or "1.1.6 early beta", the Console's spelling.
+impl std::fmt::Display for FirmwareVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        match self.pre {
+            Prerelease::Final => Ok(()),
+            Prerelease::Beta(n) => write!(f, " beta {n}"),
+            Prerelease::EarlyBeta => write!(f, " early beta"),
+        }
+    }
+}
+
+/// `REQ_GET_PLATFORM` (config.h:325, vendor_commands.c:2638-2655): asked for
+/// with a length of 7, answered with as many bytes as the firmware knows.
+///
+/// `[0]` platform, `[1]` major, `[2]` legacy `(minor << 4) | patch`, `[3]`
+/// output count, `[4]` minor, `[5]` patch, `[6]` beta ordinal. Older firmware
+/// answers 4 or 6 bytes. The decode follows the host rule of
+/// firmware_versioning_spec.md:109: minor and patch from bytes 4 and 5 when
+/// at least 6 arrive, else from the nibbles, never mixing the two; beta from
+/// byte 6 when 7 arrive. A short reply that claims 1.1.6 or later is an early
+/// beta, as the Console reads it, rather than the final release it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformInfo {
     pub platform_id: u8,
-    pub fw_major: u8,
-    /// Minor and patch packed one nibble each.
-    pub fw_minor_patch_bcd: u8,
     pub num_output_channels: u8,
+    pub version: FirmwareVersion,
+    /// How many bytes the device answered: 4, 6 or 7.
+    pub reply_len: usize,
 }
 
 impl PlatformInfo {
-    pub const SIZE: usize = 4;
+    /// What to ask for (firmware_versioning_spec.md:109).
+    pub const REQUEST_LEN: usize = 7;
+    /// The oldest reply, and the least that identifies a device.
+    pub const MIN_LEN: usize = 4;
 
     pub fn platform(&self) -> Platform {
         Platform::from_id(self.platform_id)
     }
 
+    /// The version as the Console spells it.
     pub fn firmware(&self) -> String {
-        format!(
-            "{}.{}.{}",
-            self.fw_major,
-            self.fw_minor_patch_bcd >> 4,
-            self.fw_minor_patch_bcd & 0x0F
-        )
+        self.version.to_string()
     }
 
-    pub fn encode(&self) -> [u8; Self::SIZE] {
+    /// The full 7-byte reply this firmware would send.
+    pub fn encode(&self) -> [u8; Self::REQUEST_LEN] {
+        let v = &self.version;
         [
             self.platform_id,
-            self.fw_major,
-            self.fw_minor_patch_bcd,
+            v.major,
+            (v.minor << 4) | (v.patch & 0x0F),
             self.num_output_channels,
+            v.minor,
+            v.patch,
+            v.beta().unwrap_or(0),
         ]
     }
 
     pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
-        need(b, Self::SIZE, "PlatformInfo")?;
+        need(b, Self::MIN_LEN, "PlatformInfo")?;
+        let major = b[1];
+        let (minor, patch) = if b.len() >= 6 {
+            (b[4], b[5])
+        } else {
+            (b[2] >> 4, b[2] & 0x0F)
+        };
+        let version = if b.len() >= 7 {
+            FirmwareVersion::new(major, minor, patch, b[6])
+        } else if (major, minor, patch) >= FirmwareVersion::FIRST_WITH_ORDINAL {
+            FirmwareVersion {
+                major,
+                minor,
+                patch,
+                pre: Prerelease::EarlyBeta,
+            }
+        } else {
+            FirmwareVersion::new(major, minor, patch, 0)
+        };
         Ok(Self {
             platform_id: b[0],
-            fw_major: b[1],
-            fw_minor_patch_bcd: b[2],
             num_output_channels: b[3],
+            version,
+            reply_len: b.len().min(Self::REQUEST_LEN),
+        })
+    }
+}
+
+/// `REQ_GET_BUILD_INFO`, 64 bytes (config.h:326, vendor_commands.c:2657-
+/// 2667): `git describe --always --dirty` in bytes 0-47 and the build date
+/// `YYYY-MM-DD` in bytes 48-59, both NUL padded, then four zero bytes.
+///
+/// For people only: nothing may gate on it (config.h:326-327). Firmware
+/// before beta4 stalls the request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct BuildInfo {
+    pub describe: String,
+    pub date: String,
+}
+
+impl BuildInfo {
+    pub const SIZE: usize = 64;
+    const DESCRIBE_LEN: usize = 48;
+    const DATE_AT: usize = 48;
+    const DATE_LEN: usize = 12;
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        put_name(&mut b, 0, Self::DESCRIBE_LEN, &self.describe);
+        put_name(&mut b, Self::DATE_AT, Self::DATE_LEN, &self.date);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        need(b, Self::DATE_AT + Self::DATE_LEN, "BuildInfo")?;
+        Ok(Self {
+            describe: name_at(b, 0, Self::DESCRIBE_LEN),
+            date: name_at(b, Self::DATE_AT, Self::DATE_LEN),
+        })
+    }
+}
+
+// ----------------------------------------------------------- aux outputs
+
+/// `CsBinding.extras` bits on an auxiliary output slot (control_surfaces.h:
+/// 425-437). Every other component type writes 0.
+pub mod aux_extras {
+    use crate::generated::cs;
+    /// Boot with the output on.
+    pub const BOOT_ON: u8 = cs::CS_AUX_X_BOOT_ON as u8;
+    /// `REQ_CS_SAVE` folds the live state and level into the boot fields.
+    pub const BOOT_SAVED: u8 = cs::CS_AUX_X_BOOT_SAVED as u8;
+    /// AUX_PWM only: linear duty rather than the perceptual curve.
+    pub const LINEAR: u8 = cs::CS_AUX_X_LINEAR as u8;
+    pub const MASK: u8 = cs::CS_AUX_X_MASK as u8;
+}
+
+/// `REQ_GET_CS_AUX_STATE` with `wValue = 0xFFFF`, 48 bytes (config.h:138-140):
+/// the on/off state of every binding slot, then every slot's level as an 8.8
+/// percentage. Slots that are not auxiliary outputs read zero.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CsAuxStates {
+    pub state: [u8; Self::SLOTS],
+    pub level_q8: [u16; Self::SLOTS],
+}
+
+impl CsAuxStates {
+    /// `CS_MAX_BINDINGS` (control_surfaces.h:333): the block has one entry
+    /// per binding slot, whatever the caps say is configured.
+    pub const SLOTS: usize = crate::generated::cs::CS_MAX_BINDINGS as usize;
+    pub const SIZE: usize = Self::SLOTS * 3;
+
+    pub fn is_on(&self, slot: usize) -> bool {
+        self.state.get(slot).is_some_and(|s| *s != 0)
+    }
+
+    /// Level in percent; 0 on an on/off output.
+    pub fn level_percent(&self, slot: usize) -> f32 {
+        self.level_q8.get(slot).copied().unwrap_or(0) as f32 / 256.0
+    }
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[..Self::SLOTS].copy_from_slice(&self.state);
+        for (i, l) in self.level_q8.iter().enumerate() {
+            put_u16(&mut b, Self::SLOTS + 2 * i, *l);
+        }
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        need(b, Self::SIZE, "CsAuxStates")?;
+        let mut s = Self::default();
+        s.state.copy_from_slice(&b[..Self::SLOTS]);
+        for (i, l) in s.level_q8.iter_mut().enumerate() {
+            *l = u16at(b, Self::SLOTS + 2 * i);
+        }
+        Ok(s)
+    }
+}
+
+// ------------------------------------------------------ spectrum analyser
+
+/// `RTA_CFG_VERSION` (rta.h:27). Every analyser record carries it, and
+/// version 3 is incompatible with 2, so any other value is refused.
+pub const RTA_VERSION: u8 = crate::generated::rta::RTA_CFG_VERSION as u8;
+
+fn rta_version(b: &[u8], what: &'static str) -> Result<(), PacketError> {
+    if b[0] != RTA_VERSION {
+        return Err(PacketError::Version {
+            what,
+            got: b[0],
+            want: RTA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// A level byte in dBFS: 0.5 dB steps, `level_zero` is 0 dBFS (rta_fft.h:44-45).
+/// `level_zero` comes from [`RtaCaps`] rather than a constant.
+pub fn rta_level_dbfs(level: u8, level_zero: u8) -> f32 {
+    (level as f32 - level_zero as f32) * 0.5
+}
+
+/// `RtaConfig`, 12 bytes (rta.h:59-70), written with 0x08 and read with 0x09.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtaConfig {
+    /// `RTA_TAP_INPUT` or `RTA_TAP_OUTPUT` (rta.h:30-31).
+    pub tap: u8,
+    /// Bit i is channel i at that tap; 0 stalls.
+    pub channel_mask: u16,
+    /// `RTA_ORDER_MIN..=RTA_ORDER_MAX` (rta_fft.h:39-40).
+    pub fft_order: u8,
+    /// Averaging time constant, ms; 0 turns the extra averaging off.
+    pub avg_ms: u16,
+    /// Peak decay, dB per second; 0 turns peak hold off.
+    pub peak_decay_db_s: u8,
+    /// `RTA_FLAG_*` (rta.h:34).
+    pub flags: u8,
+}
+
+impl RtaConfig {
+    pub const SIZE: usize = 12;
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0] = RTA_VERSION;
+        b[1] = self.tap;
+        put_u16(&mut b, 2, self.channel_mask);
+        b[4] = self.fft_order;
+        // 5 reserved0
+        put_u16(&mut b, 6, self.avg_ms);
+        b[8] = self.peak_decay_db_s;
+        b[9] = self.flags;
+        // 10-11 reserved
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        need(b, Self::SIZE, "RtaConfig")?;
+        rta_version(b, "RtaConfig")?;
+        Ok(Self {
+            tap: b[1],
+            channel_mask: u16at(b, 2),
+            fft_order: b[4],
+            avg_ms: u16at(b, 6),
+            peak_decay_db_s: b[8],
+            flags: b[9],
+        })
+    }
+}
+
+/// `RtaCaps`, 16 bytes (rta.h:72-87), from 0x0A with `wValue = 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RtaCaps {
+    pub input_channels: u8,
+    pub output_channels: u8,
+    pub order_min: u8,
+    pub order_max: u8,
+    pub order_default: u8,
+    /// Bands 0.. that come from the continuous bass bank.
+    pub bass_bands: u8,
+    pub max_bands: u8,
+    /// The level byte that means 0 dBFS.
+    pub level_zero: u8,
+    pub dynamic_range_db: u8,
+    pub idle_timeout_ms: u16,
+    pub max_bin_frame: u16,
+    pub bass_dynamic_range_db: u16,
+}
+
+impl RtaCaps {
+    pub const SIZE: usize = 16;
+    /// Band centres per chunk of 0x0A with `wValue >= 1` (rta.h:140-142).
+    pub const CENTRES_PER_CHUNK: usize = 32;
+
+    /// A level byte in dBFS, against this device's zero.
+    pub fn level_dbfs(&self, level: u8) -> f32 {
+        rta_level_dbfs(level, self.level_zero)
+    }
+
+    /// The `wValue`s that fetch the band-centre table, one chunk each.
+    pub fn centre_chunks(&self) -> std::ops::RangeInclusive<u16> {
+        let n = (self.max_bands as usize).div_ceil(Self::CENTRES_PER_CHUNK);
+        1..=n as u16
+    }
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0] = RTA_VERSION;
+        b[1] = self.input_channels;
+        b[2] = self.output_channels;
+        b[3] = self.order_min;
+        b[4] = self.order_max;
+        b[5] = self.order_default;
+        b[6] = self.bass_bands;
+        b[7] = self.max_bands;
+        b[8] = self.level_zero;
+        b[9] = self.dynamic_range_db;
+        put_u16(&mut b, 10, self.idle_timeout_ms);
+        put_u16(&mut b, 12, self.max_bin_frame);
+        put_u16(&mut b, 14, self.bass_dynamic_range_db);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        need(b, Self::SIZE, "RtaCaps")?;
+        rta_version(b, "RtaCaps")?;
+        Ok(Self {
+            input_channels: b[1],
+            output_channels: b[2],
+            order_min: b[3],
+            order_max: b[4],
+            order_default: b[5],
+            bass_bands: b[6],
+            max_bands: b[7],
+            level_zero: b[8],
+            dynamic_range_db: b[9],
+            idle_timeout_ms: u16at(b, 10),
+            max_bin_frame: u16at(b, 12),
+            bass_dynamic_range_db: u16at(b, 14),
+        })
+    }
+}
+
+/// One chunk of the band-centre table: up to 32 `u16` LE frequencies in Hz
+/// (rta.h:140-142, rta.c:393-405). The length comes from the reply.
+pub fn decode_rta_centres(b: &[u8]) -> Vec<u16> {
+    (0..b.len() / 2).map(|i| u16at(b, 2 * i)).collect()
+}
+
+/// `RtaBandFrame`, 82 bytes (rta.h:89-99), from 0x0B for one channel or
+/// back to back from 0x0F for every live one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtaBandFrame {
+    pub channel: u8,
+    /// Per-channel frame counter.
+    pub seq: u8,
+    /// Bands in use: 34 at 44.1 and 48 kHz, 37 at 96 kHz.
+    pub n_bands: u8,
+    /// Since the last frame; [`RtaBandFrame::NEVER`] if none yet.
+    pub age_ms: u16,
+    pub avg: [u8; Self::MAX_BANDS],
+    pub peak: [u8; Self::MAX_BANDS],
+}
+
+impl RtaBandFrame {
+    /// `RTA_MAX_BANDS` (rta_fft.h:42): the arrays are this long whatever
+    /// `n_bands` says.
+    pub const MAX_BANDS: usize = crate::generated::rta::RTA_MAX_BANDS as usize;
+    pub const SIZE: usize = 8 + 2 * Self::MAX_BANDS;
+    /// `age_ms` of a channel that has never produced a frame.
+    pub const NEVER: u16 = 0xFFFF;
+
+    /// The averaged levels of the bands in use.
+    pub fn avg_levels(&self) -> &[u8] {
+        &self.avg[..(self.n_bands as usize).min(Self::MAX_BANDS)]
+    }
+
+    /// The peak levels of the bands in use.
+    pub fn peak_levels(&self) -> &[u8] {
+        &self.peak[..(self.n_bands as usize).min(Self::MAX_BANDS)]
+    }
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0] = RTA_VERSION;
+        b[1] = self.channel;
+        b[2] = self.seq;
+        b[3] = self.n_bands;
+        put_u16(&mut b, 4, self.age_ms);
+        // 6-7 reserved
+        b[8..8 + Self::MAX_BANDS].copy_from_slice(&self.avg);
+        b[8 + Self::MAX_BANDS..].copy_from_slice(&self.peak);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        need(b, Self::SIZE, "RtaBandFrame")?;
+        rta_version(b, "RtaBandFrame")?;
+        let mut avg = [0u8; Self::MAX_BANDS];
+        let mut peak = [0u8; Self::MAX_BANDS];
+        avg.copy_from_slice(&b[8..8 + Self::MAX_BANDS]);
+        peak.copy_from_slice(&b[8 + Self::MAX_BANDS..Self::SIZE]);
+        Ok(Self {
+            channel: b[1],
+            seq: b[2],
+            n_bands: b[3],
+            age_ms: u16at(b, 4),
+            avg,
+            peak,
+        })
+    }
+
+    /// The reply to 0x0F: one frame per selected, live channel, ascending,
+    /// in 82-byte strides; empty when nothing is live (vendor_commands.c:
+    /// 4334-4355). A trailing partial frame is an error, not a frame.
+    pub fn decode_all(b: &[u8]) -> Result<Vec<Self>, PacketError> {
+        if !b.len().is_multiple_of(Self::SIZE) {
+            return Err(PacketError::TooShort {
+                what: "RtaBandFrame",
+                want: b.len().div_ceil(Self::SIZE) * Self::SIZE,
+                got: b.len(),
+            });
+        }
+        b.chunks(Self::SIZE).map(Self::decode).collect()
+    }
+}
+
+/// `RtaBinFrameHeader`, 16 bytes (rta.h:101-110), at the start of the bin
+/// frame 0x0C reads from a byte offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RtaBinHeader {
+    pub channel: u8,
+    /// Repeated as the frame's last byte.
+    pub seq: u8,
+    pub fft_order: u8,
+    pub sample_rate_hz: u32,
+    /// `N / 2`: the frame is `16 + n_bins + 1` bytes.
+    pub n_bins: u16,
+}
+
+impl RtaBinHeader {
+    pub const SIZE: usize = 16;
+
+    /// The whole frame's length for this header.
+    pub fn frame_len(&self) -> usize {
+        Self::SIZE + self.n_bins as usize + 1
+    }
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0] = RTA_VERSION;
+        b[1] = self.channel;
+        b[2] = self.seq;
+        b[3] = self.fft_order;
+        put_u32(&mut b, 4, self.sample_rate_hz);
+        put_u16(&mut b, 8, self.n_bins);
+        // 10-15 reserved[3]
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        need(b, Self::SIZE, "RtaBinHeader")?;
+        rta_version(b, "RtaBinHeader")?;
+        Ok(Self {
+            channel: b[1],
+            seq: b[2],
+            fft_order: b[3],
+            sample_rate_hz: u32at(b, 4),
+            n_bins: u16at(b, 8),
+        })
+    }
+}
+
+/// A whole bin frame, header, levels and tail.
+///
+/// 0x0C takes no lock (vendor_commands.c:4297-4311), so a frame read in
+/// chunks can straddle an update. The device writes the tail as 0xFF before
+/// it rewrites a frame and then copies the new sequence number into it, and
+/// sequence numbers skip 0xFF (rta.c:128-131, 157-161, 254-256). A frame is
+/// whole only when its tail matches its head and is not 0xFF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtaBinFrame {
+    pub header: RtaBinHeader,
+    pub levels: Vec<u8>,
+}
+
+impl RtaBinFrame {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = self.header.encode().to_vec();
+        b.extend(&self.levels);
+        b.push(self.header.seq);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        let header = RtaBinHeader::decode(b)?;
+        let len = header.frame_len();
+        need(b, len, "RtaBinFrame")?;
+        let tail = b[len - 1];
+        if tail == 0xFF || tail != header.seq {
+            return Err(PacketError::Torn {
+                head: header.seq,
+                tail,
+            });
+        }
+        Ok(Self {
+            header,
+            levels: b[RtaBinHeader::SIZE..len - 1].to_vec(),
+        })
+    }
+}
+
+/// `RtaStatus`, 24 bytes (rta.h:112-129), from 0x0D. Reading it does not
+/// count as a read: it neither starts the analyser nor keeps it alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RtaStatus {
+    /// `RTA_STATE_*` (rta.h:36-38).
+    pub state: u8,
+    pub tap: u8,
+    /// Being captured or transformed; `RTA_CH_NONE` (0xFF) when idle.
+    pub channel: u8,
+    pub live_count: u8,
+    pub live_mask: u16,
+    pub frames_per_s: u16,
+    pub busy_us_per_s: u16,
+    pub last_frame_us: u16,
+    /// Since the last data read; 0xFFFF never.
+    pub idle_ms: u16,
+    pub sample_rate_hz: u32,
+    /// 0 with a bass bank at this rate, 0xFF for an unsupported rate.
+    pub first_band: u8,
+    pub bass_busy_us_per_s: u16,
+}
+
+impl RtaStatus {
+    pub const SIZE: usize = 24;
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0] = RTA_VERSION;
+        b[1] = self.state;
+        b[2] = self.tap;
+        b[3] = self.channel;
+        // 4 reserved0
+        b[5] = self.live_count;
+        put_u16(&mut b, 6, self.live_mask);
+        put_u16(&mut b, 8, self.frames_per_s);
+        put_u16(&mut b, 10, self.busy_us_per_s);
+        put_u16(&mut b, 12, self.last_frame_us);
+        put_u16(&mut b, 14, self.idle_ms);
+        put_u32(&mut b, 16, self.sample_rate_hz);
+        b[20] = self.first_band;
+        // 21 reserved1
+        put_u16(&mut b, 22, self.bass_busy_us_per_s);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        need(b, Self::SIZE, "RtaStatus")?;
+        rta_version(b, "RtaStatus")?;
+        Ok(Self {
+            state: b[1],
+            tap: b[2],
+            channel: b[3],
+            live_count: b[5],
+            live_mask: u16at(b, 6),
+            frames_per_s: u16at(b, 8),
+            busy_us_per_s: u16at(b, 10),
+            last_frame_us: u16at(b, 12),
+            idle_ms: u16at(b, 14),
+            sample_rate_hz: u32at(b, 16),
+            first_band: b[20],
+            bass_busy_us_per_s: u16at(b, 22),
+        })
+    }
+}
+
+// ------------------------------------------------ subharm and limiter reads
+
+/// Decode `n x u16 LE` with the count taken from the reply. The subharm and
+/// limiter meters are sized by `NUM_OUTPUT_CHANNELS`, which differs between
+/// platforms (18 bytes on an RP2350, 10 on an RP2040), so no length is
+/// assumed here.
+fn u16_table(b: &[u8], what: &'static str) -> Result<Vec<u16>, PacketError> {
+    if !b.len().is_multiple_of(2) {
+        return Err(PacketError::TooShort {
+            what,
+            want: b.len() + 1,
+            got: b.len(),
+        });
+    }
+    Ok((0..b.len() / 2).map(|i| u16at(b, 2 * i)).collect())
+}
+
+/// `REQ_GET_SUBHARM_METER` (config.h:200): one `u16` per output, the synthesized
+/// sub's peak on the same 0..32767 scale as the status peaks
+/// (vendor_commands.c:2206-2216).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubharmMeter {
+    pub peaks: Vec<u16>,
+}
+
+impl SubharmMeter {
+    /// Full scale (subharm.c:437-448).
+    pub const FULL_SCALE: f32 = 32767.0;
+
+    /// Peak of output `k` as 0..1.
+    pub fn peak(&self, output: usize) -> f32 {
+        self.peaks.get(output).copied().unwrap_or(0) as f32 / Self::FULL_SCALE
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.peaks.iter().flat_map(|p| p.to_le_bytes()).collect()
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        Ok(Self {
+            peaks: u16_table(b, "SubharmMeter")?,
+        })
+    }
+}
+
+/// `REQ_LIMITER` at index `LIMITER_GET_METER` (limiter.h:19): gain reduction
+/// per output in 0.01 dB, 0 for none.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LimiterMeter {
+    pub centi_db: Vec<u16>,
+}
+
+impl LimiterMeter {
+    /// Gain reduction on output `k`, in dB.
+    pub fn reduction_db(&self, output: usize) -> f32 {
+        self.centi_db.get(output).copied().unwrap_or(0) as f32 / 100.0
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.centi_db.iter().flat_map(|p| p.to_le_bytes()).collect()
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        Ok(Self {
+            centi_db: u16_table(b, "LimiterMeter")?,
+        })
+    }
+}
+
+/// `REQ_LIMITER` at index `LIMITER_GET_STATUS` (limiter.h:20), 4 bytes
+/// (vendor_commands.c:2230-2237). Also the limiter's feature probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LimiterStatus {
+    /// The lookahead delay is in the signal path right now.
+    pub engaged: bool,
+    /// `LIMITER_DELAY`, samples of latency while engaged.
+    pub lookahead: u8,
+    /// `LIMITER_BLOCK`.
+    pub block: u8,
+    pub num_outputs: u8,
+}
+
+impl LimiterStatus {
+    pub const SIZE: usize = 4;
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        [
+            self.engaged as u8,
+            self.lookahead,
+            self.block,
+            self.num_outputs,
+        ]
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PacketError> {
+        need(b, Self::SIZE, "LimiterStatus")?;
+        Ok(Self {
+            engaged: b[0] != 0,
+            lookahead: b[1],
+            block: b[2],
+            num_outputs: b[3],
         })
     }
 }
@@ -2378,7 +3114,7 @@ const fn f(name: &'static str, kind: FieldKind, help: &'static str) -> FieldSpec
 
 // --------------------------------------------------------------- value tables
 
-/// Component types (control_surfaces.h:104-117).
+/// Component types (control_surfaces.h:128-146).
 pub const CS_TYPES: &[(&str, u8)] = &[
     ("none", 0),
     ("button", 1),
@@ -2389,9 +3125,12 @@ pub const CS_TYPES: &[(&str, u8)] = &[
     ("led_pwm", 6),
     ("ir", 7),
     ("display", 8),
+    // Caps v18: containers that own a GPIO rather than drive a parameter.
+    ("aux_out", 9),
+    ("aux_pwm", 10),
 ];
 
-/// Nouns (control_surfaces.h:123-195). The device reports how many it has, so
+/// Nouns (control_surfaces.h:152-252). The device reports how many it has, so
 /// this table is for typing and labelling; a raw number always works too.
 pub const CS_NOUNS: &[(&str, u8)] = &[
     ("user_volume", 0),
@@ -2451,6 +3190,32 @@ pub const CS_NOUNS: &[(&str, u8)] = &[
     ("display_page", 54),
     ("display_edit", 55),
     ("page_value", 56),
+    // Caps v14 and v15: the subharmonic synthesizer.
+    ("subharm", 57),
+    ("subharm_low", 58),
+    ("subharm_high", 59),
+    ("subharm_boost", 60),
+    ("subharm_top", 61),
+    ("subharm_select", 62),
+    ("subharm_depth", 63),
+    ("subharm_hold", 64),
+    ("subharm_ceiling", 65),
+    ("subharm_link", 66),
+    ("subharm_solo", 67),
+    // Caps v18: auxiliary outputs, targeting a binding slot.
+    ("aux", 68),
+    ("aux_level", 69),
+    // Caps v19: the tube preamp.
+    ("tube", 70),
+    ("tube_drive", 71),
+    ("tube_type", 72),
+    ("tube_mix", 73),
+    // Caps v20: the output limiter, targeting an output.
+    ("limiter", 74),
+    ("limiter_threshold", 75),
+    ("limiter_release", 76),
+    ("limiter_link", 77),
+    ("limiter_gr", 78),
 ];
 
 /// Actions (control_surfaces.h:227-241).
@@ -2490,14 +3255,81 @@ pub const CS_IR_FLAGS: &[(&str, u8)] = &[("wrap", 0x04), ("repeat", 0x10), ("gro
 /// The subset a macro step may carry (control_surfaces.h:463).
 pub const CS_STEP_FLAGS: &[(&str, u8)] = &[("wrap", 0x04), ("group", 0x20)];
 
-/// Target kinds (control_surfaces.h:212-217).
+/// Target kinds (control_surfaces.h:272-278).
 pub const CS_TARGET_KINDS: &[(&str, u8)] = &[
     ("none", 0),
     ("input_ch", 1),
     ("output_ch", 2),
     ("dsp_ch", 3),
     ("dsp_band", 4),
+    // Caps v18: a binding slot holding an auxiliary output; index must be 0.
+    ("aux", 5),
 ];
+
+/// `CsBinding.extras` on an auxiliary output (control_surfaces.h:425-437).
+pub const CS_AUX_EXTRAS: &[(&str, u8)] = &[
+    ("boot_on", aux_extras::BOOT_ON),
+    ("boot_saved", aux_extras::BOOT_SAVED),
+    ("linear", aux_extras::LINEAR),
+];
+
+/// `CsNounDesc.unit` (control_surfaces.h:259-269). How a noun's value, range
+/// and step are encoded depends on it, and the caps say which one each noun
+/// uses.
+pub mod cs_unit {
+    use crate::generated::cs;
+    pub const NONE: u8 = cs::CS_UNIT_NONE as u8;
+    /// Signed 8.8 dB, linear steps.
+    pub const DB: u8 = cs::CS_UNIT_DB as u8;
+    /// Plain integer Hz; the step is 8.8 octaves.
+    pub const HZ: u8 = cs::CS_UNIT_HZ as u8;
+    /// 8.8 Q; the step is 8.8 octaves.
+    pub const Q: u8 = cs::CS_UNIT_Q as u8;
+    /// 8.8 percent, linear steps.
+    pub const PERCENT: u8 = cs::CS_UNIT_PERCENT as u8;
+    /// 8.8 milliseconds, linear steps; tops out at 127 ms.
+    pub const MS: u8 = cs::CS_UNIT_MS as u8;
+    /// Caps v20: plain integer milliseconds, stepped in 8.8 octaves like Hz,
+    /// for spans past what 8.8 can hold (the limiter release, 10 to 1000 ms).
+    pub const MS_LOG: u8 = cs::CS_UNIT_MS_LOG as u8;
+}
+
+/// True when a unit carries its value, range and `min_q`/`max_q` as signed
+/// 8.8 fixed point (control_surfaces.h:262-267). Hz and MS_LOG are plain
+/// integers.
+pub fn cs_unit_is_fixed_point(unit: u8) -> bool {
+    matches!(
+        unit,
+        cs_unit::DB | cs_unit::Q | cs_unit::PERCENT | cs_unit::MS
+    )
+}
+
+/// True when a unit steps multiplicatively, so its step operand is 8.8
+/// octaves: Hz, Q and MS_LOG (the firmware's `cs_unit_is_log`,
+/// control_surfaces.h:925-927).
+pub fn cs_unit_is_log(unit: u8) -> bool {
+    matches!(unit, cs_unit::HZ | cs_unit::Q | cs_unit::MS_LOG)
+}
+
+/// A noun's wire value in its natural unit.
+pub fn cs_decode_value(q: i16, unit: u8) -> f64 {
+    if cs_unit_is_fixed_point(unit) {
+        q as f64 / 256.0
+    } else {
+        q as f64
+    }
+}
+
+/// A value in its natural unit as the wire carries it, saturating at the
+/// ends of the 16-bit field.
+pub fn cs_encode_value(v: f64, unit: u8) -> i16 {
+    let raw = if cs_unit_is_fixed_point(unit) {
+        v * 256.0
+    } else {
+        v
+    };
+    raw.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
+}
 
 /// IR protocols (control_surfaces.h:337-342).
 pub const IR_PROTOCOLS: &[(&str, u8)] =
@@ -2786,6 +3618,11 @@ impl CsBinding {
             FieldKind::U16,
             "indicator off delay, 0.1 s units",
         ),
+        f(
+            "extras",
+            FieldKind::Flags(CS_AUX_EXTRAS),
+            "auxiliary output boot and response flags; 0 on other types",
+        ),
     ];
 
     pub fn fields() -> &'static [FieldSpec] {
@@ -2811,6 +3648,7 @@ impl CsBinding {
                 "range_max" => b.range_max = parse_i16_field("range_max", value)?,
                 "on_delay" => b.on_delay = parse_u16_field("on_delay", value)?,
                 "off_delay" => b.off_delay = parse_u16_field("off_delay", value)?,
+                "extras" => b.extras = parse_flag_set("extras", CS_AUX_EXTRAS, value)?,
                 other => return Err(unknown_field("cs.binding", other, Self::FIELDS)),
             }
         }
@@ -2844,6 +3682,9 @@ impl CsBinding {
             if v != 0 {
                 out.push((name, v.to_string()));
             }
+        }
+        if self.extras != 0 {
+            out.push(("extras", format_flag_set(CS_AUX_EXTRAS, self.extras)));
         }
         out
     }
@@ -3701,6 +4542,7 @@ mod tests {
             range_max: 0x0EEE,  // :386, bytes 16-17
             on_delay: 0xF00F,   // :390, bytes 18-19
             off_delay: 0x1234,  // :391, bytes 20-21
+            extras: 0x05,       // caps v18, control_surfaces.h:468, byte 22
         };
         let w = b.encode();
         assert_eq!(w[0], 0x11, "type");
@@ -3719,7 +4561,8 @@ mod tests {
         assert_eq!(&w[16..18], &0x0EEEi16.to_le_bytes(), "range_max");
         assert_eq!(&w[18..20], &0xF00Fu16.to_le_bytes(), "on_delay");
         assert_eq!(&w[20..22], &0x1234u16.to_le_bytes(), "off_delay");
-        assert_eq!(&w[22..24], &[0, 0], "reserved2 is written as zero");
+        assert_eq!(w[22], 0x05, "extras");
+        assert_eq!(w[23], 0, "reserved2 is written as zero");
         assert_eq!(CsBinding::decode(&w).unwrap(), b);
     }
 
@@ -4222,7 +5065,7 @@ mod tests {
 
     #[test]
     fn caps_header_locates_its_maxima_past_the_type_table() {
-        // control_surfaces.h:561-576: the maxima sit at 4 + 4*type_count.
+        // control_surfaces.h:637-652: the maxima sit at 4 + 4*type_count.
         assert_eq!(CsCapsHeader::wire_len(9), CsCapsHeader::SIZE_AT_V13);
         assert_eq!(CsCapsHeader::SIZE_AT_V13, 44);
 
@@ -4894,20 +5737,496 @@ mod tests {
         assert_eq!(SystemStatus::decode(&w).unwrap().peaks.len(), 7);
     }
 
+    // ------------------------------------------------------ identification
+
+    /// A beta2 device answers 4 bytes whatever it is asked (config.h:325 at
+    /// 112f35b): the nibbles, and no ordinal. It claims 1.1.6, which only an
+    /// early beta can do without the ordinal (the Console's `earlyBeta`).
     #[test]
-    fn platform_info_decodes_the_version_nibbles() {
-        // config.h:264.
-        assert_eq!(PlatformInfo::SIZE, 4);
+    fn a_four_byte_platform_reply_decodes_the_nibbles() {
         let p = PlatformInfo::decode(&[1, 1, 0x16, 9]).unwrap();
         assert_eq!(p.platform(), Platform::Rp2350);
-        assert_eq!(p.firmware(), "1.1.6");
         assert_eq!(p.num_output_channels, 9);
-        assert_eq!(p.encode(), [1, 1, 0x16, 9]);
+        assert_eq!(p.reply_len, 4);
+        assert_eq!(p.version.pre, Prerelease::EarlyBeta);
+        assert_eq!(p.firmware(), "1.1.6 early beta");
+
+        // Below 1.1.6 a short reply is a final release, as it always was.
+        let old = PlatformInfo::decode(&[0, 1, 0x15, 5]).unwrap();
+        assert_eq!(old.version, FirmwareVersion::new(1, 1, 5, 0));
+        assert_eq!(old.firmware(), "1.1.5");
+        assert_eq!(old.platform(), Platform::Rp2040);
+
         // An unknown platform id is preserved rather than rejected.
         assert_eq!(
             PlatformInfo::decode(&[7, 1, 0x16, 9]).unwrap().platform(),
             Platform::Unknown(7)
         );
+        assert!(PlatformInfo::decode(&[1, 1, 0x16]).is_err());
+    }
+
+    /// Six bytes: full-width minor and patch in bytes 4 and 5, which win over
+    /// the nibbles (firmware_versioning_spec.md:109), and still no ordinal.
+    #[test]
+    fn a_six_byte_platform_reply_takes_minor_and_patch_from_their_own_bytes() {
+        // Patch 17 does not fit a nibble; byte 2 has wrapped and must be ignored.
+        let p = PlatformInfo::decode(&[1, 1, 0x11, 9, 1, 17]).unwrap();
+        assert_eq!((p.version.minor, p.version.patch), (1, 17));
+        assert_eq!(p.version.pre, Prerelease::EarlyBeta);
+        let p = PlatformInfo::decode(&[1, 1, 0x15, 9, 1, 5]).unwrap();
+        assert_eq!(p.version, FirmwareVersion::new(1, 1, 5, 0));
+    }
+
+    /// Seven bytes: the beta ordinal in byte 6, 0 for a final release
+    /// (config.h:664-667, vendor_commands.c:2638-2655).
+    #[test]
+    fn a_seven_byte_platform_reply_carries_the_beta() {
+        let p = PlatformInfo::decode(&[1, 1, 0x16, 9, 1, 6, 4]).unwrap();
+        assert_eq!(p.reply_len, 7);
+        assert_eq!(p.version, FirmwareVersion::new(1, 1, 6, 4));
+        assert_eq!(p.firmware(), "1.1.6 beta 4");
+        assert_eq!(p.encode(), [1, 1, 0x16, 9, 1, 6, 4]);
+        assert_eq!(PlatformInfo::decode(&p.encode()).unwrap(), p);
+
+        let fin = PlatformInfo::decode(&[0, 1, 0x16, 5, 1, 6, 0]).unwrap();
+        assert_eq!(fin.version.pre, Prerelease::Final);
+        assert_eq!(fin.firmware(), "1.1.6");
+    }
+
+    /// A beta precedes the final release of its patch: order by
+    /// `(major, minor, patch, beta == 0 ? 256 : beta)`
+    /// (firmware_versioning_spec.md:111). An early beta sorts below beta 1.
+    #[test]
+    fn firmware_versions_order_betas_before_their_release() {
+        let v = FirmwareVersion::new;
+        let early = FirmwareVersion {
+            pre: Prerelease::EarlyBeta,
+            ..v(1, 1, 6, 0)
+        };
+        let order = [
+            v(1, 1, 5, 0),
+            early,
+            v(1, 1, 6, 1),
+            v(1, 1, 6, 3),
+            v(1, 1, 6, 4),
+            v(1, 1, 6, 0),
+            v(1, 1, 7, 1),
+            v(1, 2, 0, 0),
+        ];
+        for w in order.windows(2) {
+            assert!(w[0] < w[1], "{} should sort before {}", w[0], w[1]);
+        }
+        assert_eq!(v(1, 1, 6, 4).beta(), Some(4));
+        assert_eq!(v(1, 1, 6, 0).beta(), Some(0));
+        assert_eq!(early.beta(), None);
+    }
+
+    /// The version this build expects is the headers' (config.h:659-667).
+    #[test]
+    fn the_expected_firmware_is_the_vendored_one() {
+        assert_eq!(
+            FirmwareVersion::expected(),
+            FirmwareVersion::new(1, 1, 6, 4)
+        );
+        assert_eq!(FirmwareVersion::expected().to_string(), "1.1.6 beta 4");
+    }
+
+    /// 64 bytes: describe in 0-47, date in 48-59, zeros in 60-63
+    /// (vendor_commands.c:2657-2667).
+    #[test]
+    fn build_info_reads_describe_and_date_from_their_offsets() {
+        let mut b = [0u8; 64];
+        b[..16].copy_from_slice(b"v1.1.6-beta4-2-g");
+        b[16..23].copy_from_slice(b"557bce7");
+        b[48..58].copy_from_slice(b"2026-09-28");
+        let info = BuildInfo::decode(&b).unwrap();
+        assert_eq!(info.describe, "v1.1.6-beta4-2-g557bce7");
+        assert_eq!(info.date, "2026-09-28");
+        assert_eq!(BuildInfo::SIZE, 64);
+        assert_eq!(info.encode(), b);
+        assert!(BuildInfo::decode(&b[..40]).is_err());
+    }
+
+    // -------------------------------------------------- control surfaces v20
+
+    /// Caps v18 grew the type table to 11 rows, so the header is 52 bytes and
+    /// the maxima sit at 4 + 4*11 = 48 (control_surfaces.h:637-652).
+    #[test]
+    fn a_v20_caps_header_has_eleven_types_and_its_maxima_at_48() {
+        assert_eq!(CsCapsHeader::wire_len(11), CsCapsHeader::SIZE_AT_V20);
+        assert_eq!(CsCapsHeader::SIZE_AT_V20, 52);
+
+        let mut d = vec![20u8, 16, 11, 79];
+        for t in 0..11u8 {
+            // A distinctive table, so reading a row as a maximum shows.
+            d.extend([0xEE, 0xEE, 1, t]);
+        }
+        d.extend([16, 8, 8, 8]);
+        assert_eq!(d.len(), 52);
+        let caps = CsCapsHeader::decode(&d).unwrap();
+        assert_eq!(
+            (caps.caps_version, caps.type_count, caps.noun_count),
+            (20, 11, 79)
+        );
+        assert_eq!(caps.types.len(), 11);
+        assert_eq!(caps.types[10].pin_class, 10, "the AUX_PWM row");
+        assert_eq!(
+            (
+                caps.max_ir_commands,
+                caps.max_groups,
+                caps.max_macros,
+                caps.max_macro_steps
+            ),
+            (16, 8, 8, 8)
+        );
+        assert_eq!(caps.encode(), d);
+    }
+
+    /// An aux container carries its boot flags in byte 22 (control_surfaces.h:
+    /// 425-437, 468-470).
+    #[test]
+    fn an_aux_binding_carries_its_extras() {
+        let b = CsBinding::from_fields(&[
+            ("type", "aux_pwm"),
+            ("gpio", "22"),
+            ("extras", "boot_on,linear"),
+            ("value", "12800"),
+        ])
+        .unwrap();
+        assert_eq!(b.component, 10);
+        assert_eq!(b.extras, aux_extras::BOOT_ON | aux_extras::LINEAR);
+        let w = b.encode();
+        assert_eq!(w[22], 0x05);
+        assert_eq!(w[23], 0);
+        let fields = b.to_fields();
+        assert!(fields.contains(&("extras", "boot_on,linear".to_string())));
+        assert_eq!(
+            (
+                aux_extras::BOOT_ON,
+                aux_extras::BOOT_SAVED,
+                aux_extras::LINEAR
+            ),
+            (0x01, 0x02, 0x04)
+        );
+    }
+
+    /// `CS_UNIT_MS_LOG` (control_surfaces.h:268-269) is plain integer ms for
+    /// the value and range, like Hz, and steps in 8.8 octaves, like Hz: the
+    /// limiter release's 10 to 1000 ms would not fit 8.8's 127 ms.
+    #[test]
+    fn ms_log_values_are_plain_milliseconds_and_step_in_octaves() {
+        assert_eq!(cs_unit::MS_LOG, 6);
+        assert!(!cs_unit_is_fixed_point(cs_unit::MS_LOG));
+        assert!(cs_unit_is_log(cs_unit::MS_LOG));
+        assert_eq!(cs_encode_value(1000.0, cs_unit::MS_LOG), 1000);
+        assert_eq!(cs_decode_value(10, cs_unit::MS_LOG), 10.0);
+        // The old MS unit is 8.8 and linear.
+        assert!(cs_unit_is_fixed_point(cs_unit::MS));
+        assert!(!cs_unit_is_log(cs_unit::MS));
+        assert_eq!(cs_encode_value(1.5, cs_unit::MS), 384);
+        // Hz and Q step in octaves, dB and percent linearly.
+        assert!(cs_unit_is_log(cs_unit::HZ) && cs_unit_is_log(cs_unit::Q));
+        assert!(!cs_unit_is_log(cs_unit::DB) && !cs_unit_is_log(cs_unit::PERCENT));
+        // A noun descriptor for the limiter release, as a v20 device reports it.
+        let nd = CsNounDesc {
+            kind: 0,
+            min_q: 10,
+            max_q: 1000,
+            unit: cs_unit::MS_LOG,
+            target_kind: 2,
+            target_count: 9,
+            ..Default::default()
+        };
+        assert_eq!(cs_decode_value(nd.max_q, nd.unit), 1000.0);
+    }
+
+    /// The v18 target kind addresses a binding slot (control_surfaces.h:277).
+    #[test]
+    fn the_aux_target_kind_is_known() {
+        assert!(CS_TARGET_KINDS.contains(&("aux", 5)));
+        assert_eq!(crate::generated::cs::CS_TARGET_AUX, 5);
+    }
+
+    /// `REQ_GET_CS_AUX_STATE` with 0xFFFF: 16 states, then 16 levels as 8.8
+    /// percent, 48 bytes (config.h:138-140).
+    #[test]
+    fn the_aux_state_block_is_states_then_levels() {
+        assert_eq!(CsAuxStates::SIZE, 48);
+        let mut d = vec![0u8; 48];
+        d[3] = 1;
+        d[16 + 2 * 3..16 + 2 * 3 + 2].copy_from_slice(&(75u16 * 256).to_le_bytes());
+        d[15] = 1;
+        let s = CsAuxStates::decode(&d).unwrap();
+        assert!(s.is_on(3) && s.is_on(15) && !s.is_on(0));
+        assert_eq!(s.level_percent(3), 75.0);
+        assert_eq!(s.level_percent(0), 0.0);
+        assert_eq!(s.encode().to_vec(), d);
+        assert!(CsAuxStates::decode(&d[..47]).is_err());
+    }
+
+    // ------------------------------------------------------ spectrum analyser
+
+    fn rta_caps() -> RtaCaps {
+        RtaCaps {
+            input_channels: 8,
+            output_channels: 9,
+            order_min: 8,
+            order_max: 10,
+            order_default: 10,
+            bass_bands: 14,
+            max_bands: 37,
+            level_zero: 243,
+            dynamic_range_db: 120,
+            idle_timeout_ms: 5000,
+            max_bin_frame: 529,
+            bass_dynamic_range_db: 70,
+        }
+    }
+
+    /// `RtaConfig`, 12 bytes (rta.h:59-70).
+    #[test]
+    fn rta_config_fields_are_at_their_offsets() {
+        let c = RtaConfig {
+            tap: 1,
+            channel_mask: 0x01FF,
+            fft_order: 10,
+            avg_ms: 250,
+            peak_decay_db_s: 20,
+            flags: 0x01,
+        };
+        let w = c.encode();
+        assert_eq!(w.len(), 12);
+        assert_eq!(w[0], 3, "version");
+        assert_eq!(w[1], 1, "tap");
+        assert_eq!(&w[2..4], &0x01FFu16.to_le_bytes(), "channel_mask");
+        assert_eq!(w[4], 10, "fft_order");
+        assert_eq!(w[5], 0, "reserved0");
+        assert_eq!(&w[6..8], &250u16.to_le_bytes(), "avg_ms");
+        assert_eq!(w[8], 20, "peak_decay_db_s");
+        assert_eq!(w[9], 1, "flags");
+        assert_eq!(&w[10..12], &[0, 0], "reserved");
+        assert_eq!(RtaConfig::decode(&w).unwrap(), c);
+    }
+
+    /// `RtaCaps`, 16 bytes (rta.h:72-87), and the level byte's meaning
+    /// (rta_fft.h:44-45): 0.5 dB steps from `level_zero`.
+    #[test]
+    fn rta_caps_fields_are_at_their_offsets() {
+        let c = rta_caps();
+        let w = c.encode();
+        assert_eq!(w.len(), 16);
+        assert_eq!(
+            &w[..10],
+            &[3, 8, 9, 8, 10, 10, 14, 37, 243, 120],
+            "version to dynamic_range_db"
+        );
+        assert_eq!(&w[10..12], &5000u16.to_le_bytes(), "idle_timeout_ms");
+        assert_eq!(&w[12..14], &529u16.to_le_bytes(), "max_bin_frame");
+        assert_eq!(&w[14..16], &70u16.to_le_bytes(), "bass_dynamic_range_db");
+        assert_eq!(RtaCaps::decode(&w).unwrap(), c);
+
+        assert_eq!(c.level_dbfs(243), 0.0);
+        assert_eq!(c.level_dbfs(255), 6.0);
+        assert_eq!(c.level_dbfs(0), -121.5);
+        assert_eq!(rta_level_dbfs(233, 243), -5.0);
+        // 37 bands arrive in two chunks of up to 32 (rta.c:393-405).
+        assert_eq!(c.centre_chunks(), 1..=2);
+        let chunk2: Vec<u8> = [16000u16, 20000, 25000, 31500, 40000]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_rta_centres(&chunk2),
+            vec![16000, 20000, 25000, 31500, 40000]
+        );
+    }
+
+    /// Protocol V3 is incompatible with V2, so every analyser record refuses
+    /// any other version (rta.h:27).
+    #[test]
+    fn rta_records_refuse_other_protocol_versions() {
+        let mut w = rta_caps().encode();
+        w[0] = 2;
+        assert_eq!(
+            RtaCaps::decode(&w),
+            Err(PacketError::Version {
+                what: "RtaCaps",
+                got: 2,
+                want: 3
+            })
+        );
+        let mut s = RtaStatus::default().encode();
+        s[0] = 4;
+        assert!(matches!(
+            RtaStatus::decode(&s),
+            Err(PacketError::Version { .. })
+        ));
+        let mut c = [0u8; 12];
+        c[0] = 2;
+        assert!(RtaConfig::decode(&c).is_err());
+    }
+
+    /// `RtaBandFrame`, 82 bytes (rta.h:89-99), and 0x0F's back-to-back
+    /// frames (vendor_commands.c:4334-4355).
+    #[test]
+    fn rta_band_frames_are_82_bytes_with_both_arrays_at_full_width() {
+        assert_eq!(RtaBandFrame::SIZE, 82);
+        let mut f = RtaBandFrame {
+            channel: 2,
+            seq: 9,
+            n_bands: 34,
+            age_ms: 21,
+            avg: [0; 37],
+            peak: [0; 37],
+        };
+        f.avg[0] = 200;
+        f.avg[36] = 1;
+        f.peak[0] = 230;
+        let w = f.encode();
+        assert_eq!(&w[..4], &[3, 2, 9, 34]);
+        assert_eq!(&w[4..6], &21u16.to_le_bytes(), "age_ms");
+        assert_eq!(&w[6..8], &[0, 0], "reserved");
+        assert_eq!(w[8], 200, "avg[0]");
+        assert_eq!(w[8 + 36], 1, "avg[36]");
+        assert_eq!(w[45], 230, "peak[0] follows all 37 averages");
+        let back = RtaBandFrame::decode(&w).unwrap();
+        assert_eq!(back, f);
+        assert_eq!(back.avg_levels().len(), 34, "n_bands in use at 48 kHz");
+
+        let mut two = w.to_vec();
+        let mut g = f.clone();
+        g.channel = 5;
+        two.extend(g.encode());
+        let all = RtaBandFrame::decode_all(&two).unwrap();
+        assert_eq!(
+            all.iter().map(|f| f.channel).collect::<Vec<_>>(),
+            vec![2, 5]
+        );
+        assert!(
+            RtaBandFrame::decode_all(&[]).unwrap().is_empty(),
+            "nothing live"
+        );
+        assert!(RtaBandFrame::decode_all(&two[..100]).is_err());
+    }
+
+    /// The bin frame is a 16-byte header, `n_bins` levels and a tail that
+    /// repeats the sequence number; the tail reads 0xFF mid-write and the
+    /// sequence skips 0xFF (rta.h:101-110, rta.c:128-131, 254-256).
+    #[test]
+    fn a_bin_frame_is_whole_only_when_head_and_tail_agree() {
+        let h = RtaBinHeader {
+            channel: 1,
+            seq: 42,
+            fft_order: 10,
+            sample_rate_hz: 48_000,
+            n_bins: 512,
+        };
+        let hb = h.encode();
+        assert_eq!(hb.len(), 16);
+        assert_eq!(&hb[..4], &[3, 1, 42, 10]);
+        assert_eq!(&hb[4..8], &48_000u32.to_le_bytes(), "sample_rate_hz");
+        assert_eq!(&hb[8..10], &512u16.to_le_bytes(), "n_bins");
+        assert_eq!(&hb[10..16], &[0; 6], "reserved[3]");
+        assert_eq!(h.frame_len(), 529, "RtaCaps.max_bin_frame at order 10");
+
+        let frame = RtaBinFrame {
+            header: h,
+            levels: vec![100; 512],
+        };
+        let mut w = frame.encode();
+        assert_eq!(w.len(), 529);
+        assert_eq!(*w.last().unwrap(), 42);
+        assert_eq!(RtaBinFrame::decode(&w).unwrap(), frame);
+
+        // A newer frame's tail under an older head: torn.
+        *w.last_mut().unwrap() = 43;
+        assert_eq!(
+            RtaBinFrame::decode(&w),
+            Err(PacketError::Torn { head: 42, tail: 43 })
+        );
+        // Mid-write, the tail is 0xFF.
+        *w.last_mut().unwrap() = 0xFF;
+        assert!(matches!(
+            RtaBinFrame::decode(&w),
+            Err(PacketError::Torn { .. })
+        ));
+        // Short of the tail is short, not torn.
+        assert!(matches!(
+            RtaBinFrame::decode(&w[..400]),
+            Err(PacketError::TooShort { .. })
+        ));
+    }
+
+    /// `RtaStatus`, 24 bytes (rta.h:112-129).
+    #[test]
+    fn rta_status_fields_are_at_their_offsets() {
+        let s = RtaStatus {
+            state: 2,
+            tap: 1,
+            channel: 4,
+            live_count: 3,
+            live_mask: 0x0013,
+            frames_per_s: 47,
+            busy_us_per_s: 1234,
+            last_frame_us: 900,
+            idle_ms: 60,
+            sample_rate_hz: 96_000,
+            first_band: 0xFF,
+            bass_busy_us_per_s: 65535,
+        };
+        let w = s.encode();
+        assert_eq!(w.len(), 24);
+        assert_eq!(&w[..6], &[3, 2, 1, 4, 0, 3]);
+        assert_eq!(&w[6..8], &0x0013u16.to_le_bytes(), "live_mask");
+        assert_eq!(&w[8..10], &47u16.to_le_bytes(), "frames_per_s");
+        assert_eq!(&w[10..12], &1234u16.to_le_bytes(), "busy_us_per_s");
+        assert_eq!(&w[12..14], &900u16.to_le_bytes(), "last_frame_us");
+        assert_eq!(&w[14..16], &60u16.to_le_bytes(), "idle_ms");
+        assert_eq!(&w[16..20], &96_000u32.to_le_bytes(), "sample_rate_hz");
+        assert_eq!(w[20], 0xFF, "first_band");
+        assert_eq!(&w[22..24], &65535u16.to_le_bytes(), "bass_busy_us_per_s");
+        assert_eq!(RtaStatus::decode(&w).unwrap(), s);
+    }
+
+    // ------------------------------------------------ subharm and limiter
+
+    /// One u16 per output, the count taken from the reply: 18 bytes on an
+    /// RP2350, 10 on an RP2040 (config.h:200, vendor_commands.c:2206-2216).
+    #[test]
+    fn the_subharm_meter_is_sized_by_its_reply() {
+        let rp2350: Vec<u8> = (0..9u16).flat_map(|k| (k * 1000).to_le_bytes()).collect();
+        let m = SubharmMeter::decode(&rp2350).unwrap();
+        assert_eq!(m.peaks.len(), 9);
+        assert_eq!(m.peaks[3], 3000);
+        assert_eq!(m.encode(), rp2350);
+        let rp2040 = SubharmMeter::decode(&[0xFF, 0x7F, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(rp2040.peaks.len(), 5);
+        assert_eq!(rp2040.peak(0), 1.0, "32767 is full scale");
+        assert_eq!(rp2040.peak(7), 0.0, "past the outputs reads silent");
+        assert!(SubharmMeter::decode(&[1, 2, 3]).is_err());
+    }
+
+    /// Gain reduction in 0.01 dB per output (limiter.h:19,
+    /// vendor_commands.c:2221-2229), and the 4-byte status (limiter.h:20,
+    /// vendor_commands.c:2230-2237).
+    #[test]
+    fn the_limiter_meter_and_status_decode() {
+        let d: Vec<u8> = [0u16, 150, 12000, 0, 0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let m = LimiterMeter::decode(&d).unwrap();
+        assert_eq!(m.centi_db.len(), 5);
+        assert_eq!(m.reduction_db(1), 1.5);
+        assert_eq!(m.reduction_db(2), 120.0);
+        assert_eq!(m.encode(), d);
+
+        assert_eq!(LimiterStatus::SIZE, 4);
+        let s = LimiterStatus::decode(&[1, 32, 16, 9]).unwrap();
+        assert!(s.engaged);
+        assert_eq!((s.lookahead, s.block, s.num_outputs), (32, 16, 9));
+        assert_eq!(s.encode(), [1, 32, 16, 9]);
+        assert!(LimiterStatus::decode(&[1, 32, 16]).is_err());
     }
 
     // -------------------------------------------------------- typed commands
@@ -5156,12 +6475,43 @@ mod tests {
 
     #[test]
     fn the_noun_table_covers_every_noun_the_firmware_defines() {
-        // CS_NOUN_COUNT is 57 at caps v13 (control_surfaces.h:194).
-        assert_eq!(CS_NOUNS.len(), 57);
+        use crate::generated::cs;
+        // CS_NOUN_COUNT is 79 at caps v20 (control_surfaces.h:251).
+        assert_eq!(CS_NOUNS.len(), cs::CS_NOUN_COUNT as usize);
+        assert_eq!(CS_NOUNS.len(), 79);
         for (i, (_, raw)) in CS_NOUNS.iter().enumerate() {
             assert_eq!(*raw as usize, i, "the noun table must stay in order");
         }
-        assert_eq!(CS_TYPES.len(), 9, "CS_TYPE_COUNT is 9");
+        assert_eq!(
+            CS_TYPES.len(),
+            cs::CS_TYPE_COUNT as usize,
+            "CS_TYPE_COUNT is 11"
+        );
         assert_eq!(CS_ACTIONS.len(), 12, "CS_ACT_COUNT is 12");
+    }
+
+    /// The hand tables are the header's enums, spelled in lower case: every
+    /// `CS_NOUN_X = n` and `CS_TYPE_X = n` line of the vendored
+    /// control_surfaces.h (:128-252) must appear as `("x", n)`, so a
+    /// renumbered or misspelt entry fails here rather than on a device.
+    #[test]
+    fn the_noun_and_type_tables_match_the_vendored_header() {
+        const HEADER: &str = include_str!("../firmware/control_surfaces.h");
+        let lines = |prefix: &str| -> Vec<(String, u8)> {
+            HEADER
+                .lines()
+                .filter_map(|l| {
+                    let l = l.trim().strip_prefix(prefix)?;
+                    let (name, rest) = l.split_once('=')?;
+                    let n = rest.trim().split(',').next()?.trim().parse().ok()?;
+                    Some((name.trim().to_lowercase(), n))
+                })
+                .collect()
+        };
+        let table = |t: &[(&str, u8)]| -> Vec<(String, u8)> {
+            t.iter().map(|(n, v)| (n.to_string(), *v)).collect()
+        };
+        assert_eq!(lines("CS_NOUN_"), table(CS_NOUNS));
+        assert_eq!(lines("CS_TYPE_"), table(CS_TYPES));
     }
 }
