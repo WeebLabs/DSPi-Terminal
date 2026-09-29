@@ -939,8 +939,9 @@ pub fn read_meters(t: &mut dyn Transport, num_channels: u8) -> Result<Meters> {
     let len = n * 2 + 7;
     let d = t.control_in(op::REQ_GET_STATUS, 9, len as u16)?;
 
+    // Q15 full scale, 0..32767, on every path (audio_pipeline.c:424, 704, 974).
     let peaks = (0..n)
-        .map(|i| u16::from_le_bytes([d[i * 2], d[i * 2 + 1]]) as f32 / 65535.0)
+        .map(|i| u16::from_le_bytes([d[i * 2], d[i * 2 + 1]]) as f32 / 32767.0)
         .collect();
 
     let base = n * 2;
@@ -975,7 +976,7 @@ mod meter_tests {
 
     #[test]
     fn meters_decode_peaks_cpu_clip_flags_and_input_count() {
-        let d = packet(&[65535, 32768], (34, 8), 0b10, 2);
+        let d = packet(&[32767, 16384], (34, 8), 0b10, 2);
         let mut t = MockTransport::new().data(op::REQ_GET_STATUS, d);
         let m = read_meters(&mut t, 2).unwrap();
 

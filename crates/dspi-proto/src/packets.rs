@@ -2266,9 +2266,10 @@ impl SystemStatus {
         num_channels as usize * 2 + Self::TAIL
     }
 
-    /// Peak of channel `i` as 0..1.
+    /// Peak of channel `i` as 0..1. The firmware scales peaks to Q15, 0..32767,
+    /// on every path (audio_pipeline.c:424, 704, 974).
     pub fn peak(&self, channel: usize) -> f32 {
-        self.peaks.get(channel).copied().unwrap_or(0) as f32 / 65535.0
+        self.peaks.get(channel).copied().unwrap_or(0) as f32 / 32767.0
     }
 
     /// Shifted on a u32, not a u16: channel 17 exists and its bit is real.
