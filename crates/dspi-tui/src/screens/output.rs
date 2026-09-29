@@ -874,6 +874,28 @@ mod tests {
         assert!(!f.contains("FC"), "{f}");
     }
 
+    /// Routing names are the sidebar's channel names, not 7.1 labels
+    /// (`Components.swift:950`, `inputChannelName`), cut to fit.
+    #[test]
+    fn routing_rows_carry_the_sidebar_names() {
+        let (mut p, state) = page(0);
+        let mut b = state.bulk.as_bytes().to_vec();
+        let names = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "channel_names")
+            .map(|(_, o, _)| *o)
+            .expect("section");
+        b[names..names + 64].fill(0);
+        b[names..names + 3].copy_from_slice(b"Mac");
+        b[names + 32..names + 32 + 16].copy_from_slice(b"Turntable Righty");
+        let mut state = state;
+        state.replace_bulk(dspi_proto::wire::BulkPacket::decode(b).expect("packet"));
+        let f = draw(&mut p, &state, 94, 21);
+        let lines: Vec<&str> = f.lines().collect();
+        assert!(lines[0].contains("Mac") && !lines[0].contains("FL"), "{f}");
+        assert!(lines[1].contains("Turntable…"), "{f}");
+    }
+
     #[test]
     fn the_minimum_frame_fits() {
         let (mut p, state) = page(0);
