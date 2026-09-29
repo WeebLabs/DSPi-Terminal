@@ -1,5 +1,5 @@
 //! The tool-panel template: the shape every DSP window in `DESIGN.md` 7.8 and
-//! the Test Signals panel in 7.9 are built from.
+//! the Signal Generator panel in 7.9 are built from.
 //!
 //! A panel is a pinned header (title, subtitle and the master toggle, which is
 //! always first in focus order) over a single scrolling column of rows. A panel
@@ -688,7 +688,7 @@ pub struct Header<'a> {
     /// `None` for a panel with no master switch.
     pub toggle: Option<bool>,
     pub enabled: bool,
-    /// A state pill instead of a switch, for Test Signals, whose header
+    /// A state pill instead of a switch, for the Signal Generator, whose header
     /// carries the generator's run state rather than a control.
     pub pill: Option<(String, StatusTone)>,
 }

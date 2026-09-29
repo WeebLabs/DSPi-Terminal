@@ -90,7 +90,7 @@ impl Tool {
             Self::Psybass => "Psychoacoustic Bass",
             Self::Upmixer => "Stereo Upmixer",
             Self::Leveller => "Volume Leveller",
-            Self::Signals => "Test Signals",
+            Self::Signals => "Signal Generator",
             Self::Stats => "System Statistics",
             Self::Monitor => "Interrupt Monitor",
             Self::AutoEq => "AutoEQ",

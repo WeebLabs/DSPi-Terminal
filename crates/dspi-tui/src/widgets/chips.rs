@@ -14,7 +14,7 @@ use crate::theme::{ColorDepth, Glyphs, Theme};
 pub enum ChipState {
     Off,
     On,
-    /// Selected with inverted polarity (test signals only).
+    /// Selected with inverted polarity (Signal Generator only).
     Inverted,
 }
 
@@ -32,7 +32,7 @@ pub struct ChipRow<'a> {
     pub theme: &'a Theme,
     pub focused: bool,
     pub cursor: usize,
-    /// Whether `Space` cycles through `Inverted` (test signals) or just
+    /// Whether `Space` cycles through `Inverted` (Signal Generator) or just
     /// flips.
     pub polarity: bool,
 }

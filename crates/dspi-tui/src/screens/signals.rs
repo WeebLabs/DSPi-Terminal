@@ -1,4 +1,4 @@
-//! The Test Signals panel: `TestSignalsView.swift` as a tool panel.
+//! The Signal Generator panel: `TestSignalsView.swift` as a tool panel.
 //!
 //! Unlike every other panel here, the generator's configuration is not in the
 //! bulk packet, so there is nothing in `DeviceState` to read it back from: the
@@ -947,8 +947,11 @@ impl SignalsPanel {
 }
 
 impl Screen for SignalsPanel {
+    /// The Console renamed Test Signals; its header reads "Signal Generator"
+    /// over "Onboard test and measurement signals" (`TestSignalsView.swift:
+    /// 376-378`).
     fn title(&self) -> String {
-        "Test Signals".into()
+        "Signal Generator".into()
     }
 
     fn draw(
@@ -963,7 +966,7 @@ impl Screen for SignalsPanel {
         let rows = self.rows(state, theme);
         self.body.clamp(&rows);
         let (_, label, tone) = Self::run_state(state);
-        let header = Header::new("Onboard measurement signal generator").pill(label, tone);
+        let header = Header::new("Onboard test and measurement signals").pill(label, tone);
         self.body.draw(area, buf, theme, &header, &rows, focused);
     }
 
@@ -1042,7 +1045,7 @@ mod tests {
     fn the_panel_carries_the_grid_and_every_section() {
         let (mut p, state) = panel();
         let f = testing::draw(&mut p, &state, 100, 60);
-        assert!(f.contains("Onboard measurement signal generator"), "{f}");
+        assert!(f.contains("Onboard test and measurement signals"), "{f}");
         assert!(f.contains("Idle"), "the state pill: {f}");
         assert!(f.contains("SIGNAL"), "{f}");
         for tile in ["Sine", "Pink", "Log Swp", "2-Tone", "Chan ID"] {
@@ -1119,7 +1122,7 @@ mod tests {
         for (w, h) in [(120u16, 40u16), (80, 24)] {
             let f = testing::frame(Tool::Signals, Box::new(SignalsPanel::new()), &state, w, h);
             assert_eq!(f.lines().count(), h as usize, "{w}x{h}");
-            assert!(f.contains("Test Signals"), "{w}x{h}:\n{f}");
+            assert!(f.contains("Signal Generator"), "{w}x{h}:\n{f}");
             assert!(f.contains("G closes"), "{w}x{h}:\n{f}");
         }
     }
