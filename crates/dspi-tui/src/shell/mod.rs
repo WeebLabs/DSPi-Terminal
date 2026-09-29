@@ -687,8 +687,11 @@ impl Shell {
 
     /// The graph's rows for this frame: none in the overview, whose grid
     /// carries the curves itself, and none while a tool covers the pane.
+    /// Without a device the grid has no cells, and the overview shows the
+    /// graph's empty grid instead, as the Console keeps its graph pane.
     fn graph_height(&self) -> GraphHeight {
-        if self.model.selection == Selection::Overview || self.tool.is_some() {
+        let grid = self.model.selection == Selection::Overview && self.model.connected;
+        if grid || self.tool.is_some() {
             GraphHeight::Hidden
         } else {
             self.model.graph_height

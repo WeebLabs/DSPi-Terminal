@@ -171,7 +171,14 @@ impl Overview {
     }
 
     /// The grid's cells for the device's current state, in channel order.
+    ///
+    /// None without a device: the Console's dashboard renders no cards then,
+    /// since they would only repeat the last device's channels
+    /// (`DashboardView.swift:86-91`).
     pub fn cells(&mut self, state: &DeviceState) -> Vec<Cell> {
+        if !state.connected {
+            return Vec::new();
+        }
         let ni = state.caps.num_inputs as usize;
         let mut out: Vec<Cell> = Vec::new();
         for ch in channels(state) {

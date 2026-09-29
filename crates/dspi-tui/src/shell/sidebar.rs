@@ -137,6 +137,11 @@ enum Row<'a> {
 }
 
 fn rows(model: &ShellModel) -> Vec<Row<'_>> {
+    // No channels means no device, and the Console then hides both sections,
+    // headers too (`ContentView.swift:438-446`).
+    if model.channel_count() == 0 {
+        return Vec::new();
+    }
     let mut out = vec![Row::Header("INPUTS")];
     for (i, it) in model.inputs.iter().enumerate() {
         let selected = model.selection == Selection::Input(i)

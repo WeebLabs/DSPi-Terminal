@@ -3,7 +3,7 @@
 //!   gallery [width] [height] [calm|console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
-//!                     |autoeq] [--settings <page>] [--expand n] [--busy|--full]
+//!                     |autoeq|nodevice] [--settings <page>] [--expand n] [--busy|--full]
 //!           [--depth truecolor|256|16|mono] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
@@ -178,7 +178,7 @@ fn main() {
     // The Settings pages show wiring, so they get a device with some. The
     // three Control pages are entirely caps-driven, so theirs additionally
     // reports a control-surface capability table and the records built on it.
-    let state = if settings.is_some() {
+    let mut state = if settings.is_some() {
         dspi_tui::settings::cs_model::demo::state()
     } else {
         state
@@ -364,7 +364,9 @@ fn main() {
         _ => None,
     };
     let (detail, selection): (Box<dyn Screen>, Selection) = match screen.as_str() {
-        "overview" | "matrix" => (Box::new(Overview::new(shared.clone())), Selection::Overview),
+        "overview" | "matrix" | "nodevice" => {
+            (Box::new(Overview::new(shared.clone())), Selection::Overview)
+        }
         "output" => (
             Box::new(OutputPage::new(0, shared.clone(), &state)),
             Selection::Output(0),
@@ -375,6 +377,9 @@ fn main() {
         ),
     };
     fixture::select(&mut model, &state, &theme, selection);
+    if screen == "nodevice" {
+        fixture::disconnect(&mut model, &mut state);
+    }
     let mut shell = Shell::new(model, theme, detail);
     shell.focus = Focus::Screen;
     if let Some((tool, panel)) = tool {

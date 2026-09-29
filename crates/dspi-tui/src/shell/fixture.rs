@@ -182,6 +182,18 @@ pub fn select(m: &mut ShellModel, state: &DeviceState, theme: &Theme, selection:
     m.graph_channel = channel.map(|ch| state.channel_name(ch));
 }
 
+/// The device gone, projected as the runner projects it: no channel rows, no
+/// curves, and the overview selected. The gallery's `--screen nodevice`.
+pub fn disconnect(m: &mut ShellModel, state: &mut DeviceState) {
+    state.connected = false;
+    m.connected = false;
+    m.inputs.clear();
+    m.outputs.clear();
+    m.curves.clear();
+    m.graph_channel = None;
+    m.selection = Selection::Overview;
+}
+
 /// An RP2040: two inputs, four outputs and the sub.
 pub fn rp2040(theme: &Theme) -> ShellModel {
     let mut m = rp2350(theme);
