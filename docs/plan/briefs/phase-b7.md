@@ -64,6 +64,13 @@ about aux containers, and `docs/plan/survey-firmware-beta4.md` section
    display's CYCLE_ALL mode skips aux nouns (no UI change unless the
    Terminal lists cycled nouns).
 
+8. **Preserve `extras` on every edit path.** Phase B1 noted that an aux
+   slot edited through the existing Control Surfaces code may be
+   re-encoded with `extras = 0`, which would clear its boot flags. Check
+   every path that decodes, edits and re-encodes a `CsBinding` (including
+   Revert, copy and the command line) and make sure `extras` survives,
+   with a test.
+
 ## Exit
 
 The common checks pass; golden frames for the Auxiliary Outputs page
