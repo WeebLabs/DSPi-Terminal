@@ -90,6 +90,7 @@ Each phase ends with `cargo fmt --check`, `cargo clippy --workspace
 | B8 | Spectrum analyser | L | B1 | HW-2b |
 | B9 | Graph, band list, stats and dashboard refinements | M | B3 | |
 | B10 | Documentation, carried-over defects, audit, merge | M | all | HW-3 |
+| B11 | `.dspipreset` interoperability with the Console | M | B2 | |
 
 B3 to B8 are independent of each other once B1 and B2 land, so they can run
 in parallel worktrees.
@@ -299,6 +300,17 @@ traffic.
 - Write traffic: check that holding an arrow key on a gain or frequency
   cannot flood the device. The Console now caps drags at 30 writes per
   second and commits on release.
+
+### B11: `.dspipreset` interoperability (M)
+
+Found during B2: the Terminal numbers channel entries by its own unified
+index, while the Consoles use their own ids with `eqChannel`,
+`inputIndex` and `outputIndex`, so EQ, gain and delay from a Console file
+land on the wrong channels, and the reverse. The import also drops the
+psybass, crossfeed and loudness masks and the upmix modes. Establish the
+format from the Console source, write it down, and make files move
+correctly in both directions on both platforms. Brief:
+`briefs/phase-b11.md`.
 
 ### B10: Documentation, open defects, audit and merge (M)
 
