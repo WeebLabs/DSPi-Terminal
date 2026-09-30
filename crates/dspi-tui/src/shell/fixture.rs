@@ -434,3 +434,42 @@ pub fn state() -> DeviceState {
         BulkPacket::decode(packet()).expect("fixture packet"),
     )
 }
+
+/// Give `state` a Tube Modeller: the probe's `tube_preamp` feature, and the
+/// firmware's power-on values (tube.h:61-73) in the tube section at
+/// `WireTubeParams` (bulk_params.h:403-427), with the master switch as asked.
+/// The plain fixture leaves the section zeroed, which no device reports.
+pub fn tube(state: &mut DeviceState, enabled: bool) {
+    use dspi_proto::generated::{ranges as r, tube as t};
+    state.caps.features.push(dspi_session::probe::Feature {
+        name: "tube_preamp".into(),
+        present: true,
+        evidence: "fixture".into(),
+    });
+    let o = section("tube");
+    // enabled, tube_type, rectifier, xfmr_enabled (TUBE_DEFAULT_XFMR_ENABLED).
+    let head = [
+        u8::from(enabled),
+        t::TUBE_DEFAULT_TUBE_TYPE as u8,
+        t::TUBE_DEFAULT_RECTIFIER as u8,
+        1,
+    ];
+    state.bulk.patch(o, &head);
+    state
+        .bulk
+        .patch(o + 4, &t::TUBE_DEFAULT_OUTPUT_MASK.to_le_bytes());
+    let floats = [
+        r::TUBE_DEFAULT_DRIVE,
+        r::TUBE_DEFAULT_BIAS,
+        r::TUBE_DEFAULT_ASYM,
+        r::TUBE_DEFAULT_HARDNESS,
+        r::TUBE_DEFAULT_SAG,
+        r::TUBE_DEFAULT_XFMR_DAMPING,
+        r::TUBE_DEFAULT_XFMR_RES,
+        r::TUBE_DEFAULT_MIX,
+        r::TUBE_DEFAULT_TRIM,
+    ];
+    for (i, v) in floats.iter().enumerate() {
+        state.bulk.patch(o + 8 + 4 * i, &v.to_le_bytes());
+    }
+}

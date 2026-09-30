@@ -157,6 +157,7 @@ impl Screens for ConsoleScreens {
             Tool::Stats => Box::new(StatsPanel::new(self.shared.clone())),
             Tool::Monitor => Box::new(MonitorPanel::new(self.shared.clone())),
             Tool::AutoEq => Box::new(AutoEqPanel::new(self.shared.clone())),
+            Tool::Tube => Box::new(crate::screens::TubePanel::new()),
         }
     }
 
@@ -204,6 +205,7 @@ pub const APP_VERBS: &[(&str, &str)] = &[
     ("device", "Device picker"),
     ("reconnect", "Reconnect to the device"),
     ("clear-favourites", "AutoEQ: clear favourites"),
+    ("tube", "Tube Modeller"),
 ];
 
 /// The `:` line and the `Ctrl-P` palette.
@@ -1023,6 +1025,7 @@ impl Live {
                 Some("update") => self.autoeq_update(),
                 _ => self.open_tool(Tool::AutoEq),
             },
+            "tube" => self.open_tool(Tool::Tube),
             other => self.note(format!("`{other}` is not one of this interface's verbs")),
         }
     }
@@ -1528,6 +1531,7 @@ impl Live {
             "stats" => self.open_tool(Tool::Stats),
             "monitor" => self.open_tool(Tool::Monitor),
             "autoeq" => self.open_tool(Tool::AutoEq),
+            "tube" => self.open_tool(Tool::Tube),
             "settings" => self.open_settings(session),
             _ => return false,
         }
@@ -3064,6 +3068,15 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The Tube Modeller is reachable from the palette by name, as well as by
+    /// its `D` key.
+    #[test]
+    fn the_tube_verb_opens_the_tube_modeller() {
+        let (mut l, mut s, _) = console();
+        l.run_command(&mut s, "tube");
+        assert!(matches!(l.shell.tool, Some((Tool::Tube, _))));
     }
 
     #[test]

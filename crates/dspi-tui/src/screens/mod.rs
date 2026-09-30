@@ -31,6 +31,7 @@ pub mod presets;
 pub mod psybass;
 pub mod signals;
 pub mod stats;
+pub mod tube;
 pub mod upmixer;
 
 use std::cell::RefCell;
@@ -58,6 +59,7 @@ pub use presets::{PresetChoice, PresetMenu};
 pub use psybass::PsybassPanel;
 pub use signals::SignalsPanel;
 pub use stats::StatsPanel;
+pub use tube::TubePanel;
 pub use upmixer::UpmixerPanel;
 
 /// The application-side state the screens share.

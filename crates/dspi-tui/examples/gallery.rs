@@ -3,7 +3,7 @@
 //!   gallery [width] [height] [calm|console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
-//!                     |autoeq] [--settings <page>] [--expand n] [--busy|--full]
+//!                     |autoeq|tube] [--settings <page>] [--expand n] [--busy|--full]
 //!           [--depth truecolor|256|16|mono] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
@@ -19,8 +19,8 @@
 
 use dspi_tui::screens::{
     AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
-    MonitorPanel, OutputPage, Overview, PsybassPanel, SignalsPanel, StatsPanel, UpmixerPanel,
-    shared,
+    MonitorPanel, OutputPage, Overview, PsybassPanel, SignalsPanel, StatsPanel, TubePanel,
+    UpmixerPanel, shared,
 };
 use dspi_tui::settings::{AppConfig, SettingsScreen};
 use dspi_tui::shell::{Focus, Screen, Selection, Shell, Tool, fixture};
@@ -166,6 +166,7 @@ fn main() {
     state.bulk.patch(up + 28, &10.0f32.to_le_bytes());
     state.bulk.patch(up + 32, &100.0f32.to_le_bytes());
     state.bulk.patch(up + 36, &7000.0f32.to_le_bytes());
+    fixture::tube(&mut state, true);
     state.upmix_status = Some(dspi_proto::packets::UpmixStatus {
         active: true,
         parked_reason: 0,
@@ -361,6 +362,7 @@ fn main() {
             Tool::AutoEq,
             Box::new(AutoEqPanel::searching(shared.clone(), "sennheiser")) as Box<dyn Screen>,
         )),
+        "tube" => Some((Tool::Tube, Box::new(TubePanel::new()) as Box<dyn Screen>)),
         _ => None,
     };
     let (detail, selection): (Box<dyn Screen>, Selection) = match screen.as_str() {
