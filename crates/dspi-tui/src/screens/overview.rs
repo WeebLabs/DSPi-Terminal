@@ -109,7 +109,15 @@ fn summary(state: &DeviceState, channel: usize, flat: bool) -> String {
                         m.family.short().to_uppercase(),
                         m.order
                     ),
-                    None => format!("{} {f}", type_code(p.filter_type)),
+                    // A plain pass in a crossover slot keeps the crossover's
+                    // LP / HP: only PEQ bands read as cuts (DSPMath.swift:170-172).
+                    None => match p.filter_type {
+                        FilterType::LowPass => format!("LP {f}"),
+                        FilterType::HighPass => format!("HP {f}"),
+                        FilterType::LowPass1 => format!("LP1 {f}"),
+                        FilterType::HighPass1 => format!("HP1 {f}"),
+                        other => format!("{} {f}", type_code(other)),
+                    },
                 }
             })
             .collect();
@@ -163,7 +171,14 @@ impl Overview {
     }
 
     /// The grid's cells for the device's current state, in channel order.
+    ///
+    /// None without a device: the Console's dashboard renders no cards then,
+    /// since they would only repeat the last device's channels
+    /// (`DashboardView.swift:86-91`).
     pub fn cells(&mut self, state: &DeviceState) -> Vec<Cell> {
+        if !state.connected {
+            return Vec::new();
+        }
         let ni = state.caps.num_inputs as usize;
         let mut out: Vec<Cell> = Vec::new();
         for ch in channels(state) {

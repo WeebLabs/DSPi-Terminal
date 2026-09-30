@@ -144,6 +144,36 @@ impl ConsoleScreens {
     }
 }
 
+/// A beta4 tool whose panel is still to come (phases B5 and B6).
+///
+/// The tool is shown only when the device reports its feature (the probe's
+/// `subharmonic_synth` and `tube_preamp`); without it the Console's own
+/// unsupported notice stands in for the window
+/// (`SubharmonicSynthView.swift:252-257`, `TubeModellerView.swift:404-409`).
+/// No panel is stubbed: both cases are the shell's plain [`Placeholder`],
+/// which the real panels replace.
+pub fn pending_tool(state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
+    let (feature, unsupported) = match tool {
+        Tool::Subharm => (
+            "subharmonic_synth",
+            "Requires firmware with wire format V29 or newer. Update the DSPi firmware to \
+             use the Subharmonic Synthesizer.",
+        ),
+        // Tool::Tube; the factory sends only these two here.
+        _ => (
+            "tube_preamp",
+            "Requires firmware with wire format V31 or newer. Update the DSPi firmware to \
+             use the Tube Modeller.",
+        ),
+    };
+    let body = if panel::has_feature(state, feature) {
+        "This panel arrives in a later phase."
+    } else {
+        unsupported
+    };
+    Box::new(Placeholder::new(tool.title(), body))
+}
+
 impl Screens for ConsoleScreens {
     fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen> {
         match selection {
@@ -155,6 +185,7 @@ impl Screens for ConsoleScreens {
 
     fn tool(&self, state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
         match tool {
+            Tool::Subharm | Tool::Tube => pending_tool(state, tool),
             Tool::Matrix => Box::new(MatrixPanel::new(self.shared.clone())),
             Tool::Crossfeed => Box::new(CrossfeedPanel::new()),
             Tool::Loudness => Box::new(LoudnessPanel::new()),
@@ -647,6 +678,12 @@ impl Live {
                 item(ni + o, role, !out.enabled || out.mute, &self.peaks)
             })
             .collect();
+        // Without a device the sidebar shows no channel rows: they would only
+        // describe the last device's layout (`ContentView.swift:438-446`).
+        if !s.connected {
+            m.inputs.clear();
+            m.outputs.clear();
+        }
 
         let g = s.global();
         m.strip[1].state = Some(s.crossfeed().enabled);
@@ -708,7 +745,12 @@ impl Live {
             Selection::Input(i) => Some(i),
             Selection::Output(o) => Some(ni + o),
         };
-        let graphed = self.popout_pinned.or(selected_index);
+        // No curves without a device: the magnitudes are the last device's.
+        // The graph keeps its grid (`GraphView.swift:212-216`).
+        let graphed = self
+            .popout_pinned
+            .or(selected_index)
+            .filter(|_| s.connected);
         let partner = graphed
             .filter(|_| self.partner_shown)
             .and_then(|ch| self.shared.borrow().linked_partner(ch, ni));
@@ -1530,7 +1572,8 @@ impl Live {
     /// `overview`, `input` (the first input), `output` (the first output),
     /// a tool's lowercase title word (`matrix`, `crossfeed`, `loudness`,
     /// `leveller`, `psybass`, `upmixer`, `signals`, `stats`, `monitor`,
-    /// `autoeq`, `spectrum`), or `settings`. Returns false for a name it does not know.
+    /// `autoeq`, `subharm`, `tube`, `spectrum`), or `settings`. Returns false
+    /// for a name it does not know.
     pub fn show(&mut self, session: &mut Session, name: &str) -> bool {
         match name.to_ascii_lowercase().as_str() {
             "overview" => self.select(Selection::Overview),
@@ -1546,6 +1589,8 @@ impl Live {
             "stats" => self.open_tool(Tool::Stats),
             "monitor" => self.open_tool(Tool::Monitor),
             "autoeq" => self.open_tool(Tool::AutoEq),
+            "subharm" => self.open_tool(Tool::Subharm),
+            "tube" => self.open_tool(Tool::Tube),
             "spectrum" => {
                 if !self.shared.borrow().spectrum.engine.supported() {
                     self.connect_analyser(session);
@@ -2228,6 +2273,12 @@ impl Live {
         }
         self.advance_boot();
         self.advance_rebuild();
+        // Losing the device takes a channel page back to the overview, as
+        // the Console does (`ContentView.swift:964-972`): the sidebar row
+        // that would close the page has gone with the device.
+        if !self.state.connected && self.shell.model.selection != Selection::Overview {
+            self.select(Selection::Overview);
+        }
         self.sync_model();
     }
 
@@ -2577,6 +2628,87 @@ mod tests {
         );
         l.handle_event(&mut s, ShellEvent::Select(Selection::Output(0)));
         assert!(l.shell.detail.keys().iter().any(|k| k.key == "x"));
+    }
+
+    /// `S` and `D` open the beta4 tools by their Console titles; until
+    /// their panels land, the placeholder says what the device lacks, or
+    /// that the panel is still to come when it has the feature.
+    #[test]
+    fn the_beta4_tool_keys_open_their_tools_or_say_what_is_missing() {
+        let (mut l, mut s, _) = console();
+        let frame = |l: &mut Live, w, h| crate::render_frame(w, h, |a, b| l.draw(a, b));
+        for (tool, title, missing) in [
+            (
+                Tool::Subharm,
+                "Subharmonic Synthesizer",
+                "Requires firmware with wire format V29",
+            ),
+            (
+                Tool::Tube,
+                "Tube Modeller",
+                "Requires firmware with wire format V31",
+            ),
+        ] {
+            l.handle_event(&mut s, ShellEvent::OpenTool(tool));
+            assert!(matches!(l.shell.tool, Some((t, _)) if t == tool));
+            for (w, h) in [(120u16, 40u16), (80, 24)] {
+                let f = frame(&mut l, w, h);
+                assert!(f.contains(title), "{w}x{h}:\n{f}");
+                assert!(f.contains(&format!("{} closes", tool.key())), "{f}");
+                assert!(f.contains(missing), "{w}x{h}:\n{f}");
+            }
+            l.handle_event(&mut s, ShellEvent::CloseTool);
+        }
+        for (tool, name) in [
+            (Tool::Subharm, "subharmonic_synth"),
+            (Tool::Tube, "tube_preamp"),
+        ] {
+            l.state.caps.features.push(dspi_session::probe::Feature {
+                name: name.into(),
+                present: true,
+                evidence: "test".into(),
+            });
+            l.handle_event(&mut s, ShellEvent::OpenTool(tool));
+            let f = frame(&mut l, 120, 40);
+            assert!(f.contains("This panel arrives in a later phase."), "{f}");
+            assert!(!f.contains("Requires firmware"), "{f}");
+        }
+    }
+
+    /// The Console's no-device state: no channel rows, a graph grid with no
+    /// curves, and a channel page falls back to the overview.
+    #[test]
+    fn losing_the_device_empties_the_sidebar_and_the_graph() {
+        let (mut l, mut s, _) = console();
+        l.handle_event(&mut s, ShellEvent::Select(Selection::Input(0)));
+        assert!(!l.shell.model.curves.is_empty());
+        let frame = |l: &mut Live, w, h| crate::render_frame(w, h, |a, b| l.draw(a, b));
+        assert!(frame(&mut l, 120, 40).contains("INPUTS"));
+
+        l.state.connected = false;
+        l.tick(&mut s, None);
+        let m = &l.shell.model;
+        assert_eq!(m.selection, Selection::Overview, "back to the overview");
+        assert_eq!(m.channel_count(), 0, "no channel rows");
+        assert!(
+            m.curves.is_empty() && m.graph_channel.is_none(),
+            "no curves"
+        );
+        for (w, h) in [(120u16, 40u16), (80, 24)] {
+            let f = frame(&mut l, w, h);
+            assert!(!f.contains("INPUTS") && !f.contains("OUTPUTS"), "{f}");
+            assert!(
+                f.contains("Not connected") || f.contains("No Devices"),
+                "{f}"
+            );
+            // The graph keeps its grid and axes; the overview has no cells.
+            assert!(f.contains("Filter Response"), "{w}x{h}:\n{f}");
+            assert!(f.contains("1k"), "the frequency axis: {w}x{h}:\n{f}");
+            assert!(!f.contains("╭ FL"), "no overview cells: {f}");
+        }
+        // With no rows, the sidebar's keys have nothing to select.
+        l.handle_event(&mut s, ShellEvent::Select(Selection::Overview));
+        assert_eq!(l.shell.model.selection, Selection::Overview);
     }
 
     #[test]

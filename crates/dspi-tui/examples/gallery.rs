@@ -3,8 +3,8 @@
 //!   gallery [width] [height] [calm|console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
-//!                     |autoeq|spectrum] [--settings <page>] [--expand n]
-//!           [--busy|--full] [--channels 1,2,9] [--bars|--both]
+//!                     |autoeq|subharm|tube|spectrum|nodevice] [--settings <page>]
+//!           [--expand n] [--busy|--full] [--channels 1,2,9] [--bars|--both]
 //!           [--depth truecolor|256|16|mono] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
@@ -20,6 +20,7 @@
 //! the fixture with every channel tuned, which is what the overview grid
 //! is for; `--full` the one where no two channels are alike.
 
+use dspi_tui::live::pending_tool;
 use dspi_tui::screens::{
     AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
     MonitorPanel, OutputPage, Overview, PsybassPanel, SignalsPanel, SpectrumPanel, StatsPanel,
@@ -191,7 +192,7 @@ fn main() {
     // The Settings pages show wiring, so they get a device with some. The
     // three Control pages are entirely caps-driven, so theirs additionally
     // reports a control-surface capability table and the records built on it.
-    let state = if settings.is_some() {
+    let mut state = if settings.is_some() {
         dspi_tui::settings::cs_model::demo::state()
     } else {
         state
@@ -374,6 +375,10 @@ fn main() {
             Tool::AutoEq,
             Box::new(AutoEqPanel::searching(shared.clone(), "sennheiser")) as Box<dyn Screen>,
         )),
+        // Beta4 tools whose panels have not landed: the fixture reports none
+        // of their features, so each shows what the device lacks.
+        "subharm" => Some((Tool::Subharm, pending_tool(&state, Tool::Subharm))),
+        "tube" => Some((Tool::Tube, pending_tool(&state, Tool::Tube))),
         // The analyser draws from the shared engine, which the fixture fills
         // with a device's caps and a picture of the chosen outputs.
         "spectrum" => {
@@ -405,7 +410,9 @@ fn main() {
         _ => None,
     };
     let (detail, selection): (Box<dyn Screen>, Selection) = match screen.as_str() {
-        "overview" | "matrix" => (Box::new(Overview::new(shared.clone())), Selection::Overview),
+        "overview" | "matrix" | "nodevice" => {
+            (Box::new(Overview::new(shared.clone())), Selection::Overview)
+        }
         "output" => (
             Box::new(OutputPage::new(0, shared.clone(), &state)),
             Selection::Output(0),
@@ -416,6 +423,9 @@ fn main() {
         ),
     };
     fixture::select(&mut model, &state, &theme, selection);
+    if screen == "nodevice" {
+        fixture::disconnect(&mut model, &mut state);
+    }
     let mut shell = Shell::new(model, theme, detail);
     shell.focus = Focus::Screen;
     if let Some((tool, panel)) = tool {

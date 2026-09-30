@@ -59,8 +59,6 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("i", "Invert"),
     KeyHelp::new("1-9,0", "Jump to a band"),
     KeyHelp::new("a", "Enable All"),
-    KeyHelp::new("A", "Bypass All"),
-    KeyHelp::new("D", "Clear All"),
     KeyHelp::new("x", "PEQ / XO"),
     KeyHelp::new("Backspace", "Reset to 0"),
 ];
@@ -319,13 +317,15 @@ fn cell_style(theme: &Theme, focused: bool, armed: bool) -> Style {
 
 impl OutputPage {
     /// The page grammar behind `;` (DESIGN 13): the output's own gain,
-    /// delay, mute and enable, a PEQ band in one line, and the crossover
-    /// (`xo hp 80 lr4`).
+    /// delay, mute and enable, a PEQ band in one line, the crossover (`xo hp
+    /// 80 lr4`), and Bypass All and Clear All over the bank showing.
     fn quick_reply(&self, line: &str, state: &DeviceState) -> crate::shell::Quick {
         use super::quick::{ghost, number as num, verb};
         use crate::shell::Quick;
-        const VERBS: &[&str] = &["gain", "delay", "mute", "unmute", "on", "off", "xo", "name"];
-        const SUMMARY: &str = "gain -3 · delay 2.5 · mute · unmute · on · off · 3 peak 1k -2 · xo hp 80 lr4 · name Sub";
+        const VERBS: &[&str] = &[
+            "gain", "delay", "mute", "unmute", "on", "off", "xo", "bypass", "clear", "name",
+        ];
+        const SUMMARY: &str = "gain -3 · delay 2.5 · mute · unmute · on · off · 3 peak 1k -2 · xo hp 80 lr4 · bypass · clear · name Sub";
         let o = self.output;
         let channel = output_channel(state, o);
         let lower = line.to_ascii_lowercase();
@@ -378,6 +378,28 @@ impl OutputPage {
             Some("on") => one("enabled".into(), format!("out.enable {o} on")),
             Some("off") => one("disabled".into(), format!("out.enable {o} off")),
             Some("xo") => self.quick_xover(state, channel, &tokens[1..]),
+            // Bypass All and Clear All over the bank the tabs show; they
+            // have no keys since `A` and `D` open tools. Bypassing the
+            // crossovers opens the Console's critical dialog on Enter
+            // (`quick_run`, `Components.swift:1619-1628`), and the hint
+            // carries its warning before then.
+            Some("bypass") => match self.list.bypass_all_command(state, true) {
+                Some(_) if self.list.mode == FilterMode::Xo => hint(
+                    "Bypass this output's crossovers? This sends full-range audio to this \
+                     output with no crossover protection, which can damage unprotected drivers \
+                     such as tweeters.",
+                ),
+                Some(c) => one("Bypass All".into(), c),
+                None => hint("nothing to bypass"),
+            },
+            // Enter asks the Console's "Clear All Bands?" first.
+            Some("clear") => match self.list.clear_all_command(state) {
+                Some(_) => hint(match self.list.mode {
+                    FilterMode::Xo => "Clear All Bands? · every crossover band off",
+                    FilterMode::Peq => "Clear All Bands? · every band off",
+                }),
+                None => hint("nothing to clear"),
+            },
             Some("name") => {
                 let name = line
                     .trim_start()
@@ -550,6 +572,25 @@ impl OutputPage {
 impl Screen for OutputPage {
     fn quick(&self, line: &str, state: &DeviceState) -> Option<crate::shell::Quick> {
         Some(self.quick_reply(line, state))
+    }
+
+    /// `bypass` on the XO tab and `clear` on either ask the Console's
+    /// questions before they write, as its footer buttons do.
+    fn quick_run(&mut self, line: &str, state: &DeviceState) -> Option<ScreenEvent> {
+        let lower = line.trim().to_ascii_lowercase();
+        let word = super::quick::verb(&lower, &["bypass", "clear"]).filter(|_| {
+            // Only the bare word: anything longer is another grammar's.
+            !lower.contains(char::is_whitespace)
+        })?;
+        let ev = match word {
+            "bypass" if self.list.mode == FilterMode::Xo => self.list.bypass_all(state),
+            "clear" => self.list.clear_all_confirm(state),
+            _ => return None,
+        };
+        if matches!(ev, ScreenEvent::Dialog(_)) {
+            self.list_dialog = true;
+        }
+        Some(ev)
     }
 
     fn title(&self) -> String {
@@ -872,6 +913,97 @@ mod tests {
         assert!(f.contains("TYPE"), "the filter list is beneath: {f}");
         // Only the base stereo pair; the rest is the Matrix Mixer's job.
         assert!(!f.contains("FC"), "{f}");
+    }
+
+    /// Bypass All and Clear All moved from `A` and `D` to the command bar,
+    /// over whichever bank the tabs show. Bypassing crossovers keeps the
+    /// Console's critical confirmation (audit D20), and Clear All its
+    /// question, before anything is written.
+    #[test]
+    fn the_command_bar_bypasses_and_clears_the_bank_showing() {
+        let (mut p, state) = page(0);
+        // The fixture's OUT L has a crossover and no PEQ bands.
+        assert!(p.quick_reply("bypass", &state).commands.is_empty());
+        assert!(p.quick_reply("clear", &state).commands.is_empty());
+        assert_eq!(
+            p.quick_run("clear", &state),
+            Some(ScreenEvent::Status("nothing to clear".into()))
+        );
+        p.list.mode = FilterMode::Xo;
+        let q = p.quick_reply("bypass", &state);
+        assert!(q.commands.is_empty(), "Enter asks first: {q:?}");
+        assert!(
+            q.hint.starts_with("Bypass this output's crossovers?"),
+            "{q:?}"
+        );
+        assert!(q.hint.contains("can damage unprotected drivers"), "{q:?}");
+        let Some(ScreenEvent::Dialog(d)) = p.quick_run("bypass", &state) else {
+            panic!("the Console's dialog");
+        };
+        assert_eq!(d.title, "Bypass this output's crossovers?");
+        assert!(d.body.contains("Continue only if you are sure."));
+        assert!(d.critical && d.buttons[0].destructive);
+        assert_eq!(
+            p.dialog_result(DialogOutcome::Cancelled, &state),
+            ScreenEvent::Handled,
+            "Cancel writes nothing"
+        );
+        p.quick_run("bypass", &state);
+        match p.dialog_result(DialogOutcome::Button(0), &state) {
+            ScreenEvent::Command(c) => assert!(c.starts_with("eq.bypass out.1 "), "{c}"),
+            other => panic!("{other:?}"),
+        }
+        let Some(ScreenEvent::Dialog(d)) = p.quick_run("clear", &state) else {
+            panic!("Clear All asks");
+        };
+        assert_eq!(d.title, "Clear All Bands?");
+        match p.dialog_result(DialogOutcome::Button(0), &state) {
+            ScreenEvent::Command(c) => assert!(c.lines().all(|l| l.contains(" flat ")), "{c}"),
+            other => panic!("{other:?}"),
+        }
+        // A longer line is another grammar's, and runs as commands.
+        assert_eq!(p.quick_run("clear 3", &state), None);
+    }
+
+    /// Through the shell: `;bypass` and Enter on the XO tab put the critical
+    /// dialog on screen and send nothing.
+    #[test]
+    fn semicolon_bypass_on_the_xo_tab_raises_the_dialog() {
+        let (mut p, state) = page(0);
+        p.list.mode = FilterMode::Xo;
+        let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut s =
+            crate::shell::Shell::new(crate::shell::fixture::rp2350(&theme), theme, Box::new(p));
+        let mut out = s.handle(key(KeyCode::Char(';')), &state);
+        for c in "bypass".chars() {
+            out.extend(s.handle(key(KeyCode::Char(c)), &state));
+        }
+        out.extend(s.handle(key(KeyCode::Enter), &state));
+        assert!(out.is_empty(), "nothing sent: {out:?}");
+        let d = s.dialog.as_ref().expect("the dialog is up");
+        assert_eq!(d.title, "Bypass this output's crossovers?");
+    }
+
+    /// Routing names are the sidebar's channel names, not 7.1 labels
+    /// (`Components.swift:950`, `inputChannelName`), cut to fit.
+    #[test]
+    fn routing_rows_carry_the_sidebar_names() {
+        let (mut p, state) = page(0);
+        let mut b = state.bulk.as_bytes().to_vec();
+        let names = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "channel_names")
+            .map(|(_, o, _)| *o)
+            .expect("section");
+        b[names..names + 64].fill(0);
+        b[names..names + 3].copy_from_slice(b"Mac");
+        b[names + 32..names + 32 + 16].copy_from_slice(b"Turntable Righty");
+        let mut state = state;
+        state.replace_bulk(dspi_proto::wire::BulkPacket::decode(b).expect("packet"));
+        let f = draw(&mut p, &state, 94, 21);
+        let lines: Vec<&str> = f.lines().collect();
+        assert!(lines[0].contains("Mac") && !lines[0].contains("FL"), "{f}");
+        assert!(lines[1].contains("Turntable…"), "{f}");
     }
 
     #[test]

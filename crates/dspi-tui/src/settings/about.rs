@@ -92,6 +92,8 @@ mod tests {
             "{f}"
         );
         assert!(f.contains("Made with love by Weeb Labs"), "{f}");
+        // The probe's beta-aware version, as the Console spells it.
+        assert!(f.contains("1.1.6 beta 4"), "{f}");
         assert!(f.contains("LINKS & SUPPORT"), "{f}");
         for (name, _) in LINKS {
             assert!(f.contains(name), "missing {name}\n{f}");
