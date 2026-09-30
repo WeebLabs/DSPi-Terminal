@@ -162,6 +162,14 @@ fn upmix_row(state: &DeviceState, row: usize) -> Option<&'static str> {
     }
 }
 
+/// How many rows past the stereo pair the upmixer is deriving: none, Centre
+/// alone, or Centre and both surrounds (upmix.c:105-108).
+pub(crate) fn derived_rows(state: &DeviceState) -> usize {
+    (BASE_INPUTS..BASE_INPUTS + 3)
+        .filter(|r| upmix_row(state, *r).is_some())
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // The Core 1 interlock, from the state the panel already has
 // ---------------------------------------------------------------------------

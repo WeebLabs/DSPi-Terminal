@@ -108,10 +108,15 @@ impl Selection {
     }
 }
 
-/// The channels the analyser can show at `tap`: every input, or every enabled
-/// output. Clamped to what the caps report, because a mask bit for a channel
-/// the device lacks is a refused configuration (`rtaChannels`,
+/// The channels the analyser can show at `tap`: every live input row, or
+/// every enabled output. Clamped to what the caps report, because a mask bit
+/// for a channel the device lacks is a refused configuration (`rtaChannels`,
 /// SpectrumAnalyserView.swift:691-699).
+///
+/// The live input rows are the device's: the active input count, and past
+/// the stereo pair the rows the upmixer derives while it runs on one
+/// (rta.c:95-106). The Console lists its own input count there; the
+/// Terminal has no host-side count, and the device analyses no other rows.
 pub fn channels(state: &DeviceState, engine: &RtaEngine, tap: u8) -> Vec<u8> {
     let reported = engine
         .caps()
@@ -126,7 +131,12 @@ pub fn channels(state: &DeviceState, engine: &RtaEngine, tap: u8) -> Vec<u8> {
         .unwrap_or(16)
         .min(16);
     if tap == TAP_INPUT {
-        (0..state.caps.num_inputs.min(reported)).collect()
+        // Zero until the first meter read says otherwise.
+        let live = match state.meters.active_inputs {
+            0 => state.caps.num_inputs,
+            n => n.saturating_add(super::matrix::derived_rows(state) as u8),
+        };
+        (0..live.min(state.caps.num_inputs).min(reported)).collect()
     } else {
         (0..state.caps.num_outputs.min(reported))
             .filter(|o| state.output(*o as usize).enabled)
@@ -173,6 +183,10 @@ fn channel_color(state: &DeviceState, theme: &Theme, tap: u8, channel: u8) -> Co
 }
 
 fn channel_label(state: &DeviceState, tap: u8, channel: u8) -> String {
+    if tap == TAP_INPUT {
+        // An upmixer row by what it carries, as the matrix names it.
+        return super::matrix::row_name(state, channel as usize);
+    }
     super::channel_name(state, global_channel(state, tap, channel))
 }
 
@@ -1477,6 +1491,40 @@ mod tests {
         assert!(shared.borrow().spectrum.engine.watching());
         drop(p);
         assert!(!shared.borrow().spectrum.engine.watching());
+    }
+
+    /// The input chips are the rows the device is analysing: the active
+    /// inputs, and the upmixer's derived rows while it runs on the stereo
+    /// pair (rta.c:95-106).
+    #[test]
+    fn the_input_chips_are_the_live_rows() {
+        let mut state = testing::state();
+        let shared = crate::screens::shared();
+        demo::load(&shared, TAP_INPUT, &[0]);
+        let engine = &shared.borrow().spectrum.engine;
+        let n = |state: &DeviceState| channels(state, engine, TAP_INPUT).len();
+        state.meters.active_inputs = 0;
+        assert_eq!(n(&state), 8, "unknown: every input");
+        state.meters.active_inputs = 4;
+        assert_eq!(n(&state), 4);
+        state.meters.active_inputs = 2;
+        assert_eq!(n(&state), 2, "the upmixer is off");
+        state.caps.features.push(dspi_session::probe::Feature {
+            name: "upmixer".into(),
+            present: true,
+            evidence: "test".into(),
+        });
+        let o = dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == "upmix")
+            .map(|(_, o, _)| *o)
+            .unwrap();
+        state.bulk.patch(o, &[1]);
+        assert!(state.upmix().enabled);
+        let rows = 2 + super::super::matrix::derived_rows(&state);
+        assert!(rows == 3 || rows == 5, "{rows}");
+        assert_eq!(n(&state), rows, "the derived rows are live");
+        assert_eq!(channel_label(&state, TAP_INPUT, 2), "C");
     }
 
     #[test]
