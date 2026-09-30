@@ -509,6 +509,28 @@ enum PendingAction {
     SwitchDevice(String),
 }
 
+/// The shortest gap between two writes of one value while a key is held: the
+/// Console's cap on drag traffic, 30 writes a second
+/// (`PeqGraphEditor.swift`, Console 9c33a44).
+pub const WRITE_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Holds back the writes a held arrow key produces.
+///
+/// Every write here is a round trip followed by a re-read (DESIGN 11), so a
+/// key repeating faster than the device answers would leave keys waiting in
+/// the terminal and the value moving on after the key is let go. Each value
+/// (a parameter at its indices, or a whole band) is written at most once per
+/// [`WRITE_INTERVAL`]; a newer value inside the interval replaces the one
+/// held, and the held one goes when the interval ends, so the last value
+/// always reaches the device.
+#[derive(Debug, Default)]
+struct WriteGate {
+    /// When each value was last written.
+    sent: std::collections::HashMap<String, Instant>,
+    /// The newest line for a value inside its interval, and when it may go.
+    held: Vec<(String, String, Instant)>,
+}
+
 pub struct Live {
     pub shell: Shell,
     pub state: DeviceState,
@@ -569,6 +591,10 @@ pub struct Live {
     /// The Graphing settings the graph was last built from, so a change
     /// saved in Settings reaches the graph without a restart.
     graphing: crate::settings::config::Graphing,
+    gate: WriteGate,
+    /// A stopped clock for the write gate, so a test can hold a key at a
+    /// chosen rate.
+    clock: Option<Instant>,
 }
 
 impl Live {
@@ -629,6 +655,8 @@ impl Live {
             switch_to: None,
             input_pending: false,
             graphing: config.graphing.clone(),
+            gate: WriteGate::default(),
+            clock: None,
         };
         live.sync_model();
         live
@@ -937,6 +965,75 @@ impl Live {
         }
     }
 
+    fn now(&self) -> Instant {
+        self.clock.unwrap_or_else(Instant::now)
+    }
+
+    /// The value a line writes, when it is one a held key moves: a number
+    /// set on a parameter, or a whole band. Toggles, choices and actions are
+    /// never held back.
+    fn gate_key(&self, line: &str) -> Option<String> {
+        let tokens = dspi_cmd::tokenize(line);
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        match dspi_cmd::parse(&refs, &self.ctx).ok()? {
+            dspi_cmd::Command::Set { path, indices, .. } => {
+                let d = dspi_proto::registry::by_path(path)?;
+                matches!(
+                    d.kind,
+                    dspi_proto::registry::Kind::Float { .. }
+                        | dspi_proto::registry::Kind::Int { .. }
+                )
+                .then(|| format!("{path} {indices:?}"))
+            }
+            dspi_cmd::Command::SetBand { channel, band, .. } => {
+                Some(format!("eq {channel} {band}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Run the lines a screen asked for, holding back any value written less
+    /// than [`WRITE_INTERVAL`] ago (see [`WriteGate`]).
+    fn run_screen_commands(&mut self, session: &mut Session, lines: &str) {
+        let now = self.now();
+        let mut run: Vec<&str> = Vec::new();
+        for line in lines.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let Some(key) = self.gate_key(line) else {
+                run.push(line);
+                continue;
+            };
+            self.gate.held.retain(|(k, _, _)| *k != key);
+            match self.gate.sent.get(&key).map(|at| *at + WRITE_INTERVAL) {
+                Some(due) if now < due => self.gate.held.push((key, line.to_string(), due)),
+                _ => {
+                    self.gate.sent.insert(key, now);
+                    run.push(line);
+                }
+            }
+        }
+        // A block whose every write is held has nothing to say yet.
+        if run.iter().any(|l| !l.starts_with('#')) {
+            self.run_commands(session, &run.join("\n"));
+        }
+    }
+
+    /// Send every held write whose interval has ended; with `all`, every held
+    /// write, for anything that must see the device settled first.
+    pub fn flush_writes(&mut self, session: &mut Session, all: bool) {
+        let now = self.now();
+        let (due, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.gate.held)
+            .into_iter()
+            .partition(|(_, _, at)| all || *at <= now);
+        self.gate.held = kept;
+        for (key, line, _) in due {
+            self.gate.sent.insert(key, now);
+            self.run_commands(session, &line);
+        }
+        self.gate
+            .sent
+            .retain(|_, at| now.saturating_duration_since(*at) < WRITE_INTERVAL);
+    }
+
     fn enable_output(&mut self, session: &mut Session, index: u8, enable: bool) {
         match session.enable_output(index, enable) {
             Ok(dspi_session::EnableOutcome::Done) => {
@@ -965,6 +1062,7 @@ impl Live {
     }
 
     fn undo(&mut self, session: &mut Session, redo: bool) {
+        self.flush_writes(session, true);
         let result = if redo { session.redo() } else { session.undo() };
         match result {
             Ok(Some(u)) => {
@@ -1424,7 +1522,8 @@ impl Live {
                     VolumeMode::User => "vol.user",
                     VolumeMode::Master => "vol.master",
                 };
-                self.set(session, path, &[], Value::Float(db as f32));
+                let line = format!("{path} {}", screens::number(db as f32));
+                self.run_screen_commands(session, &line);
             }
             ShellEvent::VolumeReset => {
                 let path = match self.shell.model.volume_mode {
@@ -1444,7 +1543,7 @@ impl Live {
                 };
                 self.sync_model();
             }
-            ShellEvent::Command(c) => self.run_commands(session, &c),
+            ShellEvent::Command(c) => self.run_screen_commands(session, &c),
             ShellEvent::Session(req, owner) => {
                 let reply = (req.run)(session);
                 self.refresh(session);
@@ -2070,6 +2169,7 @@ impl Live {
             if let Some(line) = p.handle(key, &self.ctx) {
                 self.prompt = None;
                 if !line.trim().is_empty() {
+                    self.flush_writes(session, true);
                     self.run_command(session, &line);
                 }
             }
@@ -2534,6 +2634,9 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
                 }
                 live.handle_key(session, key);
             }
+            // The event wait is shorter than the write interval, so a held
+            // write goes out on time.
+            live.flush_writes(session, false);
             if let Some(serial) = live.switch_to.take() {
                 match open_device(&serial) {
                     Ok((next, state)) => {
@@ -3777,5 +3880,84 @@ mod tests {
             Some(500.0),
             "the cursor still moves"
         );
+    }
+
+    /// The writes a held arrow key makes, counted against the mock at a
+    /// typical 30 Hz key repeat and at a fast 60 Hz one, one second each.
+    #[test]
+    fn a_held_key_writes_at_most_thirty_times_a_second_and_always_the_last_value() {
+        use dspi_transport::mock::Direction;
+        let sets = |log: &LogHandle| -> Vec<f32> {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|x| x.direction == Direction::Out && x.opcode == op::REQ_SET_PREAMP_CH)
+                .map(|x| f32::from_le_bytes(x.payload[..4].try_into().unwrap()))
+                .collect()
+        };
+        for (hz, most) in [(30u32, 30usize), (60, 31)] {
+            let (mut l, mut s, log) = answering();
+            log.lock().unwrap().clear();
+            let t0 = Instant::now();
+            let period = Duration::from_secs(1) / hz;
+            let mut last = 0.0;
+            for i in 0..hz {
+                l.clock = Some(t0 + period * i);
+                // A screen that keeps its own running value, as the band
+                // editor does, so every repeat asks for a new one.
+                last = -20.0 + i as f32 * 0.1;
+                l.handle_event(
+                    &mut s,
+                    ShellEvent::Command(format!("pre 1 {}", screens::number(last))),
+                );
+                l.flush_writes(&mut s, false);
+            }
+            let during = sets(&log).len();
+            assert!(during <= most, "{hz} Hz: {during} writes in a second");
+            // The key is let go: the held value goes once its interval ends.
+            l.clock = Some(t0 + period * hz + WRITE_INTERVAL);
+            l.flush_writes(&mut s, false);
+            let all = sets(&log);
+            assert_eq!(
+                *all.last().unwrap(),
+                last,
+                "{hz} Hz: the final value is sent"
+            );
+            assert!(all.len() <= most + 1, "{hz} Hz: {} writes", all.len());
+            if hz == 30 {
+                assert_eq!(all.len(), 30, "one write per repeat at 30 Hz");
+            }
+        }
+    }
+
+    /// Toggles are not held back, and a second parameter is its own value.
+    #[test]
+    fn toggles_and_other_values_are_not_held_back() {
+        use dspi_transport::mock::Direction;
+        let (mut l, mut s, log) = answering();
+        l.clock = Some(Instant::now());
+        log.lock().unwrap().clear();
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -3".into()));
+        l.handle_event(&mut s, ShellEvent::Command("pre 2 -3".into()));
+        l.handle_event(&mut s, ShellEvent::Command("bypass on".into()));
+        l.handle_event(&mut s, ShellEvent::Command("bypass off".into()));
+        let ops: Vec<u8> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|x| x.direction == Direction::Out)
+            .map(|x| x.opcode)
+            .collect();
+        assert_eq!(
+            ops.iter().filter(|o| **o == op::REQ_SET_PREAMP_CH).count(),
+            2
+        );
+        assert_eq!(ops.iter().filter(|o| **o == op::REQ_SET_BYPASS).count(), 2);
+        // The same value again inside the interval is held, and undo sees it
+        // land first.
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -4".into()));
+        assert_eq!(l.gate.held.len(), 1);
+        l.flush_writes(&mut s, true);
+        assert!(l.gate.held.is_empty());
     }
 }
