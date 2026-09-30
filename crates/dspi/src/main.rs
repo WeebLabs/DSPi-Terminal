@@ -1710,31 +1710,48 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool, force: bool) -> u
 }
 
 fn cmd_params() -> u8 {
-    for d in REGISTRY {
-        let arity = d.target.arity();
-        let args = match arity {
-            0 => String::new(),
-            1 => " <index>".into(),
-            _ => " <index> <index>".into(),
-        };
-        let range = match d.kind {
-            Kind::Float { unit, min, max } => {
-                format!("{min} to {max}{}", unit.suffix())
-            }
-            Kind::Int { unit, min, max } => format!("{min} to {max}{}", unit.suffix()),
-            Kind::Bool => "on | off".into(),
-            Kind::Choice(v) => v.iter().map(|(_, n)| *n).collect::<Vec<_>>().join(" | "),
-            Kind::Trigger => "(action)".into(),
-            _ => String::new(),
-        };
-        println!(
-            "{:<22}{:<18}{}",
-            format!("{}{args}", d.path),
-            range,
-            d.plain
-        );
+    for line in params_lines() {
+        println!("{line}");
     }
     exit::OK
+}
+
+/// One line per registry row: the address, its range and what it does.
+///
+/// The columns are 22 and 18 wide, and an entry longer than its column is
+/// followed by two spaces rather than run into the next one: a long list of
+/// choices read "all | percussive | sustainedWeight the sub...". Widening
+/// the column to the longest entry instead would push every description
+/// past 130 characters for the sake of the filter types.
+fn params_lines() -> Vec<String> {
+    let rows: Vec<(String, String, &str)> = REGISTRY
+        .iter()
+        .map(|d| {
+            let args = match d.target.arity() {
+                0 => "",
+                1 => " <index>",
+                _ => " <index> <index>",
+            };
+            let range = match d.kind {
+                Kind::Float { unit, min, max } => {
+                    format!("{min} to {max}{}", unit.suffix())
+                }
+                Kind::Int { unit, min, max } => format!("{min} to {max}{}", unit.suffix()),
+                Kind::Bool => "on | off".into(),
+                Kind::Choice(v) => v.iter().map(|(_, n)| *n).collect::<Vec<_>>().join(" | "),
+                Kind::Trigger => "(action)".into(),
+                _ => String::new(),
+            };
+            (format!("{}{args}", d.path), range, d.plain)
+        })
+        .collect();
+    rows.into_iter()
+        .map(|(a, r, plain)| {
+            let aw = 22.max(a.len() + 2);
+            let rw = 18.max(r.len() + 2);
+            format!("{a:<aw$}{r:<rw$}{plain}")
+        })
+        .collect()
 }
 
 /// Every positional token, including the first, for the shared grammar.
@@ -1839,6 +1856,30 @@ fn fail(e: TransportError) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- params -------------------------------------------------------------
+
+    /// A long list of choices once ran straight into the description:
+    /// "all | percussive | sustainedWeight the sub...".
+    #[test]
+    fn params_keep_two_spaces_between_columns() {
+        let lines = params_lines();
+        assert_eq!(lines.len(), REGISTRY.len());
+        for (line, d) in lines.iter().zip(REGISTRY) {
+            let address = line.split("  ").next().unwrap();
+            assert!(address.starts_with(d.path), "{line}");
+            assert!(line.ends_with(d.plain), "{line}");
+            let before = &line[..line.len() - d.plain.len()];
+            assert!(
+                before.ends_with("  "),
+                "no gap before the description: {line}"
+            );
+        }
+        let sub = lines.iter().find(|l| l.starts_with("sub.select ")).unwrap();
+        assert!(sub.contains("all | percussive | sustained  "), "{sub}");
+        let rect = lines.iter().find(|l| l.contains("5y3")).unwrap();
+        assert!(rect.contains("solid-state | gz34 | 5u4 | 5y3  "), "{rect}");
+    }
 
     // -- scripts ------------------------------------------------------------
 
