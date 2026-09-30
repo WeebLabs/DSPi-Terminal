@@ -1,6 +1,6 @@
 # Phase B9 brief: refinements to existing screens
 
-Read `docs/plan/briefs/common-b.md` first. Phases B1 to B8 and B11 are
+Read `docs/plan/archive/briefs/common-b.md` first. Phases B1 to B8 and B11 are
 merged; `git log --oneline -40` shows them.
 
 ## Scope

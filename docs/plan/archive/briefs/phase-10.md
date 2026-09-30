@@ -2,7 +2,7 @@
 
 You are auditing the DSPi Terminal Console-parity work on branch
 `console-parity`, in a git worktree. You are not implementing; you are
-checking, and writing `docs/plan/audit.md`. Read, in order: `docs/plan/
+checking, and writing `docs/plan/archive/audit.md`. Read, in order: `docs/plan/
 PLAN.md` (the exit conditions in section 0, the per-phase exit criteria in
 section 2, the coverage matrix in section 4, the working agreements in
 section 5), `docs/plan/DESIGN.md` (the specification, including section 11),
@@ -47,7 +47,7 @@ macros,cs_model}.rs` against `docs/plan/survey-firmware.md` section 3 and
 
 ## What to produce
 
-`docs/plan/audit.md` with: a verdict per exit condition; the matrix with a
+`docs/plan/archive/audit.md` with: a verdict per exit condition; the matrix with a
 verdict per row and a one-line reason for anything not `pass`; a list of
 defects found, each with file:line, what is wrong, what the Console or
 header says, and a severity (blocks parity / wrong but usable / cosmetic);

@@ -1,6 +1,6 @@
 # Phase B4 brief: the output limiter on the output page
 
-Read `docs/plan/briefs/common-b.md` first. Phases B1 (protocol, registry
+Read `docs/plan/archive/briefs/common-b.md` first. Phases B1 (protocol, registry
 rows `limit.*` on opcode 0x81) and B2 (`DeviceState` limiter records,
 meters, snapshot diff, output-config dirty tracking) are merged. Read `git
 log` for their commits.

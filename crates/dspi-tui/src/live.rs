@@ -33,7 +33,7 @@ use crate::screens::{
 };
 use crate::settings::{AppConfig, SettingsData, SettingsScreen};
 use crate::shell::{
-    ChannelItem, Placeholder, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
+    ChannelItem, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
 };
 use crate::theme::{ChannelRole, Glyphs, Theme};
 use crate::widgets::text::truncate;
@@ -72,45 +72,12 @@ pub trait Screens {
     fn refresh_settings(&self, _session: &mut Session) {}
 }
 
-pub struct PlaceholderScreens;
-
-impl Screens for PlaceholderScreens {
-    fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen> {
-        let (title, body) = match selection {
-            Selection::Overview => (
-                "Overview".to_string(),
-                "The dashboard cards arrive in Phase 4.".to_string(),
-            ),
-            Selection::Input(i) => (
-                state.channel_name(i),
-                "The input page arrives in Phase 4.".into(),
-            ),
-            Selection::Output(o) => (
-                state.channel_name(state.caps.num_inputs as usize + o),
-                "The output page arrives in Phase 4.".into(),
-            ),
-        };
-        Box::new(Placeholder::new(title, body))
-    }
-
-    fn tool(&self, _state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
-        Box::new(Placeholder::new(
-            tool.title(),
-            "This panel arrives in a later phase.",
-        ))
-    }
-
-    fn settings(&self, _state: &DeviceState) -> Box<dyn Screen> {
-        Box::new(Placeholder::new("Settings", "Settings arrive in Phase 7."))
-    }
-}
-
-/// The Console's screens: the dashboard, the input page and the output page.
+/// The Console's screens: the dashboard, the input and output pages, every
+/// tool panel and Settings.
 ///
-/// The Matrix Mixer is the one tool panel that exists; the rest, and Settings,
-/// are still placeholders that later phases replace. Every screen it makes
-/// shares one [`Shared`] handle, which is where the linked pairs, the preset
-/// names and the channel clipboard live.
+/// Every screen it makes shares one [`Shared`] handle, which is where the
+/// linked pairs, the preset names, the channel clipboard and the spectrum
+/// analyser's engine live.
 pub struct ConsoleScreens {
     pub shared: Shared,
     /// What Settings reads that the bulk packet does not carry, refreshed the
@@ -216,7 +183,7 @@ pub const APP_VERBS: &[(&str, &str)] = &[
     ("commit", "Commit Parameters..."),
     ("revert", "Revert to Saved..."),
     ("factory-reset", "Factory Reset..."),
-    ("bootloader", "Firmware Update..."),
+    ("bootloader", "Reboot into Bootloader..."),
     ("device", "Device picker"),
     ("reconnect", "Reconnect to the device"),
     ("clear-favourites", "AutoEQ: clear favourites"),
@@ -477,11 +444,21 @@ enum AppDialog {
     BootWait,
     /// Which device to talk to, with the serial each row stands for.
     DevicePicker(Vec<String>),
-    /// The AutoEQ Update Database menu, and the confirm in front of the
-    /// rebuild.
-    AutoEqUpdate,
+    /// The AutoEQ Update Database menu, with the method each button stands
+    /// for, and the confirm in front of the rebuild.
+    AutoEqUpdate(Vec<AutoEqMethod>),
     AutoEqRebuild,
     AutoEqRebuildProgress,
+}
+
+/// One of the Update Database menu's methods. The menu's buttons are named
+/// by these rather than by position, because "Reset to Built-in" is offered
+/// only when there is a user copy to throw away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoEqMethod {
+    Rebuild,
+    Import,
+    Reset,
 }
 
 /// Which file action a path dialog is collecting a path for.
@@ -1243,18 +1220,25 @@ impl Live {
             ),
             None => (0, "Unknown".to_string()),
         };
-        let mut buttons = vec![
-            Button::new("Rebuild from GitHub"),
-            Button::new("Import File..."),
-        ];
+        let mut methods = vec![AutoEqMethod::Rebuild, AutoEqMethod::Import];
         // Only offered once there is a user copy to throw away, as the
         // Console's menu does.
         if dspi_session::autoeq::has_user_database() {
-            buttons.push(Button::new("Reset to Built-in"));
+            methods.push(AutoEqMethod::Reset);
         }
+        let mut buttons: Vec<Button> = methods
+            .iter()
+            .map(|m| {
+                Button::new(match m {
+                    AutoEqMethod::Rebuild => "Rebuild from GitHub",
+                    AutoEqMethod::Import => "Import File...",
+                    AutoEqMethod::Reset => "Reset to Built-in",
+                })
+            })
+            .collect();
         buttons.push(Button::new("Cancel"));
         self.dialog = Some((
-            AppDialog::AutoEqUpdate,
+            AppDialog::AutoEqUpdate(methods),
             Dialog::confirm(
                 "Update AutoEQ Database",
                 format!("Current database: {date}\nEntries: {count}\n\nChoose an update method:"),
@@ -1789,7 +1773,7 @@ impl Live {
                 let watch = actions::BootloaderWatch::new();
                 self.dialog = Some((
                     AppDialog::BootWait,
-                    Dialog::progress("Firmware Update", watch.status()),
+                    Dialog::progress("Reboot into Bootloader", watch.status()),
                 ));
                 self.boot = Some(watch);
             }
@@ -1801,27 +1785,31 @@ impl Live {
             }
 
             // -------------------------------------------------------- autoeq
-            (AppDialog::AutoEqUpdate, DialogOutcome::Button(0)) => {
-                self.dialog = Some((
-                    AppDialog::AutoEqRebuild,
-                    Dialog::confirm(
-                        "Rebuild AutoEQ Database",
-                        dspi_session::autoeq::rebuild_warning(),
-                        vec![Button::new("Rebuild"), Button::new("Cancel")],
-                    )
-                    .default_button(1),
-                ));
-            }
-            (AppDialog::AutoEqUpdate, DialogOutcome::Button(1)) => {
-                self.ask_path(session, FileAction::ImportAutoEqDatabase, &[])
-            }
-            (AppDialog::AutoEqUpdate, DialogOutcome::Button(2)) => {
-                match dspi_session::autoeq::reset_to_builtin() {
-                    Ok(n) => {
-                        self.reload_autoeq();
-                        self.note(format!("Reset to built-in database.  Entries: {n}"));
+            (AppDialog::AutoEqUpdate(methods), DialogOutcome::Button(i)) => {
+                match methods.get(i) {
+                    Some(AutoEqMethod::Rebuild) => {
+                        self.dialog = Some((
+                            AppDialog::AutoEqRebuild,
+                            Dialog::confirm(
+                                "Rebuild AutoEQ Database",
+                                dspi_session::autoeq::rebuild_warning(),
+                                vec![Button::new("Rebuild"), Button::new("Cancel")],
+                            )
+                            .default_button(1),
+                        ))
                     }
-                    Err(e) => self.note(format!("Failed to reset: {e}")),
+                    Some(AutoEqMethod::Import) => {
+                        self.ask_path(session, FileAction::ImportAutoEqDatabase, &[])
+                    }
+                    Some(AutoEqMethod::Reset) => match dspi_session::autoeq::reset_to_builtin() {
+                        Ok(n) => {
+                            self.reload_autoeq();
+                            self.note(format!("Reset to built-in database.  Entries: {n}"));
+                        }
+                        Err(e) => self.note(format!("Failed to reset: {e}")),
+                    },
+                    // Cancel is the button past the last method.
+                    None => {}
                 }
             }
             (AppDialog::AutoEqRebuild, DialogOutcome::Button(0)) => {
@@ -2322,6 +2310,14 @@ impl Live {
                     Applied::InputFormat { channels } => {
                         self.note(format!("{channels} input channels active"));
                     }
+                    // The ADAT link changing state (NOTIFY_EVT_ADAT_STATE and
+                    // NOTIFY_EVT_ADAT_INPUT_STATE, notify.h) moves the Stats
+                    // panel's ADAT sections on the next tick rather than at
+                    // the next two-second poll.
+                    Applied::Status(
+                        dspi_session::notify::Event::AdatState { .. }
+                        | dspi_session::notify::Event::AdatInputState { .. },
+                    ) => self.last_stats_poll = now - Duration::from_secs(3),
                     Applied::Status(_) | Applied::Nothing => {}
                 }
             }
@@ -2413,7 +2409,7 @@ impl Live {
             if finished {
                 // A progress dialog has no buttons, so the wait becomes a
                 // report the person can dismiss once it has an answer.
-                *dialog = Dialog::report("Firmware Update", vec![status]);
+                *dialog = Dialog::report("Reboot into Bootloader", vec![status]);
             }
         }
         if finished {
@@ -2565,12 +2561,37 @@ fn display_value(d: &dspi_proto::registry::ParamDesc, v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::Placeholder;
     use crate::theme::{ColorDepth, Glyphs};
     use crate::widgets::testing::key;
     use dspi_proto::generated::opcodes as op;
     use dspi_session::Capabilities;
     use dspi_transport::mock::LogHandle;
     use dspi_transport::{MockTransport, Transport};
+
+    /// A stand-in screen factory for the runner's tests: every region is a
+    /// titled placeholder, so what a test asserts is the runner and not a
+    /// screen, and nothing reads the user's config file.
+    struct StandInScreens;
+
+    impl Screens for StandInScreens {
+        fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen> {
+            let title = match selection {
+                Selection::Overview => "Overview".to_string(),
+                Selection::Input(i) => state.channel_name(i),
+                Selection::Output(o) => state.channel_name(state.caps.num_inputs as usize + o),
+            };
+            Box::new(Placeholder::new(title, ""))
+        }
+
+        fn tool(&self, _state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
+            Box::new(Placeholder::new(tool.title(), ""))
+        }
+
+        fn settings(&self, _state: &DeviceState) -> Box<dyn Screen> {
+            Box::new(Placeholder::new("Settings", ""))
+        }
+    }
 
     fn packet() -> Vec<u8> {
         crate::shell::fixture::packet()
@@ -2595,12 +2616,7 @@ mod tests {
         let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
         // Tests run without the reveal and the easing, as --lite does, so a
         // value asserted right after a change is the value itself.
-        let live = Live::new(
-            state,
-            theme,
-            Performance::lite(),
-            Box::new(PlaceholderScreens),
-        );
+        let live = Live::new(state, theme, Performance::lite(), Box::new(StandInScreens));
         (live, session, log)
     }
 
@@ -3175,12 +3191,7 @@ mod tests {
             dspi_proto::wire::BulkPacket::decode(packet()).unwrap(),
         );
         let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
-        let live = Live::new(
-            state,
-            theme,
-            Performance::lite(),
-            Box::new(PlaceholderScreens),
-        );
+        let live = Live::new(state, theme, Performance::lite(), Box::new(StandInScreens));
         (live, session, log)
     }
 
@@ -3546,7 +3557,7 @@ mod tests {
         assert!(l.boot.is_some(), "the wait started");
         let (kind, d) = l.dialog.as_ref().expect("the progress dialog");
         assert!(matches!(kind, AppDialog::BootWait));
-        assert_eq!(d.title, "Firmware Update");
+        assert_eq!(d.title, "Reboot into Bootloader");
         match &d.kind {
             crate::widgets::DialogKind::Progress { status, .. } => {
                 assert_eq!(status, "Waiting for the device to disconnect...")
@@ -3572,7 +3583,7 @@ mod tests {
 
         l.run_command(&mut s, "autoeq update");
         let (kind, d) = l.dialog.as_ref().expect("the update menu");
-        assert!(matches!(kind, AppDialog::AutoEqUpdate));
+        assert!(matches!(kind, AppDialog::AutoEqUpdate(_)));
         assert_eq!(d.title, "Update AutoEQ Database");
         assert!(d.body.contains("Choose an update method:"), "{}", d.body);
         assert_eq!(d.buttons[0].label, "Rebuild from GitHub");
@@ -3584,6 +3595,28 @@ mod tests {
         assert!(matches!(kind, AppDialog::AutoEqRebuild));
         assert!(d.body.contains("api.github.com"), "{}", d.body);
         assert_eq!(d.default, 1, "Cancel is the default");
+    }
+
+    /// The Update Database buttons are matched by what they stand for, so
+    /// Cancel in the third place without "Reset to Built-in" never resets.
+    #[test]
+    fn the_update_menu_matches_its_buttons_by_method() {
+        let (mut l, mut s, _) = console();
+        let methods = vec![AutoEqMethod::Rebuild, AutoEqMethod::Import];
+        l.finish_dialog(
+            &mut s,
+            AppDialog::AutoEqUpdate(methods.clone()),
+            DialogOutcome::Button(2),
+        );
+        assert!(l.dialog.is_none(), "the third button is Cancel here");
+
+        l.finish_dialog(
+            &mut s,
+            AppDialog::AutoEqUpdate(methods),
+            DialogOutcome::Button(0),
+        );
+        let (kind, _) = l.dialog.as_ref().expect("the rebuild confirm");
+        assert!(matches!(kind, AppDialog::AutoEqRebuild));
     }
 
     /// One device is not a picker; the Console only offers one with more than
@@ -3638,6 +3671,26 @@ mod tests {
         assert_eq!(
             l.shell.model.echo,
             "user volume changed by the system volume"
+        );
+    }
+
+    /// An ADAT state change brings the Stats poll forward, so the panel's
+    /// ADAT section follows the link without waiting out the two seconds.
+    #[test]
+    fn an_adat_state_change_brings_the_stats_poll_forward() {
+        let (mut l, mut s, _) = live();
+        l.open_tool(Tool::Stats);
+        let polled = Instant::now();
+        l.last_stats_poll = polled;
+        let mock = MockTransport::new();
+        mock.push_notification(vec![2, 8, 0, 13, 1, 1, 12, 0]);
+        let n = Notifications::start(mock.notifications().unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        l.tick(&mut s, Some(&n));
+        assert_eq!(l.state.adat_state, Some((true, true, 12)));
+        assert!(
+            l.last_stats_poll < polled,
+            "the next tick reads Stats again"
         );
     }
 

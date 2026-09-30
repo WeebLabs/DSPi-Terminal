@@ -1,6 +1,6 @@
 # Phase B2 brief: device state, presets and notifications
 
-Read `docs/plan/briefs/common-b.md` first. Phase B1 (protocol bump to V32)
+Read `docs/plan/archive/briefs/common-b.md` first. Phase B1 (protocol bump to V32)
 is merged: the bulk image has `subharm`, `tube` and `limiter` sections,
 the registry has `sub.*`, `tube.*` and `limit.*` rows, and the probes
 report the new features. Read `git log` for B1's commits to see what

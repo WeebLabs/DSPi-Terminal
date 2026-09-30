@@ -1,6 +1,6 @@
 # Phase B6 brief: the Tube Modeller panel
 
-Read `docs/plan/briefs/common-b.md` first. Phases B1 (protocol, registry
+Read `docs/plan/archive/briefs/common-b.md` first. Phases B1 (protocol, registry
 rows `tube.*` with f32 payloads on 0x3E / 0x3F), B2 (`DeviceState` tube
 section) and B3 (the `Tool` variant for `D`) are merged. Read `git log`
 for their commits.

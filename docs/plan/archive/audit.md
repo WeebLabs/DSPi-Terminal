@@ -1,5 +1,12 @@
 # Phase 10 audit
 
+*Annotated 2026-09-30 (phase B10): every defect in section 7 carries its
+resolution, as fixed (with the commit), accepted (with its `DESIGN.md`
+section 11 entry), not a defect, or open. Two remain open: D50 and the
+graph-height half of D66. Sections 4 and 6's em-dash and `PLAN.md`
+findings are also settled: `PLAN.md` was brought up to date in phase B10,
+and no em-dash remains outside the vendored headers.*
+
 *Opus, 2026-08-30, on `console-parity` (worktree at `c10230b`, phases 0
 through 9 merged). This is the audit called for by `PLAN.md` section 2 phase
 10: every exit condition, every coverage-matrix row, every phase exit
@@ -330,6 +337,8 @@ wrong for whatever the lost packet carried. `PLAN.md` Phase 2A: "a `seq` gap
 … trigger a full chunked re-read". This is the headline Phase 2A exit
 criterion and it does not hold.
 
+> **Resolution (D1):** Fixed in `508db08` ("Phase 10: fix the notification path, the disconnect, copy-to, Ctrl-S in Settings, and screenshot without a device").
+
 **D1b. The three Control pages never re-read control-surface state after a
 write.** B. `crates/dspi-tui/src/settings/mod.rs:1671-1698`
 (`session_result`) sets `cs_dirty` and forwards the reply; it never re-reads
@@ -352,6 +361,8 @@ running: applied. Reassign the conflicting pin, then apply."**
 snapshot, so a pin claimed by a control added this session is still offered
 as free to the next one. No test renders a card after a successful apply.
 
+> **Resolution (D1b):** Fixed in `5951a0a` ("Phase 10: D1b - the Control pages re-read the device after a write").
+
 **D2. Copy-to-slot writes the live parameters over the stored source
 slot.** B, and it loses data. `crates/dspi-tui/src/live.rs:1735-1750`
 (`copy_preset_to`): after `preset.save dest` it issues `preset.save source`
@@ -362,6 +373,8 @@ preset. It also never raises the unsaved-changes prompt, which
 `survey-console.md` section 4 lists copy-to among the triggers for
 precisely this reason.
 
+> **Resolution (D2):** Fixed in `508db08` ("Phase 10: fix the notification path, the disconnect, copy-to, Ctrl-S in Settings, and screenshot without a device"). Copy-to asks first and reloads the source on Discard.
+
 **D2b. A device-side `PRESET_LOADED` leaves a false dirty marker.** B.
 `crates/dspi-tui/src/live.rs:1946-1950` re-reads but never calls
 `mark_saved()`; the host-initiated path does (`live.rs:1172`). Load a preset
@@ -370,6 +383,8 @@ preset against the *previous* preset's baseline: `*` on the slot forever,
 plus a spurious Unsaved Changes dialog on the next preset switch, device
 switch or quit. Same omission on `BulkInvalidated { source: Preset }`
 (`live.rs:1945`).
+
+> **Resolution (D2b):** Fixed in `508db08` ("Phase 10: fix the notification path, the disconnect, copy-to, Ctrl-S in Settings, and screenshot without a device").
 
 **D3. The WIDTH column is blank for 12 dB/oct shelves.** B.
 `crates/dspi-proto/src/enums.rs:96-101`: `uses_q()` returns true only for
@@ -380,6 +395,8 @@ only "for crossover and first-order types", and `DESIGN.md` 2.1's own
 reference layout draws `Low Shelf 12 dB/oct   105 Hz   +8.8 dB   0.707`.
 Confirmed in the gallery.
 
+> **Resolution (D3):** Fixed in `1b082a3` ("Phase 10: D3, give the 12 dB/oct shelves their Q back"), `b18eb63` ("Phase 10: D3, pin the shelf Q against the filter maths").
+
 **D4. The Linkwitz target Qp is read-only.** B.
 `crates/dspi-tui/src/screens/linkwitz.rs:298-304` renders Qp as a readout;
 `:50` (`QP_NOTE`) says "the command grammar has no field for it". That is
@@ -387,6 +404,8 @@ not true: `screens/mod.rs:383-386` emits qp as the seventh `eq` token and
 `dspi-cmd/src/lib.rs:464` parses it, which is the decision recorded in
 `DESIGN.md` 11. The Console's popover has "Target fp **and Qp**" (step 0.01,
 min 0.1). One of the four Linkwitz parameters is unreachable from the TUI.
+
+> **Resolution (D4):** Fixed in `c294d72` ("Phase 10: D4, make the Linkwitz target Qp editable").
 
 **D5. A disconnect is un-observable.** B.
 `crates/dspi-tui/src/live.rs:561` sets `m.connected = true;`
@@ -400,12 +419,16 @@ permanently green and the Console's "No Devices" and the 0.4-opacity dim
 `session.meters()` failure is swallowed (`if let Ok(m)`, `live.rs:1902`), so
 the control path never reports the disconnect either.
 
+> **Resolution (D5):** Fixed in `508db08` ("Phase 10: fix the notification path, the disconnect, copy-to, Ctrl-S in Settings, and screenshot without a device").
+
 **D6. `Ctrl-S` inside Settings saves a preset, not the page.** B.
 `crates/dspi-tui/src/settings/mod.rs` has no handler for `Char('s')`
 anywhere, so `SettingsScreen::handle` returns `Unhandled` and
 `shell/mod.rs:344-356` falls through to `ShellEvent::SavePreset`.
 `DESIGN.md` 6.12: "`Ctrl-S` saves from anywhere in Settings." Today it
 issues an unrelated device write.
+
+> **Resolution (D6):** Fixed in `508db08` ("Phase 10: fix the notification path, the disconnect, copy-to, Ctrl-S in Settings, and screenshot without a device").
 
 **D6b. The notification reader is never re-armed on a device switch.** B.
 `crates/dspi-tui/src/live.rs:2060-2064` builds `notifications` once, from
@@ -421,12 +444,16 @@ holding it" message about itself. (Worth double-checking nusb's clone
 semantics before treating the silent-corruption half as fact; the
 never-re-armed half follows from the code alone.)
 
+> **Resolution (D6b):** Fixed in `508db08` ("Phase 10: fix the notification path, the disconnect, copy-to, Ctrl-S in Settings, and screenshot without a device").
+
 **D7. Slave BCK Pin is not editable.** B.
 `crates/dspi-tui/src/settings/i2s.rs:149` builds the row with `enabled:
 false` in both Unified and Split. The Console renders the same row and
 enables it in Split (`DSPi_ConsoleApp.swift:7302-7322`, `setI2SSlaveBckPin`,
 0xC2 role 1). `settings/mod.rs:989-992` concedes there is no registry path
 for role 1, which also means Revert cannot restore the slave pair.
+
+> **Resolution (D7):** Fixed in `24562d7` ("Phase 10: D7 - the Slave BCK pin moves, and Revert puts it back").
 
 **D8. The echo line has no contextual action strip.** B for I2.
 `crates/dspi-tui/src/shell/mod.rs:1033-1049` (`draw_echo`) draws only the
@@ -436,27 +463,37 @@ All   PEQ │ XO`, mirroring the Console's `BypassAllControls` split pill
 whose halves grey when they would be a no-op. The actions exist only as the
 unlabelled keys `a` / `A` / `D` / `x` on the key line.
 
+> **Resolution (D8):** Fixed in `891f010` ("Phase 10: fix D8, and record the accepted deviations in the design"), `20fd830` ("Phase 10: the filter list's actions on the echo line (D8)").
+
 **D9. The upmixer's "No device connected" status is missing.** B.
 `crates/dspi-tui/src/screens/upmixer.rs:68-87` produces four of the five
 STATUS strings in `survey-console.md` 2.18 plus an invented `"Idle"`
 fallback (`:85`). The string `No device connected` appears nowhere in
 `crates/`.
 
+> **Resolution (D9):** Fixed in `e08a21d` ("Phase 10: D9 and D10, say "No device connected" where the Console says it").
+
 **D10. Test Signals is missing the "No device connected" start blocker.** B.
 `crates/dspi-tui/src/screens/signals.rs:380-391` returns three of the four
 blockers in `survey-console.md` 2.19. A disconnected device falls through to
 `Ready · Sine` with Start enabled.
+
+> **Resolution (D10):** Fixed in `e08a21d` ("Phase 10: D9 and D10, say "No device connected" where the Console says it").
 
 **D11. There is no force-reconnect.** B for S8. The Console's right-click on
 the device name forces a reconnect, and its tooltip says "Not connected.
 Right-click the device name to retry." Nothing in `dspi-tui` offers it
 (`grep reconnect` finds only a stats counter at `actions.rs:104`).
 
+> **Resolution (D11):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78"). `:reconnect`.
+
 **D12. `Enter` on the Source row opens nothing.** W/B.
 `crates/dspi-tui/src/live.rs:1250` is `ShellEvent::Source(None) => {}`.
 `DESIGN.md` 2.3: "Preset and Source are picker rows: `←`/`→` cycle, `Enter`
 opens the list." The Console's Source is a popup over the seven sources.
 Cycling works, so the sources are reachable.
+
+> **Resolution (D12):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
 
 **D13. Control Interfaces never reports the device's real status.** B.
 `crates/dspi-tui/src/settings/interfaces.rs:543` and `:554` set
@@ -471,12 +508,16 @@ tests. `CtrlIfaceStatus.uart_last_status` / `i2c_last_status` are read into
 pin writes in `outputs.rs:186-193,207,216`, `inputs.rs:427,436,472,489,502`
 and `i2s.rs:238,249,271,283`.
 
+> **Resolution (D13):** Fixed in `8cb6983` ("Phase 10: D13 - the hardware and interface rows report the device's answer"), `242b43f` ("Phase 10: D13 - an interface that refused a write is followed, not assumed").
+
 **D14. The graph pop-out has no independent visibility.** B for G3.
 `crates/dspi-tui/src/shell/mod.rs:923-933` reuses the shell's single
 visibility map. `survey-console.md` 2.22 specifies an "optional independent
 visibility map", and `settings/config.rs:40`'s `popout_follows_selection` is
 written and read only by its own Settings row (`settings/graphing.rs:229`);
 nothing consults it.
+
+> **Resolution (D14):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
 
 **D15. `dspi screenshot` needs a device.** B for the Phase 3 exit
 checklist. `crates/dspi/src/main.rs:669` calls `connect(serial)` before
@@ -486,6 +527,8 @@ documentation screenshots need no device." The subcommand is also absent
 from `--help` (`main.rs:139-166`) while `main.rs:699` refers the user to a
 `dspi screenshot --help` that does not exist.
 
+> **Resolution (D15):** Fixed in `508db08` ("Phase 10: fix the notification path, the disconnect, copy-to, Ctrl-S in Settings, and screenshot without a device").
+
 ### Wrong but usable
 
 **D16. The gallery renders no widget catalogue and no chosen colour
@@ -493,21 +536,29 @@ depth.** W. `crates/dspi-tui/examples/gallery.rs:69-73` fixes
 `ColorDepth::TrueColor` unless `--ansi`, and there is no widget mode.
 Phase 3's exit line asks for "every widget in every colour depth".
 
+> **Resolution (D16):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D17. `Space` is a no-op on three quick-strip cells.** W.
 `crates/dspi-tui/src/live.rs:1212-1217` and `:1179-1188`: `strip_path`
 returns `None` for cell 0 (Matrix), 5 (Stats) and 6 (Settings), so `Space`
 does nothing there. `DESIGN.md` 2.3 maps `Space` to the Console's left
 click, which opens those windows. `Enter` works.
 
+> **Resolution (D17):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D18. No CRC path on preset load.** W.
 `crates/dspi-tui/src/live.rs:1166-1177`. The Console distinguishes a corrupt
 preset with "Preset data is corrupted."; that string appears nowhere in the
 workspace, so a corrupt payload reads as "Load Failed".
 
+> **Resolution (D18):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D19. "Set as Default" is never disabled.** W.
 `crates/dspi-tui/src/screens/presets.rs:64` always offers it; the Console
 disables it when the slot is already the default, and `shared.default_slot`
 is on hand (`live.rs:1710,1787`).
+
+> **Resolution (D19):** Fixed in `6c433f8` ("Phase 10: D19, D21, D23 and D42, four reachability and precision fixes").
 
 **D20. No generic hazard confirm.** W. `Hazard::Flash` and
 `Hazard::Irreversible` rows are not gated: `:dev.reset` on the `:` line
@@ -515,12 +566,16 @@ is on hand (`live.rs:1710,1787`).
 `live.rs:870-875` with no confirm, as does the same command on the CLI.
 Every Console-visible destructive button does have its own confirm.
 
+> **Resolution (D20):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D21. Band gain is seeded and re-formatted at 1 dp.** W.
 `crates/dspi-tui/src/screens/filters.rs:337`, `:537`, `:743` use `{:+.1}`
 and `format!("{:.1}")` when arming and nudging. The Console's GAIN
 ValueField is 3 dp (`survey-console.md` 2.12), and `DESIGN.md` 5 says "gain
 1 dp displayed, 3 dp editable". Arming a band whose gain is 8.875 seeds
 `8.9` and any nudge writes the quantised value back.
+
+> **Resolution (D21):** Fixed in `6c433f8` ("Phase 10: D19, D21, D23 and D42, four reachability and precision fixes").
 
 **D22. `explain_status` is missing 0x05.** W.
 `crates/dspi-session/src/surfaces.rs:96-126` covers 0x00-0x04 and 0x10-0x25.
@@ -530,10 +585,14 @@ on a display record with a bad address or brightness. It renders as
 `refused with status 0x05`. `surfaces.rs:1240`
 (`every_status_code_explains_itself`) does not include it.
 
+> **Resolution (D22):** Fixed in `6168369` ("Phase 10: D22, D29 - explain PIN_CONFIG_INVALID_PARAM, and keep the learn arm's status byte").
+
 **D23. Matrix Identify is a stub.** W.
 `crates/dspi-tui/src/screens/matrix.rs:864`:
 `ScreenEvent::Status("Identify arrives with Phase 6")`. The sidebar's `i`
 already implements it (`live.rs:1379-1396`).
+
+> **Resolution (D23):** Fixed in `6c433f8` ("Phase 10: D19, D21, D23 and D42, four reachability and precision fixes").
 
 **D24. Crossfeed PARAMETERS never dim outside Custom.** W.
 `crates/dspi-tui/src/screens/crossfeed.rs:172-189` builds both rows fully
@@ -541,11 +600,15 @@ enabled. `survey-console.md` 2.14 says "PARAMETERS (opacity 0.5 unless
 Custom)" and section 5 repeats it. `Param::enabled()` exists and `ParamRow`
 honours it (`widgets/param.rs:195,246,253`); it is simply never called here.
 
+> **Resolution (D24):** Fixed in `ab03fe5` ("Phase 10: D24 and D25, draw the dim the Console draws").
+
 **D25. Output chips never dim, though the caption promises they will.** W.
 `crates/dspi-tui/src/screens/signals.rs:590-611` builds every chip with
 `enabled: true` (explicit comment at `:607`) directly under the caption
 "Dimmed outputs are disabled in the matrix mixer and stay silent." Same
 hard-coded `true` at `loudness.rs:113` and `psybass.rs:160`.
+
+> **Resolution (D25):** Fixed in `ab03fe5` ("Phase 10: D24 and D25, draw the dim the Console draws").
 
 **D26. Config import skips the progress dialog.** W.
 `crates/dspi-tui/src/live.rs:1516-1533` applies synchronously and goes
@@ -553,6 +616,8 @@ straight to the report. `Dialog::progress(…, "Writing settings to the
 device...")` exists (`widgets/dialog.rs:163`) and is exercised only by a test
 (`dialog.rs:660`). `survey-console.md` section 4 and `DESIGN.md` 7.14 both
 put a progress sheet between the options and the result.
+
+> **Resolution (D26):** Accepted: `DESIGN.md` section 11, "Configuration import shows no progress dialog".
 
 **D27. Two Inputs choice lists are fixed where the Console reads the
 device.** W. `crates/dspi-tui/src/settings/inputs.rs:120` offers Instances
@@ -562,11 +627,15 @@ always; the Console strides `2...vm.i2sMaxInputChannels` and shows a static
 "2" on a stereo-only part. The Terminal offers counts the device will
 refuse.
 
+> **Resolution (D27):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
+
 **D28. The CS band picker is hardcoded at ten bands.** W, and a
 working-agreement violation. `crates/dspi-tui/src/settings/cs_model.rs:1338`
 and `:1359`: `(0..10).collect()`. `caps.max_bands` is served by the device
 (`probe.rs:184`) and `state.bands()` already uses it. The `20..=23`
 crossover range beside it is a frozen firmware constant and is fine.
+
+> **Resolution (D28):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
 
 **D29. `arm_learn` discards the device's status byte.** W.
 `crates/dspi-session/src/surfaces.rs:624-627`:
@@ -574,6 +643,8 @@ crossover range beside it is a frozen firmware constant and is fine.
 `CS_STATUS_NO_IR` (`control_surfaces.h:798`) and the result is dropped, so a
 refused arm shows "Waiting for a button..." until Cancel or a device-side
 timeout.
+
+> **Resolution (D29):** Fixed in `6168369` ("Phase 10: D22, D29 - explain PIN_CONFIG_INVALID_PARAM, and keep the learn arm's status byte").
 
 **D30. Footer notes are clipped at four wrapped lines.** W.
 `crates/dspi-tui/src/settings/mod.rs:362` (`Row::Note`) wraps to 4 and
@@ -585,10 +656,14 @@ footer (`macros.rs:32`) loses its Save/Revert sentence; and the Control
 Interfaces footer (`interfaces.rs:54-60`) loses "Fit external pull-ups
 (2.2k - 4.7k) on the I2C bus."
 
+> **Resolution (D30):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
+
 **D31. The volume-mode choice is never persisted.** W.
 `crates/dspi-tui/src/live.rs:1269-1275` flips `model.volume_mode` and never
 writes it back to `AppConfig`; it is only read at startup (`live.rs:511`).
 The Console persists it in app settings (`survey-console.md` 2.6).
+
+> **Resolution (D31):** Accepted: `DESIGN.md` section 11, "Graphing keeps a Volume section". The persisted choice is the Graphing page's; the sidebar toggle changes it for the session.
 
 **D32. `INPUT_FORMAT` does not re-lay-out the channel list.** W.
 `crates/dspi-tui/src/live.rs:1951-1953` prints a note. `PLAN.md` Phase 2A:
@@ -597,6 +672,8 @@ rows from `caps.num_inputs` with `inactive` hardcoded false
 (`live.rs:591-599`), and `Meters::active_inputs` (`probe.rs:686`) is decoded
 and read by nothing.
 
+> **Resolution (D32):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D33. The default theme is `amber`, not `console`.** W.
 `crates/dspi/src/main.rs:45`: `None => Palette::Amber`. `DESIGN.md` 4.4 names
 `console` the default. `main.rs:164`'s help line also says
@@ -604,10 +681,14 @@ and read by nothing.
 `Palette::NAMES` is `console, amber, dark, mono`. A user who opens the app
 without `--theme` does not get the Console palette that V1 is about.
 
+> **Resolution (D33):** Fixed in `508db08` ("Phase 10: fix the notification path, the disconnect, copy-to, Ctrl-S in Settings, and screenshot without a device").
+
 **D34. `--no-animation` does not exist.** W.
 `DESIGN.md` 9 says the connect animation is "Skipped with `--lite`,
 `--no-animation`, `TERM=dumb`". Only `--lite` and the glyph/depth detection
 are implemented (`main.rs:81`, `perf.rs:33-48`).
+
+> **Resolution (D34):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
 
 **D35. `health: [u8; 8]` indexed by a caps-served count.** W (latent
 panic). `crates/dspi-tui/src/settings/groups.rs:68` and
@@ -615,9 +696,13 @@ panic). `crates/dspi-tui/src/settings/groups.rs:68` and
 `caps.max_groups` / `caps.max_macros` via `drafts.len()`, used at
 `groups.rs:190` and `macros.rs:434`.
 
+> **Resolution (D35):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
+
 **D36. `ADAT_STATE` (0x08) is stored and never displayed.** W.
 `crates/dspi-session/src/state.rs:710-717` keeps `adat_state`; it has zero
 readers. The ADAT-output status the Console shows has no source.
+
+> **Resolution (D36):** Fixed in `b398138` ("Re-read Stats on the next tick when the ADAT link changes state"). With Stats open, an ADAT state change brings its poll forward to the next tick.
 
 **D37. Every write costs a full bulk re-read.** W.
 `crates/dspi-tui/src/live.rs:761`, `:771`, `:911` call `self.refresh(session)`
@@ -627,11 +712,15 @@ after each successful write, and `refresh` (`live.rs:726-732`) is a chunked
 its own writes". `run_commands` (`live.rs:786-800`) does one write and one
 full re-read per line, so a multi-line gesture is many bulk reads.
 
+> **Resolution (D37):** Accepted: `DESIGN.md` section 11, "Every write is followed by one chunked bulk read".
+
 **D38. No sequence-based suppression of our own `HOST_SET` echo.** W.
 Suppression is by source (`Source::is_ours()`, `notify.rs:83-85`, used at
 `live.rs:1936`) and suppresses only the echo text. A second host (the
 Console open at the same time) writing a value is reported as changed by
 this host. `PLAN.md` Phase 2A asks for suppression "by sequence".
+
+> **Resolution (D38):** Accepted: `DESIGN.md` section 11, "Our own writes are recognised by source, not sequence".
 
 **D39. `SettingsData` is not reset on a device switch.** W.
 `crates/dspi-tui/src/live.rs:1653-1676` (`adopt`) clears `stats`,
@@ -641,11 +730,15 @@ preset directory hold the previous device's data until Settings is reopened.
 The Console's rule ("Settings drafts discarded on a different serial, kept
 on re-plug of the same") is not implemented in either direction.
 
+> **Resolution (D39):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D40. Firmware Update is offered unconditionally.** W.
 `crates/dspi-tui/src/live.rs:203,942`: the survey's "hidden on STM32" and
 "Option skips the confirm" are both absent. Note `dspi_proto::Platform`
 (`lib.rs:60`) has only Rp2040 / Rp2350 / Unknown, so the STM32 rule is
 currently unreachable rather than wrong.
+
+> **Resolution (D40):** Fixed in `ba18a93` ("Name the bootloader handoff for what it does"). Firmware update itself is out of scope (`PLAN-beta4.md` decision 4); the handoff is now labelled Reboot into Bootloader and recorded in `DESIGN.md` section 11, "`:bootloader` is Reboot into Bootloader".
 
 **D41. No Clear Favourites.** W. `dspi-session/src/autoeq.rs` has
 `save_favourites` but nothing calls it with an empty list; the verb is not
@@ -653,11 +746,15 @@ in `APP_VERBS` (`live.rs:192-204`) nor in the AutoEQ panel's keys
 (`screens/autoeq.rs:28-32`). `survey-console.md` section 3 lists Favorite
 Profiles + Clear Favorites.
 
+> **Resolution (D41):** Fixed in `e2cbe5f` ("Phase 10: D41, give the AutoEQ browser a Clear Favourites"), `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78"). `:clear-favourites`.
+
 **D42. Stats has no Core 1 mode row.** W.
 `crates/dspi-tui/src/screens/stats.rs:210-227` shows Clock Frequency / Core
 Voltage / Sample Rate / Temperature; `survey-console.md` 2.20 names "sample
 rate, core1 mode, etc." `diag.core1` (0x7A) is in the registry
 (`registry.rs:2711`).
+
+> **Resolution (D42):** Fixed in `6c433f8` ("Phase 10: D19, D21, D23 and D42, four reachability and precision fixes").
 
 ### Cosmetic
 
@@ -667,42 +764,62 @@ unless `graph_popout`. `DESIGN.md` 2.1 draws `┌ Filter Response ── ⤢ ┐
 `⤢` pop-out affordance is absent too, and the graph and detail share one box
 where the mockup draws two. Not recorded in `DESIGN.md` 11.
 
+> **Resolution (D43):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D44.** Mono presentation is incomplete. `widgets/legend.rs:21-29`
 (`pill_text`) keys only on `Glyphs`, so pills read `● IN1` / `* IN1`, never
 `DESIGN.md` 4.3's `[IN1]` with `*` for visible. `widgets/chips.rs:129-134`
 renders unselected chips `[2]` rather than `[ 1]`, and emits the non-ASCII
 `■` and `ø` under `Glyphs::Ascii`.
 
+> **Resolution (D44):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D45.** Panel captions are drawn above the chip row, not below it:
 `crossfeed.rs:142-151`, `loudness.rs:95-120`, `psybass.rs:140-167`,
 `signals.rs:584-617`. `DESIGN.md` 7.8's template is header, chips, caption.
 
+> **Resolution (D45):** Fixed in `119b370` ("Phase 10: D45, D46, D51, D52, D58 and D80, six presentation fixes").
+
 **D46.** PRESET radio rows are two lines each (`panel.rs:296-303,836-874`)
 where `DESIGN.md` 7.8 shows one: `● Default    700 Hz / 4.5 dB - Balanced,
 most popular`. Costs 8 rows where 4 were specified, with the width to spare.
+
+> **Resolution (D46):** Fixed in `119b370` ("Phase 10: D45, D46, D51, D52, D58 and D80, six presentation fixes").
 
 **D47.** Unsigned dB fields carry a `+`. `widgets/text.rs:83-89` formats
 every `dB` field `{:+}`, so Crossfeed Feed Level (0..15) reads `+4.5 dB`,
 Loudness Reference SPL (40..100) `+80 dB`, Leveller Max Gain (0..35)
 `+12.0 dB`, Psybass Drive (0..18) and Original Bass (-60..0) likewise.
 
+> **Resolution (D47):** Fixed in `ffc72ce` ("Phase 10: D47, sign a dB field only when its range crosses zero").
+
 **D48.** The upmixer hides three of its four gauges when the matching
 engine is off (`upmixer.rs:117-138`); `survey-console.md` 2.18 shows all
 four whenever the status is active.
 
+> **Resolution (D48):** Not a defect: `UpmixerView.swift:186-197` gates the same gauges. Pinned by a test in `fe8902e` ("Phase 10: D48 and D81, pin two non-defects against the Console source").
+
 **D49.** "Stop immediately, no fade" appears nowhere; the transport draws
 `Stop` / `Stop now` (`panel.rs:1015-1019`).
 
+> **Resolution (D49):** Fixed in `6b19769` ("Phase 10: D49 and D54, say what the transport and the Linkwitz row hold").
+
 **D50.** The tile blurb is a caption row under the grid (`signals.rs:576`);
 `DESIGN.md` 7.9 puts it on the echo line.
+
+> **Resolution (D50):** Open. The tile blurb is still a caption row under the grid (`screens/signals.rs:583`), not the echo line.
 
 **D51.** The matrix conflict marker is one-sided: `matrix.rs:503` draws `!`
 only on the PDM column, though `would_conflict` (`matrix.rs:123-135`) is
 symmetric and the ENABLE row does colour both (`matrix.rs:569`).
 
+> **Resolution (D51):** Fixed in `119b370` ("Phase 10: D45, D46, D51, D52, D58 and D80, six presentation fixes").
+
 **D52.** Matrix column names are drawn in `theme.label()` (`matrix.rs:425`);
 `DESIGN.md` 7.7 says "Column headers in the output colour". Only the `OUT n`
 descriptor row is coloured.
+
+> **Resolution (D52):** Fixed in `119b370` ("Phase 10: D45, D46, D51, D52, D58 and D80, six presentation fixes").
 
 **D53.** Sidebar meters are 8 cells at the reference width
 (`shell/sidebar.rs:72`); `DESIGN.md` 7.1 and 6.9 specify 10 plus the clip
@@ -710,72 +827,106 @@ cell. The 24-column sidebar cannot hold `DESIGN.md`'s own name-9 +
 meter-10 + clip + pill, so either the widths or the sidebar width needs
 restating.
 
+> **Resolution (D53):** Accepted: `DESIGN.md` section 11, "Sidebar meters are 8 cells at the reference width".
+
 **D54.** The Linkwitz row shows only `f0`, `fp` and `⚙`
 (`filters.rs:326-332`); `DESIGN.md` 7.6 specifies `f0 40 Hz Q0 0.5 → fp 25
 Hz Qp 0.71  +8.2 dB  ⚙`.
+
+> **Resolution (D54):** Fixed in `6b19769` ("Phase 10: D49 and D54, say what the transport and the Linkwitz row hold").
 
 **D55.** FREQ nudges by a semitone ratio rather than the Console's 10 Hz
 `scrollStep` (`filters.rs:763-775`). Deliberate and commented; min 10 is
 honoured.
 
+> **Resolution (D55):** Accepted: `DESIGN.md` section 11, "FREQ nudges by a semitone ratio".
+
 **D56.** `"Database rebuilt successfully!  Entries: {n}"` with two spaces
 (`live.rs:2014`); the Console's string has a newline. Same at `live.rs:1052`.
+
+> **Resolution (D56):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
 
 **D57.** "Reset to Built-in" is added only when `has_user_database()`
 (`live.rs:1107`), and the button index mapping in `finish_dialog`
 (`live.rs:1602`) shifts when it is absent. Harmless today (Cancel falls
 through `_ => {}`), fragile.
 
+> **Resolution (D57):** Fixed in `1c37f8b` ("Match the Update Database buttons by method, not by position").
+
 **D58.** `Row::info("r", "Reset Watermarks")` (`stats.rs:482`) renders the
 key as the label and the button text as the value, i.e. backwards. The
 action works.
+
+> **Resolution (D58):** Fixed in `119b370` ("Phase 10: D45, D46, D51, D52, D58 and D80, six presentation fixes").
 
 **D59.** Starvation "Time since last event" / "Time between last two" count
 2 s polls rather than a wall clock (`stats.rs:494-512`), so they read in
 whole 2 s steps.
 
+> **Resolution (D59):** Accepted: `DESIGN.md` section 11, "The starvation timers step in 2 s poll intervals".
+
 **D60.** AutoEQ result rows omit the Console's leading form-factor icon
 (`screens/autoeq.rs:305-336`).
+
+> **Resolution (D60):** Accepted: `DESIGN.md` section 11, "AutoEQ result rows show the form factor as text".
 
 **D61.** Hold / Release pickers fall back to index 0 for an off-list device
 value, e.g. 7 ms shows as "5 ms" (`settings/global.rs:266-269,279-282`); the
 Console appends the out-of-list value.
 
+> **Resolution (D61):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
+
 **D62.** Macros availability is `max_macros > 0` (`settings/mod.rs:788`);
 the Console is `maxMacros > 0 && maxMacroSteps > 0`.
+
+> **Resolution (D62):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
 
 **D63.** Inputs availability is `spdif_multi_input || i2s_input_channels ||
 adat_input || lg_sound_sync` (`settings/mod.rs:778-783`); the Console uses
 `inputSourceSupported`, which `probe.rs:258-270` does not probe. Firmware
 with input-source support but none of those four loses the page.
 
+> **Resolution (D63):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
+
 **D64.** "Locked to 128x at <rate>" is driven by the configured
 `input_config.i2s_input_rate` (`settings/i2s.rs:50-55,181`); the Console
 uses the device's *running* `sampleRateHz` (`mck256UnsupportedAtCurrentRate`).
 Divergence is **needs HW** to see, but the source differs.
 
+> **Resolution (D64):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
+
 **D65.** The I2S Input section footer ("Wire one ADC serial-data line per
 stereo pair…", `DSPi_ConsoleApp.swift:7748-7752`) is not carried
 (`settings/inputs.rs:261`).
+
+> **Resolution (D65):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
 
 **D66.** Graphing carries an extra "Volume / Slider" section
 (`settings/graphing.rs:236-251`) that the Console keeps in the sidebar's
 volume menu, and the Console's persisted `graphHeight` (default 250) has no
 counterpart; `GraphHeight` (`shell/model.rs:99`) is session-only.
 
+> **Resolution (D66):** Accepted: `DESIGN.md` section 11, "Graphing keeps a Volume section". The Console's persisted `graphHeight` is still open: the Terminal's graph height is session-only.
+
 **D67.** Settings Revert and Advanced Reset raise confirms the Console does
 not have (`settings/mod.rs:1798-1808`, `settings/advanced.rs:112-119`).
 Additions, not omissions.
 
+> **Resolution (D67):** Accepted: `DESIGN.md` section 11, "Settings Revert and Advanced Reset confirm".
+
 **D68.** Advanced derives factory channel names from the live slot types
 (`settings/advanced.rs:75-102`); the Console passes `slotTypes: [0,0,0,0]`
 and always writes "SPDIF n L/R". Arguably better, but different.
+
+> **Resolution (D68):** Accepted: `DESIGN.md` section 11, "Reset channel names derives the factory names from the live slot types".
 
 **D69.** Control Surfaces row labels are re-worded: `Component` /
 `Controls` / `On Press` / `Gesture` / `GPIO` for the Console's `Type` /
 `Parameter` / `Action` / `Event` / `Pins`; Groups uses `Channel Type` for
 the Console's kind picker. Against the "same words as the Console"
 agreement, though each re-wording is defensible on its own.
+
+> **Resolution (D69):** Accepted: `DESIGN.md` section 11, "The control type row is labelled `Component`". The beta4 Console itself now reads `Controls`, `On Press`, `Gesture`, `GPIO` and `Channel Type` (`DSPi_ConsoleApp.swift:3540,4593,4660,4868`), which the Terminal already used; the survey was out of date.
 
 **D70.** Action names `Next` / `Increase` and `Previous` / `Decrease`
 (`cs_model.rs:293-296`) where `survey-console.md` 2.34 lists "Up, Down";
@@ -786,14 +937,20 @@ ties "Match Members Exactly" to relative-vs-absolute, which is `LINK_ABS`,
 so the code is probably right and the survey line condensed. One Console
 lookup at `DSPi_ConsoleApp.swift:6323` settles both.
 
+> **Resolution (D70):** Not a defect: the Console's `actionName` reads Next / Previous for an enum and Increase / Decrease otherwise, with Up / Down only on Browse/Adjust (`DSPi_ConsoleApp.swift:7188-7212`), and titles the flags "Match Members Exactly" and "Require Every Member" (`:5309`, `:5315`), as the Terminal does.
+
 **D71.** The macro card carries a `Run` / `Stop` button
 (`macros.rs:412-420`, `REQ_CS_MACRO_FIRE`) the survey does not list. An
 addition; confirm the Console has it.
+
+> **Resolution (D71):** Not a defect: the Console's macro card has the same play / stop button, "Run this macro now" / "Stop this macro" through `REQ_CS_MACRO_FIRE` (`DSPi_ConsoleApp.swift:3827-3835`, `:4245-4248`).
 
 **D72.** The EDIT_GATED warning is shown only when `uses_page_value() &&
 !can_arm_editing()` (`surfaces.rs:1470-1479`); the survey states it with the
 flag unconditionally. `can_arm_editing` (`surfaces.rs:343-357`) also mixes
 draft bindings and IR with *live* macros.
+
+> **Resolution (D72):** Fixed in `eb3affc` ("Count applied controls as well as drafts before warning that nothing can arm editing"). The warning condition was already the Console's (`DSPi_ConsoleApp.swift:7279-7283`); the check now counts applied bindings and remote keys as well as drafts, as its `usesNoun` and `canArmEditing` do.
 
 **D73.** `used_by` counts bindings only (`groups.rs:141-147`); IR commands
 and macro steps also address groups with `CS_FLAG_GROUP` and are also
@@ -801,10 +958,14 @@ deactivated by an empty or re-kinded group, so "Used by N control(s)…" and
 the Remove confirm can read 0 while remote keys and macro steps break. Low
 confidence.
 
+> **Resolution (D73):** Not a defect: the Console's `bindingsUsingGroup` counts bindings only (`DSPi_ConsoleApp.swift:3401-3406`), as the Terminal does; the source is now cited at `settings/groups.rs`.
+
 **D74.** Digit keys index CS slots, not visible cards
 (`surfaces.rs:2557`, `groups.rs:470`, `macros.rs`), so with controls in
 slots 0 and 5 the key `2` does nothing. Inconsistent with the 1-based
 band-jump convention pinned in `cd86123`.
+
+> **Resolution (D74):** Fixed in `f71f28b` ("Phase 10: D27, D28, D30, D35, D61, D62, D63, D64, D65, D74").
 
 **D75.** The remote-change announcement lands on the status line, not the
 echo line, and only the last change per tick survives
@@ -813,31 +974,45 @@ where `DESIGN.md` 9 says `changed by control surface`. The test
 `live::tests::a_notification_from_elsewhere_lands_in_the_model_and_the_echo_line`
 asserts the status field, locking the divergence in.
 
+> **Resolution (D75):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D76.** `DESIGN.md` 9's easing and label flash are implemented only for the
 sidebar volume readout, and only for the `user_volume` / `master_volume`
 sections (`live.rs:45,655-664,1938-1942`). No other value eases and there is
 no flash-once-in-`ok` anywhere.
+
+> **Resolution (D76):** Accepted: `DESIGN.md` section 11, "Remote changes print on the echo line". The label flash is not implemented.
 
 **D77.** `MockNotifications` spins the reader thread at 100 % CPU
 (`dspi-transport/src/mock.rs:31-38` returns `Ok(vec![])` immediately and
 `notify.rs:348-350` `continue`s with no sleep). Test-only; the USB path
 blocks 250 ms.
 
+> **Resolution (D77):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
+
 **D78.** `has_unsaved_changes()` clones and blanks the whole 5944-byte
 packet on every call (`state.rs:636-641`), and `sync_model` calls it every
 frame (`live.rs:566`): two 6 KB allocations per frame at 20 Hz.
+
+> **Resolution (D78):** Fixed in `124bc4d` ("Phase 10: fix D11, D12, D14, D16, D17, D18, D20, D32, D34, D39, D41, D43, D44, D56, D75, D77, D78").
 
 **D79.** The theme is not selectable from the config file. `DESIGN.md` 4.4
 says "`--theme` and the config file select them"; `settings/config.rs` has
 no theme key.
 
+> **Resolution (D79):** Fixed in `7bee26a` ("Phase 10: Settings polls the device while open, the theme comes from the config file, and the design records three decisions").
+
 **D80.** `actions.rs:288` `reset_watermarks()` is dead code; the panel routes
 through `ScreenEvent::Command("diag.buffers.reset")`.
+
+> **Resolution (D80):** Fixed in `119b370` ("Phase 10: D45, D46, D51, D52, D58 and D80, six presentation fixes").
 
 **D81.** The input-mismatch alert is ordered by the page you are on rather
 than by the pair (`screens/input.rs:221-234`): from IN2 it reads "Inputs 2
 and 1 don't match" with `Keep IN2` first. Low confidence; the Console source
 for this alert was not read.
+
+> **Resolution (D81):** Not a defect: `Components.swift:790-817` orders the alert by the page, as the Terminal does. Pinned by a test in `fe8902e` ("Phase 10: D48 and D81, pin two non-defects against the Console source").
 
 ## 8. Notes for the three deep audits
 

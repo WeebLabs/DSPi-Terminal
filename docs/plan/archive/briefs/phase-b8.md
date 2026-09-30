@@ -1,6 +1,6 @@
 # Phase B8 brief: the spectrum analyser
 
-Read `docs/plan/briefs/common-b.md` first. Phase B1 (protocol) is merged:
+Read `docs/plan/archive/briefs/common-b.md` first. Phase B1 (protocol) is merged:
 the RTA codecs (`RtaConfig`, `RtaCaps`, band-centre chunks,
 `RtaBandFrame`, the bin-frame header, `RtaStatus`) and the RTA feature
 probe exist. Read `git log` for its commits.

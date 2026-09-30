@@ -442,7 +442,10 @@ impl SurfacesPage {
 
     /// Whether anything can actually arm editing: a control, a remote key, or a
     /// macro step that writes the noun. An LED bound to it only reports the
-    /// state, so the indicator actions do not count.
+    /// state, so the indicator actions do not count. Drafts and what the
+    /// device holds both count, as in the Console's `canArmEditing`
+    /// (`DSPi_ConsoleApp.swift:7302-7321`); macro drafts live on the Macros
+    /// page, so a staged macro step counts once it is applied.
     fn can_arm_editing(&self) -> bool {
         let writes = |n: u8, a: u8| {
             n == m::noun::DISPLAY_EDIT
@@ -450,8 +453,15 @@ impl SurfacesPage {
                 && a != m::act::IND_ABOVE
                 && a != m::act::IND_LEVEL
         };
-        self.drafts.iter().any(|b| writes(b.noun, b.action))
-            || self.ir_drafts.iter().any(|c| writes(c.noun, c.action))
+        self.drafts
+            .iter()
+            .chain(self.live.bindings.iter())
+            .any(|b| writes(b.noun, b.action))
+            || self
+                .ir_drafts
+                .iter()
+                .chain(self.live.ir.iter())
+                .any(|c| writes(c.noun, c.action))
             || self
                 .live
                 .macros
@@ -459,13 +469,17 @@ impl SurfacesPage {
                 .any(|mac| mac.active_steps().iter().any(|s| writes(s.noun, s.action)))
     }
 
+    /// Whether a control or remote key drives Browse/Adjust, staged or
+    /// applied, as the Console's `usesNoun` (`DSPi_ConsoleApp.swift:7287-7296`).
     fn uses_page_value(&self) -> bool {
         self.drafts
             .iter()
+            .chain(self.live.bindings.iter())
             .any(|b| !b.is_empty() && b.noun == m::noun::PAGE_VALUE)
             || self
                 .ir_drafts
                 .iter()
+                .chain(self.live.ir.iter())
                 .any(|c| !c.is_empty() && c.noun == m::noun::PAGE_VALUE)
     }
 
@@ -3742,6 +3756,12 @@ mod tests {
         );
         // A button that writes Allow Editing lifts it.
         p.drafts[1] = m::set_noun(&p.live, &p.drafts[1], m::noun::DISPLAY_EDIT);
+        assert!(p.can_arm_editing());
+        // What the device holds counts as well as the drafts, as in the
+        // Console: an applied arm control still lifts the warning while its
+        // draft is being reworked.
+        p.live.bindings[1] = p.drafts[1].clone();
+        p.drafts[1] = m::set_noun(&p.live, &p.drafts[1], m::noun::USER_MUTE);
         assert!(p.can_arm_editing());
     }
 

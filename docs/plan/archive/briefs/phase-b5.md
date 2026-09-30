@@ -1,6 +1,6 @@
 # Phase B5 brief: the Subharmonic Synthesizer panel
 
-Read `docs/plan/briefs/common-b.md` first. Phases B1 (protocol, registry
+Read `docs/plan/archive/briefs/common-b.md` first. Phases B1 (protocol, registry
 rows `sub.*`), B2 (`DeviceState` subharm section, solo and headroom
 reads, meters) and B3 (the `Tool` variant for `S`) are merged. Read `git
 log` for their commits.

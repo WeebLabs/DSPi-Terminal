@@ -144,6 +144,9 @@ impl GroupsPage {
     }
 
     /// Bindings pointed at a group, so removing one can say what it breaks.
+    /// Bindings only, as the Console's `bindingsUsingGroup` counts them
+    /// (`DSPi_ConsoleApp.swift:3401-3406`); remote keys and macro steps that
+    /// address the group are not in the count there either.
     fn used_by(cs: &CsData, g: usize) -> usize {
         cs.bindings
             .iter()

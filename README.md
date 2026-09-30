@@ -7,12 +7,14 @@ in a full-screen terminal interface, plus a scriptable one-shot CLI.
 **Status: Console-parity work in progress on the `console-parity` branch.**
 The plan, the design and the surveys it rests on are in
 [`docs/plan/`](docs/plan/). `docs/plan/PLAN.md` carries the coverage matrix
-that says which Console feature lives where, and what is still open.
+that says which Console feature lives where, and `docs/plan/PLAN-beta4.md`
+what the move to firmware and Console 1.1.6 beta 4 added and what is still
+open.
 
 ## The interface
 
 ```
- DSPi  RP2350 · fw 1.1.6 · A1B2C3D4                     ● Connected   Preset 3: Living Room *
+ DSPi  RP2350 · fw 1.1.6 beta 4 · A1B2C3D4              ● Connected   Preset 3: Living Room *
 ╭────────────────────╮╭ Filter Response · FL ─────────────────────────────────────────── ⤢ g ╮
 │ INPUTS             ││+20                  ┆                    ┆        ┆           ┆      │
 │▍▪FL     ▓▓▓▓▓▓▏ IN1││                     ┆                    ┆        ┆           ┆      │
@@ -42,10 +44,17 @@ The shape is the Console's: a channel sidebar with a colour swatch, meters
 and clip cells; the response graph for the selected channel, with a linked
 partner's curve underneath in grey; below it the input page or the output
 page. The overview is a grid of small graphs, one per group of channels
-whose curves are identical, each with a one-line summary. The Console's
-tool windows are panels that replace the right pane; Settings replaces the
-screen. Colour follows attention: the selected channel's hue, red for clip
-and mute, orange for warnings, greys for the rest. `--theme console` puts
+whose curves are identical, each with a one-line summary. The output page
+carries the output limiter beside Mute, with its threshold, release, link
+group and gain reduction. The Console's tool windows are panels that
+replace the right pane: the Matrix Mixer, the DSP panels (Loudness,
+Crossfeed, Volume Leveller, Psychoacoustic Bass, Stereo Upmixer, and
+beta4's Subharmonic Synthesizer and Tube Modeller), the Signal Generator,
+the Spectrum Analyser, Stats, the Interrupt Monitor and AutoEQ. Settings
+replaces the screen, with the Console's pages, including Display > Spectrum
+Analyser and Control > Auxiliary Outputs for relays, LEDs and dimmers on
+spare GPIOs. Colour follows attention: the selected channel's hue, red for
+clip and mute, orange for warnings, greys for the rest. `--theme console` puts
 the Console's colour on every channel instead.
 
 ### Keys
@@ -140,9 +149,14 @@ See [`docs/platforms.md`](docs/platforms.md) for what has been verified where.
 The firmware headers in `crates/dspi-proto/firmware/` are vendored from
 `WeebLabs/DSPi` at `release/v1.1.6` @ `557bce7` (firmware 1.1.6 beta 4, wire
 format V32, 244 vendor opcodes, control-surface caps v20) and parsed at build
-time to generate every opcode, constant and struct offset. Nothing is
-transcribed by hand; a coverage test refuses to build if an opcode has no
-registry row. To move to a newer firmware, follow [`docs/firmware-bump.md`](docs/firmware-bump.md).
+time to generate every opcode and constant and the wire image's section
+offsets. What the generator cannot lift from a `#define` (the packet
+structs, which the build does not parse, and the tube type table, which
+lives only in `tube.c`) is a hand table with a comment citing its source
+line, and tests check it against the headers or the firmware source. A
+coverage test fails if an opcode has neither a registry row nor a written
+reason for leaving it out. To move to a newer firmware, follow
+[`docs/firmware-bump.md`](docs/firmware-bump.md).
 
 The device pushes its own changes over a notification endpoint, so a knob on
 a control surface, a remote, or the operating system's volume slider shows up

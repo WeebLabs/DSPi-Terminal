@@ -310,7 +310,7 @@ land on the wrong channels, and the reverse. The import also drops the
 psybass, crossfeed and loudness masks and the upmix modes. Establish the
 format from the Console source, write it down, and make files move
 correctly in both directions on both platforms. Brief:
-`briefs/phase-b11.md`.
+`archive/briefs/phase-b11.md`.
 
 ### B10: Documentation, open defects, audit and merge (M)
 
@@ -334,6 +334,28 @@ correctly in both directions on both platforms. Brief:
   analyser engine and the limiter.
 - **Merge:** open a pull request from `console-parity` to `main` so CI
   runs, then fast-forward or merge.
+
+### Progress (2026-09-30)
+
+Merged on `console-parity`: B1 (wire V32, 244 of 244 opcodes, CS caps
+v20), B2 (subharm, tube and limiter state, presets and diff), B3 (Signal
+Generator, cut labels, tool keys `S` `D` `A`, the non-V32 refusal and the
+no-device state), B4 (the output limiter), B5 (the Subharmonic
+Synthesizer), B6 (the Tube Modeller), B7 (caps v14 to v20 and Auxiliary
+Outputs), B8 (the spectrum analyser engine, panel and settings) and B11
+(`.dspipreset` interoperability with both Consoles). B10's documentation
+and defect work is done on its branch: `DESIGN.md` section 11 records the
+beta4 deviations, `archive/audit.md` gives every defect its resolution,
+and D36, D40, D57 and D72 are fixed; 1213 tests pass.
+
+Open: B9 (graph, band list, Stats and dashboard refinements), which also
+owns coverage rows R4 and R5; T5, the analyser overlay on the response
+graph and the RTA strip, deferred by decision 3; audit D50 and the graph
+height half of D66; the deep audits `PLAN.md` phase 10 still owes, plus
+the analyser engine and the limiter; and the pull request to `main`.
+
+Hardware checkpoints still to run, all on beta4: HW-1, HW-2, HW-2b and
+HW-3. None has been run on this branch yet.
 
 ## 4. Hardware checkpoints (all on beta4)
 
