@@ -477,11 +477,21 @@ enum AppDialog {
     BootWait,
     /// Which device to talk to, with the serial each row stands for.
     DevicePicker(Vec<String>),
-    /// The AutoEQ Update Database menu, and the confirm in front of the
-    /// rebuild.
-    AutoEqUpdate,
+    /// The AutoEQ Update Database menu, with the method each button stands
+    /// for, and the confirm in front of the rebuild.
+    AutoEqUpdate(Vec<AutoEqMethod>),
     AutoEqRebuild,
     AutoEqRebuildProgress,
+}
+
+/// One of the Update Database menu's methods. The menu's buttons are named
+/// by these rather than by position, because "Reset to Built-in" is offered
+/// only when there is a user copy to throw away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoEqMethod {
+    Rebuild,
+    Import,
+    Reset,
 }
 
 /// Which file action a path dialog is collecting a path for.
@@ -1243,18 +1253,25 @@ impl Live {
             ),
             None => (0, "Unknown".to_string()),
         };
-        let mut buttons = vec![
-            Button::new("Rebuild from GitHub"),
-            Button::new("Import File..."),
-        ];
+        let mut methods = vec![AutoEqMethod::Rebuild, AutoEqMethod::Import];
         // Only offered once there is a user copy to throw away, as the
         // Console's menu does.
         if dspi_session::autoeq::has_user_database() {
-            buttons.push(Button::new("Reset to Built-in"));
+            methods.push(AutoEqMethod::Reset);
         }
+        let mut buttons: Vec<Button> = methods
+            .iter()
+            .map(|m| {
+                Button::new(match m {
+                    AutoEqMethod::Rebuild => "Rebuild from GitHub",
+                    AutoEqMethod::Import => "Import File...",
+                    AutoEqMethod::Reset => "Reset to Built-in",
+                })
+            })
+            .collect();
         buttons.push(Button::new("Cancel"));
         self.dialog = Some((
-            AppDialog::AutoEqUpdate,
+            AppDialog::AutoEqUpdate(methods),
             Dialog::confirm(
                 "Update AutoEQ Database",
                 format!("Current database: {date}\nEntries: {count}\n\nChoose an update method:"),
@@ -1801,27 +1818,31 @@ impl Live {
             }
 
             // -------------------------------------------------------- autoeq
-            (AppDialog::AutoEqUpdate, DialogOutcome::Button(0)) => {
-                self.dialog = Some((
-                    AppDialog::AutoEqRebuild,
-                    Dialog::confirm(
-                        "Rebuild AutoEQ Database",
-                        dspi_session::autoeq::rebuild_warning(),
-                        vec![Button::new("Rebuild"), Button::new("Cancel")],
-                    )
-                    .default_button(1),
-                ));
-            }
-            (AppDialog::AutoEqUpdate, DialogOutcome::Button(1)) => {
-                self.ask_path(session, FileAction::ImportAutoEqDatabase, &[])
-            }
-            (AppDialog::AutoEqUpdate, DialogOutcome::Button(2)) => {
-                match dspi_session::autoeq::reset_to_builtin() {
-                    Ok(n) => {
-                        self.reload_autoeq();
-                        self.note(format!("Reset to built-in database.  Entries: {n}"));
+            (AppDialog::AutoEqUpdate(methods), DialogOutcome::Button(i)) => {
+                match methods.get(i) {
+                    Some(AutoEqMethod::Rebuild) => {
+                        self.dialog = Some((
+                            AppDialog::AutoEqRebuild,
+                            Dialog::confirm(
+                                "Rebuild AutoEQ Database",
+                                dspi_session::autoeq::rebuild_warning(),
+                                vec![Button::new("Rebuild"), Button::new("Cancel")],
+                            )
+                            .default_button(1),
+                        ))
                     }
-                    Err(e) => self.note(format!("Failed to reset: {e}")),
+                    Some(AutoEqMethod::Import) => {
+                        self.ask_path(session, FileAction::ImportAutoEqDatabase, &[])
+                    }
+                    Some(AutoEqMethod::Reset) => match dspi_session::autoeq::reset_to_builtin() {
+                        Ok(n) => {
+                            self.reload_autoeq();
+                            self.note(format!("Reset to built-in database.  Entries: {n}"));
+                        }
+                        Err(e) => self.note(format!("Failed to reset: {e}")),
+                    },
+                    // Cancel is the button past the last method.
+                    None => {}
                 }
             }
             (AppDialog::AutoEqRebuild, DialogOutcome::Button(0)) => {
@@ -3572,7 +3593,7 @@ mod tests {
 
         l.run_command(&mut s, "autoeq update");
         let (kind, d) = l.dialog.as_ref().expect("the update menu");
-        assert!(matches!(kind, AppDialog::AutoEqUpdate));
+        assert!(matches!(kind, AppDialog::AutoEqUpdate(_)));
         assert_eq!(d.title, "Update AutoEQ Database");
         assert!(d.body.contains("Choose an update method:"), "{}", d.body);
         assert_eq!(d.buttons[0].label, "Rebuild from GitHub");
@@ -3584,6 +3605,28 @@ mod tests {
         assert!(matches!(kind, AppDialog::AutoEqRebuild));
         assert!(d.body.contains("api.github.com"), "{}", d.body);
         assert_eq!(d.default, 1, "Cancel is the default");
+    }
+
+    /// The Update Database buttons are matched by what they stand for, so
+    /// Cancel in the third place without "Reset to Built-in" never resets.
+    #[test]
+    fn the_update_menu_matches_its_buttons_by_method() {
+        let (mut l, mut s, _) = console();
+        let methods = vec![AutoEqMethod::Rebuild, AutoEqMethod::Import];
+        l.finish_dialog(
+            &mut s,
+            AppDialog::AutoEqUpdate(methods.clone()),
+            DialogOutcome::Button(2),
+        );
+        assert!(l.dialog.is_none(), "the third button is Cancel here");
+
+        l.finish_dialog(
+            &mut s,
+            AppDialog::AutoEqUpdate(methods),
+            DialogOutcome::Button(0),
+        );
+        let (kind, _) = l.dialog.as_ref().expect("the rebuild confirm");
+        assert!(matches!(kind, AppDialog::AutoEqRebuild));
     }
 
     /// One device is not a picker; the Console only offers one with more than
