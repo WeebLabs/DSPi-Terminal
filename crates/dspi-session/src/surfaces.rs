@@ -45,7 +45,8 @@ pub mod status {
     pub const SUCCESS: u8 = 0x00;
     /// Accepted, the apply has not run yet. Poll again.
     pub const PENDING: u8 = 0x16;
-    /// A previous SET is still queued. Back off and retry.
+    /// Another SET of the same kind was still waiting for the main loop, so
+    /// this one was dropped, not queued (vendor_commands.c:1412-1417).
     pub const BUSY: u8 = 0x1B;
     /// A value or its length is out of range (control_surfaces.h:689).
     pub const INVALID_VALUE: u8 = 0x14;
@@ -265,10 +266,14 @@ impl<'t> Surfaces<'t> {
 
     /// Poll `REQ_GET_CS_STATUS` until the deferred apply resolves.
     ///
-    /// `PENDING` means the main loop has not run it yet; `BUSY` means an
-    /// earlier SET is still queued ahead of it, which clears on its own. Both
-    /// are waited out. Giving up names the slot, because "timed out" without
-    /// saying which write is not something a user can act on.
+    /// `PENDING` means the main loop has not run it yet, and is waited out.
+    /// `BUSY` is final: the firmware's handoff is one deep, so a SET that
+    /// arrives while another of its kind is still unapplied is dropped, not
+    /// queued (vendor_commands.c:1412-1417, 1444-1449, 1473-1478). Waiting on
+    /// would only hear the other SET's result under this slot's tag, so the
+    /// BUSY is returned and [`send`](Self::send) decides what to do about it.
+    /// Giving up names the slot, because "timed out" without saying which
+    /// write is not something a user can act on.
     pub fn wait_applied(&mut self) -> Result<CsStatusPacket> {
         for _ in 0..self.max_polls {
             std::thread::sleep(self.poll_interval);
@@ -276,10 +281,6 @@ impl<'t> Surfaces<'t> {
 
             let mine = self.pending.is_none_or(|tag| st.last_slot == tag);
             if mine && st.last_status != status::PENDING {
-                if st.last_status == status::BUSY {
-                    std::thread::sleep(self.busy_backoff);
-                    continue;
-                }
                 self.pending = None;
                 return Ok(st);
             }
@@ -290,14 +291,53 @@ impl<'t> Surfaces<'t> {
         })
     }
 
+    /// Send one deferred SET and wait for its outcome.
+    ///
+    /// A `BUSY` answer means the device dropped this SET because another one
+    /// of the same kind, most likely from another host, was still waiting for
+    /// the main loop. That SET's result will land under its own slot, so this
+    /// waits until the status stops reading `BUSY` or `PENDING` and sends this
+    /// one again, once. A second `BUSY` is reported as it is: the conflict,
+    /// not someone else's result.
+    fn send(
+        &mut self,
+        request: u8,
+        wvalue: u16,
+        payload: &[u8],
+        tag: u8,
+    ) -> Result<CsStatusPacket> {
+        self.t.control_out(request, wvalue, payload)?;
+        self.expect(tag);
+        let st = self.wait_applied()?;
+        if st.last_status != status::BUSY {
+            return Ok(st);
+        }
+        self.wait_idle()?;
+        self.t.control_out(request, wvalue, payload)?;
+        self.expect(tag);
+        self.wait_applied()
+    }
+
+    /// Wait, within the poll budget, for the SET ahead of a dropped one to be
+    /// applied: the main loop overwrites `last_status` with its result, which
+    /// is neither `BUSY` nor `PENDING`. Running out of polls is not an error
+    /// here; the re-send then answers `BUSY` again and that is reported.
+    fn wait_idle(&mut self) -> Result<()> {
+        for _ in 0..self.max_polls {
+            std::thread::sleep(self.busy_backoff);
+            let st = self.read_status()?;
+            if st.last_status != status::BUSY && st.last_status != status::PENDING {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------- bindings
 
     /// Apply one binding. `CS_TYPE_NONE` clears the slot.
     pub fn write_binding(&mut self, slot: u8, b: &CsBinding) -> Result<CsStatusPacket> {
-        self.t
-            .control_out(op::REQ_SET_CS_BINDING, slot as u16, &b.encode())?;
-        self.expect(slot);
-        self.wait_applied()
+        self.send(op::REQ_SET_CS_BINDING, slot as u16, &b.encode(), slot)
     }
 
     /// Set a slot's label. A single NUL clears it.
@@ -319,18 +359,17 @@ impl<'t> Surfaces<'t> {
         if bytes.is_empty() {
             bytes.push(0);
         }
-        self.t
-            .control_out(op::REQ_SET_CS_NAME, slot as u16, &bytes)?;
-        self.expect(slot);
-        self.wait_applied()
+        self.send(op::REQ_SET_CS_NAME, slot as u16, &bytes, slot)
     }
 
     /// Apply one IR sub-slot. An all-zero record clears it.
     pub fn write_ir_command(&mut self, sub_slot: u8, c: &IrCommand) -> Result<CsStatusPacket> {
-        self.t
-            .control_out(op::REQ_SET_CS_IR_CMD, sub_slot as u16, &c.encode())?;
-        self.expect(tag::IR | sub_slot);
-        self.wait_applied()
+        self.send(
+            op::REQ_SET_CS_IR_CMD,
+            sub_slot as u16,
+            &c.encode(),
+            tag::IR | sub_slot,
+        )
     }
 
     // --------------------------------------------------------------- groups
@@ -341,10 +380,12 @@ impl<'t> Surfaces<'t> {
     /// whose group just emptied goes down with its reason in `slot_status`
     /// rather than the write being refused (control_surfaces.h:689-694).
     pub fn write_group(&mut self, index: u8, g: &CsGroup) -> Result<CsStatusPacket> {
-        self.t
-            .control_out(op::REQ_SET_CS_GROUP, index as u16, &g.encode())?;
-        self.expect(tag::GROUP | index);
-        self.wait_applied()
+        self.send(
+            op::REQ_SET_CS_GROUP,
+            index as u16,
+            &g.encode(),
+            tag::GROUP | index,
+        )
     }
 
     // --------------------------------------------------------------- macros
@@ -362,13 +403,24 @@ impl<'t> Surfaces<'t> {
         header: &CsMacroHeaderWire,
         steps: &[CsMacroStep],
     ) -> Result<CsStatusPacket> {
+        // Every record is still written after a refusal, as the Console does
+        // (`setCsMacro`, Commands.swift:3263-3277), and the first refusal is
+        // what the caller hears: each step answers under the macro's own tag,
+        // so the header's success would otherwise hide a rejected step.
+        let mut first_refusal = None;
         for (i, step) in steps.iter().enumerate() {
-            self.write_macro_step(index, i as u8, step)?;
+            let st = self.write_macro_step(index, i as u8, step)?;
+            if st.last_status != status::SUCCESS && first_refusal.is_none() {
+                first_refusal = Some(st);
+            }
         }
-        self.t
-            .control_out(op::REQ_SET_CS_MACRO, index as u16, &header.encode())?;
-        self.expect(tag::MACRO | index);
-        self.wait_applied()
+        let st = self.send(
+            op::REQ_SET_CS_MACRO,
+            index as u16,
+            &header.encode(),
+            tag::MACRO | index,
+        )?;
+        Ok(first_refusal.unwrap_or(st))
     }
 
     /// Apply one step. `wValue` packs the step above the macro index.
@@ -379,10 +431,12 @@ impl<'t> Surfaces<'t> {
         value: &CsMacroStep,
     ) -> Result<CsStatusPacket> {
         let wvalue = ((step as u16) << 8) | index as u16;
-        self.t
-            .control_out(op::REQ_SET_CS_MACRO_STEP, wvalue, &value.encode())?;
-        self.expect(tag::MACRO | index);
-        self.wait_applied()
+        self.send(
+            op::REQ_SET_CS_MACRO_STEP,
+            wvalue,
+            &value.encode(),
+            tag::MACRO | index,
+        )
     }
 
     /// Clear one step: an all-zero record is the empty step the sequencer
@@ -411,18 +465,17 @@ impl<'t> Surfaces<'t> {
     // -------------------------------------------------------------- display
 
     pub fn write_display_cfg(&mut self, cfg: &CsDisplayCfg) -> Result<CsStatusPacket> {
-        self.t
-            .control_out(op::REQ_SET_CS_DISPLAY_CFG, 0, &cfg.encode())?;
-        self.expect(tag::DISPLAY);
-        self.wait_applied()
+        self.send(op::REQ_SET_CS_DISPLAY_CFG, 0, &cfg.encode(), tag::DISPLAY)
     }
 
     /// Apply one page. An all-zero record clears the slot.
     pub fn write_display_page(&mut self, page: u8, p: &CsDisplayPage) -> Result<CsStatusPacket> {
-        self.t
-            .control_out(op::REQ_SET_CS_DISPLAY_PAGE, page as u16, &p.encode())?;
-        self.expect(tag::DISPLAY | page);
-        self.wait_applied()
+        self.send(
+            op::REQ_SET_CS_DISPLAY_PAGE,
+            page as u16,
+            &p.encode(),
+            tag::DISPLAY | page,
+        )
     }
 
     // ---------------------------------------------------- auxiliary outputs
@@ -844,16 +897,22 @@ mod tests {
         assert_eq!(log.len(), 3);
     }
 
-    /// BUSY means an earlier SET is still queued ahead of this one. It clears
-    /// on its own, so it is waited out rather than reported as a failure.
+    /// BUSY means the device dropped this SET because another of its kind
+    /// was still waiting (vendor_commands.c:1412-1417). The other SET's result
+    /// lands next, possibly under this very tag, so it must not be taken for
+    /// ours: the write waits for the device to settle and is sent again.
     #[test]
-    fn a_busy_device_is_waited_out() {
+    fn a_busy_write_is_sent_again_once_the_device_settles() {
         let mut t = MockTransport::new()
             .data(op::REQ_SET_CS_GROUP, vec![])
             .reply(
                 op::REQ_GET_CS_STATUS,
                 Reply::Sequence(vec![
                     Reply::Data(status_bytes(tag::GROUP | 2, status::BUSY)),
+                    // The other host's SET, applied under the same tag.
+                    Reply::Data(status_bytes(tag::GROUP | 2, 0x1F)),
+                    // Ours, re-sent.
+                    Reply::Data(status_bytes(tag::GROUP | 2, status::PENDING)),
                     Reply::Data(status_bytes(tag::GROUP | 2, status::SUCCESS)),
                 ]),
             );
@@ -871,13 +930,43 @@ mod tests {
             .unwrap()
         };
         assert_eq!(st.last_status, status::SUCCESS);
-        assert_eq!(t.log()[0].payload.len(), 40);
-        assert_eq!(t.log()[0].payload[0], 2, "target_kind");
-        assert_eq!(
-            &t.log()[0].payload[4..8],
-            &[0x0A, 0, 0, 0],
-            "member_mask LE"
-        );
+        let writes: Vec<_> = t
+            .log()
+            .into_iter()
+            .filter(|e| e.direction == Direction::Out)
+            .collect();
+        assert_eq!(writes.len(), 2, "the dropped SET is sent once more");
+        assert_eq!(writes[0], writes[1]);
+        assert_eq!(writes[0].payload.len(), 40);
+        assert_eq!(writes[0].payload[0], 2, "target_kind");
+        assert_eq!(&writes[0].payload[4..8], &[0x0A, 0, 0, 0], "member_mask LE");
+    }
+
+    /// A second BUSY is the conflict itself, and is reported as that rather
+    /// than waited on until another host's result turns up under this tag.
+    #[test]
+    fn a_write_still_busy_after_its_retry_reports_the_conflict() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_BINDING, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![
+                    Reply::Data(status_bytes(3, status::BUSY)),
+                    Reply::Data(status_bytes(9, status::SUCCESS)),
+                    Reply::Data(status_bytes(3, status::BUSY)),
+                ]),
+            );
+        let st = {
+            let mut s = surfaces(&mut t);
+            s.write_binding(3, &Binding::default()).unwrap()
+        };
+        assert_eq!(st.last_status, status::BUSY);
+        let sets = t
+            .log()
+            .iter()
+            .filter(|e| e.direction == Direction::Out)
+            .count();
+        assert_eq!(sets, 2, "one retry, not a loop");
     }
 
     /// A knob turned on the device also lands in `last_status`. Without the
@@ -1047,6 +1136,49 @@ mod tests {
             "the header goes last"
         );
         assert_eq!(writes[2].payload[32], 2, "step_count");
+    }
+
+    /// Every step answers under the macro's own tag, so a rejected step is
+    /// only visible in its own answer: the header's success after it must not
+    /// read as the macro having been applied.
+    #[test]
+    fn a_rejected_macro_step_is_the_macros_answer() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_MACRO_STEP, vec![])
+            .data(op::REQ_SET_CS_MACRO, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![
+                    Reply::Data(status_bytes(tag::MACRO | 1, status::SUCCESS)),
+                    Reply::Data(status_bytes(tag::MACRO | 1, 0x21)),
+                    Reply::Data(status_bytes(tag::MACRO | 1, status::SUCCESS)),
+                ]),
+            );
+        let st = {
+            let mut s = surfaces(&mut t);
+            s.write_macro(
+                1,
+                &CsMacroHeaderWire {
+                    name: "Night".into(),
+                    step_count: 2,
+                },
+                &[CsMacroStep::default(), CsMacroStep::default()],
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            st.last_status, 0x21,
+            "the step's refusal, not the header's success"
+        );
+        let writes = t
+            .log()
+            .iter()
+            .filter(|e| e.direction == Direction::Out)
+            .count();
+        assert_eq!(
+            writes, 3,
+            "the header is still written, as the Console does"
+        );
     }
 
     #[test]
