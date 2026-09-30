@@ -90,6 +90,9 @@ pub struct ParamRow<'a> {
     pub compact: bool,
     /// Labels on the slider ends, e.g. `Warm` and `Aggressive`.
     pub ends: Option<(&'a str, &'a str)>,
+    /// Shown in place of the number, for a value that means something other
+    /// than itself: the subharm band floor, which is `Off` rather than -30.
+    pub display: Option<&'a str>,
 }
 
 impl<'a> ParamRow<'a> {
@@ -118,6 +121,7 @@ impl<'a> ParamRow<'a> {
             edit: None,
             compact: false,
             ends: None,
+            display: None,
         }
     }
 
@@ -159,6 +163,10 @@ impl<'a> ParamRow<'a> {
     }
     pub fn ends(mut self, lo: &'a str, hi: &'a str) -> Self {
         self.ends = Some((lo, hi));
+        self
+    }
+    pub fn display(mut self, d: Option<&'a str>) -> Self {
+        self.display = d;
         self
     }
 
@@ -210,10 +218,11 @@ impl<'a> ParamRow<'a> {
     }
 
     fn value_text(&self) -> String {
-        match self.edit {
-            Some(e) => format!("[{}]", e.text),
+        match (self.edit, self.display) {
+            (Some(e), _) => format!("[{}]", e.text),
+            (None, Some(d)) => d.to_string(),
             // A field is a signed quantity when its own range crosses zero.
-            None => with_unit(
+            (None, None) => with_unit(
                 self.value,
                 self.unit,
                 self.decimals,

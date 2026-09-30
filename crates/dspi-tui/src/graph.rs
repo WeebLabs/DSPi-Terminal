@@ -442,7 +442,7 @@ impl Widget for Graph<'_> {
 }
 
 /// Rasterise one curve into braille (or the coarse fallback).
-fn draw_curve(
+pub(crate) fn draw_curve(
     plot: Rect,
     buf: &mut Buffer,
     theme: &Theme,

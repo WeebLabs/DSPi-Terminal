@@ -380,6 +380,89 @@ pub fn psybass_harmonics_fraction(harmonics_db: f64) -> f64 {
     ((harmonics_db + 24.0) / 36.0).clamp(0.0, 1.0)
 }
 
+// ------------------------------------------------------------------ subharm
+
+/// The divider's fundamental: a band sine flipped once per cycle puts this
+/// much of the band amplitude at half its frequency, 8/(3 pi)
+/// (`sh_div_harm[0]`, subharm.c:473; not in a header).
+const SUBHARM_DIVIDER_GAIN: f64 = 0.8488;
+
+/// The analog second-order Butterworth lowpass magnitude at `w = f / fc`
+/// (`sh_lp2_mag`, subharm.c:479-482).
+fn lp2(w: f64) -> f64 {
+    1.0 / (1.0 + w.powi(4)).sqrt()
+}
+
+/// The matching highpass (`sh_hp2_mag`, subharm.c:484-487).
+fn hp2(w: f64) -> f64 {
+    w * w / (1.0 + w.powi(4)).sqrt()
+}
+
+/// The LF boost bell's magnitude in dB at `hz`, 0 while the boost is off.
+///
+/// The peaking prototype the firmware designs its Cytomic bell from, with
+/// `A = 10^(dB/40)` (`sh_boost_amp`, subharm.c:81-84; `sh_bell_mag`,
+/// subharm.c:489-496), centred at `SUBHARM_BOOST_HZ` with
+/// `SUBHARM_BOOST_Q` (subharm.h:37-38).
+pub fn subharm_bell_db(boost_db: f64, hz: f64) -> f64 {
+    use dspi_proto::generated::ranges::{SUBHARM_BOOST_HZ, SUBHARM_BOOST_MAX, SUBHARM_BOOST_Q};
+    let db = boost_db.min(SUBHARM_BOOST_MAX as f64);
+    if db <= 0.0 {
+        return 0.0;
+    }
+    let a = 10f64.powf(db / 40.0);
+    let q = SUBHARM_BOOST_Q as f64;
+    let w = hz / SUBHARM_BOOST_HZ as f64;
+    let d = (1.0 - w * w).powi(2);
+    let num = w * a / q;
+    let den = w / (a * q);
+    10.0 * ((d + num * num) / (d + den * den)).log10()
+}
+
+/// The steady-state level, in dB below a full-scale tone at twice `hz`, of
+/// the sub that band `band` (0 to 2) synthesises at `hz`, with the boost
+/// bell applied after the sum as the firmware applies it. `None` when the
+/// band is at `SUBHARM_LEVEL_MIN`, which switches it off (subharm.h:61).
+///
+/// This is the firmware's own headroom model (`subharm_headroom_db`,
+/// subharm.c:511-530), taken at its fundamental: the input tone at `2 hz`
+/// through the 48 Hz highpass and 160 Hz anti-alias lowpass, the band's
+/// crossover split at 72 and 112 Hz (subharm.c:253-261), the divider's
+/// 8/(3 pi), and the sub's own lowpass at 40, 62 or 80 Hz
+/// (subharm.h:23-25). The harmonics the divider also makes at `3 hz` and
+/// up are left out: the curve is the sub, not its residue.
+pub fn subharm_sub_db(band: usize, level_db: f64, boost_db: f64, hz: f64) -> Option<f64> {
+    use dspi_proto::generated::ranges::{
+        SUBHARM_BAND_HI_HZ, SUBHARM_BAND_LO_HZ, SUBHARM_BAND_MID1_HZ, SUBHARM_BAND_MID2_HZ,
+        SUBHARM_LEVEL_MAX, SUBHARM_LEVEL_MIN, SUBHARM_SUB_LP0_HZ, SUBHARM_SUB_LP1_HZ,
+        SUBHARM_SUB_LP2_HZ,
+    };
+    // `sh_level_gain` (subharm.c:75-79): the floor is off, not quiet.
+    if level_db <= SUBHARM_LEVEL_MIN as f64 {
+        return None;
+    }
+    let gain = 10f64.powf(level_db.min(SUBHARM_LEVEL_MAX as f64) / 20.0);
+    let f = 2.0 * hz;
+    let pre = hp2(f / SUBHARM_BAND_LO_HZ as f64) * lp2(f / SUBHARM_BAND_HI_HZ as f64);
+    let lo2 = pre * lp2(f / SUBHARM_BAND_MID2_HZ as f64);
+    let (band_mag, sub_lp) = match band {
+        0 => (
+            lo2 * lp2(f / SUBHARM_BAND_MID1_HZ as f64),
+            SUBHARM_SUB_LP0_HZ,
+        ),
+        1 => (
+            lo2 * hp2(f / SUBHARM_BAND_MID1_HZ as f64),
+            SUBHARM_SUB_LP1_HZ,
+        ),
+        _ => (
+            pre * hp2(f / SUBHARM_BAND_MID2_HZ as f64),
+            SUBHARM_SUB_LP2_HZ,
+        ),
+    };
+    let sub = gain * band_mag * SUBHARM_DIVIDER_GAIN * lp2(hz / sub_lp as f64);
+    Some(20.0 * sub.max(1e-9).log10() + subharm_bell_db(boost_db, hz))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,5 +603,39 @@ mod tests {
         assert_eq!(psybass_harmonics_fraction(-24.0), 0.0);
         assert!(close(psybass_harmonics_fraction(-6.0), 0.5, 1e-12));
         assert_eq!(psybass_harmonics_fraction(24.0), 1.0);
+    }
+
+    /// The bell is the peaking prototype: its full gain at 70 Hz, nothing
+    /// far from it, and nothing at all while the boost is off.
+    #[test]
+    fn the_subharm_bell_peaks_at_its_gain_at_70_hz() {
+        assert!(close(subharm_bell_db(6.0, 70.0), 6.0, 1e-9));
+        assert!(close(subharm_bell_db(3.0, 70.0), 3.0, 1e-9));
+        assert!(subharm_bell_db(6.0, 1000.0) < 0.1);
+        assert_eq!(subharm_bell_db(0.0, 70.0), 0.0);
+    }
+
+    /// Each band's sub sits an octave below the program band it is derived
+    /// from, and the floor is off rather than quiet.
+    #[test]
+    fn each_subharm_band_peaks_inside_its_own_range() {
+        let peak = |band: usize| {
+            (0..400)
+                .map(|i| 16.0 * (250.0f64 / 16.0).powf(i as f64 / 399.0))
+                .map(|hz| (hz, subharm_sub_db(band, 0.0, 0.0, hz).unwrap()))
+                .fold((0.0, f64::MIN), |a, b| if b.1 > a.1 { b } else { a })
+        };
+        for (band, lo, hi) in [(0, 20.0, 40.0), (1, 34.0, 60.0), (2, 52.0, 85.0)] {
+            let (hz, db) = peak(band);
+            assert!(lo < hz && hz < hi, "band {band} peaks at {hz} Hz");
+            // Never above the divider's own 1.4 dB loss at 0 dB.
+            assert!(db < -1.4 && db > -12.0, "band {band} peaks at {db} dB");
+        }
+        assert_eq!(subharm_sub_db(0, -30.0, 0.0, 30.0), None);
+        let a = subharm_sub_db(1, 0.0, 0.0, 45.0).unwrap();
+        let b = subharm_sub_db(1, 6.0, 0.0, 45.0).unwrap();
+        assert!(close(b - a, 6.0, 1e-9), "the level is a plain gain");
+        let c = subharm_sub_db(1, 0.0, 6.0, 45.0).unwrap();
+        assert!(close(c - a, subharm_bell_db(6.0, 45.0), 1e-9));
     }
 }
