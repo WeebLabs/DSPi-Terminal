@@ -33,6 +33,7 @@ pub mod psybass;
 pub mod signals;
 pub mod spectrum;
 pub mod stats;
+pub mod subharm;
 pub mod tube;
 pub mod upmixer;
 
@@ -62,6 +63,7 @@ pub use psybass::PsybassPanel;
 pub use signals::SignalsPanel;
 pub use spectrum::SpectrumPanel;
 pub use stats::StatsPanel;
+pub use subharm::SubharmPanel;
 pub use tube::TubePanel;
 pub use upmixer::UpmixerPanel;
 

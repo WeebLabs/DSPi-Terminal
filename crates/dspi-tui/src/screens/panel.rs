@@ -93,6 +93,8 @@ pub struct Param {
     /// parameters outside the Custom voicing, where an edit switches the
     /// voicing rather than being refused (`CrossfeedView.swift:301`).
     pub dimmed: bool,
+    /// Text shown instead of the number: the Console's `displayOverride`.
+    pub display: Option<String>,
 }
 
 impl Param {
@@ -110,6 +112,7 @@ impl Param {
             ends: None,
             enabled: true,
             dimmed: false,
+            display: None,
         }
     }
     pub fn step(mut self, s: f64) -> Self {
@@ -136,6 +139,10 @@ impl Param {
         self.dimmed = d;
         self
     }
+    pub fn display(mut self, d: Option<&str>) -> Self {
+        self.display = d.map(str::to_string);
+        self
+    }
 
     /// The row as it is drawn. A dimmed parameter borrows the disabled
     /// styling and nothing else: `handle` still goes through [`Self::widget`],
@@ -156,7 +163,8 @@ impl Param {
         .step(self.step)
         .decimals(self.decimals)
         .taper(self.taper)
-        .enabled(self.enabled);
+        .enabled(self.enabled)
+        .display(self.display.as_deref());
         if let Some(c) = &self.caption {
             r = r.caption(c);
         }
@@ -206,8 +214,26 @@ pub enum PanelGraph {
         /// when they fall inside the swing.
         knees: (Option<f64>, Option<f64>),
     },
+    /// The subharmonic synthesizer's three derived bands and its LF boost
+    /// bell, over the Console's 16 to 250 Hz and -42 to +18 dB frame. The
+    /// levels are the three band settings in dB, `SUBHARM_LEVEL_MIN` for a
+    /// band that is off; the ceiling is in dBFS, 0 for off.
+    Subharm {
+        levels: [f64; 3],
+        boost: f64,
+        ceiling: f64,
+    },
     /// The master toggle is off, so the Console draws the word instead.
     Disabled,
+}
+
+/// One meter under a chip: the chip's label (so the meter lines up with
+/// it), the level from 0 to 1, and whether the chip is on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChipMeter {
+    pub label: String,
+    pub fraction: f64,
+    pub on: bool,
 }
 
 /// One row of a panel's scrolling column.
@@ -289,6 +315,15 @@ pub enum Row {
         title: String,
         body: String,
     },
+    /// A section label with a reading at its right, in a tone: the
+    /// subharmonic synthesizer's HEADROOM COST.
+    Readout {
+        title: String,
+        value: String,
+        tone: StatusTone,
+    },
+    /// A thin meter under each chip of the chip row above it.
+    Meters(Vec<ChipMeter>),
 }
 
 /// The width a tile takes, including its gap: eight columns of label, the two
@@ -368,6 +403,7 @@ impl Row {
             Row::Banner { body, .. } => {
                 1 + wrap(body, width.saturating_sub(3) as usize, 3).len() as u16
             }
+            Row::Readout { .. } | Row::Meters(_) => 1,
         }
     }
 
@@ -702,6 +738,9 @@ pub struct Header<'a> {
     /// A state pill instead of a switch, for the Signal Generator, whose header
     /// carries the generator's run state rather than a control.
     pub pill: Option<(String, StatusTone)>,
+    /// A second, smaller control drawn just left of the switch, in the style
+    /// the panel gives it: the subharmonic synthesizer's `SOLO`.
+    pub badge: Option<(String, Style)>,
 }
 
 impl<'a> Header<'a> {
@@ -711,6 +750,7 @@ impl<'a> Header<'a> {
             toggle: None,
             enabled: true,
             pill: None,
+            badge: None,
         }
     }
     pub fn toggle(mut self, on: bool) -> Self {
@@ -725,6 +765,10 @@ impl<'a> Header<'a> {
         self.pill = Some((text.into(), tone));
         self
     }
+    pub fn badge(mut self, text: impl Into<String>, style: Style) -> Self {
+        self.badge = Some((text.into(), style));
+        self
+    }
 }
 
 pub fn draw_header(area: Rect, buf: &mut Buffer, theme: &Theme, h: &Header<'_>, focused: bool) {
@@ -735,12 +779,13 @@ pub fn draw_header(area: Rect, buf: &mut Buffer, theme: &Theme, h: &Header<'_>, 
         .toggle
         .map(|on| ToggleRow::state_text(on, theme.glyphs))
         .unwrap_or("");
-    let reserve = state.chars().count()
-        + 2
+    let right = state.chars().count()
         + h.pill
             .as_ref()
             .map(|(t, _)| t.chars().count() + 2)
             .unwrap_or(0);
+    let badge = h.badge.as_ref().map(|(t, _)| t.chars().count() + 1);
+    let reserve = right + 2 + badge.unwrap_or(0);
     let title = truncate(
         h.subtitle,
         (area.width as usize).saturating_sub(reserve + 1),
@@ -778,6 +823,12 @@ pub fn draw_header(area: Rect, buf: &mut Buffer, theme: &Theme, h: &Header<'_>, 
     }
     if let Some((text, tone)) = &h.pill {
         draw_pill(area, buf, theme, text, *tone);
+    }
+    if let Some((text, style)) = &h.badge {
+        let x = (area.x + area.width).saturating_sub((right + 1 + text.chars().count()) as u16);
+        if x > area.x + 1 {
+            buf.set_string(x, area.y, text, *style);
+        }
     }
 }
 
@@ -1118,6 +1169,50 @@ fn draw_row(
         Row::Banner { title, body } => {
             Banner::warning(title, theme).body(body).render(area, buf);
         }
+        Row::Readout { title, value, tone } => {
+            SectionHeader::new(title, theme).render(area, buf);
+            let w = value.chars().count() as u16;
+            if w + title.chars().count() as u16 + 4 <= area.width {
+                let style = match tone {
+                    StatusTone::Ok => Style::default().fg(theme.ok),
+                    StatusTone::Warning => Style::default().fg(theme.warning),
+                    StatusTone::Danger => Style::default().fg(theme.danger),
+                    StatusTone::Neutral => theme.label(),
+                };
+                buf.set_string(area.x + area.width - w - 1, area.y, value, style);
+            }
+        }
+        Row::Meters(meters) => draw_chip_meters(area, buf, theme, meters),
+    }
+}
+
+/// Meters under a chip row, one per chip and as wide as it, laid out the way
+/// `ChipRow` lays out its chips so each sits under its own.
+fn draw_chip_meters(area: Rect, buf: &mut Buffer, theme: &Theme, meters: &[ChipMeter]) {
+    let eighths = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+    let mut x = area.x + 1;
+    for m in meters {
+        // `ChipRow` draws `[label]`, with a mark before the label in mono.
+        let w = m.label.chars().count() as u16
+            + 2
+            + u16::from(theme.depth == crate::theme::ColorDepth::Mono);
+        if x + w > area.x + area.width {
+            break;
+        }
+        let fill = Style::default().fg(if m.on { theme.accent } else { theme.dim });
+        let track = Style::default().fg(theme.chrome_faint);
+        let total = (m.fraction.clamp(0.0, 1.0) * w as f64 * 8.0).round() as u16;
+        for i in 0..w {
+            let here = total.saturating_sub(i * 8).min(8);
+            let (sym, style) = match (here, theme.glyphs) {
+                (0, Glyphs::Ascii) => ('.', track),
+                (0, _) => ('░', track),
+                (_, Glyphs::Ascii) => ('#', fill),
+                (n, _) => (eighths[n as usize - 1], fill),
+            };
+            buf[(x + i, area.y)].set_char(sym).set_style(style);
+        }
+        x += w + 1;
     }
 }
 
@@ -1187,6 +1282,179 @@ fn draw_graph(area: Rect, buf: &mut Buffer, theme: &Theme, g: &PanelGraph) {
             harmonics,
         } => draw_bars(area, buf, theme, *fc, *original, *harmonics),
         PanelGraph::Transfer { output, knees } => draw_transfer(area, buf, theme, output, *knees),
+        PanelGraph::Subharm {
+            levels,
+            boost,
+            ceiling,
+        } => draw_subharm(area, buf, theme, levels, *boost, *ceiling),
+    }
+}
+
+/// The subharmonic synthesizer's bands, in `SubharmBandView`'s frame: 16 to
+/// 250 Hz on a log axis, -42 to +18 dB, the dB marks hugging the empty left
+/// edge and the frequency marks at 20, 50, 100 and 200.
+///
+/// Where the Console draws each band as a flat block at its level, each band
+/// here is the shape the firmware's filters give it
+/// ([`crate::curves::subharm_sub_db`]), filled in eighths of a row; where two
+/// overlap, the louder is drawn. The LF boost bell is the one curve, and the
+/// sub ceiling a dashed line across the sub range only, since it limits the
+/// sub and not the program.
+fn draw_subharm(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    levels: &[f64; 3],
+    boost: f64,
+    ceiling: f64,
+) {
+    use crate::curves::{subharm_bell_db, subharm_sub_db};
+    use dspi_proto::generated::ranges::{SUBHARM_CEILING_MAX, SUBHARM_LEVEL_MIN};
+    const MIN_HZ: f64 = 16.0;
+    const MAX_HZ: f64 = 250.0;
+    const DB_MIN: f64 = -42.0;
+    const DB_MAX: f64 = 18.0;
+    let plot_h = area.height.saturating_sub(1);
+    if plot_h < 2 || area.width < 16 {
+        return;
+    }
+    let plot = Rect::new(area.x, area.y, area.width, plot_h);
+    let hz_at = |frac: f64| MIN_HZ * (MAX_HZ / MIN_HZ).powf(frac);
+    let x_of = |hz: f64| -> u16 {
+        let f = (hz.clamp(MIN_HZ, MAX_HZ) / MIN_HZ).ln() / (MAX_HZ / MIN_HZ).ln();
+        area.x + ((f * (area.width - 1) as f64).round() as u16).min(area.width - 1)
+    };
+    // Rows down from the top of the plot, continuous.
+    let y_of = |db: f64| (DB_MAX - db.clamp(DB_MIN, DB_MAX)) / (DB_MAX - DB_MIN) * plot_h as f64;
+    let row_of = |db: f64| plot.y + (y_of(db).floor() as u16).min(plot_h - 1);
+    let ascii = theme.glyphs == Glyphs::Ascii;
+
+    // The 0 dB reference.
+    let zero = row_of(0.0);
+    for x in plot.x..plot.x + plot.width {
+        buf[(x, zero)]
+            .set_symbol(if ascii { "-" } else { "┈" })
+            .set_style(Style::default().fg(theme.chrome_faint));
+    }
+
+    let all_off = levels.iter().all(|l| *l <= SUBHARM_LEVEL_MIN as f64);
+    let ceiling_on = !all_off && ceiling < SUBHARM_CEILING_MAX as f64;
+    if all_off {
+        let text = "All bands off";
+        let x = area.x + area.width.saturating_sub(text.len() as u16) / 2;
+        buf.set_string(x, plot.y + plot_h / 2, text, theme.label());
+    } else {
+        let blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let style = Style::default().fg(theme.accent);
+        let bottom = plot.y + plot_h - 1;
+        for col in 0..plot.width {
+            let hz = hz_at((col as f64 + 0.5) / plot.width as f64);
+            let top = (0..3)
+                .filter_map(|b| subharm_sub_db(b, levels[b], boost, hz))
+                .fold(f64::NEG_INFINITY, f64::max);
+            if !top.is_finite() {
+                continue;
+            }
+            let eighths = ((plot_h as f64 - y_of(top)) * 8.0).round() as u16;
+            for r in 0..plot_h {
+                let here = eighths.saturating_sub(r * 8).min(8);
+                if here == 0 {
+                    break;
+                }
+                let sym = if ascii {
+                    '#'
+                } else {
+                    blocks[here as usize - 1]
+                };
+                buf[(plot.x + col, bottom - r)]
+                    .set_char(sym)
+                    .set_style(style);
+            }
+        }
+        if ceiling_on {
+            let y = row_of(ceiling);
+            for x in plot.x..=x_of(80.0) {
+                buf[(x, y)]
+                    .set_symbol(if ascii { "-" } else { "╌" })
+                    .set_style(Style::default().fg(theme.danger));
+            }
+        }
+    }
+
+    if boost > 0.0 {
+        crate::graph::draw_curve(
+            plot,
+            buf,
+            theme,
+            &|frac| subharm_bell_db(boost, hz_at(frac)),
+            &|db, rows| (DB_MAX - db) / (DB_MAX - DB_MIN) * (rows - 1.0),
+            false,
+            Style::default().fg(theme.ok),
+        );
+    }
+
+    // The level marks, only where nothing has been drawn.
+    for db in [12.0, 0.0, -12.0, -24.0, -36.0] {
+        let text = if db > 0.0 {
+            format!("+{db:.0}")
+        } else {
+            format!("{db:.0}")
+        };
+        let y = row_of(db);
+        let clear = (0..text.len() as u16).all(|i| {
+            let s = buf[(plot.x + i, y)].symbol();
+            s == " " || s == "┈" || s == "-"
+        });
+        if clear {
+            buf.set_string(plot.x, y, &text, theme.label());
+        }
+    }
+
+    // Each band's range over it on the top row, as the Console labels its
+    // blocks, so bands that meet can still be told apart.
+    for (b, (lo, hi)) in [(24.0f64, 36.0f64), (36.0, 56.0), (56.0, 80.0)]
+        .iter()
+        .enumerate()
+    {
+        if levels[b] <= SUBHARM_LEVEL_MIN as f64 {
+            continue;
+        }
+        let text = format!("{lo:.0}-{hi:.0}");
+        let mid = x_of((lo * hi).sqrt());
+        let x = mid.saturating_sub(text.len() as u16 / 2);
+        if x >= plot.x && x + (text.len() as u16) < area.x + area.width {
+            buf.set_string(x, plot.y, &text, theme.label());
+        }
+    }
+
+    // What the two marks are, top right, where the Curves legend goes.
+    let mut legend: Vec<(&str, Color)> = Vec::new();
+    if boost > 0.0 {
+        legend.push(("● LF boost", theme.ok));
+    }
+    if ceiling_on {
+        legend.push((if ascii { "- ceiling" } else { "╌ ceiling" }, theme.danger));
+    }
+    for (i, (label, color)) in legend.iter().enumerate() {
+        let w = label.chars().count() as u16;
+        if i as u16 >= plot_h || w + 2 > area.width {
+            break;
+        }
+        buf.set_string(
+            area.x + area.width - w - 1,
+            area.y + i as u16,
+            label,
+            Style::default().fg(*color),
+        );
+    }
+
+    // The frequency axis, in the Console's four marks.
+    let y = area.y + plot_h;
+    for (hz, label) in [(20.0, "20"), (50.0, "50"), (100.0, "100"), (200.0, "200")] {
+        let x = x_of(hz).saturating_sub(label.len() as u16 / 2);
+        if x + label.len() as u16 <= area.x + area.width {
+            buf.set_string(x, y, label, theme.label());
+        }
     }
 }
 
@@ -1371,7 +1639,12 @@ pub(crate) mod testing {
     /// all, exactly as an old firmware would answer.
     pub fn state() -> DeviceState {
         let mut s = crate::shell::fixture::state();
-        for name in ["psychoacoustic_bass", "upmixer", "test_signals"] {
+        for name in [
+            "psychoacoustic_bass",
+            "upmixer",
+            "test_signals",
+            "subharmonic_synth",
+        ] {
             s.caps.features.push(Feature {
                 name: name.into(),
                 present: true,

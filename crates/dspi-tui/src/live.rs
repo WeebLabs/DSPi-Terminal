@@ -29,7 +29,7 @@ use crate::perf::Performance;
 use crate::screens::{
     self, AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
     MonitorPanel, OutputPage, Overview, PresetChoice, PresetMenu, PsybassPanel, Shared,
-    SignalsPanel, SpectrumPanel, StatsPanel, UpmixerPanel, clipboard, panel, presets,
+    SignalsPanel, SpectrumPanel, StatsPanel, SubharmPanel, UpmixerPanel, clipboard, panel, presets,
 };
 use crate::settings::{AppConfig, SettingsData, SettingsScreen};
 use crate::shell::{
@@ -144,36 +144,6 @@ impl ConsoleScreens {
     }
 }
 
-/// A beta4 tool whose panel is still to come (phases B5 and B6).
-///
-/// The tool is shown only when the device reports its feature (the probe's
-/// `subharmonic_synth` and `tube_preamp`); without it the Console's own
-/// unsupported notice stands in for the window
-/// (`SubharmonicSynthView.swift:252-257`, `TubeModellerView.swift:404-409`).
-/// No panel is stubbed: both cases are the shell's plain [`Placeholder`],
-/// which the real panels replace.
-pub fn pending_tool(state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
-    let (feature, unsupported) = match tool {
-        Tool::Subharm => (
-            "subharmonic_synth",
-            "Requires firmware with wire format V29 or newer. Update the DSPi firmware to \
-             use the Subharmonic Synthesizer.",
-        ),
-        // Tool::Tube; the factory sends only these two here.
-        _ => (
-            "tube_preamp",
-            "Requires firmware with wire format V31 or newer. Update the DSPi firmware to \
-             use the Tube Modeller.",
-        ),
-    };
-    let body = if panel::has_feature(state, feature) {
-        "This panel arrives in a later phase."
-    } else {
-        unsupported
-    };
-    Box::new(Placeholder::new(tool.title(), body))
-}
-
 impl Screens for ConsoleScreens {
     fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen> {
         match selection {
@@ -185,7 +155,6 @@ impl Screens for ConsoleScreens {
 
     fn tool(&self, state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
         match tool {
-            Tool::Subharm => pending_tool(state, tool),
             Tool::Matrix => Box::new(MatrixPanel::new(self.shared.clone())),
             Tool::Crossfeed => Box::new(CrossfeedPanel::new()),
             Tool::Loudness => Box::new(LoudnessPanel::new()),
@@ -197,6 +166,7 @@ impl Screens for ConsoleScreens {
             Tool::Monitor => Box::new(MonitorPanel::new(self.shared.clone())),
             Tool::AutoEq => Box::new(AutoEqPanel::new(self.shared.clone())),
             Tool::Tube => Box::new(crate::screens::TubePanel::new()),
+            Tool::Subharm => Box::new(SubharmPanel::new()),
             Tool::Spectrum => Box::new(SpectrumPanel::open(self.shared.clone(), state)),
         }
     }
@@ -251,7 +221,34 @@ pub const APP_VERBS: &[(&str, &str)] = &[
     ("reconnect", "Reconnect to the device"),
     ("clear-favourites", "AutoEQ: clear favourites"),
     ("tube", "Tube Modeller"),
+    ("subharm", "Subharmonic Synthesizer"),
 ];
+
+/// The sub meter's poll period: the Console's 10 Hz
+/// (`SubharmonicSynthView.swift:101`), and the brief's ceiling.
+const SUBHARM_METER_PERIOD: Duration = Duration::from_millis(100);
+
+/// What the runner remembers between the Subharmonic Synthesizer panel's
+/// reads; see [`Live::poll_subharm`].
+#[derive(Debug)]
+struct SubharmPoll {
+    open: bool,
+    seen: Option<dspi_session::state::Subharm>,
+    solo_at: Instant,
+    meter_at: Instant,
+}
+
+impl Default for SubharmPoll {
+    fn default() -> Self {
+        let long_ago = Instant::now() - Duration::from_secs(2);
+        Self {
+            open: false,
+            seen: None,
+            solo_at: long_ago,
+            meter_at: long_ago,
+        }
+    }
+}
 
 /// The `:` line and the `Ctrl-P` palette.
 #[derive(Debug, Clone, PartialEq)]
@@ -544,6 +541,10 @@ pub struct Live {
     /// so the only way to move the gauges is to ask, and once a second is
     /// enough for a meter a person is watching.
     last_upmix_poll: Instant,
+    /// The Subharmonic Synthesizer panel's runtime reads: whether it was on
+    /// screen last tick, the section its headroom was last read for, and when
+    /// solo and the meters were last read.
+    subharm: SubharmPoll,
     /// When the Stats panel's diagnostics were last read, on the Console's own
     /// two-second cadence.
     last_stats_poll: Instant,
@@ -612,6 +613,7 @@ impl Live {
             popout_pinned: None,
             devices_checked: None,
             last_upmix_poll: Instant::now() - Duration::from_secs(2),
+            subharm: SubharmPoll::default(),
             last_stats_poll: Instant::now() - Duration::from_secs(3),
             started: Instant::now(),
             boot: None,
@@ -889,6 +891,11 @@ impl Live {
                 if let Some(mode) = mode {
                     self.state.output_config_mode = mode;
                 }
+                // Solo has no wire offset and no notification (config.h:201),
+                // so the re-read that follows every write cannot bring it.
+                if path == "sub.solo" {
+                    let _ = self.state.refresh_subharm_solo(session);
+                }
                 self.refresh(session);
             }
             Err(e) => self.note(e.to_string()),
@@ -1081,6 +1088,7 @@ impl Live {
                 Err(m) => self.note(m),
             },
             "device" => self.open_device_picker(),
+            "subharm" => self.open_tool(Tool::Subharm),
             "autoeq" => match args.first().copied() {
                 Some("update") => self.autoeq_update(),
                 _ => self.open_tool(Tool::AutoEq),
@@ -2145,6 +2153,45 @@ impl Live {
         let _ = self.state.refresh_limiter_meter(session);
     }
 
+    /// The Subharmonic Synthesizer's runtime state, while its panel is on
+    /// screen: the headroom cost (`REQ_GET_SUBHARM_HEADROOM`, config.h:194)
+    /// when it opens and whenever the section changes, which is after every
+    /// write that can move it and after another host's too; solo
+    /// (`REQ_GET_SUBHARM_SOLO`, config.h:202) once a second, since nothing
+    /// notifies it; and the sub meters (`REQ_GET_SUBHARM_METER`,
+    /// config.h:200) at the Console's 10 Hz while the module is on.
+    ///
+    /// When the panel has gone, by whatever route, solo is switched off if it
+    /// was on, as the Console's window does on close: solo mutes the program
+    /// on the masked outputs, and the firmware keeps it across a preset load.
+    fn poll_subharm(&mut self, session: &mut Session, now: Instant) {
+        let showing = matches!(self.shell.tool, Some((Tool::Subharm, _)))
+            && panel::has_feature(&self.state, "subharmonic_synth");
+        if !showing {
+            if std::mem::take(&mut self.subharm.open) {
+                self.subharm.seen = None;
+                if self.state.subharm_solo == Some(true) {
+                    self.set(session, "sub.solo", &[], Value::Bool(false));
+                }
+            }
+            return;
+        }
+        let opened = !std::mem::replace(&mut self.subharm.open, true);
+        let section = self.state.subharm();
+        if self.subharm.seen != Some(section) {
+            self.subharm.seen = Some(section);
+            let _ = self.state.refresh_subharm_headroom(session);
+        }
+        if opened || now.duration_since(self.subharm.solo_at) >= Duration::from_secs(1) {
+            self.subharm.solo_at = now;
+            let _ = self.state.refresh_subharm_solo(session);
+        }
+        if section.enabled && now.duration_since(self.subharm.meter_at) >= SUBHARM_METER_PERIOD {
+            self.subharm.meter_at = now;
+            let _ = self.state.refresh_subharm_meter(session);
+        }
+    }
+
     /// Refresh the Stats panel's diagnostics, every two seconds and only while
     /// that panel is on screen.
     ///
@@ -2232,6 +2279,7 @@ impl Live {
         }
         self.poll_upmix_status(session, now);
         self.poll_limiter_meter(session);
+        self.poll_subharm(session, now);
         self.poll_stats(session, now);
         self.poll_screen(session, now);
         self.tick_analyser(session, now);
@@ -2664,9 +2712,9 @@ mod tests {
         assert!(l.shell.detail.keys().iter().any(|k| k.key == "x"));
     }
 
-    /// `S` and `D` open the beta4 tools by their Console titles; until
-    /// their panels land, the placeholder says what the device lacks, or
-    /// that the panel is still to come when it has the feature.
+    /// `S` and `D` open the beta4 tools by their Console titles and say what
+    /// the device lacks; with the feature, `S` is the real panel and `D`'s
+    /// placeholder says its panel is still to come.
     #[test]
     fn the_beta4_tool_keys_open_their_tools_or_say_what_is_missing() {
         let (mut l, mut s, _) = console();
@@ -2694,11 +2742,7 @@ mod tests {
             l.handle_event(&mut s, ShellEvent::CloseTool);
         }
         for (tool, name, body) in [
-            (
-                Tool::Subharm,
-                "subharmonic_synth",
-                "This panel arrives in a later phase.",
-            ),
+            (Tool::Subharm, "subharmonic_synth", "LEVELS"),
             (Tool::Tube, "tube_preamp", "TRANSFER CURVE"),
         ] {
             l.state.caps.features.push(dspi_session::probe::Feature {
@@ -3344,6 +3388,83 @@ mod tests {
         assert!(!l.state.has_unsaved_changes(), "the preset is untouched");
         let f = crate::settings::tests::frame(&mut settings, &l.state, 120, 40);
         assert!(f.contains(crate::widgets::SaveBar::FLASH), "{f}");
+    }
+
+    /// While the Subharmonic Synthesizer panel is open the runner reads its
+    /// headroom and solo, reads the headroom again only when the section
+    /// changes, meters only while the module is on, and switches solo off
+    /// once when the panel closes, as the Console's window does.
+    #[test]
+    fn the_subharm_panel_polls_its_runtime_state_and_clears_solo_on_close() {
+        let (mut l, mut s, log) = beta4(
+            packet(),
+            MockTransport::new()
+                .data(op::REQ_GET_SUBHARM_SOLO, vec![1])
+                .data(op::REQ_GET_SUBHARM_HEADROOM, 4.5f32.to_le_bytes().to_vec()),
+        );
+        let count = |log: &LogHandle, opcode: u8| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.opcode == opcode)
+                .count()
+        };
+        l.tick(&mut s, None);
+        assert_eq!(count(&log, op::REQ_GET_SUBHARM_SOLO), 0, "not while closed");
+
+        l.handle_event(&mut s, ShellEvent::OpenTool(Tool::Subharm));
+        l.tick(&mut s, None);
+        assert_eq!(l.state.subharm_solo, Some(true));
+        assert_eq!(l.state.subharm_headroom_db, Some(4.5));
+        assert_eq!(count(&log, op::REQ_GET_SUBHARM_HEADROOM), 1);
+        assert_eq!(
+            count(&log, op::REQ_GET_SUBHARM_METER),
+            0,
+            "the module is off, so nothing to meter"
+        );
+        l.tick(&mut s, None);
+        assert_eq!(
+            count(&log, op::REQ_GET_SUBHARM_HEADROOM),
+            1,
+            "the section has not changed"
+        );
+        assert_eq!(count(&log, op::REQ_GET_SUBHARM_SOLO), 1, "once a second");
+
+        // Switching the module on moves the section: headroom and meters.
+        let o = section_at("subharm");
+        l.state.bulk.patch(o, &[1]);
+        l.tick(&mut s, None);
+        assert_eq!(count(&log, op::REQ_GET_SUBHARM_HEADROOM), 2);
+        assert_eq!(count(&log, op::REQ_GET_SUBHARM_METER), 1);
+
+        l.handle_event(&mut s, ShellEvent::CloseTool);
+        l.tick(&mut s, None);
+        let offs: Vec<Vec<u8>> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.opcode == op::REQ_SET_SUBHARM_SOLO)
+            .map(|e| e.payload.clone())
+            .collect();
+        assert_eq!(offs, vec![vec![0]], "solo off, once");
+        l.tick(&mut s, None);
+        assert_eq!(count(&log, op::REQ_SET_SUBHARM_SOLO), 1, "and only once");
+    }
+
+    /// The palette offers the panel, and `subharm` opens it.
+    #[test]
+    fn the_palette_finds_the_subharmonic_synthesizer() {
+        let (mut l, mut s, _) = console();
+        let mut p = Prompt::new(true, &l.ctx);
+        p.input = "subh".into();
+        p.refresh(&l.ctx);
+        assert!(
+            p.candidates
+                .iter()
+                .any(|c| c.value == "subharm" && c.detail == "Subharmonic Synthesizer")
+        );
+        l.run_command(&mut s, "subharm");
+        assert!(matches!(l.shell.tool, Some((Tool::Subharm, _))));
     }
 
     /// A change this build cannot place in the shadow is not dropped: the
