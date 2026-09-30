@@ -164,6 +164,13 @@ pub trait Screen {
     fn quick(&self, _line: &str, _state: &DeviceState) -> Option<Quick> {
         None
     }
+
+    /// Enter on the command bar, for a line the page acts on itself rather
+    /// than as commands: one the Console confirms first, which opens its
+    /// dialog. `None` runs the line's commands as usual.
+    fn quick_run(&mut self, _line: &str, _state: &DeviceState) -> Option<ScreenEvent> {
+        None
+    }
 }
 
 /// A screen with nothing in it yet: names the selection and its keys.

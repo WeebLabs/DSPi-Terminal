@@ -295,7 +295,7 @@ fn cmd_dump(serial: Option<&str>, json: bool) -> u8 {
     }
     if let Some(sg) = &caps.siggen {
         println!(
-            "test signals: {} types, {} outputs, multitone max {}",
+            "signal generator: {} types, {} outputs, multitone max {}",
             sg.type_count, sg.output_channels, sg.multitone_max
         );
     }

@@ -3346,10 +3346,10 @@ pub static REGISTRY: &[ParamDesc] = &[
         Ps::ReadOnly,
         Rq::Always,
     ),
-    // ---------------------------------------------------------- test signals
+    // ------------------------------------------------------ signal generator
     p(
         "sig.config",
-        "Test signal",
+        "Signal generator",
         "What the generator produces",
         Diagnostics,
         Advanced,
@@ -3366,7 +3366,7 @@ pub static REGISTRY: &[ParamDesc] = &[
     p(
         "sig.control",
         "Start or stop",
-        "Run or halt the test signal",
+        "Run or halt the signal generator",
         Diagnostics,
         Advanced,
         Choice(&[(0, "stop"), (1, "start"), (2, "stop-now")]),

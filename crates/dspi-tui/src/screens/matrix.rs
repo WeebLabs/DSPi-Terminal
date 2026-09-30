@@ -82,7 +82,6 @@ enum Line {
 /// place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
-    Clear,
     Rename(usize),
     /// Enabling this output needs the other side of Core 1 switched off first.
     Enable(usize),
@@ -117,11 +116,51 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("Enter", "Edit a gain"),
     KeyHelp::new("i", "Invert"),
     KeyHelp::new("d", "Direct 1:1"),
-    KeyHelp::new("D", "Clear"),
     KeyHelp::new("r", "Rename"),
     KeyHelp::new("y Y", "Copy, paste parameters"),
     KeyHelp::new("I", "Identify"),
 ];
+
+// ---------------------------------------------------------------------------
+// Row names
+// ---------------------------------------------------------------------------
+
+/// A source row's name, the Console's `matrixRowShortName`
+/// (`DSPViewModel.swift:2067-2077`): the sidebar's channel name, except on
+/// the rows the upmixer is deriving.
+pub(crate) fn row_name(state: &DeviceState, row: usize) -> String {
+    match upmix_row(state, row) {
+        Some(name) => name.to_string(),
+        None => channel_name(state, row),
+    }
+}
+
+/// The upmixer's derived rows, `C`, `Ls` and `Rs` as the Console labels them.
+///
+/// It writes Centre to matrix source row 2 and the surrounds to rows 3 and 4
+/// (upmix.h:17-18), only while it is on and the active input is the stereo
+/// pair (upmix.h:13-14); the live count is the meter packet's active inputs
+/// against `NUM_STEREO_INPUTS` (config.h:780-784). Centre owns row 2 whenever
+/// the pass runs (upmix.h:29-32); the surrounds fill theirs only while their
+/// engine is on (upmix.h:45, `UPMIX_SURROUND_OFF` at upmix.h:83), and the
+/// Console does not show those two rows otherwise (`matrixSourceRowCount`),
+/// so here they keep their channel names.
+fn upmix_row(state: &DeviceState, row: usize) -> Option<&'static str> {
+    let u = state.upmix();
+    let derives = super::UpmixerPanel::supported(state)
+        && u.enabled
+        && state.meters.active_inputs as usize == BASE_INPUTS;
+    if !derives {
+        return None;
+    }
+    let surround = u.surround_mode as u16 != dspi_proto::generated::upmix::UPMIX_SURROUND_OFF;
+    match row {
+        2 => Some("C"),
+        3 if surround => Some("Ls"),
+        4 if surround => Some("Rs"),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The Core 1 interlock, from the state the panel already has
@@ -912,7 +951,7 @@ impl MatrixPanel {
         match row {
             Row::Input(i) => {
                 let color = theme.hue_for(ChannelRole::Input(i as u8), here);
-                let name = channel_name(state, i);
+                let name = row_name(state, i);
                 let text = fit_left(&name, self.label_w as usize - 2);
                 p.buf.set_string(x + 1, y, text, Style::default().fg(color));
             }
@@ -924,7 +963,7 @@ impl MatrixPanel {
     }
 
     /// The ROUTING band. The Console puts its Direct 1:1 and Clear buttons
-    /// here; they are the `d` and `D` keys, on the key line, so the band
+    /// here; they are the `d` key and the command bar's `clear`, so the band
     /// carries only its name.
     fn draw_routing(&self, p: &mut Paint, y: u16) {
         let (area, theme) = (p.area, p.theme);
@@ -1091,17 +1130,8 @@ impl Screen for MatrixPanel {
                     ScreenEvent::Command(cmds.join("\n"))
                 }
             }
-            KeyCode::Char('D') => {
-                if !is_8ch(state) {
-                    return ScreenEvent::Handled;
-                }
-                self.pending = Some(Pending::Clear);
-                ScreenEvent::Dialog(Dialog::confirm(
-                    "Clear",
-                    "Disconnect every crosspoint",
-                    vec![Button::destructive("Clear"), Button::new("Cancel")],
-                ))
-            }
+            // No `D` for Clear: it opens the Tube Modeller from every screen
+            // (PLAN-beta4 decision 2), and the command bar's `clear` remains.
             KeyCode::Char('r') => {
                 let channel = output_channel(state, self.col);
                 self.pending = Some(Pending::Rename(channel));
@@ -1146,14 +1176,6 @@ impl Screen for MatrixPanel {
             return ScreenEvent::Handled;
         };
         match (pending, outcome) {
-            (Pending::Clear, DialogOutcome::Button(0)) => {
-                let cmds = self.clear_routes(state);
-                if cmds.is_empty() {
-                    ScreenEvent::Handled
-                } else {
-                    ScreenEvent::Command(cmds.join("\n"))
-                }
-            }
             (Pending::Rename(channel), DialogOutcome::Text(name)) => {
                 let name = name.trim().to_string();
                 if name.is_empty() {
@@ -1382,6 +1404,59 @@ mod tests {
             compact.contains('\u{203a}'),
             "and the frame says so:\n{compact}"
         );
+    }
+
+    /// The fixture with input 1 renamed and the upmixer on, surround `mode`,
+    /// on a device reporting `active` live inputs.
+    fn upmixed(mode: u8, active: u8) -> DeviceState {
+        let (names, upmix) = (section("channel_names"), section("upmix"));
+        let mut s = edited(|b| {
+            let long = b"Living Room Left";
+            b[names..names + 32].fill(0);
+            b[names..names + long.len()].copy_from_slice(long);
+            b[upmix] = 1;
+            b[upmix + 2] = mode;
+        });
+        s.caps.features.push(dspi_session::probe::Feature {
+            name: "upmixer".into(),
+            present: true,
+            evidence: "test".into(),
+        });
+        s.meters.active_inputs = active;
+        s
+    }
+
+    /// `matrixRowShortName`: the sidebar's names, cut to the label column,
+    /// and C / Ls / Rs on the rows the upmixer derives from a stereo input.
+    #[test]
+    fn input_rows_carry_the_sidebar_names_and_the_upmixed_rows_their_own() {
+        let state = upmixed(2, 2);
+        let names: Vec<String> = (0..8).map(|r| row_name(&state, r)).collect();
+        assert_eq!(
+            names,
+            ["Living Room Left", "FR", "C", "Ls", "Rs", "BR", "SL", "SR"]
+        );
+        let f = text(&draw(&mut panel(), &state, 100, 40));
+        assert!(
+            f.contains("Living…") && !f.contains("Living R"),
+            "cut to fit:\n{f}"
+        );
+        for label in [" C ", " Ls ", " Rs "] {
+            assert!(f.contains(label), "{label}:\n{f}");
+        }
+        assert!(!f.contains(" FC "), "row 2 is the centre now:\n{f}");
+
+        // Surround off: only the centre row is derived.
+        let state = upmixed(0, 2);
+        let names: Vec<String> = (2..5).map(|r| row_name(&state, r)).collect();
+        assert_eq!(names, ["C", "LFE", "BL"]);
+        // A multichannel input carries real audio on those rows.
+        let state = upmixed(2, 8);
+        assert_eq!(row_name(&state, 2), "FC");
+        // And so does a device without the upmixer.
+        let mut state = upmixed(2, 2);
+        state.caps.features.clear();
+        assert_eq!(row_name(&state, 2), "FC");
     }
 
     #[test]
@@ -1625,32 +1700,22 @@ mod tests {
             ScreenEvent::Handled,
             "the Console only offers it in 8-channel mode"
         );
-        assert_eq!(
-            p.handle(key(KeyCode::Char('D')), &stereo()),
-            ScreenEvent::Handled
-        );
     }
 
+    /// Clear is the command bar's `clear`; `D` is the Tube Modeller's, from
+    /// every screen (PLAN-beta4 decision 2).
     #[test]
-    fn clear_confirms_then_disconnects_every_crosspoint() {
+    fn clear_disconnects_every_crosspoint_and_d_is_the_shells() {
         let state = fixture::state();
         let mut p = panel();
-        let ScreenEvent::Dialog(d) = p.handle(key(KeyCode::Char('D')), &state) else {
-            panic!("Clear asks first");
-        };
-        assert_eq!(d.body, "Disconnect every crosspoint");
-        assert!(d.buttons[0].destructive);
-        let ScreenEvent::Command(c) = p.dialog_result(DialogOutcome::Button(0), &state) else {
-            panic!("Clear wrote nothing");
-        };
+        let q = p.quick_reply("clear", &state);
         // The fixture's eight diagonal routes, gains and phase left alone.
-        assert_eq!(c.lines().count(), 8, "{c}");
-        assert_eq!(c.lines().next().unwrap(), "mix 0 0 off 0");
-        // Cancel writes nothing.
-        p.handle(key(KeyCode::Char('D')), &state);
+        assert_eq!(q.commands.len(), 8, "{q:?}");
+        assert_eq!(q.commands[0], "mix 0 0 off 0");
+        assert_eq!(q.hint, "disconnect every crosspoint (8)");
         assert_eq!(
-            p.dialog_result(DialogOutcome::Cancelled, &state),
-            ScreenEvent::Handled
+            p.handle(key(KeyCode::Char('D')), &state),
+            ScreenEvent::Unhandled
         );
     }
 

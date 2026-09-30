@@ -23,7 +23,7 @@ use crate::widgets::{Column, KeyHelp, StatusTone, Table};
 
 const KEYS: &[KeyHelp] = &[
     KeyHelp::new("Space", "Pause"),
-    KeyHelp::new("D", "Clear"),
+    KeyHelp::new("Backspace", "Clear"),
     KeyHelp::new("↑ ↓", "Scroll"),
     KeyHelp::new("End", "Follow"),
 ];
@@ -153,7 +153,9 @@ impl Screen for MonitorPanel {
                 drop(shared);
                 ScreenEvent::Status(if paused { "Paused" } else { "Listening" }.into())
             }
-            KeyCode::Char('D') => {
+            // Clear was `D` until that became the Tube Modeller's key on
+            // every screen (PLAN-beta4 decision 2).
+            KeyCode::Backspace => {
                 log.clear();
                 self.scroll = None;
                 drop(shared);
@@ -204,7 +206,7 @@ mod tests {
     use crate::screens::panel::testing;
     use crate::screens::shared;
     use crate::shell::Tool;
-    use crate::widgets::testing::{key, shift};
+    use crate::widgets::testing::key;
     use dspi_session::{Event, Notification, Source};
 
     fn note(seq: u8, event: Event) -> Notification {
@@ -284,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn space_pauses_and_shift_d_clears() {
+    fn space_pauses_and_backspace_clears() {
         let (mut p, state, shared) = panel();
         assert_eq!(
             p.handle(key(KeyCode::Char(' ')), &state),
@@ -296,7 +298,7 @@ mod tests {
             ScreenEvent::Status("Listening".into())
         );
         assert_eq!(
-            p.handle(shift(KeyCode::Char('D')), &state),
+            p.handle(key(KeyCode::Backspace), &state),
             ScreenEvent::Status("Log cleared".into())
         );
         assert!(shared.borrow().log.entries.is_empty());

@@ -230,12 +230,13 @@ impl MacrosPage {
             } else {
                 m::compatible_groups(cs, step.noun)
             };
-            let (choices, selected) = target_choices(cx, cs, nd, &usable, step.target, grouped);
+            let (choices, selected) =
+                target_choices(cx, cs, step.noun, None, &usable, step.target, grouped);
             rows.push((
                 Some(Item::StepTarget(i, s)),
                 Row::Pick {
                     label: if usable.is_empty() && !grouped {
-                        "Channel".into()
+                        m::target_noun(nd).into()
                     } else {
                         "Channel or Group".into()
                     },
@@ -701,7 +702,19 @@ impl SettingsPage for MacrosPage {
                     let mut st = self.drafts[i].steps[s].clone();
                     if st.noun != *n {
                         st.noun = *n;
-                        st.target = 0;
+                        // An aux noun addresses an aux output's slot, which is
+                        // rarely slot 0.
+                        let aux = cs
+                            .noun_desc(*n)
+                            .is_some_and(|d| d.target_kind == m::target::AUX);
+                        st.target = if aux {
+                            m::target_addresses(&cs, *n, None)
+                                .first()
+                                .copied()
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        };
                         st.index = 0;
                         let acts = m::macro_step_actions(&cs, *n);
                         if !acts.contains(&st.action) {
@@ -734,7 +747,8 @@ impl SettingsPage for MacrosPage {
                 } else {
                     m::compatible_groups(&cs, st.noun)
                 };
-                let (is_group, t) = target_choice(&nd, &usable, st.target, grouped, c);
+                let (is_group, t) =
+                    target_choice(&cs, st.noun, None, &usable, st.target, grouped, c);
                 let mut st = st;
                 if is_group {
                     st.flags |= m::flag::GROUP;

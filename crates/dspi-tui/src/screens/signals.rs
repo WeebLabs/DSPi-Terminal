@@ -1,4 +1,4 @@
-//! The Test Signals panel: `TestSignalsView.swift` as a tool panel.
+//! The Signal Generator panel: `TestSignalsView.swift` as a tool panel.
 //!
 //! Unlike every other panel here, the generator's configuration is not in the
 //! bulk packet, so there is nothing in `DeviceState` to read it back from: the
@@ -279,9 +279,8 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("← →", "Adjust"),
     KeyHelp::new("Enter", "Edit or choose"),
     KeyHelp::new("Space", "Start or stop"),
-    // `TestSignalsView.swift:913`: the Console's tooltip on the second stop
-    // button, which is the only place it explains the difference.
-    KeyHelp::new("S", "Stop immediately, no fade"),
+    // No `S`: it opens the Subharmonic Synthesizer from every screen
+    // (PLAN-beta4 decision 2). Stop now is the transport's second button.
     KeyHelp::new("a", "All outputs"),
     KeyHelp::new("n", "No outputs"),
     KeyHelp::new("Backspace", "Reset"),
@@ -781,6 +780,10 @@ impl SignalsPanel {
                 ));
             }
             parts.push("edits apply live".into());
+            // The Console's tooltip on its second stop button
+            // (`TestSignalsView.swift:928`), the only place it explains the
+            // difference; the key line carried it while `S` was Stop now.
+            parts.push("Stop now: stop immediately, no fade".into());
             parts.join(" · ")
         } else {
             match state.siggen_state.map(|(_, r, _, _)| r).unwrap_or(0) {
@@ -947,8 +950,11 @@ impl SignalsPanel {
 }
 
 impl Screen for SignalsPanel {
+    /// The Console renamed Test Signals; its header reads "Signal Generator"
+    /// over "Onboard test and measurement signals" (`TestSignalsView.swift:
+    /// 376-378`).
     fn title(&self) -> String {
-        "Test Signals".into()
+        "Signal Generator".into()
     }
 
     fn draw(
@@ -963,7 +969,7 @@ impl Screen for SignalsPanel {
         let rows = self.rows(state, theme);
         self.body.clamp(&rows);
         let (_, label, tone) = Self::run_state(state);
-        let header = Header::new("Onboard measurement signal generator").pill(label, tone);
+        let header = Header::new("Onboard test and measurement signals").pill(label, tone);
         self.body.draw(area, buf, theme, &header, &rows, focused);
     }
 
@@ -972,10 +978,8 @@ impl Screen for SignalsPanel {
         // The transport keys work from anywhere in the panel, as the Console's
         // window-wide Space shortcut does. Every row here is fully operable
         // with Enter and the arrows, so Space is free to mean Start / Stop.
-        match key.code {
-            KeyCode::Char(' ') => return self.transport(state, false),
-            KeyCode::Char('S') => return self.transport(state, true),
-            _ => {}
+        if key.code == KeyCode::Char(' ') {
+            return self.transport(state, false);
         }
         if !Self::supported(state) {
             return ScreenEvent::Unhandled;
@@ -1042,7 +1046,7 @@ mod tests {
     fn the_panel_carries_the_grid_and_every_section() {
         let (mut p, state) = panel();
         let f = testing::draw(&mut p, &state, 100, 60);
-        assert!(f.contains("Onboard measurement signal generator"), "{f}");
+        assert!(f.contains("Onboard test and measurement signals"), "{f}");
         assert!(f.contains("Idle"), "the state pill: {f}");
         assert!(f.contains("SIGNAL"), "{f}");
         for tile in ["Sine", "Pink", "Log Swp", "2-Tone", "Chan ID"] {
@@ -1079,23 +1083,59 @@ mod tests {
     }
 
     /// D49: the difference between the two stops is explained nowhere but the
-    /// Console's tooltip, so the key line carries its words.
+    /// Console's tooltip, so the running transport carries its words beside
+    /// the Stop now button, which is where stopping at once lives now that
+    /// `S` opens the Subharmonic Synthesizer.
     #[test]
-    fn the_key_line_says_what_stop_now_actually_does() {
-        assert!(
-            KEYS.iter()
-                .any(|k| k.key == "S" && k.does == "Stop immediately, no fade"),
-            "{KEYS:?}"
+    fn the_transport_says_what_stop_now_actually_does() {
+        assert!(!KEYS.iter().any(|k| k.key == "S"), "{KEYS:?}");
+        let (mut p, mut state) = panel();
+        state.siggen_state = Some((2, 0, 0, 0xFF));
+        let f = testing::draw(&mut p, &state, 100, 60);
+        assert!(f.contains("Stop now"), "{f}");
+        assert!(f.contains("stop immediately, no fade"), "{f}");
+        let rows = p.rows(&state, panel::key_theme());
+        let i = rows
+            .iter()
+            .position(|r| matches!(r, Row::Transport { .. }))
+            .expect("a transport row");
+        match p.act(&rows, i, Action::Button(1), &state) {
+            ScreenEvent::Command(c) => assert_eq!(c, "sig.control stop-now"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `S` belongs to the Subharmonic Synthesizer, and the shell has it
+    /// even while the Signal Generator has the keyboard.
+    #[test]
+    fn s_d_and_a_open_their_tools_from_the_signal_generator() {
+        use crate::shell::{Focus, ShellEvent};
+        let (_, mut state) = panel();
+        let theme = Theme::console(
+            crate::theme::ColorDepth::TrueColor,
+            crate::theme::Glyphs::Braille,
         );
-        let (_, state) = panel();
-        let f = testing::frame(
-            Tool::Signals,
-            Box::new(SignalsPanel::new()),
-            &state,
-            120,
-            40,
+        let mut s = crate::shell::Shell::new(
+            crate::shell::fixture::rp2350(&theme),
+            theme,
+            Box::new(crate::shell::Placeholder::new("Overview", "")),
         );
-        assert!(f.contains("Stop immediately, no fade"), "{f}");
+        s.open_tool(Tool::Signals, Box::new(SignalsPanel::new()));
+        assert_eq!(s.focus, Focus::Screen);
+        for running in [false, true] {
+            state.siggen_state = running.then_some((2, 0, 0, 0xFF));
+            for (c, tool) in [
+                ('S', Tool::Subharm),
+                ('D', Tool::Tube),
+                ('A', Tool::Spectrum),
+            ] {
+                assert_eq!(
+                    s.handle(shift(KeyCode::Char(c)), &state),
+                    vec![ShellEvent::OpenTool(tool)],
+                    "{c}, running {running}"
+                );
+            }
+        }
     }
 
     /// D45: `DESIGN.md` 7.8's template is header, chips, caption.
@@ -1119,7 +1159,7 @@ mod tests {
         for (w, h) in [(120u16, 40u16), (80, 24)] {
             let f = testing::frame(Tool::Signals, Box::new(SignalsPanel::new()), &state, w, h);
             assert_eq!(f.lines().count(), h as usize, "{w}x{h}");
-            assert!(f.contains("Test Signals"), "{w}x{h}:\n{f}");
+            assert!(f.contains("Signal Generator"), "{w}x{h}:\n{f}");
             assert!(f.contains("G closes"), "{w}x{h}:\n{f}");
         }
     }
@@ -1195,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn space_starts_and_stops_and_shift_s_stops_immediately() {
+    fn space_starts_and_stops_and_shift_s_is_left_to_the_shell() {
         let (mut p, mut state) = panel();
         match p.handle(key(KeyCode::Char(' ')), &state) {
             ScreenEvent::Command(c) => {
@@ -1209,9 +1249,10 @@ mod tests {
             p.handle(key(KeyCode::Char(' ')), &state),
             ScreenEvent::Command("sig.control stop".into())
         );
+        // `S` opens the Subharmonic Synthesizer; Stop now is a button.
         assert_eq!(
             p.handle(shift(KeyCode::Char('S')), &state),
-            ScreenEvent::Command("sig.control stop-now".into())
+            ScreenEvent::Unhandled
         );
     }
 

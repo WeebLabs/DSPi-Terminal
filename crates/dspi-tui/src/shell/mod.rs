@@ -46,7 +46,11 @@ pub enum Tool {
     Stats,
     Monitor,
     AutoEq,
+    /// Beta4's three tools (`DSPi_ConsoleApp.swift:11028-11056`). Their keys
+    /// are global like the rest; the factory gates each on its feature.
     Subharm,
+    Tube,
+    Spectrum,
 }
 
 impl Tool {
@@ -64,6 +68,8 @@ impl Tool {
             'I' => Self::Monitor,
             'B' => Self::AutoEq,
             'S' => Self::Subharm,
+            'D' => Self::Tube,
+            'A' => Self::Spectrum,
             _ => return None,
         })
     }
@@ -81,6 +87,8 @@ impl Tool {
             Self::Monitor => 'I',
             Self::AutoEq => 'B',
             Self::Subharm => 'S',
+            Self::Tube => 'D',
+            Self::Spectrum => 'A',
         }
     }
 
@@ -93,11 +101,15 @@ impl Tool {
             Self::Psybass => "Psychoacoustic Bass",
             Self::Upmixer => "Stereo Upmixer",
             Self::Leveller => "Volume Leveller",
-            Self::Signals => "Test Signals",
+            Self::Signals => "Signal Generator",
             Self::Stats => "System Statistics",
             Self::Monitor => "Interrupt Monitor",
             Self::AutoEq => "AutoEQ",
+            // SubharmonicSynthView.swift:25, TubeModellerView.swift:19,
+            // SpectrumAnalyserView.swift:1503.
             Self::Subharm => "Subharmonic Synthesizer",
+            Self::Tube => "Tube Modeller",
+            Self::Spectrum => "Spectrum Analyser",
         }
     }
 }
@@ -197,7 +209,7 @@ const GLOBAL_KEYS: &[KeyHelp] = &[
     KeyHelp::new("Tab", "Next region"),
     KeyHelp::new("Ctrl-P", "Search everything"),
     KeyHelp::new(":", "Command line"),
-    KeyHelp::new("M L X P U V G T I B", "Open a tool"),
+    KeyHelp::new("M L X P S D U V G A T I B", "Open a tool"),
     KeyHelp::new(",", "Settings"),
     KeyHelp::new("Ctrl-S", "Commit parameters to the preset"),
     KeyHelp::new("Ctrl-D", "Device picker"),
@@ -500,6 +512,17 @@ impl Shell {
                 if line.is_empty() {
                     return;
                 }
+                // A line the page runs itself, such as one that has to ask
+                // before it writes.
+                let run = {
+                    let (s, owner) = self.top();
+                    s.quick_run(&line, state).map(|ev| (ev, owner))
+                };
+                if let Some((ev, owner)) = run {
+                    self.absorb(ev, owner, out);
+                    self.quick_history.push(line);
+                    return;
+                }
                 let commands = {
                     let (s, _) = self.top();
                     s.quick(&line, state)
@@ -691,8 +714,11 @@ impl Shell {
 
     /// The graph's rows for this frame: none in the overview, whose grid
     /// carries the curves itself, and none while a tool covers the pane.
+    /// Without a device the grid has no cells, and the overview shows the
+    /// graph's empty grid instead, as the Console keeps its graph pane.
     fn graph_height(&self) -> GraphHeight {
-        if self.model.selection == Selection::Overview || self.tool.is_some() {
+        let grid = self.model.selection == Selection::Overview && self.model.connected;
+        if grid || self.tool.is_some() {
             GraphHeight::Hidden
         } else {
             self.model.graph_height
@@ -1378,7 +1404,7 @@ mod tests {
         let f = frame(&mut s, &mut term);
         let lines: Vec<&str> = f.lines().collect();
         assert!(
-            lines[0].starts_with(" DSPi  RP2350 · fw 1.1.6 · A1B2C3D4"),
+            lines[0].starts_with(" DSPi  RP2350 · fw 1.1.6 beta 4 · A1B2C3D4"),
             "{:?}",
             lines[0]
         );
