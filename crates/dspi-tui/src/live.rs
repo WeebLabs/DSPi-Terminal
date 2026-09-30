@@ -842,6 +842,12 @@ impl Live {
             indices: indices.to_vec(),
             value: value.clone(),
         };
+        // In INDEPENDENT mode a limiter write is output configuration: keep
+        // what it replaces so Settings can offer Save and Revert for it.
+        if path.starts_with("limit.") {
+            self.state.begin_limiter_edit();
+        }
+        let mode = (path == "preset.iomode").then(|| value.as_u8()).flatten();
         match session.write(path, indices, value) {
             // A packet parameter has no scalar readback: the confirming read
             // asks for one byte of a structure, so a byte-for-byte comparison
@@ -860,6 +866,12 @@ impl Live {
             }
             Ok(_) => {
                 self.echo(dspi_cmd::format(&cmd, &self.ctx));
+                if path == "dev.save.io" {
+                    self.state.limiter_saved();
+                }
+                if let Some(mode) = mode {
+                    self.state.output_config_mode = mode;
+                }
                 self.refresh(session);
             }
             Err(e) => self.note(e.to_string()),
@@ -1045,7 +1057,11 @@ impl Live {
                 Ok(m) | Err(m) => self.note(m),
             },
             "save-output-config" => match actions::save_output_config(session) {
-                Ok(m) | Err(m) => self.note(m),
+                Ok(m) => {
+                    self.state.limiter_saved();
+                    self.note(m)
+                }
+                Err(m) => self.note(m),
             },
             "device" => self.open_device_picker(),
             "autoeq" => match args.first().copied() {
@@ -1679,6 +1695,11 @@ impl Live {
                 // uses, so what a bar would animate is a few hundred
                 // milliseconds of transfers; the report is the part that
                 // matters and it comes up when they are done.
+                if options.hardware_io {
+                    // Imported limiters are live but unsaved output
+                    // configuration (PresetDocumentTransfer.swift:438).
+                    self.state.begin_limiter_edit();
+                }
                 let report = dspi_session::preset_file::apply(session, &doc, options);
                 self.refresh(session);
                 self.dialog = Some((
@@ -1949,10 +1970,14 @@ impl Live {
         {
             let mut shared = self.shared.borrow_mut();
             shared.preset_names = names;
-            if let Some(dir) = dir {
+            if let Some(dir) = &dir {
                 shared.occupied = dir.occupied;
                 shared.default_slot = (dir.startup_mode == 0).then_some(dir.default_slot);
             }
+        }
+        // The same packet says whether a limiter edit is a preset change.
+        if let Some(dir) = dir {
+            self.state.output_config_mode = dir.output_config_mode;
         }
         self.sync_model();
     }
@@ -2960,6 +2985,167 @@ mod tests {
             !sent.iter().any(|e| e.opcode == op::REQ_SAVE_OUTPUT_CONFIG),
             "0x52 is Save Output Configuration now, not Load Params"
         );
+    }
+
+    // -- the beta4 sections through the write path ---------------------------
+
+    fn section_at(name: &str) -> usize {
+        dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, o, _)| *o)
+            .unwrap()
+    }
+
+    /// A runner whose device already holds `after`: the state starts from the
+    /// fixture packet, so whatever the re-read after a write brings is what
+    /// the device changed on its own.
+    fn beta4(after: Vec<u8>, mock: MockTransport) -> (Live, Session, LogHandle) {
+        let mut caps = caps();
+        for name in ["subharmonic_synth", "tube_preamp", "output_limiter"] {
+            caps.features.push(dspi_session::probe::Feature {
+                name: name.into(),
+                present: true,
+                evidence: "test".into(),
+            });
+        }
+        let mock = mock
+            .window(op::REQ_GET_ALL_PARAMS_CHUNK, after)
+            .data(op::REQ_GET_STATUS, vec![0; 41])
+            .answering_everything(vec![0; 64]);
+        let log = mock.log_handle();
+        let session = Session::new(Box::new(mock), caps.clone()).unwrap();
+        let state = DeviceState::new(
+            caps,
+            dspi_proto::wire::BulkPacket::decode(packet()).unwrap(),
+        );
+        let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let live = Live::new(
+            state,
+            theme,
+            Performance::lite(),
+            Box::new(PlaceholderScreens),
+        );
+        (live, session, log)
+    }
+
+    /// Choosing a tube type makes the device load that type's bias,
+    /// asymmetry, hardness and sag (tube.c:122-212). The Terminal does not
+    /// copy the row itself; the re-read that follows every write brings the
+    /// four values in (DESIGN section 11).
+    #[test]
+    fn a_tube_type_write_brings_its_four_values_back_with_the_reread() {
+        let row = dspi_session::tube::type_row(3).unwrap();
+        let mut after = packet();
+        let t = section_at("tube");
+        after[t + 1] = 3;
+        for (i, v) in [row.bias_pct, row.asym_db, row.hardness_pct, row.sag_pct]
+            .iter()
+            .enumerate()
+        {
+            after[t + 12 + 4 * i..t + 16 + 4 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        let (mut l, mut s, log) = beta4(
+            after,
+            MockTransport::new().data(op::REQ_GET_TUBE_PARAM, 3.0f32.to_le_bytes().to_vec()),
+        );
+        assert_eq!(l.state.tube().tube_type, 0);
+        l.run_command(&mut s, "tube.type 3");
+        let tube = l.state.tube();
+        assert_eq!(tube.tube_type, 3);
+        assert_eq!(
+            (tube.bias_pct, tube.asym_db, tube.hardness_pct, tube.sag_pct),
+            (5.0, 2.0, 55.0, 10.0),
+            "the 12AT7 row"
+        );
+        let sent = log.lock().unwrap();
+        let set = sent
+            .iter()
+            .position(|e| e.opcode == op::REQ_SET_TUBE_PARAM)
+            .unwrap();
+        assert!(
+            sent[set..]
+                .iter()
+                .any(|e| e.opcode == op::REQ_GET_ALL_PARAMS_CHUNK),
+            "a whole-packet re-read follows the one write"
+        );
+    }
+
+    /// A write to one member of a limiter link group moves the whole group
+    /// (limiter.c:143-194); the re-read shows the others moving too, with no
+    /// copy of the ganging rules here.
+    #[test]
+    fn a_limiter_write_on_a_linked_output_brings_the_group_back() {
+        let l0 = section_at("limiter");
+        let mut after = packet();
+        for o in 0..2 {
+            after[l0 + 12 * o + 1] = 1;
+            after[l0 + 12 * o + 4..l0 + 12 * o + 8].copy_from_slice(&(-6.0f32).to_le_bytes());
+        }
+        let (mut l, mut s, _) = beta4(
+            after,
+            MockTransport::new().data(op::REQ_LIMITER, (-6.0f32).to_le_bytes().to_vec()),
+        );
+        l.run_command(&mut s, "limit.threshold 0 -6");
+        assert_eq!(l.state.limiter(0).unwrap().threshold_db, -6.0);
+        assert_eq!(l.state.limiter(1).unwrap().threshold_db, -6.0);
+        assert_eq!(l.state.limiter(1).unwrap().link_group, 1);
+        assert_eq!(l.state.limiter(2).unwrap().threshold_db, 0.0);
+        // WITH_PRESET, the default: a preset change, not output config.
+        assert!(l.state.has_unsaved_changes());
+        assert!(!l.state.limiter_unsaved());
+    }
+
+    /// In INDEPENDENT mode the same write is output configuration: the
+    /// preset stays clean, Settings shows it unsaved, and Save Output
+    /// Configuration takes it as saved.
+    #[test]
+    fn in_independent_mode_a_limiter_write_waits_for_save_output_configuration() {
+        let l0 = section_at("limiter");
+        let mut after = packet();
+        after[l0 + 4..l0 + 8].copy_from_slice(&(-6.0f32).to_le_bytes());
+        let mut dir = dspi_proto::packets::PresetDirectory::default().encode();
+        dir[5] = 0; // output_config_mode INDEPENDENT (config.h:497)
+        let (mut l, mut s, _) = beta4(
+            after,
+            MockTransport::new()
+                .data(op::REQ_LIMITER, (-6.0f32).to_le_bytes().to_vec())
+                .data(op::REQ_PRESET_GET_DIR, dir.to_vec()),
+        );
+        l.refresh_presets(&mut s);
+        assert_eq!(l.state.output_config_mode, 0, "read with the directory");
+        l.run_command(&mut s, "limit.threshold 0 -6");
+        assert!(!l.state.has_unsaved_changes(), "the preset is untouched");
+        assert!(l.state.limiter_unsaved());
+        l.run_command(&mut s, "save-output-config");
+        assert!(!l.state.limiter_unsaved());
+    }
+
+    /// A change this build cannot place in the shadow is not dropped: the
+    /// runner re-reads the whole packet, as the Console resyncs on an offset
+    /// it does not decode (survey-console-beta4 section 3).
+    #[test]
+    fn a_change_past_the_packet_makes_the_runner_reread() {
+        let (mut l, mut s, log) = beta4(packet(), MockTransport::new());
+        let notes = MockTransport::new();
+        let mut p = vec![2, 2, 0, 1];
+        p.extend((dspi_proto::generated::BULK_SIZE as u16).to_le_bytes());
+        p.extend(4u16.to_le_bytes());
+        p.extend([5, 0, 0, 0]);
+        p.extend(1.0f32.to_le_bytes());
+        notes.push_notification(p);
+        let n = Notifications::start(notes.notifications().unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        log.lock().unwrap().clear();
+        l.tick(&mut s, Some(&n));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.opcode == op::REQ_GET_ALL_PARAMS_CHUNK),
+            "the whole packet is read again"
+        );
+        assert!(!l.state.stale);
     }
 
     #[test]

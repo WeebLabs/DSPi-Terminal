@@ -1270,7 +1270,7 @@ pub fn import_options_dialog(doc: &preset_file::PresetDocument, state: &DeviceSt
         vec![
             ("Volume levels (master and listening volume)".into(), false),
             (
-                "Hardware I/O (GPIO pins, clocks, ADAT, inputs)".into(),
+                "Hardware I/O (GPIO pins, clocks, ADAT, inputs, output limiters)".into(),
                 false,
             ),
         ],
@@ -1758,7 +1758,10 @@ mod tests {
         match &d.kind {
             crate::widgets::DialogKind::Checklist { items, .. } => {
                 assert_eq!(items[0].0, "Volume levels (master and listening volume)");
-                assert_eq!(items[1].0, "Hardware I/O (GPIO pins, clocks, ADAT, inputs)");
+                assert_eq!(
+                    items[1].0,
+                    "Hardware I/O (GPIO pins, clocks, ADAT, inputs, output limiters)"
+                );
                 assert!(!items[0].1 && !items[1].1, "both off by default");
             }
             other => panic!("{other:?}"),
