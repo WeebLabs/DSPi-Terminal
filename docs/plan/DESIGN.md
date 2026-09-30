@@ -934,7 +934,44 @@ Recorded as they were taken, so the document stays the spec.
 - **Held-key writes are coalesced to one per value per 33 ms** (B9), the
   Console's 30 writes a second for a drag, with the last value always
   sent. Toggles and actions are never held; undo and `:` commands flush
-  anything held first.
+  anything held first. A bypassed band's `eq` line and its `eq.bypass` are
+  held and sent as one, because `eq` sends the band active
+  (vendor_commands.c:545-550). Any write that is not held, any shell
+  action and any dialog's outcome send the held writes first; quitting and
+  switching device send them to the device they were for, and a switch
+  drops anything left.
+- **Quitting or switching device switches the sub solo off** when it is
+  on, as closing the Subharmonic Synthesizer panel does: solo is runtime
+  state the device keeps until told (config.h:201).
+- **"Link all stereo pairs" can adopt a lower-numbered member's
+  settings**, as the Console's does: an output joining a group that
+  already has a member copies the lowest other member's enable, threshold
+  and release (limiter.c:143-149, 176-186), so linking a pair into a
+  group number an earlier output already uses takes that output's
+  settings rather than the pair's own.
+- **Undo puts back what a write moved on its own.** A tube type or
+  character write, a limiter link change and a limiter write to every
+  output journal the values the device changes besides the one written
+  (the rest of the voicing, tube.c:113-165; the settings a joining output
+  adopts, limiter.c:180-186; each output's own value), and undo restores
+  them after the value itself; the echo lists every write, joined by `;`.
+  The Console has no undo, so there is nothing to match.
+- **Deferred preset actions are waited for.** A preset load and a factory
+  reset wait, up to 1.5 s, for the device's `BULK_INVALIDATED` before the
+  re-read and the new baseline; a preset save waits for the device to
+  report the slot active, as the Console's copy does between its two
+  saves (`waitForPresetActivation`). A save of the slot that is already
+  active has nothing to watch and is given 100 ms, the Console's own pause
+  after a load. The Console re-reads 100 ms after a load without waiting
+  for the device; the Terminal waits because Copy To after Discard saves
+  straight after the load, and a save taken before the load would store
+  the discarded edits. A load the device kept its old slot through (a CRC
+  failure, flash_storage.c:4316-4327) is reported as corrupt.
+- **The analyser's input chips are the device's live rows** (the active
+  input count, plus the upmixer's derived rows while it runs on the
+  stereo pair, rta.c:95-106). The Console lists its own host-side input
+  count, which the Terminal does not have, and does not offer the derived
+  rows the device analyses.
 - **Grid Opacity is Off / Dim / Normal** (B9) rather than the Console's
   0..200 % slider; Dim, the default, is the Console's 50 %. The readout
   toggles govern the `h` / `l` cursor's status line.
