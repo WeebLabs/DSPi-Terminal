@@ -457,3 +457,47 @@ pub fn state() -> DeviceState {
 pub fn spectrum(shared: &crate::screens::Shared, channels: &[u8]) {
     crate::screens::spectrum::demo::load(shared, dspi_session::rta::TAP_OUTPUT, channels);
 }
+
+/// Give a state a working Subharmonic Synthesizer, for the gallery and the
+/// panel's tests: the feature present, the section at the firmware's
+/// defaults (subharm.h:85-94, `WireSubharmParams` at bulk_params.h:378-400)
+/// but on, with the 36 - 56 Hz band at -6 dB and a +3 dB bell, and the three
+/// reads the runner makes while the panel is open: headroom, solo and the
+/// sub meters.
+pub fn with_subharm(state: &mut DeviceState) {
+    if !state
+        .caps
+        .features
+        .iter()
+        .any(|f| f.name == "subharmonic_synth")
+    {
+        state.caps.features.push(dspi_session::probe::Feature {
+            name: "subharmonic_synth".into(),
+            present: true,
+            evidence: "fixture".into(),
+        });
+    }
+    let o = section("subharm");
+    let mask = crate::screens::panel::all_outputs_mask(state);
+    state.bulk.patch(o, &[1, 0]);
+    state.bulk.patch(o + 2, &mask.to_le_bytes());
+    for (at, v) in [
+        (4, 0.0f32),
+        (8, -6.0),
+        (12, 3.0),
+        (16, -30.0),
+        (20, 100.0),
+        (24, 150.0),
+        (28, 0.0),
+    ] {
+        state.bulk.patch(o + at, &v.to_le_bytes());
+    }
+    state.bulk.patch(o + 32, &[0, 1]);
+    state.subharm_headroom_db = Some(4.2);
+    state.subharm_solo = Some(false);
+    state.subharm_meter = Some(dspi_proto::packets::SubharmMeter {
+        peaks: (0..state.caps.num_outputs as u16)
+            .map(|o| 4_000 + 3_000 * (o % 4))
+            .collect(),
+    });
+}
