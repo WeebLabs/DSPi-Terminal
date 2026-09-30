@@ -949,8 +949,11 @@ pub fn read_meters(t: &mut dyn Transport, num_channels: u8) -> Result<Meters> {
 
     Ok(Meters {
         peaks,
-        // Shift on u32, not u16: channel 17 exists and its bit is real.
-        clipped: (0..n).map(|i| flags & (1u32 << i) != 0).collect(),
+        // Shift on u32, not u16: channel 17 exists and its bit is real. A
+        // channel count past 32 from a confused device has no flag.
+        clipped: (0..n)
+            .map(|i| flags.checked_shr(i as u32).unwrap_or(0) & 1 != 0)
+            .collect(),
         cpu0: d[base],
         cpu1: d[base + 1],
         active_inputs: d[base + 6],
@@ -1009,6 +1012,17 @@ mod meter_tests {
         assert_eq!(m.clipped.len(), 17);
         assert!(m.clipped[16], "the PDM sub's clip flag was lost");
         assert!(!m.clipped[15]);
+    }
+
+    /// A channel count past the flag word's 32 bits, from a confused device,
+    /// reads as unclipped rather than overflowing the shift.
+    #[test]
+    fn a_channel_past_the_flag_word_is_not_clipped() {
+        let d = packet(&[0; 40], (0, 0), u32::MAX, 8);
+        let mut t = MockTransport::new().data(op::REQ_GET_STATUS, d);
+        let m = read_meters(&mut t, 40).unwrap();
+        assert!(m.clipped[31]);
+        assert!(!m.clipped[32] && !m.clipped[39]);
     }
 
     #[test]

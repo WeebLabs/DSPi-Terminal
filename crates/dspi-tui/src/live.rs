@@ -2693,9 +2693,9 @@ impl Live {
                 self.state.caps.active_preset = active.or(Some(slot));
                 if active.is_none_or(|a| a == slot) {
                     self.state.mark_saved();
-                    self.note(format!("Preset {} loaded", slot + 1));
+                    self.note(format!("Preset {} loaded", slot as u16 + 1));
                 } else {
-                    self.note(format!("Preset {} failed to load", slot + 1));
+                    self.note(format!("Preset {} failed to load", slot as u16 + 1));
                 }
             }
             None if fresh && fx.preset_bulk => self.state.mark_saved(),

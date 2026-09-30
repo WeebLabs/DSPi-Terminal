@@ -1161,7 +1161,7 @@ impl DeviceState {
     pub fn update_meters(&mut self, m: Meters) {
         for (i, c) in m.clipped.iter().enumerate() {
             if *c {
-                self.clip_latched |= 1 << i;
+                self.clip_latched |= 1u32.checked_shl(i as u32).unwrap_or(0);
             }
         }
         self.meters = m;
@@ -1172,7 +1172,7 @@ impl DeviceState {
     }
 
     pub fn is_clipped(&self, channel: usize) -> bool {
-        self.clip_latched & (1 << channel) != 0
+        self.clip_latched & 1u32.checked_shl(channel as u32).unwrap_or(0) != 0
     }
 
     /// Apply one notification to the shadow.
@@ -1607,6 +1607,19 @@ mod tests {
 
     fn state() -> DeviceState {
         DeviceState::new(caps(), BulkPacket::decode(packet()).unwrap())
+    }
+
+    /// The clip latch is a 32-bit word: a channel past it, from a confused
+    /// device, is never latched rather than overflowing the shift.
+    #[test]
+    fn a_channel_past_the_clip_latch_is_not_clipped() {
+        let mut s = state();
+        s.update_meters(Meters {
+            clipped: vec![true; 40],
+            ..Meters::default()
+        });
+        assert!(s.is_clipped(31));
+        assert!(!s.is_clipped(32) && !s.is_clipped(39));
     }
 
     #[test]
