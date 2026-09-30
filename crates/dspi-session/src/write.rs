@@ -548,7 +548,7 @@ impl Session {
     }
 
     /// Range-check indices against the device's actual topology, never a constant.
-    fn check_indices(&self, d: &ParamDesc, indices: &[u8]) -> Result<(), WriteError> {
+    pub(crate) fn check_indices(&self, d: &ParamDesc, indices: &[u8]) -> Result<(), WriteError> {
         let want = d.target.arity();
         if indices.len() != want {
             return Err(WriteError::WrongArity {

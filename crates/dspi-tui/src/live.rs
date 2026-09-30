@@ -1087,13 +1087,19 @@ impl Live {
             } => {
                 self.set(session, path, indices, value.clone());
             }
-            dspi_cmd::Command::Get { path, ref indices } => match session.read(path, indices) {
-                Ok(v) => {
-                    let shown = dspi_proto::registry::by_path(path)
-                        .map(|d| display_value(d, &v))
-                        .unwrap_or_default();
-                    self.note(format!("{path} = {shown}"));
-                }
+            dspi_cmd::Command::Get { path, ref indices } => match session.read_whole(path, indices)
+            {
+                // A status or packet row, read at its own length.
+                Ok(Some(r)) => self.note(format!("{path} = {}", r.one_line())),
+                Ok(None) => match session.read(path, indices) {
+                    Ok(v) => {
+                        let shown = dspi_proto::registry::by_path(path)
+                            .map(|d| display_value(d, &v))
+                            .unwrap_or_default();
+                        self.note(format!("{path} = {shown}"));
+                    }
+                    Err(e) => self.note(e.to_string()),
+                },
                 Err(e) => self.note(e.to_string()),
             },
             dspi_cmd::Command::SetBand {
