@@ -643,9 +643,9 @@ impl RtaEngine {
         report: &mut TickReport,
     ) {
         // Nobody is watching: stop the device once, and forget the picture.
+        // A device without the analyser has nothing to stop.
         if !self.watching() {
-            if self.stop_pending {
-                self.stop_pending = false;
+            if std::mem::take(&mut self.stop_pending) && self.supported() {
                 report.transfers += 1;
                 let r = t.control_in(op::REQ_RTA_CONTROL, CTL_STOP, 1);
                 report.disconnected |= matches!(r, Err(TransportError::Disconnected));
