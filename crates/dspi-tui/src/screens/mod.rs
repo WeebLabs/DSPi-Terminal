@@ -31,6 +31,7 @@ pub mod panel;
 pub mod presets;
 pub mod psybass;
 pub mod signals;
+pub mod spectrum;
 pub mod stats;
 pub mod upmixer;
 
@@ -58,6 +59,7 @@ pub mod quick;
 pub use presets::{PresetChoice, PresetMenu};
 pub use psybass::PsybassPanel;
 pub use signals::SignalsPanel;
+pub use spectrum::SpectrumPanel;
 pub use stats::StatsPanel;
 pub use upmixer::UpmixerPanel;
 
@@ -93,6 +95,9 @@ pub struct SharedState {
     /// The main graph's window and zoom, mirrored by the runner each frame so
     /// the overview's cells draw on the same axes (DESIGN 12.2).
     pub graph: crate::graph::GraphSettings,
+    /// The spectrum analyser: its engine, its Settings values and the
+    /// channels chosen. The runner ticks the engine; views subscribe to it.
+    pub spectrum: spectrum::SpectrumState,
 }
 
 impl SharedState {
@@ -241,23 +246,29 @@ pub fn type_name(t: FilterType) -> String {
     }
 }
 
-/// The dashboard's compact code, `DashboardRow.typeCode`. The Console draws an
-/// em-dash for an unset band; we draw `OFF`, which is what its own switch says.
+/// The dashboard's compact code, `DashboardRow.typeCode`
+/// (`DashboardView.swift:370-384`), which reads `OFF` for an unset band.
+///
+/// PEQ passes read as cuts, as their full names do: a low pass is a high cut
+/// (`HC`) and a high pass a low cut (`LC`), after `FilterType.shortLabel`
+/// (`DSPMath.swift:168-179`). Crossovers keep `LP` and `HP`, and filter files
+/// keep REW's pass codes (`fileCode`, `DSPMath.swift:285-297`), which is why
+/// `dspi_session::filterfile` keeps a table of its own.
 pub fn type_code(t: FilterType) -> String {
     match t {
         FilterType::Flat => "OFF".into(),
         FilterType::Peaking => "PK".into(),
         FilterType::LowShelf => "LS".into(),
         FilterType::HighShelf => "HS".into(),
-        FilterType::LowPass => "LP".into(),
-        FilterType::HighPass => "HP".into(),
+        FilterType::LowPass => "HC".into(),
+        FilterType::HighPass => "LC".into(),
         FilterType::Notch => "NO".into(),
         FilterType::AllPass => "AP".into(),
         FilterType::AllPass1 => "AP1".into(),
         FilterType::LowShelf1 => "LS1".into(),
         FilterType::HighShelf1 => "HS1".into(),
-        FilterType::LowPass1 => "LP1".into(),
-        FilterType::HighPass1 => "HP1".into(),
+        FilterType::LowPass1 => "HC1".into(),
+        FilterType::HighPass1 => "LC1".into(),
         FilterType::LinkwitzTransform => "LT".into(),
         other => match xover::meta(other.to_raw()) {
             Some(m) => format!(
@@ -621,23 +632,42 @@ pub(crate) mod tests {
     }
 
     /// The shell hands the key to the focused screen before it looks at it
-    /// itself, so a screen's own letters have to survive the trip.
+    /// itself, so a screen's own letters have to survive the trip, and the
+    /// tool keys a band list gave up (PLAN-beta4 decision 2) have to pass
+    /// through it to the shell.
     #[test]
-    fn a_screens_keys_reach_it_through_the_shell() {
+    fn a_screens_keys_reach_it_and_the_band_list_lets_s_d_and_a_through() {
+        use crate::shell::{Selection, ShellEvent, Tool};
         let state = fixture::state();
-        let mut s = shell(
-            Box::new(InputPage::new(0, shared(), &state)),
-            crate::shell::Selection::Input(0),
-        );
-        let events = s.handle(
-            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
-            &state,
-        );
-        assert!(
-            events.is_empty(),
-            "D opened the Clear All dialog, not a tool"
-        );
-        assert!(s.dialog.is_some());
+        let pages: [(Box<dyn crate::shell::Screen>, Selection); 2] = [
+            (
+                Box::new(InputPage::new(0, shared(), &state)),
+                Selection::Input(0),
+            ),
+            (
+                Box::new(OutputPage::new(0, shared(), &state)),
+                Selection::Output(0),
+            ),
+        ];
+        for (page, selection) in pages {
+            let mut s = shell(page, selection);
+            // Down into the band list, where `A` and `D` used to be bound.
+            s.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state);
+            let events = s.handle(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &state,
+            );
+            assert!(events.is_empty(), "`a` is the list's Enable All");
+            for (c, tool) in [
+                ('S', Tool::Subharm),
+                ('D', Tool::Tube),
+                ('A', Tool::Spectrum),
+            ] {
+                let events = s.handle(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT), &state);
+                assert_eq!(events, vec![ShellEvent::OpenTool(tool)], "{c}");
+                assert!(s.dialog.is_none(), "{c} opened a dialog");
+            }
+        }
     }
 
     #[test]
@@ -676,6 +706,41 @@ pub(crate) mod tests {
         assert_eq!(type_token(FilterType::Peaking), "peak");
         assert_eq!(type_token(FilterType::from_raw(35)), "lr4hp");
         assert_eq!(type_token(FilterType::from_raw(56)), "bes2lp");
+    }
+
+    /// PEQ passes read as cuts in the interface; crossovers keep LP and HP,
+    /// and a filter file keeps REW's pass codes (DSPMath.swift:168-179,
+    /// 285-297).
+    #[test]
+    fn peq_passes_read_as_cuts_and_crossovers_and_files_keep_passes() {
+        let codes: Vec<String> = [
+            FilterType::LowPass,
+            FilterType::HighPass,
+            FilterType::LowPass1,
+            FilterType::HighPass1,
+        ]
+        .into_iter()
+        .map(type_code)
+        .collect();
+        assert_eq!(codes, ["HC", "LC", "HC1", "LC1"]);
+        assert_eq!(type_name(FilterType::LowPass), "High Cut 12 dB/oct");
+        assert_eq!(type_name(FilterType::HighPass1), "Low Cut 6 dB/oct");
+        // An LR4 low pass and high pass.
+        assert_eq!(type_code(FilterType::from_raw(34)), "LR4LP");
+        assert_eq!(type_code(FilterType::from_raw(35)), "LR4HP");
+        assert_eq!(type_name(FilterType::from_raw(35)), "LR4 High Pass");
+        use dspi_session::filterfile::{Bank, format_band};
+        let band = |t: FilterType| dspi_proto::dsp::Band {
+            filter_type: t,
+            freq: 80.0,
+            q: 0.707,
+            gain_db: 0.0,
+            bypass: false,
+        };
+        let line = format_band(Bank::Peq, 1, &band(FilterType::LowPass), None);
+        assert!(line.contains(" LP "), "{line}");
+        let line = format_band(Bank::Peq, 1, &band(FilterType::HighPass1), None);
+        assert!(line.contains(" HP1 "), "{line}");
     }
 
     #[test]

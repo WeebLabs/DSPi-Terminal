@@ -3,7 +3,8 @@
 //!   gallery [width] [height] [calm|console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|limiter|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
-//!                     |autoeq] [--settings <page>] [--expand n] [--busy|--full]
+//!                     |autoeq|subharm|tube|spectrum|nodevice] [--settings <page>]
+//!           [--expand n] [--busy|--full] [--channels 1,2,9] [--bars|--both]
 //!           [--depth truecolor|256|16|mono] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
@@ -11,16 +12,19 @@
 //! pane: one of the Console's detail screens, or one of its tool panels, which
 //! replace the graph as well. The default is the input page. `--settings`
 //! opens Settings on one of its pages, as `,` does: about, advanced, graphing,
-//! overview, inputs, outputs, i2s, global, surfaces, interfaces, groups,
-//! macros. `--expand n` opens the nth card on one of the three Control pages,
+//! spectrum, overview, inputs, outputs, i2s, global, surfaces, interfaces,
+//! groups, macros, aux. `--channels` picks the outputs the spectrum panel
+//! shows (one, with bins, by default) and `--bars` or `--both` how it draws
+//! them. `--expand n` opens the nth card on one of the four card pages,
 //! whose bodies are otherwise behind a collapsed header. `--busy` swaps in
 //! the fixture with every channel tuned, which is what the overview grid
 //! is for; `--full` the one where no two channels are alike.
 
+use dspi_tui::live::pending_tool;
 use dspi_tui::screens::{
     AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
-    MonitorPanel, OutputPage, Overview, PsybassPanel, SignalsPanel, StatsPanel, UpmixerPanel,
-    shared,
+    MonitorPanel, OutputPage, Overview, PsybassPanel, SignalsPanel, SpectrumPanel, StatsPanel,
+    UpmixerPanel, shared, spectrum,
 };
 use dspi_tui::settings::{AppConfig, SettingsScreen};
 use dspi_tui::shell::{Focus, Screen, Selection, Shell, Tool, fixture};
@@ -60,10 +64,20 @@ fn main() {
     let mut args: Vec<&String> = Vec::new();
     let mut skip = false;
     for a in &raw {
-        if std::mem::take(&mut skip) || a == "--ansi" || a == "--busy" || a == "--full" {
+        if std::mem::take(&mut skip)
+            || ["--ansi", "--busy", "--full", "--bars", "--both"].contains(&a.as_str())
+        {
             continue;
         }
-        if a == "--screen" || a == "--settings" || a == "--expand" || a == "--quick" {
+        if [
+            "--screen",
+            "--settings",
+            "--expand",
+            "--quick",
+            "--channels",
+        ]
+        .contains(&a.as_str())
+        {
             skip = true;
             continue;
         }
@@ -184,7 +198,7 @@ fn main() {
     // The Settings pages show wiring, so they get a device with some. The
     // three Control pages are entirely caps-driven, so theirs additionally
     // reports a control-surface capability table and the records built on it.
-    let state = if settings.is_some() {
+    let mut state = if settings.is_some() {
         dspi_tui::settings::cs_model::demo::state()
     } else {
         state
@@ -367,10 +381,44 @@ fn main() {
             Tool::AutoEq,
             Box::new(AutoEqPanel::searching(shared.clone(), "sennheiser")) as Box<dyn Screen>,
         )),
+        // Beta4 tools whose panels have not landed: the fixture reports none
+        // of their features, so each shows what the device lacks.
+        "subharm" => Some((Tool::Subharm, pending_tool(&state, Tool::Subharm))),
+        "tube" => Some((Tool::Tube, pending_tool(&state, Tool::Tube))),
+        // The analyser draws from the shared engine, which the fixture fills
+        // with a device's caps and a picture of the chosen outputs.
+        "spectrum" => {
+            let channels: Vec<u8> = raw
+                .iter()
+                .position(|a| a == "--channels")
+                .and_then(|i| raw.get(i + 1))
+                .map(|list| {
+                    list.split(',')
+                        .filter_map(|c| c.trim().parse::<u8>().ok())
+                        .filter(|c| *c > 0)
+                        .map(|c| c - 1)
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![0]);
+            fixture::spectrum(&shared, &channels);
+            let mode = if raw.iter().any(|a| a == "--both") {
+                spectrum::Mode::Both
+            } else if raw.iter().any(|a| a == "--bars") {
+                spectrum::Mode::Bars
+            } else {
+                spectrum::Mode::Curves
+            };
+            Some((
+                Tool::Spectrum,
+                Box::new(SpectrumPanel::open(shared.clone(), &state).mode(mode)) as Box<dyn Screen>,
+            ))
+        }
         _ => None,
     };
     let (detail, selection): (Box<dyn Screen>, Selection) = match screen.as_str() {
-        "overview" | "matrix" => (Box::new(Overview::new(shared.clone())), Selection::Overview),
+        "overview" | "matrix" | "nodevice" => {
+            (Box::new(Overview::new(shared.clone())), Selection::Overview)
+        }
         "output" => (
             Box::new(OutputPage::new(0, shared.clone(), &state)),
             Selection::Output(0),
@@ -394,6 +442,9 @@ fn main() {
         ),
     };
     fixture::select(&mut model, &state, &theme, selection);
+    if screen == "nodevice" {
+        fixture::disconnect(&mut model, &mut state);
+    }
     let mut shell = Shell::new(model, theme, detail);
     shell.focus = Focus::Screen;
     if let Some((tool, panel)) = tool {
@@ -412,12 +463,9 @@ fn main() {
             eprintln!("unknown settings page {name}");
             std::process::exit(2);
         });
-        let mut s = SettingsScreen::new(
-            &state,
-            dspi_tui::settings::cs_model::demo::settings_data(),
-            AppConfig::default(),
-        )
-        .open(page, &state);
+        let mut data = dspi_tui::settings::cs_model::demo::settings_data();
+        data.rta = Some(spectrum::demo::caps());
+        let mut s = SettingsScreen::new(&state, data, AppConfig::default()).open(page, &state);
         if let Some(n) = expand {
             use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
             let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
