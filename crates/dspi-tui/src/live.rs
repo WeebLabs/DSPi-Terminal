@@ -1080,10 +1080,13 @@ impl Live {
                 Ok(m) => self.note(m),
                 Err(e) => self.note(e),
             },
-            FileAction::ExportConfig => match actions::export_config(session, path) {
-                Ok(m) => self.note(m),
-                Err(e) => self.note(e),
-            },
+            FileAction::ExportConfig => {
+                let linked = self.shared.borrow().linked_pairs;
+                match actions::export_config(session, path, &linked) {
+                    Ok(m) => self.note(m),
+                    Err(e) => self.note(e),
+                }
+            }
             FileAction::ImportFilters => {
                 let text = match std::fs::read_to_string(actions::expand(path)) {
                     Ok(t) => t,
@@ -1652,6 +1655,14 @@ impl Live {
                     self.state.begin_limiter_edit();
                 }
                 let report = dspi_session::preset_file::apply(session, &doc, options);
+                // The pair links are the app's, so the device apply leaves
+                // them here (PresetDocumentTransfer.swift:367-375).
+                let mut shared = self.shared.borrow_mut();
+                for pair in 0..shared.linked_pairs.len() {
+                    let on = doc.global.input_pair_linked.get(pair).copied();
+                    shared.set_linked(pair, on.unwrap_or(false));
+                }
+                drop(shared);
                 self.refresh(session);
                 self.dialog = Some((
                     AppDialog::Report,
