@@ -1516,6 +1516,25 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool, force: bool) -> u
     match cmd {
         Command::Get { path, indices } => {
             let d = by_path(path).expect("the parser only returns known paths");
+            // A status or packet row is read at its own length and decoded;
+            // a scalar read of one would be its first byte.
+            match s.read_whole(path, &indices) {
+                Ok(Some(r)) => {
+                    if json {
+                        println!("{}", serde_json::json!({ "path": path, "value": r.json }));
+                    } else {
+                        for line in &r.lines {
+                            println!("{line}");
+                        }
+                    }
+                    return exit::OK;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("dspi: {e}");
+                    return write_exit(&e);
+                }
+            }
             match s.read(path, &indices) {
                 Ok(v) => {
                     if json {
