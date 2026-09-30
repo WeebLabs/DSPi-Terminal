@@ -104,12 +104,26 @@ impl GroupsPage {
         }
     }
 
-    /// Follow the device when Settings is reopened against a fresh read and
-    /// this page has nothing staged.
+    /// Follow the device on every read, card by card, wherever this page holds
+    /// no edit of its own (DESIGN section 11, B7). `SettingsData` is re-read
+    /// after every write and after a Revert, and the Console beside this can
+    /// change a group too; a card that kept its snapshot would show the old
+    /// group and its next Apply would write it back over the new one. A
+    /// staged edit is kept, and the group being applied is left to the
+    /// apply's own answer.
     fn adopt(&mut self, cs: &CsData) {
         if self.drafts.len() != cs.groups.len() {
             self.drafts = cs.groups.clone();
             self.live = cs.groups.clone();
+        }
+        for g in 0..self.drafts.len() {
+            if self.applying == Some(g) {
+                continue;
+            }
+            if self.drafts[g] == self.live[g] {
+                self.drafts[g] = cs.groups[g].clone();
+            }
+            self.live[g] = cs.groups[g].clone();
         }
         self.health = cs.ext.group_status;
     }
@@ -518,7 +532,7 @@ impl SettingsPage for GroupsPage {
         };
         match outcome {
             DialogOutcome::Text(name) => {
-                self.drafts[g].name = name.chars().take(31).collect();
+                self.drafts[g].name = dspi_proto::packets::truncate_name(&name, 31).to_string();
                 PageEvent::Handled
             }
             DialogOutcome::Button(0) => self.remove(g),
@@ -750,6 +764,47 @@ mod tests {
         };
         assert_eq!(p.visible().len(), 12);
         assert!(!p.build(&cx).is_empty());
+    }
+
+    /// A card with nothing staged follows each re-read (a Revert, another
+    /// host), so its next Apply cannot write a stale group back; a card being
+    /// edited keeps the edit.
+    #[test]
+    fn a_card_without_a_staged_edit_follows_the_device() {
+        let d = m::demo::settings_data();
+        let mut p = GroupsPage::new(&d);
+        let mut cs = d.cs.clone().expect("cs");
+        p.drafts[1] = CsGroup {
+            target_kind: m::target::OUTPUT_CH,
+            member_mask: 0b0100,
+            name: "Staged".into(),
+        };
+        cs.groups[0].name = "Changed Elsewhere".into();
+        cs.groups[0].member_mask = 0b0110;
+        cs.groups[1].name = "Also Changed".into();
+        p.adopt(&cs);
+        assert_eq!(p.drafts[0], cs.groups[0], "the untouched card follows");
+        assert!(!p.dirty(0));
+        assert_eq!(p.drafts[1].name, "Staged", "the edit is the user's");
+        assert!(p.dirty(1), "and now differs from what the device holds");
+    }
+
+    /// A name is cut to 31 bytes on a character boundary, not to 31
+    /// characters, which could be 62 bytes and split one on the wire.
+    #[test]
+    fn a_rename_is_cut_on_a_character_boundary() {
+        let d = m::demo::settings_data();
+        let mut p = GroupsPage::new(&d);
+        let cx = Cx {
+            state: &m::demo::state(),
+            data: &d,
+            config: &AppConfig::default(),
+            connected: true,
+            global_dirty: false,
+        };
+        p.dialog = Some(Item::Header(0));
+        p.dialog_result(DialogOutcome::Text("é".repeat(30)), &cx);
+        assert_eq!(p.drafts[0].name, "é".repeat(15));
     }
 
     #[test]
