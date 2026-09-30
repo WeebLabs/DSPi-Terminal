@@ -4032,7 +4032,7 @@ mod interop_tests {
         );
 
         assert_eq!(sent(&log, op::REQ_SET_LOUDNESS_MASK)[0].1, vec![0x03, 0x00]);
-        assert_eq!(sent(&log, op::REQ_SET_CROSSFEED_OUTPUTS)[0].1[0], 0x02);
+        assert_eq!(sent(&log, op::REQ_SET_CROSSFEED_OUTPUTS)[0].1, vec![0x02]);
         assert_eq!(
             sent(&log, op::REQ_SET_LEVELLER_MASKS)[0].1,
             vec![0x03, 0x02]

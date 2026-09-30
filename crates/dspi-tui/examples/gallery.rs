@@ -283,6 +283,17 @@ fn main() {
             }),
             ..Default::default()
         };
+        // Eight polls of history, so the sparklines have something to trace.
+        if let Some(latest) = app.stats.buffers.clone() {
+            for k in 0..8u8 {
+                let mut b = latest.clone();
+                b.spdif[0].consumer_fill_pct = 44 + (k * 5) % 13;
+                b.spdif[1].consumer_fill_pct = 64 + k * 4;
+                b.pdm.dma_fill_pct = 16 + k % 4;
+                b.pdm.ring_fill_pct = 8 + k;
+                app.stats.fill_history.push(Some(&b));
+            }
+        }
 
         app.log.active = true;
         let mut at = 0.125;

@@ -19,6 +19,39 @@ use ratatui::widgets::Widget;
 
 use crate::theme::{ColorDepth, Glyphs, Theme};
 
+/// How strongly the grid is drawn: the Console's Grid Opacity slider
+/// (0..200 %, `DSPi_ConsoleApp.swift:1864-1869`) in the three steps a
+/// terminal cell can show. Off is 0 %, Dim is anything below 100 % (the
+/// Console's 50 % default), and Normal is 100 % and up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GridStrength {
+    Off,
+    #[default]
+    Dim,
+    Normal,
+}
+
+impl GridStrength {
+    pub const CHOICES: [&'static str; 3] = ["Off", "Dim", "Normal"];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Dim => 1,
+            Self::Normal => 2,
+        }
+    }
+
+    pub fn from_index(i: usize) -> Self {
+        match i {
+            0 => Self::Off,
+            2 => Self::Normal,
+            _ => Self::Dim,
+        }
+    }
+}
+
 /// Settings > Graphing, with the Console's defaults.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphSettings {
@@ -32,6 +65,14 @@ pub struct GraphSettings {
     pub freq_labels: bool,
     pub db_grid: bool,
     pub db_labels: bool,
+    /// The cursor readout's frequency and its per-curve dB: the Console's
+    /// Show Frequency Readout and Show Gain Readout.
+    pub freq_readout: bool,
+    pub gain_readout: bool,
+    pub grid: GridStrength,
+    /// The overview's cells per row: 0 is Auto, otherwise at most this many
+    /// (the Console's Dashboard Layout).
+    pub dashboard_cards: u8,
 }
 
 impl Default for GraphSettings {
@@ -47,6 +88,10 @@ impl Default for GraphSettings {
             freq_labels: true,
             db_grid: true,
             db_labels: true,
+            freq_readout: true,
+            gain_readout: true,
+            grid: GridStrength::Dim,
+            dashboard_cards: 0,
         }
     }
 }
@@ -173,6 +218,24 @@ impl<'a> Graph<'a> {
             .collect()
     }
 
+    /// The cursor readout as the status line shows it, `1000 Hz  IN1 +6.0`,
+    /// with the frequency and the levels each left out when Graphing turns
+    /// them off. None when both are off.
+    pub fn readout_text(&self, hz: f64) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if self.settings.freq_readout {
+            parts.push(format!("{hz:.0} Hz"));
+        }
+        if self.settings.gain_readout {
+            parts.extend(
+                self.readout(hz)
+                    .iter()
+                    .map(|(d, db)| format!("{d} {db:+.1}")),
+            );
+        }
+        (!parts.is_empty()).then(|| parts.join("  "))
+    }
+
     fn db_label(db: f64) -> String {
         if db == 0.0 {
             "0".into()
@@ -238,8 +301,14 @@ impl Widget for Graph<'_> {
             Some(plot.x + ((f * (plot.width - 1) as f64).round() as u16).min(plot.width - 1))
         };
 
-        // Grid first, so the curves draw over it.
-        if s.db_grid {
+        // Grid first, so the curves draw over it. Dim is the quiet look
+        // (DESIGN 12); Normal lifts each line one step.
+        let (grid_major, grid_minor) = match s.grid {
+            GridStrength::Normal => (t.dim, t.chrome),
+            _ => (t.chrome, t.chrome_faint),
+        };
+        let grid_on = s.grid != GridStrength::Off;
+        if s.db_grid && grid_on {
             let step = s.db_step();
             // A grid line on every row is no grid at all; below two rows per
             // step only the zero line is drawn.
@@ -258,7 +327,7 @@ impl Widget for Graph<'_> {
                         } else {
                             "─"
                         },
-                        Style::default().fg(t.chrome),
+                        Style::default().fg(grid_major),
                     )
                 } else {
                     (
@@ -267,7 +336,7 @@ impl Widget for Graph<'_> {
                         } else {
                             "┈"
                         },
-                        Style::default().fg(t.chrome_faint),
+                        Style::default().fg(grid_minor),
                     )
                 };
                 for x in plot.x..plot.x + plot.width {
@@ -276,7 +345,7 @@ impl Widget for Graph<'_> {
                 db += step;
             }
         }
-        if s.freq_grid {
+        if s.freq_grid && grid_on {
             let major = [100.0, 1_000.0, 10_000.0];
             // The Console draws every minor decade line at 6 % white, which
             // is nearly invisible. A terminal cell is not, so only the 2 and
@@ -291,7 +360,7 @@ impl Widget for Graph<'_> {
             for hz in minor.iter().filter(|_| wide).chain(major.iter()) {
                 let Some(x) = x_of(*hz) else { continue };
                 let is_major = major.contains(hz);
-                let style = Style::default().fg(if is_major { t.chrome } else { t.chrome_faint });
+                let style = Style::default().fg(if is_major { grid_major } else { grid_minor });
                 let sym = match (is_major, t.glyphs) {
                     (_, Glyphs::Ascii) => ":",
                     (true, _) => "┆",
@@ -657,6 +726,57 @@ mod tests {
         let out = render(Graph::new(&curves, &s, &t), 60, 12);
         assert!(out.lines().next().unwrap().ends_with("+180"), "{out}");
         assert!(out.lines().nth(10).unwrap().ends_with("-180"), "{out}");
+    }
+
+    #[test]
+    fn the_readout_leaves_out_what_graphing_turns_off() {
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let curves = vec![tuned("IN1", t.inputs[0], 6.0)];
+        let mut s = GraphSettings::default();
+        let text = |s: &GraphSettings| Graph::new(&curves, s, &t).readout_text(1000.0);
+        assert_eq!(text(&s).as_deref(), Some("1000 Hz  IN1 +6.0"));
+        s.gain_readout = false;
+        assert_eq!(text(&s).as_deref(), Some("1000 Hz"));
+        s.freq_readout = false;
+        assert_eq!(text(&s), None);
+        s.gain_readout = true;
+        assert_eq!(text(&s).as_deref(), Some("IN1 +6.0"));
+    }
+
+    #[test]
+    fn the_grid_strength_picks_the_grid_colours() {
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let curves: Vec<GraphCurve> = Vec::new();
+        let colours = |grid: GridStrength| {
+            let s = GraphSettings {
+                grid,
+                ..Default::default()
+            };
+            // Wide and tall enough for the minor lines both ways.
+            let buf = render_buf(Graph::new(&curves, &s, &t), 120, 40);
+            let mut seen = Vec::new();
+            for y in 0..39 {
+                for x in 4..120 {
+                    let c = &buf[(x, y)];
+                    if c.symbol() != " " && !seen.contains(&c.fg) {
+                        seen.push(c.fg);
+                    }
+                }
+            }
+            seen
+        };
+        assert!(colours(GridStrength::Off).is_empty(), "no grid at all");
+        let dim = colours(GridStrength::Dim);
+        assert!(
+            dim.contains(&t.chrome) && dim.contains(&t.chrome_faint),
+            "{dim:?}"
+        );
+        let normal = colours(GridStrength::Normal);
+        assert!(
+            normal.contains(&t.dim) && normal.contains(&t.chrome),
+            "{normal:?}"
+        );
+        assert!(!normal.contains(&t.chrome_faint), "{normal:?}");
     }
 
     #[test]

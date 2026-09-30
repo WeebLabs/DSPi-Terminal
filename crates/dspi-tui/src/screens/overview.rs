@@ -231,11 +231,15 @@ impl Overview {
     /// whole wherever the pane has room for it (DESIGN 12.7). When even the
     /// smallest cells will not fit, the grid takes the most columns it can
     /// at the smallest height and scrolls.
-    fn shape(area: Rect, n: usize) -> (usize, u16) {
+    ///
+    /// `most` is Graphing's Dashboard Layout: 0 for Auto, otherwise the most
+    /// columns the grid may take, as the Console's "Up to N cards per row".
+    fn shape(area: Rect, n: usize, most: u8) -> (usize, u16) {
         let n = n.max(1);
+        let most = if most == 0 { 8 } else { most as usize };
         let mut best: Option<(usize, u16, u16)> = None;
         let mut widest_cols = 1;
-        for cols in 1..=8usize {
+        for cols in 1..=most {
             let w = area.width / cols as u16;
             if w < Self::MIN_W {
                 break;
@@ -285,7 +289,8 @@ impl Screen for Overview {
             return;
         }
         self.cursor = self.cursor.min(cells.len() - 1);
-        let (cols, step) = Self::shape(area, cells.len());
+        let most = self.shared.borrow().graph.dashboard_cards;
+        let (cols, step) = Self::shape(area, cells.len(), most);
         self.cols = cols;
         let rows = cells.len().div_ceil(cols) as u16;
 
@@ -693,18 +698,38 @@ mod tests {
         assert!(f.contains("▼"), "more rows below: {f}");
     }
 
+    /// Dashboard Layout caps the columns ("Up to N cards per row"); a cap
+    /// wider than the pane allows changes nothing, and Auto is the rule above.
+    #[test]
+    fn the_dashboard_layout_caps_the_cells_per_row() {
+        let wide = Rect::new(0, 0, 170, 55);
+        assert_eq!(Overview::shape(wide, 17, 1).0, 1);
+        assert_eq!(Overview::shape(wide, 17, 2).0, 2);
+        assert_eq!(Overview::shape(wide, 17, 3).0, 3);
+        assert_eq!(Overview::shape(Rect::new(0, 0, 54, 19), 17, 3).0, 2);
+        let state = fixture::full_state();
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let sh = shared();
+        sh.borrow_mut().graph.dashboard_cards = 1;
+        let mut s = Overview::new(sh);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(94, 35)).unwrap();
+        term.draw(|f| s.draw(f.area(), f.buffer_mut(), &t, &state, true))
+            .unwrap();
+        assert_eq!(s.cols, 1);
+    }
+
     #[test]
     fn the_grid_sizes_its_cells_so_every_channel_fits_where_it_can() {
         // Seventeen distinct channels at the Normal density's 94x35: four
         // columns of seven-row cells, five rows, all on one screen.
-        assert_eq!(Overview::shape(Rect::new(0, 0, 94, 35), 17), (4, 7));
+        assert_eq!(Overview::shape(Rect::new(0, 0, 94, 35), 17, 0), (4, 7));
         // At Wide's 170x55: five columns, thirteen-row cells.
-        assert_eq!(Overview::shape(Rect::new(0, 0, 170, 55), 17), (5, 13));
+        assert_eq!(Overview::shape(Rect::new(0, 0, 170, 55), 17, 0), (5, 13));
         // Five cells get the tallest cells three abreast.
-        assert_eq!(Overview::shape(Rect::new(0, 0, 94, 35), 5), (3, 13));
+        assert_eq!(Overview::shape(Rect::new(0, 0, 94, 35), 5, 0), (3, 13));
         // Compact's 54x19 cannot hold seventeen: two columns, the smallest
         // cells, and the grid scrolls.
-        assert_eq!(Overview::shape(Rect::new(0, 0, 54, 19), 17), (2, 6));
+        assert_eq!(Overview::shape(Rect::new(0, 0, 54, 19), 17, 0), (2, 6));
         let state = fixture::full_state();
         let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
         let mut s = Overview::new(shared());

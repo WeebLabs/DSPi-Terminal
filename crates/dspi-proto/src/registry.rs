@@ -335,7 +335,9 @@ impl ParamDesc {
     /// (config.h:228-231, tube.h:15) and the limiter's (config.h:233-236). A
     /// one-byte payload there is a short payload, which the upmixer stalls on
     /// and the tube and limiter silently ignore. The auxiliary output level is
-    /// an 8.8 fixed-point percentage (config.h:141-145).
+    /// an 8.8 fixed-point percentage (config.h:141-145), and the crossfeed
+    /// output mask a single byte of pair bits (config.h:581-583), where the
+    /// kind would send the two bytes the other masks take.
     pub fn repr(&self) -> Repr {
         if matches!(self.kind, Kind::Status | Kind::Packet | Kind::Trigger) {
             return self.kind.repr();
@@ -349,6 +351,7 @@ impl ParamDesc {
                 | op::REQ_LIMITER,
             ) => Repr::F32,
             Some(op::REQ_SET_CS_AUX_LEVEL | op::REQ_GET_CS_AUX_LEVEL) => Repr::U16Q8,
+            Some(op::REQ_SET_CROSSFEED_OUTPUTS | op::REQ_GET_CROSSFEED_OUTPUTS) => Repr::U8,
             _ => self.kind.repr(),
         }
     }
@@ -3859,6 +3862,17 @@ mod tests {
         assert_eq!(by_path("sub.select").unwrap().repr(), Repr::U8);
         assert_eq!(by_path("sub.low").unwrap().repr(), Repr::F32);
         assert_eq!(by_path("cs.aux.level").unwrap().repr(), Repr::U16Q8);
+    }
+
+    /// The crossfeed output mask is "uint8 pair mask" (config.h:582-583),
+    /// one byte on the wire where the other masks take two.
+    #[test]
+    fn the_crossfeed_output_mask_travels_as_one_byte() {
+        let d = by_path("cf.outputs").unwrap();
+        assert_eq!(d.repr(), Repr::U8);
+        assert_eq!(d.repr().encode(&Value::Mask(0x0B)).unwrap(), vec![0x0B]);
+        assert!(d.repr().encode(&Value::Mask(0x100)).is_err());
+        assert_eq!(d.repr().decode(&[0x05]), Some(Value::Int(5)));
     }
 
     /// Tube parameter ids come from tube.h:16-32, in wire order.
