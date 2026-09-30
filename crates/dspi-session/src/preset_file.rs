@@ -5,6 +5,13 @@
 //! are destined for the macOS Console too, so divergence would break
 //! interchange rather than merely inconvenience it.
 //!
+//! The macOS Console's `PresetDocument.swift` and `PresetDocumentTransfer.swift`
+//! (DSPi Console `9dbb07a`) are the reference for everything the Windows schema
+//! lacks, and for how a channel entry is placed. `docs/preset-format.md` writes
+//! the format down, including the channel numbering, which is the part most
+//! easily got wrong: a channel entry's `channelId` is the Windows Console's
+//! channel id, not the firmware's unified channel index. See [`channel_id`].
+//!
 //! Four decisions are inherited deliberately, because each is correct and each
 //! would be tempting to get wrong:
 //!
@@ -98,6 +105,14 @@ pub struct Meta {
     pub input_channel_count: i32,
     #[serde(default)]
     pub output_channel_count: i32,
+    /// The source device's `MASTER_VOLUME_MODE_*` (config.h:484-485), so an
+    /// import can say why it left master volume alone. Additive in the
+    /// Console (PresetDocument.swift:90-93).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_volume_mode: Option<i32>,
+    /// The source device's `OUTPUT_CONFIG_MODE_*` (config.h:497-498).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config_mode: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,16 +146,36 @@ impl Default for GlobalBlock {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// Loudness compensation. A missing key takes the Console's default
+/// (PresetDocument.swift:149-164), which is the firmware's: a Windows file
+/// written before the output mask existed must not switch loudness off on
+/// every output by reading the mask as zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LoudnessBlock {
     pub enabled: bool,
     pub ref_spl: f32,
     pub intensity_pct: f32,
+    /// Bit k: loudness runs on output k (bulk_params.h:64).
     pub output_mask: i32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+impl Default for LoudnessBlock {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ref_spl: 83.0,
+            intensity_pct: 100.0,
+            // LOUDNESS_DEFAULT_OUTPUT_MASK (firmware loudness.h:11, not
+            // vendored; Constants.swift:34).
+            output_mask: 0xFFFF,
+        }
+    }
+}
+
+/// Crossfeed, defaulted as the Console defaults it
+/// (PresetDocument.swift:166-185).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CrossfeedBlock {
     pub enabled: bool,
@@ -148,10 +183,28 @@ pub struct CrossfeedBlock {
     pub freq_hz: f32,
     pub feed_db: f32,
     pub itd: bool,
+    /// Bit p: crossfeed runs on output pair p (bulk_params.h:76).
     pub output_pair_mask: i32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+impl Default for CrossfeedBlock {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preset: 0,
+            freq_hz: 700.0,
+            feed_db: 4.5,
+            itd: true,
+            // The firmware's pair 1 only (usb_audio.c:261, not vendored;
+            // CROSSFEED_DEFAULT_OUTPUT_MASK, Constants.swift:50).
+            output_pair_mask: 0x01,
+        }
+    }
+}
+
+/// The volume leveller, defaulted as the Console defaults it
+/// (PresetDocument.swift:187-210).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LevellerBlock {
     pub enabled: bool,
@@ -160,11 +213,29 @@ pub struct LevellerBlock {
     pub amount_pct: f32,
     pub max_gain_db: f32,
     pub gate_db: f32,
+    /// `[detector_mask, apply_mask]` on the wire (config.h:441).
     pub detector_mask: i32,
     pub apply_mask: i32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+impl Default for LevellerBlock {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            speed: 0,
+            lookahead: true,
+            amount_pct: 50.0,
+            max_gain_db: 15.0,
+            gate_db: -96.0,
+            detector_mask: 0xFF,
+            apply_mask: 0xFF,
+        }
+    }
+}
+
+/// Psychoacoustic bass, defaulted to the firmware's values
+/// (psybass.h:50-55, PresetDocument.swift:212-233).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PsybassBlock {
     pub enabled: bool,
@@ -176,7 +247,25 @@ pub struct PsybassBlock {
     pub output_mask: i32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+impl Default for PsybassBlock {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cutoff_hz: 80.0,
+            harmonics_db: 0.0,
+            drive_db: 6.0,
+            character_pct: 50.0,
+            original_db: 0.0,
+            // PSYBASS_DEFAULT_OUTPUT_MASK (psybass.h:55).
+            output_mask: 0xFFFF,
+        }
+    }
+}
+
+/// The stereo upmixer, defaulted to the firmware's values (upmix.h:111-123,
+/// PresetDocument.swift:311-346). The two modes are the raw
+/// `UPMIX_CENTER_*` and `UPMIX_SURROUND_*` numbers (upmix.h:78-85).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct UpmixBlock {
     pub enabled: bool,
@@ -193,6 +282,28 @@ pub struct UpmixBlock {
     pub surround_lpf_hz: f32,
     pub decorr_pct: f32,
     pub presence_db: f32,
+}
+
+impl Default for UpmixBlock {
+    fn default() -> Self {
+        use dspi_proto::generated::{ranges as r, upmix as u};
+        Self {
+            enabled: false,
+            center_mode: u::UPMIX_CENTER_ADAPTIVE as i32,
+            surround_mode: u::UPMIX_SURROUND_ADAPTIVE as i32,
+            strength_pct: r::UPMIX_DEFAULT_STRENGTH,
+            center_width_pct: r::UPMIX_DEFAULT_WIDTH,
+            threshold_pct: r::UPMIX_DEFAULT_THRESH,
+            attack_ms: r::UPMIX_DEFAULT_ATTACK,
+            release_ms: r::UPMIX_DEFAULT_RELEASE,
+            detector_hpf_hz: r::UPMIX_DEFAULT_DET_HPF,
+            surround_delay_ms: r::UPMIX_DEFAULT_SUR_DELAY,
+            surround_hpf_hz: r::UPMIX_DEFAULT_SUR_HPF,
+            surround_lpf_hz: r::UPMIX_DEFAULT_SUR_LPF,
+            decorr_pct: r::UPMIX_DEFAULT_DECORR,
+            presence_db: r::UPMIX_DEFAULT_PRESENCE,
+        }
+    }
 }
 
 /// The subharmonic synthesizer, as the Console's `SubharmBlock`
@@ -315,24 +426,41 @@ impl Default for LimiterBlock {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChannelBlock {
+    /// The Windows Console's channel id, which is not the firmware's unified
+    /// channel index: see [`channel_id`]. Written for every channel, and read
+    /// when the entry carries no `inputIndex` or `outputIndex`.
     pub channel_id: i32,
     #[serde(default)]
     pub name: String,
     pub is_output: bool,
+    /// The unified channel index (config.h:788-790): inputs from 0, outputs
+    /// from `CH_OUT_1`. Written as the Console writes it
+    /// (PresetDocumentTransfer.swift:192); neither Console places a channel
+    /// by it, and nor does this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eq_channel: Option<i32>,
+    /// Wire input index 0..7, on inputs only. Wins over `channelId`
+    /// (PresetDocument.swift:679-683).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_index: Option<i32>,
+    /// Matrix output index, on outputs only. Wins over `channelId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_index: Option<i32>,
+    /// Pre-matrix channel delay (`REQ_SET_DELAY`, config.h:245).
     pub delay_ms: f32,
     pub gain_db: f32,
     pub muted: bool,
     pub enabled: bool,
+    /// Post-matrix output delay (`REQ_SET_OUTPUT_DELAY`, config.h:311), a
+    /// separate value from `delayMs` that the Windows schema omits. Outputs
+    /// only; absent leaves the device's alone (PresetDocument.swift:372-374).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_delay_ms: Option<f32>,
     #[serde(default)]
     pub eq: Vec<BandBlock>,
     /// Empty for inputs.
     #[serde(default)]
     pub crossover: Vec<BandBlock>,
-    /// The Console's own output index (PresetDocument.swift:360-363), which
-    /// it reads in preference to `channelId`. Read here only to place a
-    /// limiter; this build writes none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_index: Option<i32>,
     /// This output's limiter (PresetDocument.swift:375-379). Absent on inputs
     /// and when the source device had no limiter, which leaves the device's
     /// own alone. Applied only with the hardware I/O option, because the
@@ -347,18 +475,179 @@ impl Default for ChannelBlock {
             channel_id: 0,
             name: String::new(),
             is_output: false,
+            eq_channel: None,
+            input_index: None,
+            output_index: None,
             delay_ms: 0.0,
             gain_db: 0.0,
             muted: false,
             // A channel is enabled unless the file says otherwise, matching the
             // reference implementation's property default.
             enabled: true,
+            output_delay_ms: None,
             eq: Vec::new(),
             crossover: Vec::new(),
-            output_index: None,
             limiter: None,
         }
     }
+}
+
+/// Where a channel entry lands on a device: a wire input index, or a matrix
+/// output index (the Console's `PresetChannelRef`, PresetDocument.swift:
+/// 617-621). Inputs sort before outputs, which is the order the Console
+/// applies them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChannelRef {
+    Input(u8),
+    Output(u8),
+}
+
+impl ChannelRef {
+    /// The unified channel index on a device with `num_inputs` inputs:
+    /// outputs start at `CH_OUT_1 = NUM_INPUT_CHANNELS` (config.h:788-790).
+    pub fn unified(self, num_inputs: u8) -> u8 {
+        match self {
+            ChannelRef::Input(i) => i,
+            ChannelRef::Output(o) => num_inputs.saturating_add(o),
+        }
+    }
+}
+
+/// The Windows Console's channel ids, which both Consoles write as
+/// `channelId` (PresetDocument.swift:623-672).
+///
+/// They were laid down when the device had two inputs, and outputs grew in
+/// the middle: inputs 0 and 1 keep their index, outputs follow from 2, and
+/// the extra inputs of the eight-input model sit above the widest output
+/// bank at 11..16. On RP2040 (two inputs, five outputs, config.h:776-777)
+/// this coincides with the unified index; on RP2350 (eight inputs, nine
+/// outputs, config.h:773-774) it does not, which is why the unified index
+/// must never be written here. The Console gives RP2350's PDM output id 10
+/// by a special case, which is the same number the arithmetic gives, so no
+/// platform test is needed and none is compiled in.
+///
+/// These numbers are the file format's, not the device's: a device's own
+/// input and output counts decide only whether a resolved channel exists.
+pub mod channel_id {
+    use super::ChannelRef;
+
+    /// Inputs below this keep their index as their id: the stereo inputs
+    /// (`NUM_STEREO_INPUTS`, config.h:784; the Console's
+    /// `BASE_MATRIX_INPUTS`, Constants.swift:772).
+    const STEREO_INPUTS: i32 = 2;
+    /// The id of the first output (S/PDIF 1 L).
+    const OUTPUT_BASE: i32 = 2;
+    /// The id of wire input 2, the first extra input.
+    const EXTRA_INPUT_BASE: i32 = 11;
+    /// Extra inputs the schema has ids for: eight inputs less the stereo two
+    /// (`MAX_MATRIX_INPUTS`, Constants.swift:771).
+    const EXTRA_INPUTS: i32 = 6;
+
+    /// The id for a wire input index.
+    pub fn for_input(input: u8) -> i32 {
+        let i = input as i32;
+        if i < STEREO_INPUTS {
+            i
+        } else {
+            EXTRA_INPUT_BASE + (i - STEREO_INPUTS)
+        }
+    }
+
+    /// The id for a matrix output index.
+    pub fn for_output(output: u8) -> i32 {
+        OUTPUT_BASE + output as i32
+    }
+
+    /// The channel an id names, before asking whether the device has it
+    /// (`PresetChannelID.ref(forID:platform:)`). Inputs are tested first, so
+    /// 11..16 are always inputs.
+    pub fn resolve(id: i32) -> Option<ChannelRef> {
+        if (0..STEREO_INPUTS).contains(&id) {
+            return Some(ChannelRef::Input(id as u8));
+        }
+        if (EXTRA_INPUT_BASE..EXTRA_INPUT_BASE + EXTRA_INPUTS).contains(&id) {
+            return Some(ChannelRef::Input(
+                (STEREO_INPUTS + id - EXTRA_INPUT_BASE) as u8,
+            ));
+        }
+        u8::try_from(id - OUTPUT_BASE).ok().map(ChannelRef::Output)
+    }
+
+    /// Whether an entry's direction agrees with the id table. Every file
+    /// either Console writes agrees; an older Terminal file written on an
+    /// eight-input device does not.
+    pub(super) fn agrees(id: i32, is_output: bool) -> bool {
+        match resolve(id) {
+            Some(ChannelRef::Input(_)) => !is_output,
+            Some(ChannelRef::Output(_)) => is_output,
+            None => false,
+        }
+    }
+}
+
+impl ChannelBlock {
+    /// The channel this entry refers to, as the Console reads it
+    /// (PresetDocument.swift:674-684): its own `inputIndex` or `outputIndex`
+    /// when present, otherwise the shared `channelId`.
+    ///
+    /// `legacy_inputs` is set only for a document an older Terminal wrote,
+    /// whose `channelId` is the unified index on a device with that many
+    /// inputs (see [`legacy_numbering`]).
+    pub fn placement(&self, legacy_inputs: Option<u8>) -> Option<ChannelRef> {
+        if self.is_output
+            && let Some(o) = self.output_index
+        {
+            return u8::try_from(o).ok().map(ChannelRef::Output);
+        }
+        if !self.is_output
+            && let Some(i) = self.input_index
+        {
+            return u8::try_from(i).ok().map(ChannelRef::Input);
+        }
+        if let Some(n) = legacy_inputs {
+            let n = n as i32;
+            return match self.channel_id {
+                id if (0..n).contains(&id) => Some(ChannelRef::Input(id as u8)),
+                id => u8::try_from(id - n).ok().map(ChannelRef::Output),
+            };
+        }
+        channel_id::resolve(self.channel_id)
+    }
+}
+
+/// Whether a document uses the numbering Terminal builds before this one
+/// wrote, and with how many inputs.
+///
+/// Those builds wrote the unified channel index as `channelId` and none of
+/// the Console's own index fields. On a two-input device the two numberings
+/// coincide, so only an eight-input document can differ, and there the
+/// difference shows: the older numbering marks ids 2..7 as inputs and 8..16
+/// as outputs, where the id table has 2..10 as outputs and 11..16 as inputs.
+/// A document counts as older only when no entry carries an index field,
+/// every entry agrees with the unified numbering, and at least one disagrees
+/// with the id table. No file either Console writes can pass that test,
+/// since every one of their entries agrees with the table.
+///
+/// The input count is the document's own `inputChannelCount`, or the
+/// connected device's when the document does not say.
+pub fn legacy_numbering(doc: &PresetDocument, device_inputs: u8) -> Option<u8> {
+    let n = u8::try_from(doc.meta.input_channel_count)
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(device_inputs);
+    let own_fields = doc
+        .channels
+        .iter()
+        .any(|c| c.eq_channel.is_some() || c.input_index.is_some() || c.output_index.is_some());
+    let unified = doc
+        .channels
+        .iter()
+        .all(|c| c.channel_id >= 0 && (c.channel_id < n as i32) != c.is_output);
+    let table = doc
+        .channels
+        .iter()
+        .all(|c| channel_id::agrees(c.channel_id, c.is_output));
+    (!own_fields && unified && !table).then_some(n)
 }
 
 /// One filter band. Field meanings follow the wire encoding, including the
@@ -626,47 +915,61 @@ pub fn write(doc: &PresetDocument) -> String {
     serde_json::to_string_pretty(doc).unwrap_or_default()
 }
 
-/// Which of a document's channels this device can accept.
+/// A document's channels placed on a device, and the names of those it has
+/// nowhere to put.
+pub type Placement<'a> = std::collections::BTreeMap<ChannelRef, &'a ChannelBlock>;
+
+/// Place a document's channels on a device with this many inputs and
+/// outputs, as the Console does (PresetDocumentTransfer.swift:302-313).
 ///
-/// Channels are matched by id and never remapped: the Windows implementation
-/// reports what a device does not have rather than translating an eight-input
-/// document onto a two-input part, and inventing a different rule here would
-/// make the same file behave differently depending on which app opened it.
-pub fn resolve_channels<'a>(
-    doc: &'a PresetDocument,
-    device_channel_ids: &[i32],
-) -> (Vec<&'a ChannelBlock>, Vec<String>) {
-    let mut usable = Vec::new();
+/// Each entry lands where its own index fields or its `channelId` say, read
+/// against the connected device; one that names a channel the device does
+/// not have is reported rather than moved somewhere else, so an eight-input
+/// document on a two-input part reports its extra inputs. A duplicated
+/// channel takes the last entry rather than failing.
+pub fn place_channels(
+    doc: &PresetDocument,
+    num_inputs: u8,
+    num_outputs: u8,
+) -> (Placement<'_>, Vec<String>) {
+    let legacy = legacy_numbering(doc, num_inputs);
+    let mut placed = Placement::new();
     let mut missing = Vec::new();
 
-    // A hand-edited file with a duplicated id should apply the last one rather
-    // than fail, matching the reference implementation.
-    let mut by_id: std::collections::BTreeMap<i32, &ChannelBlock> = Default::default();
     for c in &doc.channels {
-        by_id.insert(c.channel_id, c);
-    }
-
-    for c in by_id.values() {
-        if device_channel_ids.contains(&c.channel_id) {
-            usable.push(*c);
-        } else {
-            missing.push(if c.name.is_empty() {
+        let exists = |r: &ChannelRef| match *r {
+            ChannelRef::Input(i) => i < num_inputs,
+            ChannelRef::Output(o) => o < num_outputs,
+        };
+        match c.placement(legacy).filter(exists) {
+            Some(r) => {
+                placed.insert(r, c);
+            }
+            None => missing.push(if c.name.is_empty() {
                 format!("channel {}", c.channel_id)
             } else {
                 c.name.clone()
-            });
+            }),
         }
     }
-    (usable, missing)
+    (placed, missing)
 }
 
 // ---------------------------------------------------------------------------
 // Applying
 // ---------------------------------------------------------------------------
 
-use crate::{Outcome, Session};
+use crate::{EnableOutcome, Outcome, Session};
 use dspi_proto::generated::status;
 use dspi_proto::value::{EqParamPacket, Value};
+
+/// `MASTER_VOLUME_MODE_WITH_PRESET` (config.h:485), which the generated
+/// constants do not carry.
+const MASTER_VOLUME_MODE_WITH_PRESET: u8 = 1;
+
+/// Crossover bands per output, at wire band indices 20..23.
+const CROSSOVER_BANDS: u8 = 4;
+const CROSSOVER_FIRST_BAND: u8 = 20;
 
 /// Apply a document to a device.
 ///
@@ -674,12 +977,15 @@ use dspi_proto::value::{EqParamPacket, Value};
 /// clamping, capability gating and readback verification as a typed command.
 /// Nothing is applied that the options did not ask for, and the report says what
 /// actually happened rather than leaving the user to infer it from the UI.
+///
+/// The input pair links (`global.inputPairLinked`) are the app's, not the
+/// device's, so this leaves them to the caller; the Terminal applies them to
+/// its own link state after this returns.
 pub fn apply(session: &mut Session, doc: &PresetDocument, options: ApplyOptions) -> ApplyReport {
     let mut report = ApplyReport::default();
 
     let caps = session.capabilities().clone();
-    let ids: Vec<i32> = caps.channels.iter().map(|c| c.index as i32).collect();
-    let (usable, missing) = resolve_channels(doc, &ids);
+    let (placed, missing) = place_channels(doc, caps.num_inputs, caps.num_outputs);
     report.missing_channels = missing;
 
     if !options.audio_processing {
@@ -687,52 +993,20 @@ pub fn apply(session: &mut Session, doc: &PresetDocument, options: ApplyOptions)
             .skipped
             .push("audio processing (not requested)".into());
     } else {
-        // Pair linking first. A linked input pair mirrors every filter and
-        // preamp write to its partner, so applying it afterwards would let the
-        // device's current link state rewrite what was just pushed. This
-        // ordering is inherited from the reference implementation.
-        //
-        // The firmware has no notion of linking, so there is nothing to write
-        // here yet; the ordering is preserved so that when it gains one, the
-        // sequence is already right.
-        let _ = &doc.global.input_pair_linked;
+        apply_output_enables(session, &placed, &mut report);
 
-        for block in &usable {
-            let ch = block.channel_id as u8;
-            let mut touched = false;
-
-            for (i, b) in block.eq.iter().enumerate() {
-                if i as u8 >= caps.max_bands {
-                    break;
-                }
-                if apply_band(session, ch, i as u8, b).is_some() {
-                    report.bands_applied += 1;
-                    touched = true;
-                }
-            }
-
-            // Crossover bands live at wire indices 20-23 and only on outputs.
-            if block.is_output {
-                for (i, b) in block.crossover.iter().enumerate().take(4) {
-                    if apply_band(session, ch, 20 + i as u8, b).is_some() {
-                        report.crossover_bands_applied += 1;
-                        touched = true;
-                    }
-                }
-            }
-
-            let _ = session.write("ch.delay", &[ch], Value::Float(block.delay_ms));
-
-            if block.is_output
-                && let Some(out) = caps.num_inputs.checked_sub(0).map(|n| ch.wrapping_sub(n))
-                && out < caps.num_outputs
-            {
-                let _ = session.write("out.gain", &[out], Value::Float(block.gain_db));
-                let _ = session.write("out.mute", &[out], Value::Bool(block.muted));
-            }
-
-            if touched {
-                report.channels_applied += 1;
+        // One channel at a time, inputs first, as the Console does
+        // (PresetDocumentTransfer.swift:394-415).
+        for (&r, block) in &placed {
+            apply_channel(session, r, block, &mut report);
+            if let ChannelRef::Input(i) = r {
+                let db = doc
+                    .global
+                    .input_preamps_db
+                    .get(i as usize)
+                    .copied()
+                    .unwrap_or(0.0);
+                let _ = session.write("pre", &[i], Value::Float(db));
             }
         }
 
@@ -764,15 +1038,14 @@ pub fn apply(session: &mut Session, doc: &PresetDocument, options: ApplyOptions)
     }
 
     if options.volume_levels {
-        let _ = session.write("vol.master", &[], Value::Float(doc.global.master_volume_db));
-        let _ = session.write("vol.user", &[], Value::Float(doc.global.user_volume_db));
+        apply_volumes(session, doc, &mut report);
     } else {
         report.skip("volume levels (not requested)");
     }
 
     if options.hardware_io {
         apply_io(session, &doc.io, &mut report);
-        apply_limiters(session, doc, &mut report);
+        apply_limiters(session, &placed, &mut report);
     } else {
         report.skip("hardware I/O (not requested)");
     }
@@ -787,6 +1060,95 @@ pub fn apply(session: &mut Session, doc: &PresetDocument, options: ApplyOptions)
     }
 
     report
+}
+
+/// Output enables: every disable, then every enable
+/// (PresetDocumentTransfer.swift:377-392). An enable can collide with an
+/// output the document is about to switch off (PDM against the Core 1 EQ
+/// workers), so freeing first is what lets the pair land. An enable that
+/// would still collide is reported in the Console's words, not forced.
+fn apply_output_enables(session: &mut Session, placed: &Placement, report: &mut ApplyReport) {
+    for enabling in [false, true] {
+        for (&r, block) in placed {
+            let ChannelRef::Output(o) = r else { continue };
+            if block.enabled != enabling {
+                continue;
+            }
+            let now = session
+                .read("out.enable", &[o])
+                .ok()
+                .and_then(|v| v.as_bool());
+            if now == Some(enabling) {
+                continue;
+            }
+            if let Ok(EnableOutcome::NeedsConfirm(_)) = session.enable_output(o, enabling) {
+                report.skip(format!(
+                    "{} could not be enabled (conflicts with another output)",
+                    block.name
+                ));
+            }
+        }
+    }
+}
+
+/// One channel's name, delay, output strip and filter banks
+/// (PresetDocumentTransfer.swift:451-505).
+fn apply_channel(
+    session: &mut Session,
+    r: ChannelRef,
+    block: &ChannelBlock,
+    report: &mut ApplyReport,
+) {
+    let caps = session.capabilities().clone();
+    let ch = r.unified(caps.num_inputs);
+
+    let current_name = caps
+        .channels
+        .iter()
+        .find(|c| c.index == ch)
+        .map(|c| c.name.as_str());
+    if !block.name.is_empty() && current_name != Some(block.name.as_str()) {
+        let _ = session.write("ch.name", &[ch], Value::Text(block.name.clone()));
+    }
+    let _ = session.write("ch.delay", &[ch], Value::Float(block.delay_ms));
+
+    if let ChannelRef::Output(o) = r {
+        let _ = session.write("out.gain", &[o], Value::Float(block.gain_db));
+        let muted = session
+            .read("out.mute", &[o])
+            .ok()
+            .and_then(|v| v.as_bool());
+        if muted != Some(block.muted) {
+            let _ = session.write("out.mute", &[o], Value::Bool(block.muted));
+        }
+        // Additive: a document without it leaves the output delay alone.
+        if let Some(ms) = block.output_delay_ms {
+            let _ = session.write("out.delay", &[o], Value::Float(ms));
+        }
+    }
+
+    // A document with no bands for a channel leaves its EQ alone; one with
+    // some flattens the rest, so an imported channel is never a blend of two
+    // configurations. Bands past this device's bank are dropped.
+    let flat = BandBlock::default();
+    if !block.eq.is_empty() {
+        for band in 0..caps.max_bands {
+            let b = block.eq.get(band as usize).unwrap_or(&flat);
+            if apply_band(session, ch, band, b).is_some() {
+                report.bands_applied += 1;
+            }
+        }
+    }
+    if matches!(r, ChannelRef::Output(_)) && !block.crossover.is_empty() {
+        for band in 0..CROSSOVER_BANDS {
+            let b = block.crossover.get(band as usize).unwrap_or(&flat);
+            if apply_band(session, ch, CROSSOVER_FIRST_BAND + band, b).is_some() {
+                report.crossover_bands_applied += 1;
+            }
+        }
+    }
+
+    report.channels_applied += 1;
 }
 
 fn apply_band(session: &mut Session, channel: u8, band: u8, b: &BandBlock) -> Option<()> {
@@ -806,8 +1168,28 @@ fn apply_band(session: &mut Session, channel: u8, band: u8, b: &BandBlock) -> Op
     }
 }
 
-/// The feature blocks, each skipped with a reason when this device lacks it.
+/// Master and listening volume (PresetDocumentTransfer.swift:669-680).
+/// Master volume belongs to a preset only when the device says so; in
+/// independent mode it is device-global, and a file overwriting it would
+/// fight the user's own setting.
+fn apply_volumes(session: &mut Session, doc: &PresetDocument, report: &mut ApplyReport) {
+    let mode = current_u8(session, "vol.master.mode", &[]);
+    if mode == Some(MASTER_VOLUME_MODE_WITH_PRESET) {
+        let _ = session.write("vol.master", &[], Value::Float(doc.global.master_volume_db));
+    } else {
+        report.skip("Master volume (device is in independent master-volume mode)");
+    }
+    let _ = session.write("vol.user", &[], Value::Float(doc.global.user_volume_db));
+}
+
+/// The feature blocks, in the Console's order
+/// (PresetDocumentTransfer.swift:537-667): each feature's parameters before
+/// its switch, so the device never runs it for a moment on the old values,
+/// and each mask only where the firmware has one. A block the device lacks
+/// is skipped with a reason.
 fn apply_features(session: &mut Session, doc: &PresetDocument, report: &mut ApplyReport) {
+    let caps = session.capabilities().clone();
+    let has = |name: &str| caps.features.iter().any(|f| f.name == name && f.present);
     let mut set = |path: &str, v: Value, label: &str, report: &mut ApplyReport| {
         if let Err(e) = session.write(path, &[], v) {
             // An absent feature is information, not a failure: a document from a
@@ -817,112 +1199,8 @@ fn apply_features(session: &mut Session, doc: &PresetDocument, report: &mut Appl
             }
         }
     };
-
-    let l = &doc.loudness;
-    set("loud.on", Value::Bool(l.enabled), "loudness", report);
-    set("loud.ref", Value::Float(l.ref_spl), "loudness", report);
-    set(
-        "loud.intensity",
-        Value::Float(l.intensity_pct),
-        "loudness",
-        report,
-    );
-
-    let c = &doc.crossfeed;
-    set("cf.on", Value::Bool(c.enabled), "crossfeed", report);
-    set(
-        "cf.preset",
-        Value::Choice(c.preset as u8),
-        "crossfeed",
-        report,
-    );
-    set("cf.freq", Value::Float(c.freq_hz), "crossfeed", report);
-    set("cf.feed", Value::Float(c.feed_db), "crossfeed", report);
-    set("cf.itd", Value::Bool(c.itd), "crossfeed", report);
-
-    let v = &doc.leveller;
-    set("lev.on", Value::Bool(v.enabled), "leveller", report);
-    set(
-        "lev.speed",
-        Value::Choice(v.speed as u8),
-        "leveller",
-        report,
-    );
-    set("lev.amount", Value::Float(v.amount_pct), "leveller", report);
-    set(
-        "lev.maxgain",
-        Value::Float(v.max_gain_db),
-        "leveller",
-        report,
-    );
-    set(
-        "lev.lookahead",
-        Value::Bool(v.lookahead),
-        "leveller",
-        report,
-    );
-    set("lev.gate", Value::Float(v.gate_db), "leveller", report);
-
-    if let Some(b) = &doc.psybass {
-        set(
-            "bass.on",
-            Value::Bool(b.enabled),
-            "psychoacoustic bass",
-            report,
-        );
-        set(
-            "bass.cutoff",
-            Value::Float(b.cutoff_hz),
-            "psychoacoustic bass",
-            report,
-        );
-        set(
-            "bass.harmonics",
-            Value::Float(b.harmonics_db),
-            "psychoacoustic bass",
-            report,
-        );
-        set(
-            "bass.drive",
-            Value::Float(b.drive_db),
-            "psychoacoustic bass",
-            report,
-        );
-        set(
-            "bass.character",
-            Value::Float(b.character_pct),
-            "psychoacoustic bass",
-            report,
-        );
-        set(
-            "bass.original",
-            Value::Float(b.original_db),
-            "psychoacoustic bass",
-            report,
-        );
-    }
-
-    if let Some(u) = &doc.upmix {
-        set("up.on", Value::Bool(u.enabled), "upmixer", report);
-        set(
-            "up.strength",
-            Value::Float(u.strength_pct),
-            "upmixer",
-            report,
-        );
-        set(
-            "up.width",
-            Value::Float(u.center_width_pct),
-            "upmixer",
-            report,
-        );
-        set(
-            "up.presence",
-            Value::Float(u.presence_db),
-            "upmixer",
-            report,
-        );
-    }
+    let mask = |m: i32| Value::Mask(m as u16 as u32);
+    let choice = |c: i32| Value::Choice(c.clamp(0, 255) as u8);
 
     // The input source is applied at the very end of `apply`, after any
     // hardware wiring has moved.
@@ -933,7 +1211,119 @@ fn apply_features(session: &mut Session, doc: &PresetDocument, report: &mut Appl
         report,
     );
 
+    if has("lg_sound_sync") {
+        set(
+            "in.lg",
+            Value::Bool(doc.global.lg_sound_sync_enabled),
+            "LG Sound Sync",
+            report,
+        );
+    } else if doc.global.lg_sound_sync_enabled {
+        report.skip("LG Sound Sync (not supported by this firmware)");
+    }
+
+    let l = &doc.loudness;
+    set("loud.ref", Value::Float(l.ref_spl), "loudness", report);
+    set(
+        "loud.intensity",
+        Value::Float(l.intensity_pct),
+        "loudness",
+        report,
+    );
+    if has("loudness_output_mask") {
+        set("loud.mask", mask(l.output_mask), "loudness", report);
+    }
+    set("loud.on", Value::Bool(l.enabled), "loudness", report);
+
+    let c = &doc.crossfeed;
+    set("cf.preset", choice(c.preset), "crossfeed", report);
+    set("cf.freq", Value::Float(c.freq_hz), "crossfeed", report);
+    set("cf.feed", Value::Float(c.feed_db), "crossfeed", report);
+    set("cf.itd", Value::Bool(c.itd), "crossfeed", report);
+    if has("crossfeed_output_mask") {
+        set(
+            "cf.outputs",
+            mask(c.output_pair_mask & 0xFF),
+            "crossfeed",
+            report,
+        );
+    }
+    set("cf.on", Value::Bool(c.enabled), "crossfeed", report);
+
+    let v = &doc.leveller;
+    set("lev.speed", choice(v.speed), "leveller", report);
+    set(
+        "lev.lookahead",
+        Value::Bool(v.lookahead),
+        "leveller",
+        report,
+    );
+    set("lev.amount", Value::Float(v.amount_pct), "leveller", report);
+    set(
+        "lev.maxgain",
+        Value::Float(v.max_gain_db),
+        "leveller",
+        report,
+    );
+    set("lev.gate", Value::Float(v.gate_db), "leveller", report);
+    if has("leveller_masks") {
+        // One two-byte parameter, detector first (config.h:441).
+        let word = (v.detector_mask & 0xFF) | ((v.apply_mask & 0xFF) << 8);
+        set("lev.masks", mask(word), "leveller", report);
+    }
+    set("lev.on", Value::Bool(v.enabled), "leveller", report);
+
+    if let Some(b) = &doc.psybass {
+        if has("psychoacoustic_bass") {
+            let label = "psychoacoustic bass";
+            set("bass.cutoff", Value::Float(b.cutoff_hz), label, report);
+            set(
+                "bass.harmonics",
+                Value::Float(b.harmonics_db),
+                label,
+                report,
+            );
+            set("bass.drive", Value::Float(b.drive_db), label, report);
+            set(
+                "bass.character",
+                Value::Float(b.character_pct),
+                label,
+                report,
+            );
+            set("bass.original", Value::Float(b.original_db), label, report);
+            set("bass.mask", mask(b.output_mask), label, report);
+            set("bass.on", Value::Bool(b.enabled), label, report);
+        } else {
+            report.skip("Psychoacoustic bass (not supported by this firmware)");
+        }
+    }
+
     apply_subharm_and_tube(session, doc, report);
+
+    if let Some(u) = &doc.upmix {
+        if has("upmixer") {
+            // UPMIX_PARAM_* (upmix.h:188-201) through the registry's rows.
+            let mut set = |path: &str, v: Value| {
+                let _ = session.write(path, &[], v);
+            };
+            set("up.center_mode", choice(u.center_mode));
+            set("up.surround_mode", choice(u.surround_mode));
+            set("up.strength", Value::Float(u.strength_pct));
+            set("up.width", Value::Float(u.center_width_pct));
+            set("up.threshold", Value::Float(u.threshold_pct));
+            set("up.attack", Value::Float(u.attack_ms));
+            set("up.release", Value::Float(u.release_ms));
+            set("up.det_hpf", Value::Float(u.detector_hpf_hz));
+            set("up.sur_delay", Value::Float(u.surround_delay_ms));
+            set("up.sur_hpf", Value::Float(u.surround_hpf_hz));
+            set("up.sur_lpf", Value::Float(u.surround_lpf_hz));
+            set("up.decorr", Value::Float(u.decorr_pct));
+            set("up.presence", Value::Float(u.presence_db));
+            set("up.on", Value::Bool(u.enabled));
+        } else {
+            report.skip("Stereo upmixer (not supported by this device)");
+        }
+    }
 }
 
 /// The subharmonic synthesizer and the tube modeller, in the Console's order
@@ -1008,21 +1398,17 @@ fn apply_subharm_and_tube(session: &mut Session, doc: &PresetDocument, report: &
 /// change is unlinked first, then given its values, and the groups are set
 /// again last in ascending order, each joining output adopting the settings
 /// its lowest member already holds. An output with no block is left alone.
-fn apply_limiters(session: &mut Session, doc: &PresetDocument, report: &mut ApplyReport) {
+fn apply_limiters(session: &mut Session, placed: &Placement, report: &mut ApplyReport) {
     let caps = session.capabilities().clone();
-    // The Console's own output index wins where the file has one; otherwise
-    // the channel id, as the rest of this apply reads it. A duplicated
-    // output takes the last block, as a duplicated channel does.
-    let mut blocks: std::collections::BTreeMap<u8, &LimiterBlock> = Default::default();
-    for c in doc.channels.iter().filter(|c| c.is_output) {
-        let Some(l) = &c.limiter else { continue };
-        let out = c
-            .output_index
-            .unwrap_or(c.channel_id - caps.num_inputs as i32);
-        if (0..caps.num_outputs as i32).contains(&out) {
-            blocks.insert(out as u8, l);
-        }
-    }
+    // Placed as every other channel value is, so a limiter lands on the
+    // output its gain and EQ land on.
+    let blocks: std::collections::BTreeMap<u8, &LimiterBlock> = placed
+        .iter()
+        .filter_map(|(r, c)| match (r, &c.limiter) {
+            (ChannelRef::Output(o), Some(l)) => Some((*o, l)),
+            _ => None,
+        })
+        .collect();
     if blocks.is_empty() {
         return;
     }
@@ -1635,7 +2021,10 @@ fn spdif_input_config(session: &mut Session) -> (u8, u8) {
         .unwrap_or((1, 1))
 }
 
-/// Capture the current device state as a document.
+/// Capture the current device state as a document, in the Console's shape
+/// (PresetDocumentTransfer.swift:20-197): every channel carries the Windows
+/// id as `channelId` and the Console's own index fields beside it, so either
+/// Console places it where it came from.
 pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
     let caps = session.capabilities().clone();
 
@@ -1654,51 +2043,69 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
     let read_u8 = |s: &mut Session, path: &str| -> u8 {
         s.read(path, &[]).ok().and_then(|v| v.as_u8()).unwrap_or(0)
     };
-    let read_mask = |s: &mut Session, path: &str| -> i32 {
+    // A mask the device will not give up reads as the given default, which is
+    // what the Console's model holds before its first fetch.
+    let read_mask = |s: &mut Session, path: &str, default: i32| -> i32 {
         match s.read(path, &[]) {
             Ok(Value::Mask(m)) => m as i32,
-            _ => 0xFFFF,
+            _ => default,
         }
     };
     let has = |name: &str| caps.features.iter().any(|f| f.name == name && f.present);
 
     let mut channels = Vec::new();
     for c in &caps.channels {
+        let r = if c.is_output {
+            ChannelRef::Output(c.index.saturating_sub(caps.num_inputs))
+        } else {
+            ChannelRef::Input(c.index)
+        };
         let mut block = ChannelBlock {
-            channel_id: c.index as i32,
             name: c.name.clone(),
             is_output: c.is_output,
+            eq_channel: Some(c.index as i32),
             delay_ms: read_f32(session, "ch.delay", &[c.index]),
             ..Default::default()
         };
-        if c.is_output {
-            let out = c.index - caps.num_inputs;
-            block.gain_db = read_f32(session, "out.gain", &[out]);
-            block.muted = session
-                .read("out.mute", &[out])
-                .ok()
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            block.enabled = session
-                .read("out.enable", &[out])
-                .ok()
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            if has("output_limiter") {
-                let on = session
-                    .read("limit.on", &[out])
+        match r {
+            ChannelRef::Input(i) => {
+                block.channel_id = channel_id::for_input(i);
+                block.input_index = Some(i as i32);
+            }
+            ChannelRef::Output(out) => {
+                block.channel_id = channel_id::for_output(out);
+                block.output_index = Some(out as i32);
+                block.gain_db = read_f32(session, "out.gain", &[out]);
+                block.muted = session
+                    .read("out.mute", &[out])
                     .ok()
-                    .and_then(|v| v.as_bool());
-                block.limiter = on.map(|enabled| LimiterBlock {
-                    enabled,
-                    threshold_db: read_f32(session, "limit.threshold", &[out]),
-                    release_ms: read_f32(session, "limit.release", &[out]),
-                    link_group: session
-                        .read("limit.link", &[out])
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                block.enabled = session
+                    .read("out.enable", &[out])
+                    .ok()
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                block.output_delay_ms = session
+                    .read("out.delay", &[out])
+                    .ok()
+                    .and_then(|v| v.as_f32());
+                if has("output_limiter") {
+                    let on = session
+                        .read("limit.on", &[out])
                         .ok()
-                        .and_then(|v| v.as_u8())
-                        .unwrap_or(0) as i32,
-                });
+                        .and_then(|v| v.as_bool());
+                    block.limiter = on.map(|enabled| LimiterBlock {
+                        enabled,
+                        threshold_db: read_f32(session, "limit.threshold", &[out]),
+                        release_ms: read_f32(session, "limit.release", &[out]),
+                        link_group: session
+                            .read("limit.link", &[out])
+                            .ok()
+                            .and_then(|v| v.as_u8())
+                            .unwrap_or(0) as i32,
+                    });
+                }
             }
         }
         for b in 0..caps.max_bands {
@@ -1707,7 +2114,7 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
             }
         }
         if c.is_output {
-            for b in 20..24 {
+            for b in CROSSOVER_FIRST_BAND..CROSSOVER_FIRST_BAND + CROSSOVER_BANDS {
                 if let Ok(p) = session.read_band(c.index, b) {
                     block.crossover.push(band_block(&p));
                 }
@@ -1742,6 +2149,25 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
     // Before the document is built, because it needs the transport too.
     let io = capture_io(session);
 
+    let defaults = (
+        LoudnessBlock::default(),
+        CrossfeedBlock::default(),
+        LevellerBlock::default(),
+        PsybassBlock::default(),
+    );
+    // `[detector, apply]` in one word (config.h:441).
+    let lev_masks = if has("leveller_masks") {
+        read_mask(session, "lev.masks", 0xFFFF)
+    } else {
+        0xFFFF
+    };
+    let mode = |s: &mut Session, path: &str| {
+        s.read(path, &[])
+            .ok()
+            .and_then(|v| v.as_u8())
+            .map(i32::from)
+    };
+
     PresetDocument {
         schema_version: CURRENT_SCHEMA_VERSION,
         meta: Meta {
@@ -1752,7 +2178,9 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
             wire_format_version: caps.wire_format as i32,
             input_channel_count: caps.num_inputs as i32,
             output_channel_count: caps.num_outputs as i32,
-            saved_utc: None,
+            saved_utc: Some(utc_now()),
+            master_volume_mode: mode(session, "vol.master.mode"),
+            output_config_mode: mode(session, "preset.iomode"),
         },
         global: GlobalBlock {
             input_preamps_db: preamps,
@@ -1761,13 +2189,18 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
             user_volume_db: read_f32(session, "vol.user", &[]),
             input_source: read_u8(session, "in.source"),
             lg_sound_sync_enabled: read_bool(session, "in.lg"),
+            // The app's own; the caller fills it in (see `apply`).
             input_pair_linked: vec![false; 4],
         },
         loudness: LoudnessBlock {
             enabled: read_bool(session, "loud.on"),
             ref_spl: read_f32(session, "loud.ref", &[]),
             intensity_pct: read_f32(session, "loud.intensity", &[]),
-            output_mask: 0xFFFF,
+            output_mask: if has("loudness_output_mask") {
+                read_mask(session, "loud.mask", defaults.0.output_mask)
+            } else {
+                defaults.0.output_mask
+            },
         },
         crossfeed: CrossfeedBlock {
             enabled: read_bool(session, "cf.on"),
@@ -1775,7 +2208,11 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
             freq_hz: read_f32(session, "cf.freq", &[]),
             feed_db: read_f32(session, "cf.feed", &[]),
             itd: read_bool(session, "cf.itd"),
-            output_pair_mask: 0xFF,
+            output_pair_mask: if has("crossfeed_output_mask") {
+                read_mask(session, "cf.outputs", defaults.1.output_pair_mask) & 0xFF
+            } else {
+                defaults.1.output_pair_mask
+            },
         },
         leveller: LevellerBlock {
             enabled: read_bool(session, "lev.on"),
@@ -1784,8 +2221,8 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
             amount_pct: read_f32(session, "lev.amount", &[]),
             max_gain_db: read_f32(session, "lev.maxgain", &[]),
             gate_db: read_f32(session, "lev.gate", &[]),
-            detector_mask: 0xFF,
-            apply_mask: 0xFF,
+            detector_mask: lev_masks & 0xFF,
+            apply_mask: (lev_masks >> 8) & 0xFF,
         },
         // Absent rather than defaulted: a document must not claim a device had a
         // feature it does not.
@@ -1796,14 +2233,23 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
             drive_db: read_f32(session, "bass.drive", &[]),
             character_pct: read_f32(session, "bass.character", &[]),
             original_db: read_f32(session, "bass.original", &[]),
-            output_mask: 0xFFFF,
+            output_mask: read_mask(session, "bass.mask", defaults.3.output_mask),
         }),
         upmix: has("upmixer").then(|| UpmixBlock {
             enabled: read_bool(session, "up.on"),
+            center_mode: read_u8(session, "up.center_mode") as i32,
+            surround_mode: read_u8(session, "up.surround_mode") as i32,
             strength_pct: read_f32(session, "up.strength", &[]),
             center_width_pct: read_f32(session, "up.width", &[]),
+            threshold_pct: read_f32(session, "up.threshold", &[]),
+            attack_ms: read_f32(session, "up.attack", &[]),
+            release_ms: read_f32(session, "up.release", &[]),
+            detector_hpf_hz: read_f32(session, "up.det_hpf", &[]),
+            surround_delay_ms: read_f32(session, "up.sur_delay", &[]),
+            surround_hpf_hz: read_f32(session, "up.sur_hpf", &[]),
+            surround_lpf_hz: read_f32(session, "up.sur_lpf", &[]),
+            decorr_pct: read_f32(session, "up.decorr", &[]),
             presence_db: read_f32(session, "up.presence", &[]),
-            ..Default::default()
         }),
         // Every field, as the Console exports them (PresetDocumentTransfer.
         // swift:100-137).
@@ -1813,7 +2259,7 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
             high_db: read_f32(session, "sub.high", &[]),
             top_db: read_f32(session, "sub.top", &[]),
             boost_db: read_f32(session, "sub.boost", &[]),
-            output_mask: read_mask(session, "sub.mask"),
+            output_mask: read_mask(session, "sub.mask", 0xFFFF),
             select_mode: read_u8(session, "sub.select") as i32,
             select_depth_pct: read_f32(session, "sub.depth", &[]),
             select_hold_ms: read_f32(session, "sub.hold", &[]),
@@ -1822,7 +2268,7 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
         }),
         tube: has("tube_preamp").then(|| TubeBlock {
             enabled: read_bool(session, "tube.on"),
-            output_mask: read_mask(session, "tube.mask"),
+            output_mask: read_mask(session, "tube.mask", 0xFFFF),
             tube_type: read_u8(session, "tube.type") as i32,
             drive_db: read_f32(session, "tube.drive", &[]),
             bias_pct: read_f32(session, "tube.bias", &[]),
@@ -1840,6 +2286,38 @@ pub fn capture(session: &mut Session, name: Option<String>) -> PresetDocument {
         matrix,
         io,
     }
+}
+
+/// The current time as the ISO-8601 UTC string the Console writes
+/// (`ISO8601DateFormatter`, PresetDocumentTransfer.swift:25), such as
+/// `2026-09-30T10:00:00Z`.
+fn utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    iso8601(secs)
+}
+
+/// Seconds since the epoch as an ISO-8601 UTC timestamp, by the civil-from-
+/// days algorithm (Howard Hinnant's), which needs no calendar crate.
+fn iso8601(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 fn band_block(p: &EqParamPacket) -> BandBlock {
@@ -1984,27 +2462,28 @@ mod tests {
         assert!(!text.to_lowercase().contains("lowshelf"));
     }
 
-    /// Channels match by id and are never remapped; the reference implementation
-    /// reports what the device lacks rather than translating.
+    /// A channel the device does not have is reported, never moved somewhere
+    /// else; the reference implementation reports rather than translating.
     #[test]
-    fn channels_match_by_id_and_the_rest_are_reported() {
+    fn a_channel_the_device_lacks_is_reported() {
         let mut d = doc();
         d.channels.push(ChannelBlock {
-            channel_id: 12,
-            name: "SPDIF 3 L".into(),
+            // Windows id 8: S/PDIF 4 L, output 6.
+            channel_id: 8,
+            name: "SPDIF 4 L".into(),
             is_output: true,
             ..Default::default()
         });
 
-        // A two-input part: channel 12 does not exist there.
-        let (usable, missing) = resolve_channels(&d, &[0, 1, 2, 3, 4, 5, 6]);
-        assert_eq!(usable.len(), 1);
-        assert_eq!(usable[0].channel_id, 0);
-        assert_eq!(missing, vec!["SPDIF 3 L"]);
+        // A two-input, five-output part: output 6 does not exist there.
+        let (placed, missing) = place_channels(&d, 2, 5);
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[&ChannelRef::Input(0)].channel_id, 0);
+        assert_eq!(missing, vec!["SPDIF 4 L"]);
     }
 
     #[test]
-    fn a_duplicated_channel_id_takes_the_last_rather_than_failing() {
+    fn a_duplicated_channel_takes_the_last_rather_than_failing() {
         let mut d = doc();
         d.channels.push(ChannelBlock {
             channel_id: 0,
@@ -2012,9 +2491,13 @@ mod tests {
             delay_ms: 5.0,
             ..Default::default()
         });
-        let (usable, missing) = resolve_channels(&d, &[0]);
-        assert_eq!(usable.len(), 1);
-        assert_eq!(usable[0].delay_ms, 5.0, "the last block should win");
+        let (placed, missing) = place_channels(&d, 2, 5);
+        assert_eq!(placed.len(), 1);
+        assert_eq!(
+            placed[&ChannelRef::Input(0)].delay_ms,
+            5.0,
+            "the last block should win"
+        );
         assert!(missing.is_empty());
     }
 
@@ -2645,7 +3128,7 @@ mod beta4_tests {
             ..Default::default()
         });
         d.channels.push(ChannelBlock {
-            channel_id: 8,
+            channel_id: channel_id::for_output(0),
             name: "Main L".into(),
             is_output: true,
             limiter: Some(LimiterBlock {
@@ -3120,7 +3603,7 @@ mod beta4_tests {
             },
         );
         let w = writes(&log, &[op::REQ_LIMITER]);
-        // Output 0 (channel 8): threshold, release, enable, then the group.
+        // Output 0 (Windows id 2): threshold, release, enable, then the group.
         let values: Vec<u16> = w.iter().map(|w| w.1).collect();
         assert_eq!(values, vec![0x0001, 0x0002, 0x0000, 0x0003]);
         assert_eq!(w[0].2, (-3.0f32).to_le_bytes().to_vec());
@@ -3171,5 +3654,816 @@ mod beta4_tests {
         let d = capture(&mut s, None);
         assert!(d.subharm.is_none() && d.tube.is_none());
         assert!(d.channels.iter().all(|c| c.limiter.is_none()));
+    }
+}
+
+/// Interchange with the Consoles: the channel numbering on both platforms,
+/// the fields the Console carries, and files from older Terminal builds
+/// (PresetDocument.swift:615-684, PresetDocumentTransfer.swift:20-667).
+#[cfg(test)]
+mod interop_tests {
+    use super::*;
+    use crate::probe::{Capabilities, ChannelInfo, Feature};
+    use dspi_proto::Platform;
+    use dspi_proto::generated::opcodes as op;
+    use dspi_transport::MockTransport;
+    use dspi_transport::mock::{Direction, LogHandle};
+
+    /// A device of either shape: RP2350 has eight inputs and nine outputs
+    /// (config.h:773-774), RP2040 two and five (config.h:776-777).
+    fn caps(platform: Platform, features: &[&str]) -> Capabilities {
+        let (inputs, outputs) = match platform {
+            Platform::Rp2040 => (2u8, 5u8),
+            _ => (8, 9),
+        };
+        let n = inputs + outputs;
+        Capabilities {
+            serial: "TEST".into(),
+            platform,
+            firmware: "1.1.6 beta 4".into(),
+            firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 6, 4),
+            build_info: None,
+            wire_format: dspi_proto::generated::wire::WIRE_FORMAT_VERSION as u8,
+            num_channels: n,
+            num_inputs: inputs,
+            num_outputs: outputs,
+            max_bands: 10,
+            band_storage: 12,
+            channels: (0..n)
+                .map(|i| ChannelInfo {
+                    index: i,
+                    name: format!("Ch {i}"),
+                    slug: format!("ch.{i}"),
+                    is_output: i >= inputs,
+                })
+                .collect(),
+            features: features
+                .iter()
+                .map(|n| Feature {
+                    name: (*n).into(),
+                    present: true,
+                    evidence: "test".into(),
+                })
+                .collect(),
+            cs: None,
+            siggen: None,
+            active_preset: None,
+        }
+    }
+
+    const FEATURES: &[&str] = &[
+        "loudness_output_mask",
+        "crossfeed_output_mask",
+        "leveller_masks",
+        "psychoacoustic_bass",
+        "upmixer",
+        "lg_sound_sync",
+        "subharmonic_synth",
+        "tube_preamp",
+        "output_limiter",
+    ];
+
+    fn rig_with(t: MockTransport, platform: Platform, features: &[&str]) -> (Session, LogHandle) {
+        let log = t.log_handle();
+        (
+            Session::new(Box::new(t), caps(platform, features)).unwrap(),
+            log,
+        )
+    }
+
+    fn rig(platform: Platform) -> (Session, LogHandle) {
+        rig_with(
+            MockTransport::new().answering_everything(vec![0; 64]),
+            platform,
+            FEATURES,
+        )
+    }
+
+    /// `(wValue, payload)` of every OUT transfer with this opcode, in order.
+    fn sent(log: &LogHandle, opcode: u8) -> Vec<(u16, Vec<u8>)> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.direction == Direction::Out && e.opcode == opcode)
+            .map(|e| (e.value, e.payload.clone()))
+            .collect()
+    }
+
+    /// The unified channels that received an EQ band with this frequency.
+    fn eq_channels_at(log: &LogHandle, freq: f32) -> Vec<u8> {
+        let mut chs: Vec<u8> = sent(log, op::REQ_SET_EQ_PARAM)
+            .iter()
+            .filter(|(_, p)| p[4..8] == freq.to_le_bytes())
+            .map(|(_, p)| p[0])
+            .collect();
+        chs.dedup();
+        chs
+    }
+
+    // ------------------------------------------------------------ the table
+
+    /// PresetDocumentTests.swift:195-240, both directions and the fixed
+    /// points.
+    #[test]
+    fn the_channel_ids_are_the_windows_consoles() {
+        for i in 0..8 {
+            assert_eq!(
+                channel_id::resolve(channel_id::for_input(i)),
+                Some(ChannelRef::Input(i))
+            );
+        }
+        for o in 0..9 {
+            assert_eq!(
+                channel_id::resolve(channel_id::for_output(o)),
+                Some(ChannelRef::Output(o))
+            );
+        }
+        assert_eq!(channel_id::for_input(0), 0);
+        assert_eq!(channel_id::for_input(1), 1);
+        assert_eq!(channel_id::for_input(2), 11);
+        assert_eq!(channel_id::for_input(7), 16);
+        assert_eq!(channel_id::for_output(0), 2);
+        assert_eq!(channel_id::for_output(4), 6, "RP2040's PDM");
+        assert_eq!(channel_id::for_output(8), 10, "RP2350's PDM");
+        assert_eq!(channel_id::resolve(-1), None);
+    }
+
+    /// The Console's own index fields win over the shared id
+    /// (PresetDocumentTests.swift:244-253).
+    #[test]
+    fn the_consoles_index_fields_win_over_the_shared_id() {
+        let mut b = ChannelBlock {
+            channel_id: 2,
+            is_output: true,
+            output_index: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(b.placement(None), Some(ChannelRef::Output(5)));
+        b.output_index = None;
+        assert_eq!(b.placement(None), Some(ChannelRef::Output(0)));
+        // An input's own index wins too, and an output index on an input
+        // entry is not read.
+        let b = ChannelBlock {
+            channel_id: 11,
+            input_index: Some(3),
+            output_index: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(b.placement(None), Some(ChannelRef::Input(3)));
+    }
+
+    // ------------------------------------------------- Console-written files
+
+    /// An RP2350 document as the Console writes one: the Windows id, the
+    /// unified `eqChannel`, and its own index (PresetDocumentTransfer.swift:
+    /// 166-197). The ids and the unified numbers differ for every channel but
+    /// the first two, so a placement by either would show here.
+    const CONSOLE_RP2350: &str = r#"{
+      "schemaVersion": 1,
+      "meta": {"platform": "RP2350", "savedUtc": "2026-09-29T10:00:00Z",
+               "inputChannelCount": 8, "outputChannelCount": 9, "wireFormatVersion": 32},
+      "channels": [
+        {"channelId": 0, "eqChannel": 0, "inputIndex": 0, "isOutput": false, "name": "USB 1",
+         "delayMs": 0, "eq": [{"type": 1, "freqHz": 100, "q": 1, "gain": 3}], "crossover": []},
+        {"channelId": 11, "eqChannel": 2, "inputIndex": 2, "isOutput": false, "name": "USB 3",
+         "delayMs": 1, "eq": [{"type": 1, "freqHz": 102, "q": 1, "gain": 3}], "crossover": []},
+        {"channelId": 16, "eqChannel": 7, "inputIndex": 7, "isOutput": false, "name": "USB 8",
+         "delayMs": 0, "eq": [{"type": 1, "freqHz": 107, "q": 1, "gain": 3}], "crossover": []},
+        {"channelId": 2, "eqChannel": 8, "outputIndex": 0, "isOutput": true, "name": "SPDIF 1 L",
+         "gainDb": -2, "muted": false, "enabled": true, "outputDelayMs": 1.5, "delayMs": 0,
+         "eq": [{"type": 1, "freqHz": 200, "q": 1, "gain": 3}],
+         "crossover": [{"type": 34, "freqHz": 80, "q": 0.707, "gain": 0}]},
+        {"channelId": 10, "eqChannel": 16, "outputIndex": 8, "isOutput": true, "name": "PDM",
+         "gainDb": -4, "muted": false, "enabled": true, "outputDelayMs": 0, "delayMs": 0,
+         "eq": [{"type": 1, "freqHz": 208, "q": 1, "gain": 3}], "crossover": []}
+      ]
+    }"#;
+
+    /// The same channels as a Windows file carries them: the shared id and
+    /// nothing else (PresetDocumentTests.swift:260-323).
+    const WINDOWS_RP2350: &str = r#"{
+      "schemaVersion": 1,
+      "meta": {"platform": "RP2350", "savedUtc": "2026-07-14T09:31:07.4821563+00:00",
+               "inputChannelCount": 8, "outputChannelCount": 9},
+      "channels": [
+        {"channelId": 0, "name": "Master L", "isOutput": false, "eq": [{"type": 1, "freqHz": 100}]},
+        {"channelId": 11, "name": "Input 3", "isOutput": false, "eq": [{"type": 1, "freqHz": 102}]},
+        {"channelId": 16, "name": "Input 8", "isOutput": false, "eq": [{"type": 1, "freqHz": 107}]},
+        {"channelId": 2, "name": "SPDIF 1 L", "isOutput": true, "gainDb": -2,
+         "eq": [{"type": 1, "freqHz": 200}]},
+        {"channelId": 10, "name": "PDM", "isOutput": true, "gainDb": -4,
+         "eq": [{"type": 1, "freqHz": 208}]}
+      ]
+    }"#;
+
+    /// An RP2040 document as the Console writes one. Here the id and the
+    /// unified index coincide, and PDM is the fifth output at id 6.
+    const CONSOLE_RP2040: &str = r#"{
+      "schemaVersion": 1,
+      "meta": {"platform": "RP2040", "savedUtc": "2026-09-29T10:00:00Z",
+               "inputChannelCount": 2, "outputChannelCount": 5},
+      "channels": [
+        {"channelId": 0, "eqChannel": 0, "inputIndex": 0, "isOutput": false, "name": "USB L",
+         "eq": [{"type": 1, "freqHz": 100}]},
+        {"channelId": 1, "eqChannel": 1, "inputIndex": 1, "isOutput": false, "name": "USB R",
+         "eq": [{"type": 1, "freqHz": 101}]},
+        {"channelId": 2, "eqChannel": 2, "outputIndex": 0, "isOutput": true, "name": "SPDIF 1 L",
+         "gainDb": -2, "eq": [{"type": 1, "freqHz": 200}]},
+        {"channelId": 6, "eqChannel": 6, "outputIndex": 4, "isOutput": true, "name": "PDM",
+         "gainDb": -4, "eq": [{"type": 1, "freqHz": 204}]}
+      ]
+    }"#;
+
+    fn places(text: &str, inputs: u8, outputs: u8) -> Vec<(ChannelRef, String)> {
+        let doc = parse(text).unwrap();
+        let (placed, missing) = place_channels(&doc, inputs, outputs);
+        assert!(missing.is_empty(), "{missing:?}");
+        placed.iter().map(|(r, c)| (*r, c.name.clone())).collect()
+    }
+
+    #[test]
+    fn a_console_document_places_every_channel_on_rp2350() {
+        use ChannelRef::*;
+        for text in [CONSOLE_RP2350, WINDOWS_RP2350] {
+            let got: Vec<ChannelRef> = places(text, 8, 9).into_iter().map(|p| p.0).collect();
+            assert_eq!(
+                got,
+                vec![Input(0), Input(2), Input(7), Output(0), Output(8)],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_console_document_places_every_channel_on_rp2040() {
+        use ChannelRef::*;
+        let got: Vec<ChannelRef> = places(CONSOLE_RP2040, 2, 5)
+            .into_iter()
+            .map(|p| p.0)
+            .collect();
+        assert_eq!(got, vec![Input(0), Input(1), Output(0), Output(4)]);
+    }
+
+    /// Applied to an RP2350, each channel's EQ reaches its unified channel
+    /// (config.h:788-790) and each output strip its output index.
+    #[test]
+    fn a_console_document_applies_to_the_right_channels_on_rp2350() {
+        for text in [CONSOLE_RP2350, WINDOWS_RP2350] {
+            let (mut s, log) = rig(Platform::Rp2350);
+            let report = apply(&mut s, &parse(text).unwrap(), ApplyOptions::default());
+            assert!(report.missing_channels.is_empty());
+            assert_eq!(report.channels_applied, 5);
+            for (freq, unified) in [(100.0, 0), (102.0, 2), (107.0, 7), (200.0, 8), (208.0, 16)] {
+                assert_eq!(eq_channels_at(&log, freq), vec![unified], "{freq} Hz");
+            }
+            let gains: Vec<(u16, Vec<u8>)> = sent(&log, op::REQ_SET_OUTPUT_GAIN);
+            assert_eq!(
+                gains,
+                vec![
+                    (0, (-2.0f32).to_le_bytes().to_vec()),
+                    (8, (-4.0f32).to_le_bytes().to_vec())
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a_console_document_applies_to_the_right_channels_on_rp2040() {
+        let (mut s, log) = rig(Platform::Rp2040);
+        let report = apply(
+            &mut s,
+            &parse(CONSOLE_RP2040).unwrap(),
+            ApplyOptions::default(),
+        );
+        assert!(report.missing_channels.is_empty());
+        for (freq, unified) in [(100.0, 0), (101.0, 1), (200.0, 2), (204.0, 6)] {
+            assert_eq!(eq_channels_at(&log, freq), vec![unified], "{freq} Hz");
+        }
+        let gains: Vec<u16> = sent(&log, op::REQ_SET_OUTPUT_GAIN)
+            .iter()
+            .map(|g| g.0)
+            .collect();
+        assert_eq!(gains, vec![0, 4]);
+    }
+
+    /// An eight-input document on a two-input part reports what the part
+    /// lacks rather than folding it onto what it has.
+    #[test]
+    fn an_rp2350_document_on_an_rp2040_reports_what_is_missing() {
+        let doc = parse(CONSOLE_RP2350).unwrap();
+        let (placed, missing) = place_channels(&doc, 2, 5);
+        assert_eq!(
+            placed.keys().copied().collect::<Vec<_>>(),
+            vec![ChannelRef::Input(0), ChannelRef::Output(0)]
+        );
+        assert_eq!(missing, vec!["USB 3", "USB 8", "PDM"]);
+    }
+
+    /// The post-matrix output delay and the channel name travel too.
+    #[test]
+    fn the_output_delay_and_names_are_applied() {
+        let (mut s, log) = rig(Platform::Rp2350);
+        apply(
+            &mut s,
+            &parse(CONSOLE_RP2350).unwrap(),
+            ApplyOptions::default(),
+        );
+        let delays = sent(&log, op::REQ_SET_OUTPUT_DELAY);
+        assert_eq!(delays[0], (0, 1.5f32.to_le_bytes().to_vec()));
+        let names: Vec<(u16, String)> = sent(&log, op::REQ_SET_CHANNEL_NAME)
+            .into_iter()
+            .map(|(v, p)| (v, String::from_utf8_lossy(&p).trim_end_matches('\0').into()))
+            .collect();
+        assert!(names.contains(&(2, "USB 3".into())), "{names:?}");
+        assert!(names.contains(&(16, "PDM".into())), "{names:?}");
+    }
+
+    /// Bands a document carries replace the channel's; the rest of the bank
+    /// goes flat, and an empty list leaves the channel alone
+    /// (PresetDocumentTransfer.swift:474-502).
+    #[test]
+    fn a_partial_bank_flattens_the_rest_and_an_empty_one_is_left_alone() {
+        let (mut s, log) = rig(Platform::Rp2350);
+        apply(
+            &mut s,
+            &parse(CONSOLE_RP2350).unwrap(),
+            ApplyOptions::default(),
+        );
+        let eq = sent(&log, op::REQ_SET_EQ_PARAM);
+        let on = |ch: u8| eq.iter().filter(|(_, p)| p[0] == ch).count();
+        // Ten EQ bands on input 0; ten plus four crossover on output 0.
+        assert_eq!(on(0), 10);
+        assert_eq!(on(8), 14);
+        // Output 8 carries no crossover, so only its EQ is written.
+        assert_eq!(on(16), 10);
+        // Input 1 is not in the document at all.
+        assert_eq!(on(1), 0);
+    }
+
+    // ---------------------------------------------- the fields it now carries
+
+    /// The masks and the upmix modes, each where the firmware has one.
+    #[test]
+    fn masks_and_upmix_modes_are_applied() {
+        let mut doc = parse(CONSOLE_RP2350).unwrap();
+        doc.loudness.output_mask = 0x0003;
+        doc.crossfeed.output_pair_mask = 0x02;
+        doc.leveller.detector_mask = 0x03;
+        doc.leveller.apply_mask = 0x02;
+        doc.psybass = Some(PsybassBlock {
+            output_mask: 0x0100,
+            ..Default::default()
+        });
+        doc.upmix = Some(UpmixBlock {
+            center_mode: 0,
+            surround_mode: 1,
+            threshold_pct: 40.0,
+            surround_lpf_hz: 6000.0,
+            ..Default::default()
+        });
+        doc.global.lg_sound_sync_enabled = true;
+
+        let (mut s, log) = rig(Platform::Rp2350);
+        let report = apply(&mut s, &doc, ApplyOptions::default());
+        assert!(
+            !report.skipped.iter().any(|r| r.contains("not supported")),
+            "{:?}",
+            report.skipped
+        );
+
+        assert_eq!(sent(&log, op::REQ_SET_LOUDNESS_MASK)[0].1, vec![0x03, 0x00]);
+        assert_eq!(sent(&log, op::REQ_SET_CROSSFEED_OUTPUTS)[0].1[0], 0x02);
+        assert_eq!(
+            sent(&log, op::REQ_SET_LEVELLER_MASKS)[0].1,
+            vec![0x03, 0x02]
+        );
+        assert_eq!(sent(&log, op::REQ_SET_PSYBASS_MASK)[0].1, vec![0x00, 0x01]);
+        assert_eq!(sent(&log, op::REQ_SET_LG_SOUND_SYNC_ENABLE)[0].1, vec![1]);
+
+        // UPMIX_PARAM_* by wValue (upmix.h:188-201), every one a float.
+        let up: Vec<(u16, Vec<u8>)> = sent(&log, op::REQ_UPMIX_SET_PARAM);
+        let wvalues: Vec<u16> = up.iter().map(|u| u.0).collect();
+        assert_eq!(wvalues, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0]);
+        assert_eq!(up[0].1, 0.0f32.to_le_bytes().to_vec());
+        assert_eq!(up[1].1, 1.0f32.to_le_bytes().to_vec());
+        assert_eq!(up[4].1, 40.0f32.to_le_bytes().to_vec());
+        assert_eq!(up[10].1, 6000.0f32.to_le_bytes().to_vec());
+    }
+
+    /// Each feature's parameters go before its switch
+    /// (PresetDocumentTransfer.swift:557-584).
+    #[test]
+    fn every_switch_follows_its_parameters() {
+        let (mut s, log) = rig(Platform::Rp2350);
+        apply(
+            &mut s,
+            &parse(CONSOLE_RP2350).unwrap(),
+            ApplyOptions::default(),
+        );
+        let order: Vec<u8> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.direction == Direction::Out)
+            .map(|e| e.opcode)
+            .collect();
+        let at = |o: u8| order.iter().position(|x| *x == o).unwrap();
+        assert!(at(op::REQ_SET_LOUDNESS_MASK) < at(op::REQ_SET_LOUDNESS));
+        assert!(at(op::REQ_SET_CROSSFEED_OUTPUTS) < at(op::REQ_SET_CROSSFEED));
+        assert!(at(op::REQ_SET_LEVELLER_MASKS) < at(op::REQ_SET_LEVELLER_ENABLE));
+    }
+
+    /// A feature the device lacks is skipped in the Console's words, and a
+    /// mask the firmware predates is not sent.
+    #[test]
+    fn missing_features_are_skipped_in_the_consoles_words() {
+        let mut doc = parse(CONSOLE_RP2350).unwrap();
+        doc.psybass = Some(PsybassBlock::default());
+        doc.upmix = Some(UpmixBlock::default());
+        doc.global.lg_sound_sync_enabled = true;
+        let (mut s, log) = rig_with(
+            MockTransport::new().answering_everything(vec![0; 64]),
+            Platform::Rp2350,
+            &[],
+        );
+        let report = apply(&mut s, &doc, ApplyOptions::default());
+        for reason in [
+            "Psychoacoustic bass (not supported by this firmware)",
+            "Stereo upmixer (not supported by this device)",
+            "LG Sound Sync (not supported by this firmware)",
+        ] {
+            assert!(report.skipped.iter().any(|r| r == reason), "{reason}");
+        }
+        for opcode in [
+            op::REQ_SET_LOUDNESS_MASK,
+            op::REQ_SET_CROSSFEED_OUTPUTS,
+            op::REQ_SET_LEVELLER_MASKS,
+            op::REQ_UPMIX_SET_PARAM,
+        ] {
+            assert!(sent(&log, opcode).is_empty(), "0x{opcode:02X}");
+        }
+    }
+
+    /// A Windows file from before the masks existed takes the firmware's
+    /// defaults, not zero, which would switch loudness off everywhere
+    /// (PresetDocument.swift:149-185).
+    #[test]
+    fn absent_masks_take_the_firmware_defaults() {
+        let d = parse(
+            r#"{"schemaVersion":1,"loudness":{"enabled":true},"crossfeed":{"enabled":true},
+                "leveller":{},"upmix":{},"psybass":{},"channels":[{"channelId":0}]}"#,
+        )
+        .unwrap();
+        assert_eq!(d.loudness.output_mask, 0xFFFF);
+        assert_eq!(
+            (d.loudness.ref_spl, d.loudness.intensity_pct),
+            (83.0, 100.0)
+        );
+        assert_eq!(d.crossfeed.output_pair_mask, 0x01);
+        assert_eq!((d.crossfeed.freq_hz, d.crossfeed.feed_db), (700.0, 4.5));
+        assert_eq!(
+            (d.leveller.detector_mask, d.leveller.apply_mask),
+            (0xFF, 0xFF)
+        );
+        assert_eq!(d.psybass.unwrap().output_mask, 0xFFFF);
+        let u = d.upmix.unwrap();
+        assert_eq!((u.center_mode, u.surround_mode), (1, 2));
+        assert_eq!(u.surround_lpf_hz, 7000.0);
+    }
+
+    /// Master volume is a preset's only in with-preset mode
+    /// (PresetDocumentTransfer.swift:669-680); listening volume always is.
+    #[test]
+    fn master_volume_follows_the_devices_mode() {
+        let doc = parse(CONSOLE_RP2350).unwrap();
+        let options = ApplyOptions {
+            volume_levels: true,
+            ..Default::default()
+        };
+
+        let (mut s, log) = rig(Platform::Rp2350);
+        let report = apply(&mut s, &doc, options);
+        assert!(sent(&log, op::REQ_SET_MASTER_VOLUME).is_empty());
+        assert_eq!(sent(&log, op::REQ_SET_USER_VOLUME).len(), 1);
+        assert!(
+            report
+                .skipped
+                .contains(&"Master volume (device is in independent master-volume mode)".into())
+        );
+
+        let (mut s, log) = rig_with(
+            MockTransport::new()
+                .answering_everything(vec![0; 64])
+                .data(op::REQ_GET_MASTER_VOLUME_MODE, vec![1]),
+            Platform::Rp2350,
+            FEATURES,
+        );
+        apply(&mut s, &doc, options);
+        assert_eq!(sent(&log, op::REQ_SET_MASTER_VOLUME).len(), 1);
+    }
+
+    /// Disables first, then enables, so an output the document switches off
+    /// is free before the one it switches on needs it
+    /// (PresetDocumentTransfer.swift:377-392).
+    #[test]
+    fn outputs_are_disabled_before_any_is_enabled() {
+        let mut doc = parse(CONSOLE_RP2350).unwrap();
+        // The document turns output 0 off and PDM on; the device holds
+        // output 0 on and PDM off.
+        doc.channels[3].enabled = false;
+        doc.channels[4].enabled = true;
+        use dspi_transport::mock::Reply;
+        let reads = |v: &[u8]| v.iter().map(|b| Reply::Data(vec![*b])).collect::<Vec<_>>();
+        let (mut s, log) = rig_with(
+            MockTransport::new()
+                .answering_everything(vec![0; 64])
+                // Output 0: the check, the write's own read, its readback;
+                // then the same three for PDM.
+                .reply(
+                    op::REQ_GET_OUTPUT_ENABLE,
+                    Reply::Sequence(reads(&[1, 1, 0, 0, 0, 1])),
+                ),
+            Platform::Rp2350,
+            FEATURES,
+        );
+        apply(&mut s, &doc, ApplyOptions::default());
+        let enables: Vec<(u16, u8)> = sent(&log, op::REQ_SET_OUTPUT_ENABLE)
+            .iter()
+            .map(|(v, p)| (*v, p[0]))
+            .collect();
+        assert_eq!(enables, vec![(0, 0), (8, 1)]);
+    }
+
+    /// An enable that still collides with Core 1 is reported, not forced.
+    #[test]
+    fn a_colliding_enable_is_reported() {
+        let mut doc = parse(CONSOLE_RP2350).unwrap();
+        doc.channels[4].enabled = true;
+        let (mut s, log) = rig_with(
+            MockTransport::new()
+                .answering_everything(vec![0; 64])
+                .data(op::REQ_GET_CORE1_CONFLICT, vec![1]),
+            Platform::Rp2350,
+            FEATURES,
+        );
+        let report = apply(&mut s, &doc, ApplyOptions::default());
+        assert!(
+            report
+                .skipped
+                .contains(&"PDM could not be enabled (conflicts with another output)".into()),
+            "{:?}",
+            report.skipped
+        );
+        assert!(
+            !sent(&log, op::REQ_SET_OUTPUT_ENABLE)
+                .iter()
+                .any(|(_, p)| p[0] == 1)
+        );
+    }
+
+    // ------------------------------------------------------------- exports
+
+    /// An export numbers channels as the Console does and carries its keys
+    /// (PresetDocumentTests.swift:337-433, PresetDocumentTransfer.swift:
+    /// 166-197).
+    #[test]
+    fn an_rp2350_export_uses_the_consoles_numbering_and_keys() {
+        let (mut s, _) = rig(Platform::Rp2350);
+        let d = capture(&mut s, Some("Test".into()));
+
+        let ids: Vec<i32> = d.channels.iter().map(|c| c.channel_id).collect();
+        assert_eq!(
+            ids,
+            vec![0, 1, 11, 12, 13, 14, 15, 16, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        );
+        for (unified, c) in d.channels.iter().enumerate() {
+            assert_eq!(c.eq_channel, Some(unified as i32));
+            if c.is_output {
+                assert_eq!(c.output_index, Some(unified as i32 - 8));
+                assert_eq!(c.input_index, None);
+                assert!(c.output_delay_ms.is_some());
+            } else {
+                assert_eq!(c.input_index, Some(unified as i32));
+                assert_eq!(c.output_index, None);
+            }
+        }
+
+        let json: serde_json::Value = serde_json::from_str(&write(&d)).unwrap();
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            v.as_object().unwrap().keys().cloned().collect()
+        };
+        let has_all = |v: &serde_json::Value, want: &[&str]| {
+            let got = keys(v);
+            for k in want {
+                assert!(got.iter().any(|g| g == k), "missing {k} in {got:?}");
+            }
+        };
+        has_all(
+            &json,
+            &[
+                "schemaVersion",
+                "meta",
+                "global",
+                "loudness",
+                "crossfeed",
+                "leveller",
+                "psybass",
+                "upmix",
+                "subharm",
+                "tube",
+                "channels",
+                "matrix",
+                "io",
+            ],
+        );
+        has_all(
+            &json["meta"],
+            &[
+                "name",
+                "savedUtc",
+                "appVersion",
+                "platform",
+                "firmwareVersion",
+                "wireFormatVersion",
+                "inputChannelCount",
+                "outputChannelCount",
+                "masterVolumeMode",
+                "outputConfigMode",
+            ],
+        );
+        has_all(
+            &json["upmix"],
+            &[
+                "enabled",
+                "centerMode",
+                "surroundMode",
+                "strengthPct",
+                "centerWidthPct",
+                "thresholdPct",
+                "attackMs",
+                "releaseMs",
+                "detectorHpfHz",
+                "surroundDelayMs",
+                "surroundHpfHz",
+                "surroundLpfHz",
+                "decorrPct",
+                "presenceDb",
+            ],
+        );
+        has_all(
+            &json["channels"][2],
+            &["channelId", "eqChannel", "inputIndex", "name"],
+        );
+        has_all(
+            &json["channels"][16],
+            &[
+                "channelId",
+                "name",
+                "isOutput",
+                "delayMs",
+                "gainDb",
+                "muted",
+                "enabled",
+                "eq",
+                "crossover",
+                "eqChannel",
+                "outputIndex",
+                "outputDelayMs",
+                "limiter",
+            ],
+        );
+        assert_eq!(json["channels"][16]["channelId"], 10, "PDM");
+        assert_eq!(json["channels"][16]["outputIndex"], 8);
+        assert_eq!(json["channels"][16]["eqChannel"], 16);
+        let saved = json["meta"]["savedUtc"].as_str().unwrap();
+        assert_eq!(saved.len(), 20, "{saved}");
+        assert!(saved.ends_with('Z'));
+    }
+
+    #[test]
+    fn an_rp2040_export_uses_the_consoles_numbering() {
+        let (mut s, _) = rig(Platform::Rp2040);
+        let d = capture(&mut s, None);
+        let ids: Vec<(i32, Option<i32>, Option<i32>)> = d
+            .channels
+            .iter()
+            .map(|c| (c.channel_id, c.input_index, c.output_index))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                (0, Some(0), None),
+                (1, Some(1), None),
+                (2, None, Some(0)),
+                (3, None, Some(1)),
+                (4, None, Some(2)),
+                (5, None, Some(3)),
+                (6, None, Some(4)),
+            ]
+        );
+    }
+
+    /// An export read back lands every channel where it came from, on both
+    /// platforms, whether read by its own index fields or, as a Windows
+    /// reader does, by `channelId` alone.
+    #[test]
+    fn an_export_round_trips_on_both_platforms() {
+        for (platform, inputs, outputs) in [(Platform::Rp2350, 8, 9), (Platform::Rp2040, 2, 5)] {
+            let (mut s, _) = rig(platform);
+            let d = parse(&write(&capture(&mut s, None))).unwrap();
+            let (placed, missing) = place_channels(&d, inputs, outputs);
+            assert!(missing.is_empty());
+            assert_eq!(placed.len(), (inputs + outputs) as usize);
+            for (r, c) in &placed {
+                assert_eq!(Some(r.unified(inputs) as i32), c.eq_channel, "{platform:?}");
+                // What a Windows reader sees.
+                assert_eq!(channel_id::resolve(c.channel_id), Some(*r));
+            }
+
+            // Applied back, every channel's bank reaches its own channel.
+            let (mut s, log) = rig(platform);
+            apply(&mut s, &d, ApplyOptions::default());
+            let mut chs: Vec<u8> = sent(&log, op::REQ_SET_EQ_PARAM)
+                .iter()
+                .map(|(_, p)| p[0])
+                .collect();
+            chs.dedup();
+            assert_eq!(chs, (0..inputs + outputs).collect::<Vec<_>>());
+        }
+    }
+
+    // --------------------------------------------- older Terminal documents
+
+    /// An eight-input file an older Terminal build wrote: the unified index
+    /// as `channelId`, no index fields, no timestamp.
+    fn older_terminal_rp2350() -> String {
+        let chans: Vec<String> = (0..17)
+            .map(|i| {
+                format!(
+                    r#"{{"channelId":{i},"name":"Ch {i}","isOutput":{},"eq":[{{"type":1,"freqHz":{}}}]}}"#,
+                    i >= 8,
+                    300 + i
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"schemaVersion":1,"meta":{{"appVersion":"2.0.0-dev","platform":"RP2350",
+                "inputChannelCount":8,"outputChannelCount":9}},"channels":[{}]}}"#,
+            chans.join(",")
+        )
+    }
+
+    #[test]
+    fn an_older_terminal_document_is_recognised_and_placed() {
+        let d = parse(&older_terminal_rp2350()).unwrap();
+        assert_eq!(legacy_numbering(&d, 8), Some(8));
+        let (placed, missing) = place_channels(&d, 8, 9);
+        assert!(missing.is_empty());
+        for (r, c) in &placed {
+            assert_eq!(r.unified(8) as i32, c.channel_id, "{}", c.name);
+        }
+
+        let (mut s, log) = rig(Platform::Rp2350);
+        apply(&mut s, &d, ApplyOptions::default());
+        for i in 0..17u8 {
+            assert_eq!(eq_channels_at(&log, 300.0 + i as f32), vec![i]);
+        }
+    }
+
+    /// No file either Console writes looks like an older Terminal one, and on
+    /// a two-input device the two numberings are the same thing.
+    #[test]
+    fn console_documents_are_never_taken_for_older_terminal_ones() {
+        for text in [CONSOLE_RP2350, WINDOWS_RP2350, CONSOLE_RP2040] {
+            assert_eq!(legacy_numbering(&parse(text).unwrap(), 8), None, "{text}");
+        }
+        let (mut s, _) = rig(Platform::Rp2350);
+        let exported = capture(&mut s, None);
+        assert_eq!(legacy_numbering(&exported, 8), None);
+        // An older RP2040 file already agrees with the table.
+        let old = r#"{"schemaVersion":1,"meta":{"inputChannelCount":2},"channels":[
+            {"channelId":0},{"channelId":1},{"channelId":2,"isOutput":true},
+            {"channelId":6,"isOutput":true}]}"#;
+        assert_eq!(legacy_numbering(&parse(old).unwrap(), 2), None);
+        assert_eq!(
+            place_channels(&parse(old).unwrap(), 2, 5)
+                .0
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![
+                ChannelRef::Input(0),
+                ChannelRef::Input(1),
+                ChannelRef::Output(0),
+                ChannelRef::Output(4)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_timestamp_is_iso_8601_utc() {
+        assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(iso8601(1_790_762_645), "2026-09-30T10:04:05Z");
     }
 }

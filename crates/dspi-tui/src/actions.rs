@@ -1198,13 +1198,21 @@ pub fn import_report(
 // ---------------------------------------------------------------------------
 
 /// Capture the whole device into a `.dspipreset`.
-pub fn export_config(session: &mut Session, path: &str) -> Result<String, String> {
+///
+/// The input pair links are the app's rather than the device's, so they come
+/// from the caller (PresetDocumentTransfer.swift:43).
+pub fn export_config(
+    session: &mut Session,
+    path: &str,
+    linked_pairs: &[bool],
+) -> Result<String, String> {
     let path = expand(path);
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string());
-    let doc = preset_file::capture(session, name);
+    let mut doc = preset_file::capture(session, name);
+    doc.global.input_pair_linked = linked_pairs.to_vec();
     std::fs::write(&path, preset_file::write(&doc))
         .map_err(|e| format!("Failed to write file: {e}"))?;
 
