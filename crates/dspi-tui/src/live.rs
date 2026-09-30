@@ -989,7 +989,11 @@ impl Live {
         let tokens = dspi_cmd::tokenize(line);
         let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
         match dspi_cmd::parse(&refs, &self.ctx).ok()? {
-            dspi_cmd::Command::Set { path, indices, .. } if path == "eq.bypass" => {
+            dspi_cmd::Command::Set {
+                path: "eq.bypass",
+                indices,
+                ..
+            } => {
                 let (&channel, &band) = (indices.first()?, indices.get(1)?);
                 Some(format!("eq {channel} {band}"))
             }
@@ -1107,6 +1111,12 @@ impl Live {
 
     fn undo(&mut self, session: &mut Session, redo: bool) {
         self.flush_writes(session, true);
+        // A reversal can be a limiter write, which in INDEPENDENT mode is
+        // output configuration: keep the baseline it moves away from, as
+        // `set` does, or undoing past a save would read as saved. Taken when
+        // the limiters are clean, the baseline is what they are now, so doing
+        // this for a reversal that is not a limiter write changes nothing.
+        self.state.begin_limiter_edit();
         let result = if redo { session.redo() } else { session.undo() };
         match result {
             Ok(Some(u)) => {
@@ -3492,6 +3502,17 @@ mod tests {
         assert!(l.state.limiter_unsaved());
         l.run_command(&mut s, "save-output-config");
         assert!(!l.state.limiter_unsaved());
+
+        // Undo past the save moves the limiters off the saved configuration,
+        // so the save bar has to come back. The mock's bulk read does not
+        // follow writes, so the device's side is patched in by hand.
+        l.handle_event(&mut s, ShellEvent::Undo);
+        assert!(l.state.limiter_baseline.is_some(), "the saved baseline");
+        l.state
+            .bulk
+            .patch(section_at("limiter") + 4, &0.0f32.to_le_bytes());
+        assert!(l.state.limiter_unsaved());
+        assert!(!l.state.has_unsaved_changes(), "the preset is untouched");
     }
 
     /// The gain-reduction meter is read on the meter tick only while an
