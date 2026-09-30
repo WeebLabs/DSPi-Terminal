@@ -1118,7 +1118,9 @@ impl RtaEngine {
 /// channel the device could not fill is zeroed (vendor_commands.c:4344-4347),
 /// which fails the version check and is skipped rather than failing the rest.
 fn decode_frames(b: &[u8]) -> Vec<RtaBandFrame> {
-    b.chunks_exact(RtaBandFrame::SIZE)
+    b.as_chunks::<{ RtaBandFrame::SIZE }>()
+        .0
+        .iter()
         .filter_map(|c| RtaBandFrame::decode(c).ok())
         .collect()
 }

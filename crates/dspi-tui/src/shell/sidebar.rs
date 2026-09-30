@@ -210,8 +210,7 @@ pub fn draw_list(
     }
     let t = theme;
     let all = rows(model);
-    let mut y = area.y;
-    for r in all.iter().skip(scroll) {
+    for (y, r) in (area.y..).zip(all.iter().skip(scroll)) {
         if y >= area.y + area.height {
             break;
         }
@@ -233,7 +232,6 @@ pub fn draw_list(
                 );
             }
         }
-        y += 1;
     }
     // Scroll hints sit in the border column to the right of the list, so
     // they never cover a pill.

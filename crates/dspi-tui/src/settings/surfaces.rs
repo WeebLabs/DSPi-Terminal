@@ -817,15 +817,13 @@ impl SurfacesPage {
                     );
                 }
             }
-            m::act::IND_LEVEL => {
-                if k == m::kind::CONTINUOUS {
-                    span(
-                        &mut rows,
-                        "Brightness Range",
-                        "Value mapped to the LED fully off.",
-                        "Value mapped to the LED fully lit.",
-                    );
-                }
+            m::act::IND_LEVEL if k == m::kind::CONTINUOUS => {
+                span(
+                    &mut rows,
+                    "Brightness Range",
+                    "Value mapped to the LED fully off.",
+                    "Value mapped to the LED fully lit.",
+                );
             }
             _ => {}
         }

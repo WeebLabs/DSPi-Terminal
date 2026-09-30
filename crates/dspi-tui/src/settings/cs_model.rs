@@ -1798,12 +1798,10 @@ pub fn default_operands(cs: &CsData, b: &CsBinding) -> CsBinding {
                 b.value = 1;
             }
         }
-        act::IND_ABOVE => {
-            // A quarter of the way up the range: -45 dB on a -60..0 meter.
-            if k == kind::CONTINUOUS {
-                let (lo, hi) = (decode_value(nd.min_q, u), decode_value(nd.max_q, u));
-                b.value = encode_value(lo + 0.25 * (hi - lo), u);
-            }
+        // A quarter of the way up the range: -45 dB on a -60..0 meter.
+        act::IND_ABOVE if k == kind::CONTINUOUS => {
+            let (lo, hi) = (decode_value(nd.min_q, u), decode_value(nd.max_q, u));
+            b.value = encode_value(lo + 0.25 * (hi - lo), u);
         }
         _ => {}
     }
