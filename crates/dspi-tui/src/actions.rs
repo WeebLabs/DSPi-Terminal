@@ -785,12 +785,22 @@ pub fn path_dialog(title: &str, body: &str, value: &str, action: &str) -> Dialog
     d
 }
 
+/// Whether `c` separates path components here: `/` everywhere, and `\` too
+/// on Windows, where both are accepted.
+fn is_separator(c: char) -> bool {
+    c == '/' || std::path::is_separator(c)
+}
+
 /// Expand a leading `~`, so a typed path behaves the way it does in a shell.
+/// The home directory comes from the platform, not `HOME`, which Windows does
+/// not set.
 pub fn expand(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+    let mut chars = path.chars();
+    if chars.next() == Some('~')
+        && chars.next().is_some_and(is_separator)
+        && let Some(home) = dirs::home_dir()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(&path[2..]);
     }
     PathBuf::from(path)
 }
@@ -803,7 +813,7 @@ pub fn expand(path: &str) -> PathBuf {
 /// is taken.
 pub fn complete_path(typed: &str) -> Option<String> {
     let expanded = expand(typed);
-    let (dir, prefix) = match typed.ends_with('/') {
+    let (dir, prefix) = match typed.ends_with(is_separator) {
         true => (expanded.clone(), String::new()),
         false => (
             expanded.parent().unwrap_or(Path::new(".")).to_path_buf(),
@@ -856,7 +866,7 @@ pub fn complete_path(typed: &str) -> Option<String> {
 
     // Put the completion back onto the text the person typed, so a `~` stays a
     // `~` rather than being rewritten to their home directory under them.
-    let head = match typed.rfind('/') {
+    let head = match typed.rfind(is_separator) {
         Some(i) => &typed[..=i],
         None => "",
     };
@@ -2023,11 +2033,8 @@ mod tests {
 
     #[test]
     fn a_tilde_is_expanded_but_not_written_back() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        assert_eq!(
-            expand("~/tuning.txt"),
-            PathBuf::from(home).join("tuning.txt")
-        );
+        let home = dirs::home_dir().unwrap_or_default();
+        assert_eq!(expand("~/tuning.txt"), home.join("tuning.txt"));
         assert_eq!(expand("/tmp/x"), PathBuf::from("/tmp/x"));
         assert_eq!(expand("x"), PathBuf::from("x"));
     }
