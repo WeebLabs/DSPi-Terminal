@@ -46,6 +46,7 @@ pub enum Tool {
     Stats,
     Monitor,
     AutoEq,
+    Subharm,
 }
 
 impl Tool {
@@ -62,6 +63,7 @@ impl Tool {
             'T' => Self::Stats,
             'I' => Self::Monitor,
             'B' => Self::AutoEq,
+            'S' => Self::Subharm,
             _ => return None,
         })
     }
@@ -78,6 +80,7 @@ impl Tool {
             Self::Stats => 'T',
             Self::Monitor => 'I',
             Self::AutoEq => 'B',
+            Self::Subharm => 'S',
         }
     }
 
@@ -94,6 +97,7 @@ impl Tool {
             Self::Stats => "System Statistics",
             Self::Monitor => "Interrupt Monitor",
             Self::AutoEq => "AutoEQ",
+            Self::Subharm => "Subharmonic Synthesizer",
         }
     }
 }

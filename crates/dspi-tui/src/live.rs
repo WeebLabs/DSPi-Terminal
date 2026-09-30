@@ -29,7 +29,7 @@ use crate::perf::Performance;
 use crate::screens::{
     self, AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
     MonitorPanel, OutputPage, Overview, PresetChoice, PresetMenu, PsybassPanel, Shared,
-    SignalsPanel, StatsPanel, UpmixerPanel, clipboard, panel, presets,
+    SignalsPanel, StatsPanel, SubharmPanel, UpmixerPanel, clipboard, panel, presets,
 };
 use crate::settings::{AppConfig, SettingsData, SettingsScreen};
 use crate::shell::{
@@ -157,6 +157,7 @@ impl Screens for ConsoleScreens {
             Tool::Stats => Box::new(StatsPanel::new(self.shared.clone())),
             Tool::Monitor => Box::new(MonitorPanel::new(self.shared.clone())),
             Tool::AutoEq => Box::new(AutoEqPanel::new(self.shared.clone())),
+            Tool::Subharm => Box::new(SubharmPanel::new()),
         }
     }
 
@@ -204,7 +205,34 @@ pub const APP_VERBS: &[(&str, &str)] = &[
     ("device", "Device picker"),
     ("reconnect", "Reconnect to the device"),
     ("clear-favourites", "AutoEQ: clear favourites"),
+    ("subharm", "Subharmonic Synthesizer"),
 ];
+
+/// The sub meter's poll period: the Console's 10 Hz
+/// (`SubharmonicSynthView.swift:101`), and the brief's ceiling.
+const SUBHARM_METER_PERIOD: Duration = Duration::from_millis(100);
+
+/// What the runner remembers between the Subharmonic Synthesizer panel's
+/// reads; see [`Live::poll_subharm`].
+#[derive(Debug)]
+struct SubharmPoll {
+    open: bool,
+    seen: Option<dspi_session::state::Subharm>,
+    solo_at: Instant,
+    meter_at: Instant,
+}
+
+impl Default for SubharmPoll {
+    fn default() -> Self {
+        let long_ago = Instant::now() - Duration::from_secs(2);
+        Self {
+            open: false,
+            seen: None,
+            solo_at: long_ago,
+            meter_at: long_ago,
+        }
+    }
+}
 
 /// The `:` line and the `Ctrl-P` palette.
 #[derive(Debug, Clone, PartialEq)]
@@ -497,6 +525,10 @@ pub struct Live {
     /// so the only way to move the gauges is to ask, and once a second is
     /// enough for a meter a person is watching.
     last_upmix_poll: Instant,
+    /// The Subharmonic Synthesizer panel's runtime reads: whether it was on
+    /// screen last tick, the section its headroom was last read for, and when
+    /// solo and the meters were last read.
+    subharm: SubharmPoll,
     /// When the Stats panel's diagnostics were last read, on the Console's own
     /// two-second cadence.
     last_stats_poll: Instant,
@@ -562,6 +594,7 @@ impl Live {
             popout_pinned: None,
             devices_checked: None,
             last_upmix_poll: Instant::now() - Duration::from_secs(2),
+            subharm: SubharmPoll::default(),
             last_stats_poll: Instant::now() - Duration::from_secs(3),
             started: Instant::now(),
             boot: None,
@@ -827,6 +860,11 @@ impl Live {
                 if let Some(mode) = mode {
                     self.state.output_config_mode = mode;
                 }
+                // Solo has no wire offset and no notification (config.h:201),
+                // so the re-read that follows every write cannot bring it.
+                if path == "sub.solo" {
+                    let _ = self.state.refresh_subharm_solo(session);
+                }
                 self.refresh(session);
             }
             Err(e) => self.note(e.to_string()),
@@ -1019,6 +1057,7 @@ impl Live {
                 Err(m) => self.note(m),
             },
             "device" => self.open_device_picker(),
+            "subharm" => self.open_tool(Tool::Subharm),
             "autoeq" => match args.first().copied() {
                 Some("update") => self.autoeq_update(),
                 _ => self.open_tool(Tool::AutoEq),
@@ -1512,7 +1551,8 @@ impl Live {
     /// `overview`, `input` (the first input), `output` (the first output),
     /// a tool's lowercase title word (`matrix`, `crossfeed`, `loudness`,
     /// `leveller`, `psybass`, `upmixer`, `signals`, `stats`, `monitor`,
-    /// `autoeq`), or `settings`. Returns false for a name it does not know.
+    /// `autoeq`, `subharm`), or `settings`. Returns false for a name it does
+    /// not know.
     pub fn show(&mut self, session: &mut Session, name: &str) -> bool {
         match name.to_ascii_lowercase().as_str() {
             "overview" => self.select(Selection::Overview),
@@ -1528,6 +1568,7 @@ impl Live {
             "stats" => self.open_tool(Tool::Stats),
             "monitor" => self.open_tool(Tool::Monitor),
             "autoeq" => self.open_tool(Tool::AutoEq),
+            "subharm" => self.open_tool(Tool::Subharm),
             "settings" => self.open_settings(session),
             _ => return false,
         }
@@ -2042,6 +2083,45 @@ impl Live {
         }
     }
 
+    /// The Subharmonic Synthesizer's runtime state, while its panel is on
+    /// screen: the headroom cost (`REQ_GET_SUBHARM_HEADROOM`, config.h:194)
+    /// when it opens and whenever the section changes, which is after every
+    /// write that can move it and after another host's too; solo
+    /// (`REQ_GET_SUBHARM_SOLO`, config.h:202) once a second, since nothing
+    /// notifies it; and the sub meters (`REQ_GET_SUBHARM_METER`,
+    /// config.h:200) at the Console's 10 Hz while the module is on.
+    ///
+    /// When the panel has gone, by whatever route, solo is switched off if it
+    /// was on, as the Console's window does on close: solo mutes the program
+    /// on the masked outputs, and the firmware keeps it across a preset load.
+    fn poll_subharm(&mut self, session: &mut Session, now: Instant) {
+        let showing = matches!(self.shell.tool, Some((Tool::Subharm, _)))
+            && panel::has_feature(&self.state, "subharmonic_synth");
+        if !showing {
+            if std::mem::take(&mut self.subharm.open) {
+                self.subharm.seen = None;
+                if self.state.subharm_solo == Some(true) {
+                    self.set(session, "sub.solo", &[], Value::Bool(false));
+                }
+            }
+            return;
+        }
+        let opened = !std::mem::replace(&mut self.subharm.open, true);
+        let section = self.state.subharm();
+        if self.subharm.seen != Some(section) {
+            self.subharm.seen = Some(section);
+            let _ = self.state.refresh_subharm_headroom(session);
+        }
+        if opened || now.duration_since(self.subharm.solo_at) >= Duration::from_secs(1) {
+            self.subharm.solo_at = now;
+            let _ = self.state.refresh_subharm_solo(session);
+        }
+        if section.enabled && now.duration_since(self.subharm.meter_at) >= SUBHARM_METER_PERIOD {
+            self.subharm.meter_at = now;
+            let _ = self.state.refresh_subharm_meter(session);
+        }
+    }
+
     /// Refresh the Stats panel's diagnostics, every two seconds and only while
     /// that panel is on screen.
     ///
@@ -2110,6 +2190,7 @@ impl Live {
             Err(_) => {}
         }
         self.poll_upmix_status(session, now);
+        self.poll_subharm(session, now);
         self.poll_stats(session, now);
         self.poll_screen(session, now);
 
