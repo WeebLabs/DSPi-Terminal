@@ -35,10 +35,13 @@ use crate::shell::{Screen, ScreenEvent};
 use crate::theme::{ChannelRole, Theme};
 use crate::widgets::{Action, ChipState, KeyHelp, PopupList};
 
+/// Name, detail, type, drive, rectifier, output stage, damping, resonance.
+type StartingPoint = (&'static str, &'static str, u8, f32, u8, bool, f32, f32);
+
 /// `tubeStartingPoints`, `TubeModellerView.swift:88-99`: name, detail, then
 /// type, drive, rectifier, output stage, damping and resonance. Each also
 /// sets mix 100 and trim 0 (`:463-464`).
-const STARTING_POINTS: [(&str, &str, u8, f32, u8, bool, f32, f32); 5] = [
+const STARTING_POINTS: [StartingPoint; 5] = [
     (
         "Clean default",
         "12AX7, level-neutral, output stage on",
@@ -959,6 +962,545 @@ impl Screen for TubePanel {
                 _ => ScreenEvent::Handled,
             },
             _ => ScreenEvent::Handled,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screens::panel::testing;
+    use crate::shell::{Tool, fixture};
+    use crate::widgets::testing::key;
+    use crossterm::event::KeyCode;
+
+    fn section(name: &str) -> usize {
+        dspi_proto::generated::SECTIONS
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, o, _)| *o)
+            .expect("section")
+    }
+
+    /// The RP2350 fixture with the tube at its power-on values.
+    fn state(enabled: bool) -> DeviceState {
+        let mut s = fixture::state();
+        fixture::tube(&mut s, enabled);
+        s
+    }
+
+    /// The RP2040's shape: two inputs and five outputs, the sub the fifth.
+    fn rp2040(enabled: bool) -> DeviceState {
+        let mut s = state(enabled);
+        s.caps.platform = dspi_proto::Platform::Rp2040;
+        s.caps.num_inputs = 2;
+        s.caps.num_outputs = 5;
+        s
+    }
+
+    fn set_type(s: &mut DeviceState, n: u8) {
+        s.bulk.patch(section("tube") + 1, &[n]);
+    }
+    fn set_rect(s: &mut DeviceState, n: u8) {
+        s.bulk.patch(section("tube") + 2, &[n]);
+    }
+    fn set_stage(s: &mut DeviceState, on: bool) {
+        s.bulk.patch(section("tube") + 3, &[u8::from(on)]);
+    }
+    fn set_f32(s: &mut DeviceState, at: usize, v: f32) {
+        s.bulk.patch(section("tube") + at, &v.to_le_bytes());
+    }
+
+    /// Put the cursor on the first row that matches.
+    fn focus(p: &mut TubePanel, s: &DeviceState, pick: impl Fn(&Row) -> bool) {
+        let rows = p.rows(s, panel::key_theme());
+        p.body.focus = panel::focus_rows(&rows)
+            .iter()
+            .position(|r| pick(&rows[*r]))
+            .expect("a matching row")
+            + 1;
+    }
+
+    fn frames(s: &DeviceState) -> Vec<(u16, u16, String)> {
+        [(120u16, 40u16), (80, 24)]
+            .into_iter()
+            .map(|(w, h)| {
+                let f = testing::frame(Tool::Tube, Box::new(TubePanel::new()), s, w, h);
+                assert_eq!(f.lines().count(), h as usize, "{w}x{h}");
+                assert!(f.contains("Tube Modeller"), "{w}x{h}:\n{f}");
+                assert!(f.contains("D closes"), "{w}x{h}:\n{f}");
+                (w, h, f)
+            })
+            .collect()
+    }
+
+    /// The panel alone, tall enough to hold every row.
+    fn whole(s: &DeviceState) -> String {
+        testing::draw(&mut TubePanel::new(), s, 100, 80)
+    }
+
+    #[test]
+    fn golden_frames_disabled() {
+        let s = state(false);
+        for (w, h, f) in frames(&s) {
+            assert!(f.contains("○ Off"), "{w}x{h}:\n{f}");
+            assert!(f.contains("TRANSFER CURVE"), "{w}x{h}:\n{f}");
+            assert!(f.contains("Disabled"), "{w}x{h}:\n{f}");
+            assert!(!f.contains("0 dBFS"), "no curve while off: {f}");
+        }
+    }
+
+    #[test]
+    fn golden_frames_enabled_with_the_12ax7() {
+        let s = state(true);
+        for (w, h, f) in frames(&s) {
+            assert!(f.contains("● On"), "{w}x{h}:\n{f}");
+            assert!(f.contains("0 dBFS") && f.contains("out"), "{w}x{h}:\n{f}");
+            assert!(f.contains("Apply preset ▾"), "{w}x{h}:\n{f}");
+        }
+        let (_, _, f) = &frames(&s)[0];
+        assert!(f.contains("AT FULL SCALE"), "{f}");
+        assert!(f.contains("2nd -39 dB   3rd -44 dB"), "{f}");
+        assert!(f.contains("Tube  12AX7 / ECC83 ▾"), "{f}");
+        assert!(f.contains("High-gain preamp triode."), "{f}");
+        assert!(f.contains("from 12AX7 / ECC83"), "{f}");
+        let all = whole(&s);
+        for text in [
+            "Valve-style harmonic colour, supply sag and a tube amplifier's output stage",
+            "STAGE",
+            "Drive",
+            "-12.0 dB",
+            "Dry",
+            "All tube",
+            "Output Trim",
+            "CHARACTER",
+            "Knee Hardness",
+            "Solid state",
+            "GZ34",
+            "5U4",
+            "5Y3",
+            "Sag depth x0.6, 5 ms attack, 120 ms release.",
+            "OUTPUT STAGE",
+            "A valve amplifier's loose grip on the speaker.",
+            "Damping Factor",
+            "1 (loose)",
+            "20 (tight)",
+            "+2.5 dB at resonance, +1.6 dB at the top.",
+            "Speaker Resonance",
+            "95 Hz",
+            "OUTPUTS",
+            "Presets ▾",
+        ] {
+            assert!(all.contains(text), "{text:?}:\n{all}");
+        }
+    }
+
+    #[test]
+    fn golden_frames_custom() {
+        let mut s = state(true);
+        set_type(&mut s, 0);
+        set_f32(&mut s, 12, -20.0);
+        for (w, h, f) in frames(&s) {
+            assert!(f.contains("Custom ▾"), "{w}x{h}:\n{f}");
+        }
+        let all = whole(&s);
+        assert!(
+            all.contains("Character controls as set, no tube row applied."),
+            "{all}"
+        );
+        assert!(all.contains("custom"), "the character label: {all}");
+        assert!(all.contains("-20%"), "{all}");
+    }
+
+    #[test]
+    fn golden_frames_output_stage_off() {
+        let mut s = state(true);
+        set_type(&mut s, 12);
+        set_stage(&mut s, false);
+        for (w, h, f) in frames(&s) {
+            assert!(f.contains("EL34 ▾"), "{w}x{h}:\n{f}");
+        }
+        let all = whole(&s);
+        assert!(
+            all.contains(
+                "Push-pull power, mid crunch, deep sag. Meant for use with the output stage on."
+            ),
+            "{all}"
+        );
+        assert!(!all.contains("Damping Factor"), "{all}");
+    }
+
+    #[test]
+    fn golden_frames_solid_state_rectifier() {
+        let mut s = state(true);
+        set_rect(&mut s, 0);
+        for (_, _, f) in frames(&s) {
+            assert!(f.contains("TRANSFER CURVE"), "{f}");
+        }
+        let all = whole(&s);
+        assert!(
+            all.contains("No sag: the supply holds up however hard the stage is driven."),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn the_type_menu_is_custom_then_the_consoles_three_groups() {
+        let menu = type_menu();
+        let labels: Vec<&str> = menu.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels[0], "Custom");
+        assert_eq!(labels[1], "#Preamp triodes");
+        assert_eq!(labels[2], "12AX7 / ECC83");
+        assert_eq!(labels[9], "6DJ8 / ECC88 / 6922");
+        assert_eq!(labels[10], "#Preamp pentodes");
+        assert_eq!(labels[11], "EF86 / 6267");
+        assert_eq!(labels[13], "#Power stages");
+        assert_eq!(labels[14], "EL84 / 6BQ5");
+        assert_eq!(labels[19], "300B / 2A3");
+        assert_eq!(menu.len(), 1 + 3 + t::TUBE_TYPE_MAX as usize);
+        let types: Vec<u8> = menu.iter().filter_map(|(_, n)| *n).collect();
+        assert_eq!(types, (0..=t::TUBE_TYPE_MAX as u8).collect::<Vec<_>>());
+
+        // The popup opens on the current type and answers with its number.
+        let s = state(true);
+        let mut p = TubePanel::new();
+        focus(&mut p, &s, |r| matches!(r, Row::Buttons { .. }));
+        match p.handle(key(KeyCode::Enter), &s) {
+            ScreenEvent::Popup(list) => {
+                assert_eq!(list.title, "Tube");
+                assert_eq!(list.cursor, 2, "on the 12AX7");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            p.popup_result(Some(15), &s),
+            ScreenEvent::Command("tube.type 12".into()),
+            "EL34, and nothing else: the device loads the row"
+        );
+    }
+
+    #[test]
+    fn sag_is_dimmed_but_live_with_a_solid_state_rectifier() {
+        let s = state(true);
+        let mut solid = state(true);
+        set_rect(&mut solid, 0);
+        let lit = testing::fg_of(&mut TubePanel::new(), &s, 100, 80, "Sag ");
+        let dim = testing::fg_of(&mut TubePanel::new(), &solid, 100, 80, "Sag ");
+        let bias = testing::fg_of(&mut TubePanel::new(), &solid, 100, 80, "Bias");
+        assert_ne!(lit, dim, "dimmed with solid state");
+        assert_eq!(lit, bias, "and only Sag");
+        let mut p = TubePanel::new();
+        focus(
+            &mut p,
+            &solid,
+            |r| matches!(r, Row::Param(p) if p.label == "Sag"),
+        );
+        assert_eq!(
+            p.handle(key(KeyCode::Right), &solid),
+            ScreenEvent::Command("tube.sag 16".into())
+        );
+    }
+
+    #[test]
+    fn the_output_stage_rows_hide_while_it_is_off() {
+        let mut s = state(true);
+        let labels = |s: &DeviceState| -> Vec<String> {
+            TubePanel::new()
+                .rows(s, panel::key_theme())
+                .iter()
+                .filter_map(|r| match r {
+                    Row::Param(p) => Some(p.label.clone()),
+                    Row::Caption(c) if c.contains("at resonance") => Some(c.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let on = labels(&s);
+        assert!(on.iter().any(|l| l == "Damping Factor"));
+        assert!(on.iter().any(|l| l == "Speaker Resonance"));
+        assert!(on.iter().any(|l| l.contains("at resonance")));
+        set_stage(&mut s, false);
+        let off = labels(&s);
+        assert!(!off.iter().any(|l| l == "Damping Factor"), "{off:?}");
+        assert!(!off.iter().any(|l| l == "Speaker Resonance"), "{off:?}");
+        assert!(!off.iter().any(|l| l.contains("at resonance")), "{off:?}");
+        // The toggle stays, and turns it back on.
+        let mut p = TubePanel::new();
+        focus(&mut p, &s, |r| matches!(r, Row::Toggle { .. }));
+        assert_eq!(
+            p.handle(key(KeyCode::Char(' ')), &s),
+            ScreenEvent::Command("tube.xfmr on".into())
+        );
+    }
+
+    #[test]
+    fn exclude_sub_clears_the_pdm_output_on_both_platforms() {
+        for (s, all, no_sub) in [(state(true), 0x1FF, 0xFF), (rp2040(true), 0x1F, 0x0F)] {
+            let mut p = TubePanel::new();
+            focus(&mut p, &s, |r| matches!(r, Row::Chips { .. }));
+            match p.handle(key(KeyCode::Char('p')), &s) {
+                ScreenEvent::Popup(list) => {
+                    assert_eq!(list.items, vec!["All outputs", "Exclude sub", "None"])
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                p.popup_result(Some(1), &s),
+                ScreenEvent::Command(format!("tube.mask 0x{no_sub:X}"))
+            );
+            p.pending = Some(Pending::Outputs);
+            assert_eq!(
+                p.popup_result(Some(0), &s),
+                ScreenEvent::Command(format!("tube.mask 0x{all:X}"))
+            );
+            p.pending = Some(Pending::Outputs);
+            assert_eq!(
+                p.popup_result(Some(2), &s),
+                ScreenEvent::Command("tube.mask 0x0".into())
+            );
+            let chips = p
+                .rows(&s, panel::key_theme())
+                .into_iter()
+                .find_map(|r| match r {
+                    Row::Chips { chips, .. } => Some(chips.len()),
+                    _ => None,
+                });
+            assert_eq!(chips, Some(s.caps.num_outputs as usize));
+        }
+    }
+
+    #[test]
+    fn a_starting_point_writes_the_consoles_eight_lines() {
+        let s = state(true);
+        let mut p = TubePanel::new();
+        focus(&mut p, &s, |r| matches!(r, Row::Menu { .. }));
+        match p.handle(key(KeyCode::Enter), &s) {
+            ScreenEvent::Popup(list) => {
+                assert_eq!(list.items.len(), 5);
+                assert_eq!(
+                    list.items[3],
+                    "Guitar-amp style - 12AX7 pushed, 5U4, loose damping"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            p.popup_result(Some(3), &s),
+            ScreenEvent::Command(
+                "tube.type 1\ntube.drive 15\ntube.rectifier 5u4\ntube.damping 2\n\
+                 tube.resonance 100\ntube.xfmr on\ntube.mix 100\ntube.trim 0"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn every_line_the_panel_writes_parses_in_the_shared_grammar() {
+        let s = state(true);
+        let ctx = dspi_cmd::Context {
+            channel_slugs: Vec::new(),
+            num_inputs: s.caps.num_inputs,
+            num_outputs: s.caps.num_outputs,
+            max_bands: s.caps.max_bands,
+        };
+        let mut lines: Vec<String> = (0..STARTING_POINTS.len())
+            .flat_map(|i| {
+                TubePanel::starting_point(i)
+                    .lines()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        lines.extend(RECT_TOKENS.iter().map(|t| format!("tube.rectifier {t}")));
+        lines.push("tube.mask 0x1FF".into());
+        lines.push("tube.on on".into());
+        for label in [
+            "Drive",
+            "Mix",
+            "Output Trim",
+            "Bias",
+            "Asymmetry",
+            "Knee Hardness",
+            "Sag",
+            "Damping Factor",
+            "Speaker Resonance",
+        ] {
+            let ScreenEvent::Command(line) =
+                TubePanel::param_command(label, TubePanel::default_for(label) as f64)
+            else {
+                unreachable!()
+            };
+            lines.push(line);
+        }
+        for line in lines {
+            let tokens = dspi_cmd::tokenize(&line);
+            let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            dspi_cmd::parse(&refs, &ctx).unwrap_or_else(|e| panic!("{line}: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_command_bar_speaks_the_panels_words() {
+        let s = state(true);
+        let p = TubePanel::new();
+        let q = |line: &str| p.quick(line, &s).unwrap();
+        assert_eq!(q("on").commands, vec!["tube.on on"]);
+        assert_eq!(q("off").commands, vec!["tube.on off"]);
+        assert_eq!(q("type 12ax7").commands, vec!["tube.type 1"]);
+        assert_eq!(q("type el34").commands, vec!["tube.type 12"]);
+        assert_eq!(q("ty ecc88").commands, vec!["tube.type 8"]);
+        assert_eq!(q("type custom").commands, vec!["tube.type 0"]);
+        assert_eq!(q("type 16").commands, vec!["tube.type 16"]);
+        assert_eq!(q("dri -6").commands, vec!["tube.drive -6"]);
+        assert_eq!(q("mix 50").commands, vec!["tube.mix 50"]);
+        assert_eq!(q("trim -1.5").commands, vec!["tube.trim -1.5"]);
+        assert_eq!(q("bias -20").commands, vec!["tube.bias -20"]);
+        assert_eq!(q("asym 4").commands, vec!["tube.asym 4"]);
+        assert_eq!(q("hard 70").commands, vec!["tube.hardness 70"]);
+        assert_eq!(q("sag 30").commands, vec!["tube.sag 30"]);
+        assert_eq!(q("rect solid").commands, vec!["tube.rectifier solid-state"]);
+        assert_eq!(q("rect 5ar4").commands, vec!["tube.rectifier gz34"]);
+        assert_eq!(q("rect 3").commands, vec!["tube.rectifier 5y3"]);
+        assert_eq!(q("stage off").commands, vec!["tube.xfmr off"]);
+        assert_eq!(q("damp 8").commands, vec!["tube.damping 8"]);
+        assert_eq!(q("res 80").commands, vec!["tube.resonance 80"]);
+        assert_eq!(q("type el34").hint, "Tube EL34");
+        // Incomplete, out of range or ambiguous lines run nothing, and say
+        // why.
+        for partial in [
+            "", "type", "type 12a", "type 17", "drive", "drive 30", "mix -1", "rect", "rect x",
+            "stage", "s", "d", "r", "t",
+        ] {
+            let r = q(partial);
+            assert!(r.commands.is_empty(), "{partial:?} ran {:?}", r.commands);
+            assert!(!r.hint.is_empty(), "{partial:?}");
+        }
+        assert_eq!(q("drive 30").hint, "drive -30 to 24 dB (now -12 dB)");
+        assert_eq!(q("hard").ghost.as_deref(), Some("ness"));
+        let other = q("eq in.1 3 peak 1k -2");
+        assert!(other.fallthrough && other.commands.is_empty());
+    }
+
+    /// The curve is the firmware's, so it has to keep the firmware's own
+    /// promises: unity small-signal gain at every drive (tube.c:254-255), a
+    /// rest point at zero, and the header's figures for the defaults and the
+    /// output stage (tube.h:52-53, :62).
+    #[test]
+    fn the_shaper_keeps_the_firmwares_promises() {
+        let s = state(true);
+        let mut p = s.tube();
+        // Unbiased: bias moves the operating point off the centre of the curve.
+        p.bias_pct = 0.0;
+        for drive in [-30.0, -12.0, 0.0, 24.0] {
+            p.drive_db = drive;
+            let sh = Shaper::new(&p);
+            assert!(sh.output(0.0).abs() < 1e-12, "rest point at {drive}");
+            let slope = (sh.output(1e-6) - sh.output(-1e-6)) / 2e-6;
+            assert!((slope - 1.0).abs() < 1e-3, "unity gain at {drive}: {slope}");
+        }
+
+        // tube.h:62: the 12AX7 row at -12 dB drive gives about 0.23 % THD at
+        // -12 dBFS.
+        let sh = Shaper::new(&s.tube());
+        let amp = 10f64.powf(-12.0 / 20.0);
+        let n = 1024;
+        let mut bins = [0.0f64; 8];
+        for (k, bin) in bins.iter_mut().enumerate() {
+            let (mut re, mut im) = (0.0, 0.0);
+            for i in 0..n {
+                let ph = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+                let y = sh.output(amp * ph.sin());
+                re += y * ((k + 1) as f64 * ph).cos();
+                im += y * ((k + 1) as f64 * ph).sin();
+            }
+            *bin = re.hypot(im);
+        }
+        let thd = bins[1..].iter().map(|b| b * b).sum::<f64>().sqrt() / bins[0] * 100.0;
+        assert!((0.2..0.26).contains(&thd), "THD {thd:.3} %");
+
+        let (bell, top) = xfmr_lift(1.0);
+        assert_eq!(format!("{bell:.1} {top:.1}"), "4.1 2.5");
+        assert_eq!(format!("{:.1}", xfmr_lift(20.0).0), "0.3");
+
+        // Pushed hard, both knees fall inside the swing and are marked.
+        p = s.tube();
+        p.drive_db = 15.0;
+        let (neg, pos) = Shaper::new(&p).knees();
+        assert!(neg.is_some() && pos.is_some());
+        assert_eq!(Shaper::new(&s.tube()).knees(), (None, None));
+    }
+
+    #[test]
+    fn an_old_firmware_gets_the_consoles_banner_instead_of_the_body() {
+        let s = fixture::state();
+        let mut p = TubePanel::new();
+        let f = testing::draw(&mut p, &s, 100, 30);
+        assert!(
+            f.contains("Requires firmware with wire format V31 or newer."),
+            "{f}"
+        );
+        assert!(
+            f.contains("Update the DSPi firmware to use the Tube Modeller."),
+            "{f}"
+        );
+        assert!(!f.contains("TRANSFER CURVE"), "{f}");
+        assert_eq!(
+            p.handle(key(KeyCode::Char(' ')), &s),
+            ScreenEvent::Unhandled
+        );
+    }
+
+    #[test]
+    fn the_header_switch_and_the_rows_write_their_parameters() {
+        let s = state(true);
+        let mut p = TubePanel::new();
+        assert_eq!(
+            p.handle(key(KeyCode::Char(' ')), &s),
+            ScreenEvent::Command("tube.on off".into())
+        );
+        focus(
+            &mut p,
+            &s,
+            |r| matches!(r, Row::Param(p) if p.label == "Drive"),
+        );
+        assert_eq!(
+            p.handle(key(KeyCode::Right), &s),
+            ScreenEvent::Command("tube.drive -11.5".into())
+        );
+        assert_eq!(
+            p.handle(key(KeyCode::Backspace), &s),
+            ScreenEvent::Command("tube.drive -12".into())
+        );
+        focus(&mut p, &s, |r| matches!(r, Row::Segmented { .. }));
+        assert_eq!(
+            p.handle(key(KeyCode::Right), &s),
+            ScreenEvent::Command("tube.rectifier 5u4".into())
+        );
+        focus(&mut p, &s, |r| matches!(r, Row::Chips { .. }));
+        assert_eq!(
+            p.handle(key(KeyCode::Char(' ')), &s),
+            ScreenEvent::Command("tube.mask 0xFFFE".into())
+        );
+    }
+
+    #[test]
+    fn every_advertised_key_is_handled_somewhere() {
+        let s = state(true);
+        for help in KEYS {
+            for k in crate::screens::tests::keys_for(help.key) {
+                let mut hit = false;
+                for focus in 0..20 {
+                    let mut p = TubePanel::new();
+                    p.body.focus = focus;
+                    let before = (p.body.focus, p.chip);
+                    let ev = p.handle(k, &s);
+                    if ev != ScreenEvent::Unhandled || (p.body.focus, p.chip) != before {
+                        hit = true;
+                        break;
+                    }
+                }
+                assert!(hit, "{:?} from {:?} is not bound", k.code, help.key);
+            }
         }
     }
 }
