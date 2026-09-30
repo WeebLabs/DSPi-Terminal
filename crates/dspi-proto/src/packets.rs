@@ -108,12 +108,26 @@ fn name_at(b: &[u8], o: usize, len: usize) -> String {
     String::from_utf8_lossy(&field[..end]).to_string()
 }
 
-/// Write a name into a fixed-width NUL-padded field, truncated so the
-/// terminator always survives, exactly as the firmware does on its side.
+/// The longest prefix of `name` that fits in `max` bytes and ends on a
+/// character boundary. The firmware cuts names by bytes, so a cut in the
+/// middle of a multi-byte character would leave invalid UTF-8 on the device.
+pub fn truncate_name(name: &str, max: usize) -> &str {
+    if name.len() <= max {
+        return name;
+    }
+    let mut n = max;
+    while !name.is_char_boundary(n) {
+        n -= 1;
+    }
+    &name[..n]
+}
+
+/// Write a name into a fixed-width NUL-padded field, truncated on a character
+/// boundary so the terminator always survives, as the firmware does on its
+/// side.
 fn put_name(b: &mut [u8], o: usize, len: usize, name: &str) {
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(len - 1);
-    b[o..o + n].copy_from_slice(&bytes[..n]);
+    let bytes = truncate_name(name, len - 1).as_bytes();
+    b[o..o + bytes.len()].copy_from_slice(bytes);
 }
 
 // ------------------------------------------------------------ control surfaces
@@ -4762,6 +4776,35 @@ mod tests {
         assert_eq!(w[38], b'x');
         assert_eq!(w[39], 0, "the last name byte stays NUL");
         assert_eq!(CsGroup::decode(&w).unwrap().name.len(), 31);
+    }
+
+    /// Thirty "é"s are 60 bytes; byte 31 falls inside the sixteenth. The cut
+    /// has to land before it, or the device holds invalid UTF-8.
+    #[test]
+    fn a_long_name_is_cut_on_a_character_boundary() {
+        let name = "é".repeat(30);
+        assert_eq!(truncate_name(&name, 31), "é".repeat(15));
+        assert_eq!(truncate_name("Front", 31), "Front");
+        for w in [
+            CsGroup {
+                name: name.clone(),
+                ..Default::default()
+            }
+            .encode()
+            .to_vec(),
+            CsMacroHeaderWire {
+                name: name.clone(),
+                step_count: 0,
+            }
+            .encode()
+            .to_vec(),
+        ] {
+            let at = if w.len() == CsGroup::SIZE { 8 } else { 0 };
+            let field = &w[at..at + 32];
+            let end = field.iter().position(|c| *c == 0).unwrap();
+            assert_eq!(end, 30, "fifteen whole characters");
+            assert!(std::str::from_utf8(&field[..end]).is_ok());
+        }
     }
 
     // ---------------------------------------------------------------- macros

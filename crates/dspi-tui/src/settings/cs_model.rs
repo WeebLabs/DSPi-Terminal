@@ -225,6 +225,13 @@ pub const MACRO_STEP_ACTIONS: [u8; 5] = [act::SET, act::TOGGLE, act::INC, act::D
 /// Button events, in wire order.
 pub const EVENT_NAMES: [&str; 3] = ["Press", "Long press", "Double press"];
 
+/// `CsBinding.event` on a button (control_surfaces.h:308-313).
+pub mod evt {
+    pub const PRESS: u8 = 0;
+    pub const LONG: u8 = 1;
+    pub const DOUBLE: u8 = 2;
+}
+
 /// The three line alignments (`CS_DALIGN_*`); 3 is reserved.
 pub const ALIGN_NAMES: [&str; 3] = ["Left", "Centre", "Right"];
 
@@ -496,6 +503,15 @@ pub fn bool_label(n: u8, on: bool) -> &'static str {
             }
         }
     }
+}
+
+/// The models a display may be set to. `model_count` in the config reply is
+/// `CS_DISP_MODEL_COUNT`, one past the last model (vendor_commands.c:3045,
+/// control_surfaces.h:348-357), and model 0 is none, so the range is
+/// `1..count`, as the Console builds it (DSPi_ConsoleApp.swift:6410); the
+/// firmware refuses anything else (control_surfaces.c:1643).
+pub fn display_models(cs: &CsData) -> Vec<u8> {
+    (1..cs.caps.display_models.max(2)).collect()
 }
 
 /// The Console's `csDisplayModelName` (`Constants.swift:754`).
@@ -1214,6 +1230,46 @@ pub fn valid_actions(cs: &CsData, t: u8, n: u8) -> Vec<u8> {
     (0..16u8).filter(|a| eff & act_bit(*a) != 0).collect()
 }
 
+/// The actions a binding may take with its gesture. Hold-to-engage owns the
+/// hold, so the firmware takes `MOMENTARY` only on a button's short press
+/// (control_surfaces.c:1729-1734); a long or double press never offers it.
+pub fn binding_actions(cs: &CsData, t: u8, n: u8, event: u8) -> Vec<u8> {
+    let mut acts = valid_actions(cs, t, n);
+    if t == ty::BUTTON && event != evt::PRESS {
+        acts.retain(|a| *a != act::MOMENTARY);
+    }
+    acts
+}
+
+/// The gestures a button binding may use with its action: a momentary one
+/// only the short press (control_surfaces.c:1729-1734).
+pub fn binding_gestures(b: &CsBinding) -> Vec<u8> {
+    if b.action == act::MOMENTARY {
+        vec![evt::PRESS]
+    } else {
+        vec![evt::PRESS, evt::LONG, evt::DOUBLE]
+    }
+}
+
+/// Whether the firmware takes hold-to-repeat on this binding: a button whose
+/// short press steps up or down. Set anywhere else, the whole binding is
+/// refused, as `INVALID_EVENT` on another gesture and `INVALID_VALUE` on
+/// another action (control_surfaces.c:1729-1741).
+pub fn repeat_allowed(b: &CsBinding) -> bool {
+    b.component == ty::BUTTON
+        && (b.action == act::INC || b.action == act::DEC)
+        && b.event == evt::PRESS
+}
+
+/// Drop the repeat flag where it has stopped being valid. Its row is hidden
+/// there, so a flag left set would fail Apply with nothing on screen to turn
+/// off.
+pub fn sanitize_repeat(b: &mut CsBinding) {
+    if !repeat_allowed(b) {
+        b.flags &= !flag::REPEAT;
+    }
+}
+
 /// A sensible default action for a freshly picked (type, noun).
 pub fn default_action(cs: &CsData, t: u8, n: u8) -> u8 {
     let avail = valid_actions(cs, t, n);
@@ -1757,6 +1813,7 @@ pub fn default_operands(cs: &CsData, b: &CsBinding) -> CsBinding {
         b.range_min = 0;
         b.range_max = 0;
     }
+    sanitize_repeat(&mut b);
     sanitize_group_flags(cs, &b)
 }
 
@@ -1994,9 +2051,13 @@ pub fn set_noun_in(cs: &CsData, b: &CsBinding, n: u8, own: Option<usize>) -> CsB
     b.noun = n;
     b.target = 0;
     b.index = 0;
-    let acts = valid_actions(cs, b.component, n);
+    let acts = binding_actions(cs, b.component, n, b.event);
     if !acts.contains(&b.action) {
         b.action = default_action(cs, b.component, n);
+    }
+    // A noun whose only fitting action is momentary takes the short press.
+    if b.action == act::MOMENTARY {
+        b.event = evt::PRESS;
     }
     let mut b = default_operands(cs, &b);
     // Slot 0 is rarely an aux output, so an aux noun starts on the first one.
@@ -2031,12 +2092,18 @@ pub fn switch_aux_kind(b: &CsBinding, t: u8) -> CsBinding {
 // ---------------------------------------------------------------------------
 
 /// Nouns a macro step can drive: those accepting at least one step action.
-/// MACRO and PAGE_VALUE are rejected as step nouns by the firmware.
+/// MACRO and PAGE_VALUE are rejected as step nouns by the firmware. An aux
+/// noun is offered only once an aux output exists, as on the binding and IR
+/// pickers (DESIGN section 11, B7): with none there is nothing to point at.
 pub fn macro_step_nouns(cs: &CsData) -> Vec<u8> {
     let mask = MACRO_STEP_ACTIONS.iter().fold(0u16, |m, a| m | act_bit(*a));
     (0..cs.nouns.len() as u8)
         .filter(|n| {
-            *n != noun::MACRO && *n != noun::PAGE_VALUE && cs.nouns[*n as usize].actions & mask != 0
+            let nd = &cs.nouns[*n as usize];
+            *n != noun::MACRO
+                && *n != noun::PAGE_VALUE
+                && nd.actions & mask != 0
+                && has_somewhere_to_point(cs, *n, nd)
         })
         .collect()
 }
@@ -2075,6 +2142,15 @@ pub fn default_step_operands(cs: &CsData, step: &CsMacroStep) -> CsMacroStep {
     if st.action == act::TRIGGER || !nd.is_targeted() {
         st.flags &= !flag::GROUP;
         st.target = 0;
+    } else if st.flags & flag::GROUP != 0 && compatible_groups(cs, st.noun).is_empty() {
+        // A noun no group fits, an aux output above all (control_surfaces.h:
+        // 277-278), is refused with GROUP set. `target` was a group index,
+        // so it goes back to the noun's first address, not to channel N.
+        st.flags &= !flag::GROUP;
+        st.target = target_addresses(cs, st.noun, None)
+            .first()
+            .copied()
+            .unwrap_or(0);
     }
     st
 }
@@ -2101,14 +2177,17 @@ pub fn default_macro_step(cs: &CsData) -> CsMacroStep {
 // ---------------------------------------------------------------------------
 
 /// Nouns a page can show: anything the platform has, minus the three display
-/// nouns themselves, which the firmware rejects as page nouns.
+/// nouns themselves, which the firmware rejects as page nouns. An aux noun
+/// waits for an aux output to exist, as on every other noun picker.
 pub fn display_page_nouns(cs: &CsData) -> Vec<u8> {
     (0..cs.nouns.len() as u8)
         .filter(|n| {
-            cs.nouns[*n as usize].is_available()
+            let nd = &cs.nouns[*n as usize];
+            nd.is_available()
                 && *n != noun::DISPLAY_PAGE
                 && *n != noun::DISPLAY_EDIT
                 && *n != noun::PAGE_VALUE
+                && has_somewhere_to_point(cs, *n, nd)
         })
         .collect()
 }
@@ -2517,7 +2596,8 @@ pub mod demo {
             max_macros: 8,
             max_macro_steps: 8,
             max_pages: 16,
-            display_models: 8,
+            // `CS_DISP_MODEL_COUNT`, one past the last model (vendor_commands.c:3045).
+            display_models: 9,
             types: vec![
                 t(0, 0, 0),
                 t(button, 1, 0),
@@ -3597,5 +3677,149 @@ mod tests {
         let td = cs.type_desc(ty::POT).unwrap();
         assert_eq!(td.pin_class, dspi_proto::packets::CsTypeDesc::PINCLASS_ADC);
         assert_eq!(cs.type_desc(ty::ENCODER).unwrap().pin_count, 2);
+    }
+
+    /// A button's volume up with Repeat While Held, the only shape the
+    /// firmware takes the flag on (control_surfaces.c:1729-1741).
+    fn repeating(cs: &CsData) -> CsBinding {
+        let b = CsBinding {
+            component: ty::BUTTON,
+            noun: noun::USER_VOLUME,
+            action: act::INC,
+            gpio: [16, GPIO_UNUSED],
+            flags: flag::REPEAT,
+            ..Default::default()
+        };
+        assert!(valid_actions(cs, ty::BUTTON, noun::USER_VOLUME).contains(&act::DEC));
+        assert!(repeat_allowed(&b));
+        b
+    }
+
+    /// The row explaining the flag is hidden everywhere else, so the flag has
+    /// to go with it or Apply fails with nothing on screen to turn off.
+    #[test]
+    fn repeat_is_cleared_when_it_stops_being_valid() {
+        let cs = demo::data();
+        let b = repeating(&cs);
+
+        let mut dec = b.clone();
+        dec.action = act::DEC;
+        assert_eq!(
+            default_operands(&cs, &dec).flags & flag::REPEAT,
+            flag::REPEAT
+        );
+
+        let mut set = b.clone();
+        set.action = act::SET;
+        assert_eq!(
+            default_operands(&cs, &set).flags & flag::REPEAT,
+            0,
+            "action"
+        );
+
+        let muted = set_noun_in(&cs, &b, noun::USER_MUTE, Some(1));
+        assert_eq!(muted.flags & flag::REPEAT, 0, "noun");
+
+        let mut long = b.clone();
+        long.event = evt::LONG;
+        sanitize_repeat(&mut long);
+        assert_eq!(long.flags & flag::REPEAT, 0, "gesture");
+    }
+
+    /// Hold-to-engage owns the hold, so the firmware takes MOMENTARY only on
+    /// the short press; neither list offers the other combination.
+    #[test]
+    fn momentary_is_offered_only_on_the_short_press() {
+        let mut cs = demo::data();
+        cs.nouns[noun::USER_MUTE as usize].actions |= act_bit(act::MOMENTARY);
+        assert!(
+            binding_actions(&cs, ty::BUTTON, noun::USER_MUTE, evt::PRESS).contains(&act::MOMENTARY)
+        );
+        for e in [evt::LONG, evt::DOUBLE] {
+            assert!(
+                !binding_actions(&cs, ty::BUTTON, noun::USER_MUTE, e).contains(&act::MOMENTARY),
+                "gesture {e}"
+            );
+        }
+        let held = CsBinding {
+            component: ty::BUTTON,
+            noun: noun::USER_MUTE,
+            action: act::MOMENTARY,
+            ..Default::default()
+        };
+        assert_eq!(binding_gestures(&held), vec![evt::PRESS]);
+        let toggle = CsBinding {
+            action: act::TOGGLE,
+            ..held.clone()
+        };
+        assert_eq!(binding_gestures(&toggle).len(), 3);
+
+        // A noun whose only fitting action is momentary takes the short press.
+        let mut only = cs.clone();
+        only.nouns[noun::USER_MUTE as usize].actions = act_bit(act::MOMENTARY);
+        let long = CsBinding {
+            event: evt::LONG,
+            ..cs.bindings[1].clone()
+        };
+        let b = set_noun_in(&only, &long, noun::USER_MUTE, Some(1));
+        assert_eq!((b.action, b.event), (act::MOMENTARY, evt::PRESS));
+    }
+
+    /// Aux nouns wait for an aux output, as on the binding pickers.
+    #[test]
+    fn macro_steps_and_pages_offer_aux_nouns_only_once_one_exists() {
+        let cs = demo::data();
+        assert!(macro_step_nouns(&cs).contains(&noun::AUX));
+        let mut none = cs.clone();
+        none.bindings[10] = CsBinding::default();
+        none.bindings[11] = CsBinding::default();
+        assert!(!macro_step_nouns(&none).contains(&noun::AUX));
+        assert!(!macro_step_nouns(&none).contains(&noun::AUX_LEVEL));
+        assert!(!display_page_nouns(&none).contains(&noun::AUX));
+    }
+
+    /// An aux noun takes no group, so a grouped step moved onto one drops the
+    /// group and points at an aux output, not at the old group index read as
+    /// a slot.
+    #[test]
+    fn a_step_moved_onto_an_aux_noun_drops_its_group() {
+        let cs = demo::data();
+        let st = CsMacroStep {
+            noun: noun::AUX,
+            action: act::TOGGLE,
+            flags: flag::GROUP,
+            target: 0,
+            ..Default::default()
+        };
+        let st = default_step_operands(&cs, &st);
+        assert_eq!(st.flags & flag::GROUP, 0);
+        assert_eq!(st.target, 10);
+
+        // A channel noun with a group that fits keeps it.
+        let grouped = CsMacroStep {
+            noun: noun::OUTPUT_MUTE,
+            action: act::SET,
+            flags: flag::GROUP,
+            target: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            default_step_operands(&cs, &grouped).flags & flag::GROUP,
+            flag::GROUP
+        );
+    }
+
+    /// `model_count` is one past the last model (vendor_commands.c:3045), so
+    /// "Model 9" is never offered.
+    #[test]
+    fn the_model_list_stops_before_the_count() {
+        let cs = demo::data();
+        assert_eq!(cs.caps.display_models, 9);
+        assert_eq!(display_models(&cs), (1..=8).collect::<Vec<u8>>());
+        assert!(
+            display_models(&cs)
+                .iter()
+                .all(|m| !display_model_name(*m).starts_with("Model "))
+        );
     }
 }

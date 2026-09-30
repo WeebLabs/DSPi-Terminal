@@ -128,6 +128,13 @@ impl MacrosPage {
         self.health.get(i).copied().unwrap_or(0)
     }
 
+    /// Follow the device on every read, card by card, wherever this page holds
+    /// no edit of its own (DESIGN section 11, B7). `SettingsData` is re-read
+    /// after every write, on the Settings poll and so after a Revert, and the
+    /// Console beside this can change a macro too; a card that kept its
+    /// snapshot would show the old sequence and its next Apply would write it
+    /// back over the new one. A staged edit is kept, and the macro being
+    /// applied is left to the apply's own answer.
     fn adopt(&mut self, cs: &CsData) {
         if self.drafts.len() != cs.macros.len() {
             self.max_steps = cs.caps.max_macro_steps.max(1) as usize;
@@ -137,6 +144,16 @@ impl MacrosPage {
                 .map(|x| normalise(x, self.max_steps))
                 .collect();
             self.live = self.drafts.clone();
+        }
+        for i in 0..self.drafts.len() {
+            if self.applying == Some(i) {
+                continue;
+            }
+            let device = normalise(&cs.macros[i], self.max_steps);
+            if self.drafts[i] == self.live[i] {
+                self.drafts[i] = device.clone();
+            }
+            self.live[i] = device;
         }
         self.health = cs.ext.macro_status;
         // Nothing pushes sequencer progress to the host, so the running badge
@@ -913,7 +930,7 @@ impl SettingsPage for MacrosPage {
         };
         match outcome {
             DialogOutcome::Text(name) => {
-                self.drafts[i].name = name.chars().take(31).collect();
+                self.drafts[i].name = dspi_proto::packets::truncate_name(&name, 31).to_string();
                 PageEvent::Handled
             }
             DialogOutcome::Button(0) => self.remove(i),
@@ -1103,6 +1120,109 @@ mod tests {
         // The ends do not wrap.
         p.move_step(0, 0, -1);
         assert_eq!(p.drafts[0].steps[0], b);
+    }
+
+    /// A card with nothing staged follows each re-read (a Revert, another
+    /// host), so its next Apply cannot write a stale sequence back; a card
+    /// being edited keeps the edit.
+    #[test]
+    fn a_card_without_a_staged_edit_follows_the_device() {
+        let d = m::demo::settings_data();
+        let mut p = MacrosPage::new(&d);
+        let mut cs = d.cs.clone().expect("cs");
+        cs.macros[0].name = "Changed Elsewhere".into();
+        cs.macros[0].step_count = 1;
+        cs.macros[1] = CsMacro {
+            name: "Also Changed".into(),
+            step_count: 0,
+            steps: Vec::new(),
+        };
+        p.drafts[1].name = "Staged".into();
+        p.adopt(&cs);
+        assert_eq!(p.drafts[0].name, "Changed Elsewhere");
+        assert_eq!(p.drafts[0].step_count, 1);
+        assert!(!p.dirty(0));
+        assert_eq!(p.drafts[1].name, "Staged", "the edit is the user's");
+        assert!(p.dirty(1));
+    }
+
+    /// A rejected step is the apply's answer, in the Console's words, and the
+    /// card stays unapplied rather than taking the draft as what the device
+    /// holds.
+    #[test]
+    fn a_rejected_step_fails_the_apply_and_keeps_the_draft() {
+        use dspi_proto::generated::opcodes as op;
+        use dspi_proto::packets::CsStatusPacket;
+        use dspi_transport::MockTransport;
+        use dspi_transport::mock::Reply;
+
+        let status = |code: u8| {
+            Reply::Data(
+                CsStatusPacket {
+                    last_status: code,
+                    last_slot: 0x60,
+                    max_bindings: 16,
+                    dirty: true,
+                    active_mask: 0,
+                    slot_status: vec![0; 16],
+                    ir_active_mask: 0,
+                    ir_learn_state: 0,
+                    ir_cmd_status: vec![0; 16],
+                }
+                .encode(),
+            )
+        };
+        let mut caps = crate::shell::fixture::caps();
+        caps.cs = Some(m::demo::caps());
+        let t = MockTransport::new()
+            .data(op::REQ_SET_CS_MACRO_STEP, vec![])
+            .data(op::REQ_SET_CS_MACRO, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![status(0x21), status(0)]),
+            );
+        let mut session = dspi_session::Session::new(Box::new(t), caps).expect("session");
+
+        let d = m::demo::settings_data();
+        let (st, cfg) = (m::demo::state(), AppConfig::default());
+        let cx = Cx {
+            state: &st,
+            data: &d,
+            config: &cfg,
+            connected: true,
+            global_dirty: false,
+        };
+        let mut p = MacrosPage::new(&d);
+        p.drafts[0].name = "Renamed".into();
+        let PageEvent::Session(req) = p.apply(0) else {
+            panic!("an apply is a session request");
+        };
+        let reply = (req.run)(&mut session);
+        assert_eq!(
+            reply,
+            SessionReply::Err("That macro step is not a valid action".into())
+        );
+        p.session_result(req.tag, reply, &cx);
+        assert_eq!(p.live[0].name, "Night", "the device's, not the draft");
+        assert!(p.dirty(0));
+        assert!(p.messages[&0].1, "the card says why");
+    }
+
+    #[test]
+    fn a_rename_is_cut_on_a_character_boundary() {
+        let d = m::demo::settings_data();
+        let mut p = MacrosPage::new(&d);
+        let (st, cfg) = (m::demo::state(), AppConfig::default());
+        let cx = Cx {
+            state: &st,
+            data: &d,
+            config: &cfg,
+            connected: true,
+            global_dirty: false,
+        };
+        p.dialog = Some(Item::Header(0));
+        p.dialog_result(DialogOutcome::Text("é".repeat(30)), &cx);
+        assert_eq!(p.drafts[0].name, "é".repeat(15));
     }
 
     #[test]

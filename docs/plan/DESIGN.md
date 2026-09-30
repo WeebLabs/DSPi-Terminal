@@ -946,6 +946,23 @@ Recorded as they were taken, so the document stays the spec.
   Graphing changes waited for a restart.
 - **Grey ghosts for bypassed bands are not drawn** (B3): the Terminal's
   graph draws a channel's combined curve, not each band's contribution.
+- **Control-surface editors never build a combination the firmware
+  refuses** (audit of the Control pages). The Console offers Hold on a long
+  or double press, keeps Repeat While Held after the gesture or action that
+  allowed it has gone, and clears a remote key's group when only its action
+  changes, turning group N into channel N. The Terminal offers Hold only on
+  the short press and only the short press to Hold
+  (control_surfaces.c:1729-1741), drops the repeat flag with its row, and
+  keeps a remote key's addressing across an action change.
+- **A control-surface SET the device dropped as BUSY is sent once more.**
+  The firmware's handoff is one deep and drops, not queues, a SET that
+  arrives while another is pending (vendor_commands.c:1412-1417); the
+  Terminal waits for the device to settle, re-sends once, and reports a
+  second BUSY as the conflict rather than taking the other SET's result.
+- **A refused display write puts the row back.** The display config and
+  pages apply as they are edited, as the Console's do; the Terminal keeps
+  what each write replaced until the device answers and restores it on a
+  refusal, and otherwise follows each re-read like the cards.
 
 ## 12. The quiet redesign: one curve per graph, colour on demand
 
