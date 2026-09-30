@@ -46,6 +46,7 @@ pub enum Tool {
     Stats,
     Monitor,
     AutoEq,
+    Spectrum,
 }
 
 impl Tool {
@@ -62,6 +63,7 @@ impl Tool {
             'T' => Self::Stats,
             'I' => Self::Monitor,
             'B' => Self::AutoEq,
+            'A' => Self::Spectrum,
             _ => return None,
         })
     }
@@ -78,6 +80,7 @@ impl Tool {
             Self::Stats => 'T',
             Self::Monitor => 'I',
             Self::AutoEq => 'B',
+            Self::Spectrum => 'A',
         }
     }
 
@@ -94,6 +97,7 @@ impl Tool {
             Self::Stats => "System Statistics",
             Self::Monitor => "Interrupt Monitor",
             Self::AutoEq => "AutoEQ",
+            Self::Spectrum => "Spectrum Analyser",
         }
     }
 }
@@ -193,7 +197,7 @@ const GLOBAL_KEYS: &[KeyHelp] = &[
     KeyHelp::new("Tab", "Next region"),
     KeyHelp::new("Ctrl-P", "Search everything"),
     KeyHelp::new(":", "Command line"),
-    KeyHelp::new("M L X P U V G T I B", "Open a tool"),
+    KeyHelp::new("M L X P U V G T I B A", "Open a tool"),
     KeyHelp::new(",", "Settings"),
     KeyHelp::new("Ctrl-S", "Commit parameters to the preset"),
     KeyHelp::new("Ctrl-D", "Device picker"),
