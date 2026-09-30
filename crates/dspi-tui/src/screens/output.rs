@@ -4,6 +4,10 @@
 //! thing anyone wants to know, then the output's own gain, delay and mute, and
 //! then the PEQ or crossover bank behind the tab strip. Every routing edit is
 //! one `mix` write, which is how the firmware stores a crosspoint.
+//!
+//! On firmware with the output limiter, its cell sits beside MUTE, where the
+//! Console puts its icon, and its settings open in place of the filter list
+//! (see [`super::limiter`]).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dspi_session::DeviceState;
@@ -13,6 +17,7 @@ use ratatui::style::Style;
 use ratatui::widgets::Widget;
 
 use super::filters::{FilterList, FilterMode};
+use super::limiter::{self, LimiterSettings};
 use super::{Shared, channel_name, max_delay_ms, number, output_channel, supports_crossover};
 use crate::shell::{Screen, ScreenEvent};
 use crate::theme::{ChannelRole, Glyphs, Theme};
@@ -49,13 +54,15 @@ pub struct OutputPage {
     edit: Option<NumberEdit>,
     /// The filter list raised the dialog on screen.
     list_dialog: bool,
+    /// The limiter's settings, open in place of the filter list.
+    limiter: Option<LimiterSettings>,
 }
 
 const KEYS: &[KeyHelp] = &[
     KeyHelp::new("↑ ↓", "Row, or band"),
     KeyHelp::new("← →", "Field"),
     KeyHelp::new("Enter", "Edit"),
-    KeyHelp::new("Space", "Connect, mute, bypass"),
+    KeyHelp::new("Space", "Connect, mute, limiter, bypass"),
     KeyHelp::new("i", "Invert"),
     KeyHelp::new("1-9,0", "Jump to a band"),
     KeyHelp::new("a", "Enable All"),
@@ -77,7 +84,13 @@ impl OutputPage {
             column: 0,
             edit: None,
             list_dialog: false,
+            limiter: None,
         }
+    }
+
+    /// Is the cursor on the limiter cell of the MUTE row?
+    fn on_limiter(&self, state: &DeviceState, item: Item) -> bool {
+        item == Item::Mute && self.column == 1 && limiter::available(state, self.output)
     }
 
     fn inputs(&self, state: &DeviceState) -> usize {
@@ -254,10 +267,15 @@ impl OutputPage {
         }
         if y < bottom {
             let muted = state.output(self.output).mute;
+            let on_limiter = here(Item::Mute) && self.on_limiter(state, Item::Mute);
             buf.set_string(
                 area.x,
                 y,
-                if here(Item::Mute) { "▸" } else { " " },
+                if here(Item::Mute) && !on_limiter {
+                    "▸"
+                } else {
+                    " "
+                },
                 theme.focused(),
             );
             buf.set_string(area.x + 1, y, "MUTE", theme.section());
@@ -277,6 +295,18 @@ impl OutputPage {
                     theme.label()
                 },
             );
+            if limiter::available(state, self.output) {
+                limiter::draw_indicator(
+                    area.x + 17,
+                    y,
+                    area.x + area.width,
+                    buf,
+                    theme,
+                    state,
+                    self.output,
+                    on_limiter,
+                );
+            }
             y += 1;
         }
         if items.contains(&Item::Tabs) && y < bottom {
@@ -324,8 +354,10 @@ impl OutputPage {
         use crate::shell::Quick;
         const VERBS: &[&str] = &[
             "gain", "delay", "mute", "unmute", "on", "off", "xo", "bypass", "clear", "name",
+            "limit", "release", "link",
         ];
         const SUMMARY: &str = "gain -3 · delay 2.5 · mute · unmute · on · off · 3 peak 1k -2 · xo hp 80 lr4 · bypass · clear · name Sub";
+        const LIMITER: &str = " · limit on · limit -1 · release 100 · link 1";
         let o = self.output;
         let channel = output_channel(state, o);
         let lower = line.to_ascii_lowercase();
@@ -336,8 +368,14 @@ impl OutputPage {
             ghost: ghost(&lower, VERBS),
             commands: Vec::new(),
         };
+        // The limiter's words only where there is a limiter.
+        let summary = if limiter::available(state, o) {
+            format!("{SUMMARY}{LIMITER}")
+        } else {
+            SUMMARY.to_string()
+        };
         let Some(&first) = tokens.first() else {
-            return hint(SUMMARY);
+            return hint(&summary);
         };
         if let Ok(band) = first.parse::<usize>() {
             let max = state.caps.max_bands as usize;
@@ -378,6 +416,10 @@ impl OutputPage {
             Some("on") => one("enabled".into(), format!("out.enable {o} on")),
             Some("off") => one("disabled".into(), format!("out.enable {o} off")),
             Some("xo") => self.quick_xover(state, channel, &tokens[1..]),
+            Some(v @ ("limit" | "release" | "link")) => Quick {
+                ghost: ghost(&lower, VERBS),
+                ..limiter::quick(state, o, v, &tokens[1..])
+            },
             // Bypass All and Clear All over the bank the tabs show; they
             // have no keys since `A` and `D` open tools. Bypassing the
             // crossovers opens the Console's critical dialog on Enter
@@ -417,7 +459,7 @@ impl OutputPage {
             }
             _ => Quick {
                 fallthrough: true,
-                hint: SUMMARY.to_string(),
+                hint: summary,
                 ghost: ghost(&lower, VERBS),
                 commands: Vec::new(),
             },
@@ -608,16 +650,30 @@ impl Screen for OutputPage {
         if area.height < 2 || area.width < 20 {
             return;
         }
-        let y = self.draw_header(area, buf, theme, state, focused);
+        let open = self.limiter.is_some();
+        let y = self.draw_header(area, buf, theme, state, focused && !open);
         let used = y - area.y;
         if area.height > used {
-            let list = Rect::new(area.x, y, area.width, area.height - used);
-            self.list
-                .draw(list, buf, theme, state, focused && self.header.is_none());
+            let rest = Rect::new(area.x, y, area.width, area.height - used);
+            match self.limiter.as_mut() {
+                Some(l) => l.draw(rest, buf, theme, state, focused),
+                None => self
+                    .list
+                    .draw(rest, buf, theme, state, focused && self.header.is_none()),
+            }
         }
     }
 
     fn handle(&mut self, key: KeyEvent, state: &DeviceState) -> ScreenEvent {
+        if let Some(l) = self.limiter.as_mut() {
+            return match l.handle(key, state) {
+                limiter::Outcome::Event(ev) => ev,
+                limiter::Outcome::Close => {
+                    self.limiter = None;
+                    ScreenEvent::Handled
+                }
+            };
+        }
         let Some(index) = self.header else {
             let ev = self.list.handle(key, state);
             if ev == ScreenEvent::Unhandled && key.code == KeyCode::Up {
@@ -680,7 +736,13 @@ impl Screen for OutputPage {
                         self.list.field = 0;
                         ScreenEvent::Handled
                     }
-                    Item::Mute => ScreenEvent::Handled,
+                    // Between MUTE and the limiter cell beside it.
+                    Item::Mute => {
+                        if limiter::available(state, self.output) {
+                            self.column = usize::from(dir > 0.0);
+                        }
+                        ScreenEvent::Handled
+                    }
                 }
             }
             KeyCode::Enter | KeyCode::Char(' ') => match item {
@@ -721,6 +783,16 @@ impl Screen for OutputPage {
                         dirty: false,
                     });
                     ScreenEvent::Handled
+                }
+                // Space switches the limiter and Enter opens its settings, as
+                // the Console's click and right-click do.
+                Item::Mute if self.on_limiter(state, item) => {
+                    if key.code == KeyCode::Enter {
+                        self.limiter = Some(LimiterSettings::new(self.output));
+                        ScreenEvent::Handled
+                    } else {
+                        ScreenEvent::Command(limiter::toggle_command(state, self.output))
+                    }
                 }
                 Item::Mute => {
                     let muted = state.output(self.output).mute;
@@ -775,14 +847,24 @@ impl Screen for OutputPage {
     }
 
     fn actions(&self, state: &DeviceState) -> Vec<(String, bool)> {
+        if self.limiter.is_some() {
+            return Vec::new();
+        }
         self.list.actions(state, true)
     }
 
     fn keys(&self) -> &'static [KeyHelp] {
-        KEYS
+        if self.limiter.is_some() {
+            limiter::KEYS
+        } else {
+            KEYS
+        }
     }
 
     fn popup_result(&mut self, choice: Option<usize>, state: &DeviceState) -> ScreenEvent {
+        if let Some(l) = self.limiter.as_mut().filter(|l| l.awaiting_menu()) {
+            return l.popup_result(choice, state);
+        }
         self.list_dialog = false;
         self.list.popup_result(choice, state)
     }
@@ -1123,6 +1205,218 @@ mod tests {
         assert_eq!(p.header, Some(5));
     }
 
+    // ------------------------------------------------------- the limiter
+
+    fn limited() -> DeviceState {
+        limiter::demo_state(fixture::state())
+    }
+
+    /// The whole shell with this page in it, so a golden frame is what a
+    /// person sees.
+    fn shell_frame(p: OutputPage, state: &DeviceState, w: u16, h: u16) -> String {
+        let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut model = fixture::rp2350(&theme);
+        fixture::select(
+            &mut model,
+            state,
+            &theme,
+            crate::shell::Selection::Output(0),
+        );
+        let mut shell = crate::shell::Shell::new(model, theme, Box::new(p));
+        shell.focus = crate::shell::Focus::Screen;
+        crate::render_frame(w, h, |area, buf| shell.draw(area, buf, state))
+    }
+
+    fn mute_line(f: &str) -> String {
+        f.lines()
+            .find(|l| l.contains("MUTE"))
+            .unwrap_or_else(|| panic!("no MUTE row:\n{f}"))
+            .to_string()
+    }
+
+    #[test]
+    fn the_limiter_cell_needs_the_feature() {
+        let (mut p, state) = page(0);
+        let f = draw(&mut p, &state, 94, 21);
+        assert!(!f.contains("LIMITER"), "{f}");
+        // Right on MUTE has nowhere to go without it.
+        p.header = Some(4);
+        p.handle(key(KeyCode::Right), &state);
+        assert_eq!(p.column, 0);
+    }
+
+    #[test]
+    fn golden_frames_with_the_limiter_off_on_and_reducing() {
+        let mut state = limited();
+        for (w, h) in [(120u16, 40u16), (80, 24)] {
+            // On, at the default ceiling, nothing to take off.
+            let f = shell_frame(OutputPage::new(0, shared(), &state), &state, w, h);
+            assert_eq!(f.lines().count(), h as usize);
+            let m = mute_line(&f);
+            assert!(
+                m.contains("LIMITER ● -1.0 dBFS") && m.contains("GR 0.0 dB"),
+                "{w}x{h}:\n{f}"
+            );
+            assert!(f.contains("TYPE"), "the filter list is still there:\n{f}");
+            // Off: grey, and says so.
+            let off = shell_frame(OutputPage::new(2, shared(), &state), &state, w, h);
+            assert!(mute_line(&off).contains("LIMITER ○ Off"), "{w}x{h}:\n{off}");
+        }
+        // Reducing: the reading is next to the indicator, in the warning
+        // colour, as the Console's icon turns orange.
+        state.limiter_meter = Some(dspi_proto::packets::LimiterMeter {
+            centi_db: vec![320, 0, 0, 0, 0, 0, 0, 0, 0],
+        });
+        for (w, h) in [(120u16, 40u16), (80, 24)] {
+            let f = shell_frame(OutputPage::new(0, shared(), &state), &state, w, h);
+            assert!(mute_line(&f).contains("GR 3.2 dB"), "{w}x{h}:\n{f}");
+        }
+        let t = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut p = OutputPage::new(0, shared(), &state);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 94, 21));
+        p.draw(Rect::new(0, 0, 94, 21), &mut buf, &t, &state, true);
+        let y = 4; // the MUTE row, under two routes, gain and delay
+        let dot = (0..94u16)
+            .find(|x| buf[(*x, y)].symbol() == "●" && *x > 17)
+            .expect("the indicator");
+        assert_eq!(buf[(dot, y)].fg, t.warning);
+        state.limiter_meter = None;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 94, 21));
+        p.draw(Rect::new(0, 0, 94, 21), &mut buf, &t, &state, true);
+        assert_eq!(buf[(dot, y)].fg, t.accent, "on and idle is the accent");
+        let mut off = OutputPage::new(2, shared(), &state);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 94, 21));
+        off.draw(Rect::new(0, 0, 94, 21), &mut buf, &t, &state, true);
+        assert_eq!(buf[(dot, y)].fg, t.dim, "off is grey");
+    }
+
+    #[test]
+    fn golden_frames_of_the_settings() {
+        let state = limited();
+        let name = |o| channel_name(&state, output_channel(&state, o));
+        let title = format!("Output Limiter · {}", name(0));
+        let linked = format!("Linked with {}.", name(1));
+        // `downs` walks the cursor down the settings first, which is how the
+        // lower rows come into view on a short terminal.
+        let open = |downs: usize, w: u16, h: u16| {
+            let mut p = OutputPage::new(0, shared(), &state);
+            p.header = Some(4);
+            p.column = 1;
+            p.handle(key(KeyCode::Enter), &state);
+            assert!(p.limiter.is_some());
+            for _ in 0..downs {
+                p.handle(key(KeyCode::Down), &state);
+            }
+            let f = shell_frame(p, &state, w, h);
+            assert_eq!(f.lines().count(), h as usize);
+            assert!(!f.contains("TYPE"), "the list gives way:\n{f}");
+            assert!(f.contains("MUTE"), "the page header stays:\n{f}");
+            f
+        };
+        let everything = [
+            title.as_str(),
+            "● On",
+            "Threshold",
+            "-30 dBFS",
+            "Release",
+            "10 ms",
+            "Link group",
+            linked.as_str(),
+            "Copy to all outputs",
+            "All outputs ▾",
+            "32 samples of latency",
+            "Esc Close",
+        ];
+        let f = open(0, 120, 40);
+        for want in everything {
+            assert!(f.contains(want), "{want:?} at 120x40:\n{f}");
+        }
+        // At 80x24 the column scrolls under the page header.
+        let top = open(0, 80, 24);
+        for want in [title.as_str(), "● On", "Threshold", "-30 dBFS"] {
+            assert!(top.contains(want), "{want:?} at 80x24:\n{top}");
+        }
+        let bottom = open(4, 80, 24);
+        for want in [
+            "Link group",
+            linked.as_str(),
+            "Copy to all outputs",
+            "All outputs ▾",
+        ] {
+            assert!(bottom.contains(want), "{want:?} at 80x24:\n{bottom}");
+        }
+    }
+
+    #[test]
+    fn the_limiter_cell_toggles_on_space_and_opens_on_enter() {
+        let state = limited();
+        let mut p = OutputPage::new(2, shared(), &state);
+        p.header = Some(4);
+        assert_eq!(
+            p.handle(key(KeyCode::Char(' ')), &state),
+            ScreenEvent::Command("out.mute 2 on".into()),
+            "MUTE first"
+        );
+        p.handle(key(KeyCode::Right), &state);
+        assert_eq!(p.column, 1);
+        assert_eq!(
+            p.handle(key(KeyCode::Char(' ')), &state),
+            ScreenEvent::Command("limit.on 2 on".into())
+        );
+        assert_eq!(p.keys(), KEYS);
+        p.handle(key(KeyCode::Enter), &state);
+        assert!(p.limiter.is_some());
+        assert_eq!(p.keys(), limiter::KEYS);
+        assert!(p.actions(&state).is_empty(), "no filter-list footer");
+        // The menu's answer goes to the settings, not the filter list.
+        for _ in 0..4 {
+            p.handle(key(KeyCode::Down), &state);
+        }
+        p.handle(key(KeyCode::Right), &state);
+        // Off: the menu stays shut.
+        assert_eq!(p.handle(key(KeyCode::Enter), &state), ScreenEvent::Handled);
+        p.handle(key(KeyCode::Esc), &state);
+        assert!(p.limiter.is_none());
+        assert_eq!(p.keys(), KEYS);
+        let mut on = OutputPage::new(0, shared(), &state);
+        on.limiter = Some(LimiterSettings::new(0));
+        for _ in 0..4 {
+            on.handle(key(KeyCode::Down), &state);
+        }
+        on.handle(key(KeyCode::Right), &state);
+        assert!(matches!(
+            on.handle(key(KeyCode::Enter), &state),
+            ScreenEvent::Popup(_)
+        ));
+        assert_eq!(
+            on.popup_result(Some(0), &state),
+            ScreenEvent::Command(limiter::link_all_pairs(&state))
+        );
+    }
+
+    #[test]
+    fn the_command_bar_has_the_limiters_words() {
+        let state = limited();
+        let p = OutputPage::new(3, shared(), &state);
+        let q = |line: &str| p.quick(line, &state).unwrap();
+        assert_eq!(q("limit on").commands, vec!["limit.on 3 on"]);
+        assert_eq!(q("limit off").commands, vec!["limit.on 3 off"]);
+        assert_eq!(q("limit -3").commands, vec!["limit.threshold 3 -3"]);
+        assert_eq!(q("release 200").commands, vec!["limit.release 3 200"]);
+        assert_eq!(q("link 2").commands, vec!["limit.link 3 2"]);
+        assert_eq!(q("link off").commands, vec!["limit.link 3 0"]);
+        assert_eq!(q("rel").ghost.as_deref(), Some("ease"));
+        assert_eq!(q("lim").ghost.as_deref(), Some("it"));
+        assert!(q("").hint.contains("limit on"), "{}", q("").hint);
+        for partial in ["limit", "release", "link", "link 9"] {
+            let r = q(partial);
+            assert!(r.commands.is_empty(), "{partial:?} ran {:?}", r.commands);
+            assert!(!r.hint.is_empty());
+        }
+        // Without the limiter the summary does not offer it.
+        let (plain, st) = page(0);
+        assert!(!plain.quick("", &st).unwrap().hint.contains("limit"));
+    }
     #[test]
     fn every_advertised_key_is_handled() {
         let state = fixture::state();

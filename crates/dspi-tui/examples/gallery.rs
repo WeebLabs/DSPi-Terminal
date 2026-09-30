@@ -1,7 +1,7 @@
 //! Render the shell with fixture data, for design review without a device.
 //!
 //!   gallery [width] [height] [calm|console|amber|dark|mono] [rp2350|rp2040]
-//!           [--screen overview|input|output|matrix|crossfeed|loudness
+//!           [--screen overview|input|output|limiter|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
 //!                     |autoeq|subharm|tube|spectrum|nodevice] [--settings <page>]
 //!           [--expand n] [--busy|--full] [--channels 1,2,9] [--bars|--both]
@@ -138,6 +138,12 @@ fn main() {
             evidence: "fixture".into(),
         });
     }
+    // The output limiter: output 1 and 2 on and linked, output 1 reducing,
+    // so the output page shows the cell in its orange state.
+    state = dspi_tui::screens::limiter::demo_state(state);
+    state.limiter_meter = Some(dspi_proto::packets::LimiterMeter {
+        centi_db: vec![320, 0, 0, 0, 0, 0, 0, 0, 0],
+    });
     state.caps.siggen = Some(dspi_session::probe::SiggenCaps {
         version: 1,
         type_count: 15,
@@ -417,6 +423,19 @@ fn main() {
             Box::new(OutputPage::new(0, shared.clone(), &state)),
             Selection::Output(0),
         ),
+        // The output page with the limiter's settings open, as Enter on its
+        // cell beside MUTE does.
+        "limiter" => {
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+            let mut page = OutputPage::new(0, shared.clone(), &state);
+            for _ in 0..4 {
+                page.handle(key(KeyCode::Down), &state);
+            }
+            page.handle(key(KeyCode::Right), &state);
+            page.handle(key(KeyCode::Enter), &state);
+            (Box::new(page), Selection::Output(0))
+        }
         _ => (
             Box::new(InputPage::new(0, shared.clone(), &state)),
             Selection::Input(0),

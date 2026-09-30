@@ -2112,6 +2112,25 @@ impl Live {
         }
     }
 
+    /// Read the limiters' gain reduction (`REQ_LIMITER` index
+    /// `LIMITER_GET_METER`, limiter.h:19) on every meter tick, but only while
+    /// an output page is showing and some limiter is on: the Console's
+    /// `pollLimiter(meter:)`, which clears the readings once rather than
+    /// polling when nothing can be limiting (Commands.swift:1713-1728).
+    fn poll_limiter_meter(&mut self, session: &mut Session) {
+        let showing = self.shell.tool.is_none()
+            && self.shell.settings.is_none()
+            && matches!(self.shell.model.selection, Selection::Output(_));
+        if !panel::has_feature(&self.state, screens::limiter::FEATURE) {
+            return;
+        }
+        if !showing || !screens::limiter::any_on(&self.state) {
+            self.state.limiter_meter = None;
+            return;
+        }
+        let _ = self.state.refresh_limiter_meter(session);
+    }
+
     /// Refresh the Stats panel's diagnostics, every two seconds and only while
     /// that panel is on screen.
     ///
@@ -2198,6 +2217,7 @@ impl Live {
             Err(_) => {}
         }
         self.poll_upmix_status(session, now);
+        self.poll_limiter_meter(session);
         self.poll_stats(session, now);
         self.poll_screen(session, now);
         self.tick_analyser(session, now);
@@ -3192,6 +3212,120 @@ mod tests {
         assert!(l.state.limiter_unsaved());
         l.run_command(&mut s, "save-output-config");
         assert!(!l.state.limiter_unsaved());
+    }
+
+    /// The gain-reduction meter is read on the meter tick only while an
+    /// output page is showing and some limiter is on, as the Console polls
+    /// it only while its icon is on screen; otherwise the reading is cleared.
+    #[test]
+    fn the_limiter_meter_is_polled_only_on_an_output_page_with_a_limiter_on() {
+        let l0 = section_at("limiter");
+        let mut meter = vec![0u8; 18];
+        meter[0..2].copy_from_slice(&320u16.to_le_bytes());
+        let (mut l, mut s, log) =
+            beta4(packet(), MockTransport::new().data(op::REQ_LIMITER, meter));
+        let reads = |log: &LogHandle| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e.opcode == op::REQ_LIMITER
+                        && e.value == dspi_proto::generated::limiter::LIMITER_GET_METER
+                })
+                .count()
+        };
+        l.state.bulk.patch(l0, &[1]);
+        l.tick(&mut s, None);
+        assert_eq!(reads(&log), 0, "the overview does not show the limiter");
+        l.shell.model.selection = Selection::Output(0);
+        l.state.bulk.patch(l0, &[0]);
+        l.tick(&mut s, None);
+        assert_eq!(reads(&log), 0, "every limiter is off");
+        l.state.bulk.patch(l0, &[1]);
+        l.tick(&mut s, None);
+        l.tick(&mut s, None);
+        assert_eq!(reads(&log), 2, "once per meter tick");
+        assert_eq!(screens::limiter::reduction_db(&l.state, 0), 3.2);
+        l.shell.model.selection = Selection::Overview;
+        l.tick(&mut s, None);
+        assert_eq!(reads(&log), 2);
+        assert!(l.state.limiter_meter.is_none(), "cleared once, not polled");
+    }
+
+    /// Space on the output page's limiter cell switches output 1 on; the
+    /// device switches its linked partner too (limiter.c:143-194), and the
+    /// re-read after the write is what shows it.
+    #[test]
+    fn a_limiter_switched_on_from_the_output_page_brings_its_linked_partner_on() {
+        use crate::shell::Screen;
+        let l0 = section_at("limiter");
+        let mut after = packet();
+        for o in 0..2 {
+            after[l0 + 12 * o] = 1;
+            after[l0 + 12 * o + 1] = 1;
+        }
+        let (mut l, mut s, _) = beta4(
+            after,
+            MockTransport::new().data(op::REQ_LIMITER, 1.0f32.to_le_bytes().to_vec()),
+        );
+        for o in 0..2 {
+            l.state.bulk.patch(l0 + 12 * o + 1, &[1]);
+        }
+        let mut page = screens::OutputPage::new(0, screens::shared(), &l.state);
+        for _ in 0..4 {
+            page.handle(key(KeyCode::Down), &l.state);
+        }
+        page.handle(key(KeyCode::Right), &l.state);
+        let crate::shell::ScreenEvent::Command(c) = page.handle(key(KeyCode::Char(' ')), &l.state)
+        else {
+            panic!("Space on the limiter cell writes");
+        };
+        assert_eq!(c, "limit.on 0 on");
+        assert!(!l.state.limiter(1).unwrap().enabled);
+        l.run_command(&mut s, &c);
+        assert!(l.state.limiter(0).unwrap().enabled);
+        assert!(
+            l.state.limiter(1).unwrap().enabled,
+            "the partner came back with the re-read"
+        );
+        assert!(!l.state.limiter(2).unwrap().enabled);
+    }
+
+    /// In INDEPENDENT mode a limiter edit from the output page's command bar
+    /// leaves the preset clean and puts the save bar up in Settings.
+    #[test]
+    fn in_independent_mode_the_save_bar_shows_a_limiter_edit() {
+        use crate::shell::Screen;
+        let l0 = section_at("limiter");
+        let mut after = packet();
+        after[l0 + 4..l0 + 8].copy_from_slice(&(-6.0f32).to_le_bytes());
+        let mut dir = dspi_proto::packets::PresetDirectory::default().encode();
+        dir[5] = 0; // output_config_mode INDEPENDENT (config.h:497)
+        let (mut l, mut s, _) = beta4(
+            after,
+            MockTransport::new()
+                .data(op::REQ_LIMITER, (-6.0f32).to_le_bytes().to_vec())
+                .data(op::REQ_PRESET_GET_DIR, dir.to_vec()),
+        );
+        l.refresh_presets(&mut s);
+        let page = screens::OutputPage::new(0, screens::shared(), &l.state);
+        let q = page.quick("limit -6", &l.state).unwrap();
+        assert_eq!(q.commands, vec!["limit.threshold 0 -6"]);
+        let mut settings = SettingsScreen::new(
+            &l.state,
+            crate::settings::tests::data(),
+            AppConfig::default(),
+        )
+        .open(crate::settings::Page::About, &l.state);
+        let before = crate::settings::tests::frame(&mut settings, &l.state, 120, 40);
+        assert!(
+            !before.contains(crate::widgets::SaveBar::FLASH),
+            "nothing unsaved yet:\n{before}"
+        );
+        l.run_command(&mut s, &q.commands[0]);
+        assert!(!l.state.has_unsaved_changes(), "the preset is untouched");
+        let f = crate::settings::tests::frame(&mut settings, &l.state, 120, 40);
+        assert!(f.contains(crate::widgets::SaveBar::FLASH), "{f}");
     }
 
     /// A change this build cannot place in the shadow is not dropped: the

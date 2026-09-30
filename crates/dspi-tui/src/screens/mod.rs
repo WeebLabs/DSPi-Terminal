@@ -20,6 +20,7 @@ pub mod crossfeed;
 pub mod filters;
 pub mod input;
 pub mod leveller;
+pub mod limiter;
 pub mod linkwitz;
 pub mod loudness;
 pub mod matrix;

@@ -995,7 +995,7 @@ any unambiguous prefix (`ga` is `gain`, `de` is `delay`).
 |---|---|
 | Matrix | `1 3 > 5` connect (every listed input to every listed output) · `1 x all` disconnect · `1 > 3 -6 inv` connect with gain and polarity (a gain needs a sign, a point or an out-of-range value, so `1 > 3 4` stays two outputs) · `gain 1 3 -6` · `inv 1 3` (toggle) · `out 3-5 mute·unmute·on·off·gain -2·delay 2.5` · `direct` · `clear` |
 | Input page | `pre -5.3` · `3 peak 1k -2 [q]` (types: peak ls hs lp hp notch allpass) · `3 off` · `delay 2.5` · `clear` · `name Front L` — every edit mirrors to a linked partner |
-| Output page | `gain -3` · `delay 2.5` · `mute` `unmute` `on` `off` · `3 peak 1k -2 [q]` · `3 off` · `xo hp 80 [lr4]` `xo lp 120 bw2` `xo off` · `name Sub` |
+| Output page | `gain -3` · `delay 2.5` · `mute` `unmute` `on` `off` · `3 peak 1k -2 [q]` · `3 off` · `xo hp 80 [lr4]` `xo lp 120 bw2` `xo off` · `name Sub` · with the limiter: `limit on` `limit off` · `limit -1` (threshold, dBFS) · `release 100` · `link 1` `link off` |
 | Crossfeed, Loudness, Leveller, Bass, Upmixer | `on` · `off`; everything else falls through |
 | Everywhere else | the `:` grammar as typed |
 
