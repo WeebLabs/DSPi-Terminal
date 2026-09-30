@@ -33,6 +33,7 @@ pub mod psybass;
 pub mod signals;
 pub mod spectrum;
 pub mod stats;
+pub mod tube;
 pub mod upmixer;
 
 use std::cell::RefCell;
@@ -61,6 +62,7 @@ pub use psybass::PsybassPanel;
 pub use signals::SignalsPanel;
 pub use spectrum::SpectrumPanel;
 pub use stats::StatsPanel;
+pub use tube::TubePanel;
 pub use upmixer::UpmixerPanel;
 
 /// The application-side state the screens share.

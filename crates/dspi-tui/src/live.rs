@@ -185,7 +185,7 @@ impl Screens for ConsoleScreens {
 
     fn tool(&self, state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
         match tool {
-            Tool::Subharm | Tool::Tube => pending_tool(state, tool),
+            Tool::Subharm => pending_tool(state, tool),
             Tool::Matrix => Box::new(MatrixPanel::new(self.shared.clone())),
             Tool::Crossfeed => Box::new(CrossfeedPanel::new()),
             Tool::Loudness => Box::new(LoudnessPanel::new()),
@@ -196,6 +196,7 @@ impl Screens for ConsoleScreens {
             Tool::Stats => Box::new(StatsPanel::new(self.shared.clone())),
             Tool::Monitor => Box::new(MonitorPanel::new(self.shared.clone())),
             Tool::AutoEq => Box::new(AutoEqPanel::new(self.shared.clone())),
+            Tool::Tube => Box::new(crate::screens::TubePanel::new()),
             Tool::Spectrum => Box::new(SpectrumPanel::open(self.shared.clone(), state)),
         }
     }
@@ -249,6 +250,7 @@ pub const APP_VERBS: &[(&str, &str)] = &[
     ("device", "Device picker"),
     ("reconnect", "Reconnect to the device"),
     ("clear-favourites", "AutoEQ: clear favourites"),
+    ("tube", "Tube Modeller"),
 ];
 
 /// The `:` line and the `Ctrl-P` palette.
@@ -1083,6 +1085,7 @@ impl Live {
                 Some("update") => self.autoeq_update(),
                 _ => self.open_tool(Tool::AutoEq),
             },
+            "tube" => self.open_tool(Tool::Tube),
             other => self.note(format!("`{other}` is not one of this interface's verbs")),
         }
     }
@@ -2679,9 +2682,13 @@ mod tests {
             }
             l.handle_event(&mut s, ShellEvent::CloseTool);
         }
-        for (tool, name) in [
-            (Tool::Subharm, "subharmonic_synth"),
-            (Tool::Tube, "tube_preamp"),
+        for (tool, name, body) in [
+            (
+                Tool::Subharm,
+                "subharmonic_synth",
+                "This panel arrives in a later phase.",
+            ),
+            (Tool::Tube, "tube_preamp", "TRANSFER CURVE"),
         ] {
             l.state.caps.features.push(dspi_session::probe::Feature {
                 name: name.into(),
@@ -2690,7 +2697,7 @@ mod tests {
             });
             l.handle_event(&mut s, ShellEvent::OpenTool(tool));
             let f = frame(&mut l, 120, 40);
-            assert!(f.contains("This panel arrives in a later phase."), "{f}");
+            assert!(f.contains(body), "{f}");
             assert!(!f.contains("Requires firmware"), "{f}");
         }
     }
@@ -3414,6 +3421,15 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The Tube Modeller is reachable from the palette by name, as well as by
+    /// its `D` key.
+    #[test]
+    fn the_tube_verb_opens_the_tube_modeller() {
+        let (mut l, mut s, _) = console();
+        l.run_command(&mut s, "tube");
+        assert!(matches!(l.shell.tool, Some((Tool::Tube, _))));
     }
 
     #[test]

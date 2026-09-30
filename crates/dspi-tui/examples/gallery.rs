@@ -24,7 +24,7 @@ use dspi_tui::live::pending_tool;
 use dspi_tui::screens::{
     AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
     MonitorPanel, OutputPage, Overview, PsybassPanel, SignalsPanel, SpectrumPanel, StatsPanel,
-    UpmixerPanel, shared, spectrum,
+    TubePanel, UpmixerPanel, shared, spectrum,
 };
 use dspi_tui::settings::{AppConfig, SettingsScreen};
 use dspi_tui::shell::{Focus, Screen, Selection, Shell, Tool, fixture};
@@ -186,6 +186,7 @@ fn main() {
     state.bulk.patch(up + 28, &10.0f32.to_le_bytes());
     state.bulk.patch(up + 32, &100.0f32.to_le_bytes());
     state.bulk.patch(up + 36, &7000.0f32.to_le_bytes());
+    fixture::tube(&mut state, true);
     state.upmix_status = Some(dspi_proto::packets::UpmixStatus {
         active: true,
         parked_reason: 0,
@@ -381,10 +382,10 @@ fn main() {
             Tool::AutoEq,
             Box::new(AutoEqPanel::searching(shared.clone(), "sennheiser")) as Box<dyn Screen>,
         )),
-        // Beta4 tools whose panels have not landed: the fixture reports none
-        // of their features, so each shows what the device lacks.
+        "tube" => Some((Tool::Tube, Box::new(TubePanel::new()) as Box<dyn Screen>)),
+        // A beta4 tool whose panel has not landed: the fixture reports no
+        // feature for it, so it shows what the device lacks.
         "subharm" => Some((Tool::Subharm, pending_tool(&state, Tool::Subharm))),
-        "tube" => Some((Tool::Tube, pending_tool(&state, Tool::Tube))),
         // The analyser draws from the shared engine, which the fixture fills
         // with a device's caps and a picture of the chosen outputs.
         "spectrum" => {

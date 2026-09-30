@@ -197,6 +197,15 @@ pub enum PanelGraph {
         original: f64,
         harmonics: f64,
     },
+    /// The Tube Modeller's static transfer curve: output against input over
+    /// one full-scale swing, as `TubeTransferView` draws it.
+    Transfer {
+        /// The output at evenly spaced inputs from -1 to +1.
+        output: Vec<f64>,
+        /// The inputs past which the stage clips, negative then positive,
+        /// when they fall inside the swing.
+        knees: (Option<f64>, Option<f64>),
+    },
     /// The master toggle is off, so the Console draws the word instead.
     Disabled,
 }
@@ -1177,7 +1186,106 @@ fn draw_graph(area: Rect, buf: &mut Buffer, theme: &Theme, g: &PanelGraph) {
             original,
             harmonics,
         } => draw_bars(area, buf, theme, *fc, *original, *harmonics),
+        PanelGraph::Transfer { output, knees } => draw_transfer(area, buf, theme, output, *knees),
     }
+}
+
+/// The output range a transfer graph draws: a little room above full scale,
+/// because hot trim and asymmetry can pass it (`TubeTransferView.yMax`).
+const TRANSFER_Y_MAX: f64 = 1.4;
+
+/// The tube's transfer curve over the grey axes, with the full-scale rules
+/// and the knees marked the way the band edges are on the bass spectrum.
+///
+/// One curve, as `DESIGN.md` 12 asks: the Console's dashed straight line is
+/// drawn as a faint dotted guide, part of the grid rather than a second
+/// series, and its orange clip shading becomes the two knee marks.
+fn draw_transfer(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    output: &[f64],
+    knees: (Option<f64>, Option<f64>),
+) {
+    if area.height < 3 || area.width < 8 || output.len() < 2 {
+        return;
+    }
+    let (w, h) = (area.width, area.height);
+    let col = |x: f64| area.x + (((x + 1.0) / 2.0 * (w - 1) as f64).round() as u16).min(w - 1);
+    let row = |y: f64| {
+        let c = y.clamp(-TRANSFER_Y_MAX, TRANSFER_Y_MAX);
+        area.y
+            + (((TRANSFER_Y_MAX - c) / (2.0 * TRANSFER_Y_MAX) * (h - 1) as f64).round() as u16)
+                .min(h - 1)
+    };
+    let faint = Style::default().fg(theme.chrome_faint);
+
+    // The zero axes, then the full-scale rules over them.
+    let (x0, y0) = (col(0.0), row(0.0));
+    for x in area.x..area.x + w {
+        buf[(x, y0)].set_symbol("─").set_style(faint);
+    }
+    for y in area.y..area.y + h {
+        buf[(x0, y)]
+            .set_symbol(if y == y0 { "┼" } else { "│" })
+            .set_style(faint);
+    }
+    for fs in [-1.0, 1.0] {
+        let y = row(fs);
+        for x in area.x..area.x + w {
+            if x != x0 {
+                buf[(x, y)].set_symbol("┄").set_style(faint);
+            }
+        }
+    }
+    for x in [knees.0, knees.1].into_iter().flatten() {
+        let x = col(x);
+        for y in area.y..area.y + h {
+            buf[(x, y)].set_symbol("┆").set_style(theme.chrome_style());
+        }
+    }
+
+    let to_row = |v: f64, rows: f64| (TRANSFER_Y_MAX - v) / (2.0 * TRANSFER_Y_MAX) * (rows - 1.0);
+    let clipped = |v: f64| {
+        if v.abs() > TRANSFER_Y_MAX {
+            f64::NAN
+        } else {
+            v
+        }
+    };
+    let reference = |frac: f64| clipped(frac * 2.0 - 1.0);
+    crate::graph::draw_curve(area, buf, theme, &reference, &to_row, true, faint);
+    let n = output.len() - 1;
+    let sample = |frac: f64| {
+        let at = frac.clamp(0.0, 1.0) * n as f64;
+        let i = (at.floor() as usize).min(n - 1);
+        let t = at - i as f64;
+        clipped(output[i] + (output[i + 1] - output[i]) * t)
+    };
+    crate::graph::draw_curve(
+        area,
+        buf,
+        theme,
+        &sample,
+        &to_row,
+        false,
+        Style::default().fg(theme.accent),
+    );
+
+    // The Console's three labels: the axes and full scale out.
+    let label = |buf: &mut Buffer, x: u16, y: u16, text: &str| {
+        if x + text.len() as u16 <= area.x + w {
+            buf.set_string(x, y, text, theme.label());
+        }
+    };
+    label(buf, area.x + w - 2, y0.saturating_sub(1).max(area.y), "in");
+    label(buf, x0 + 2, area.y, "out");
+    label(
+        buf,
+        area.x,
+        row(1.0).saturating_sub(1).max(area.y),
+        "0 dBFS",
+    );
 }
 
 /// The psychoacoustic-bass spectrum: two blocks over a log frequency axis with

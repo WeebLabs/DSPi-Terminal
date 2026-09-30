@@ -441,8 +441,10 @@ impl Widget for Graph<'_> {
     }
 }
 
-/// Rasterise one curve into braille (or the coarse fallback).
-fn draw_curve(
+/// Rasterise one curve into braille (or the coarse fallback). `sample` maps
+/// a fraction of the width to a value and `to_row` a value to a row of dots
+/// (or cells), so a panel graph with its own axes can reuse it.
+pub(crate) fn draw_curve(
     plot: Rect,
     buf: &mut Buffer,
     theme: &Theme,
