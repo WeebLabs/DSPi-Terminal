@@ -35,6 +35,7 @@ pub mod interfaces;
 pub mod macros;
 pub mod outputs;
 pub mod overview;
+pub mod spectrum;
 pub mod surfaces;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -93,6 +94,9 @@ pub struct SettingsData {
     /// `SAMPLE_RATE`), which is what the Console's 128x lock reads. The
     /// configured rate in the bulk packet is what it will run at next time.
     pub sample_rate_hz: Option<u32>,
+    /// The spectrum analyser's caps, when this device has one. The runner
+    /// copies them from its engine, which read them on connect.
+    pub rta: Option<dspi_proto::packets::RtaCaps>,
 }
 
 impl SettingsData {
@@ -153,6 +157,7 @@ impl SettingsData {
         let sample_rate_hz = read_sample_rate(session);
         Self {
             sample_rate_hz,
+            rta: None,
             directory,
             startup,
             uart,
@@ -936,6 +941,7 @@ pub enum Page {
     About,
     Advanced,
     Graphing,
+    Spectrum,
     Overview,
     Inputs,
     Outputs,
@@ -954,6 +960,7 @@ impl Page {
             Page::About => "About",
             Page::Advanced => "Advanced",
             Page::Graphing => "Graphing",
+            Page::Spectrum => "Spectrum Analyser",
             Page::Overview => "Overview",
             Page::Inputs => "Inputs",
             Page::Outputs => "Outputs",
@@ -973,6 +980,7 @@ impl Page {
             Page::Global => "Global Params",
             Page::Surfaces => "Control Surf.",
             Page::Interfaces => "Control Interf.",
+            Page::Spectrum => "Spectrum",
             other => other.title(),
         }
     }
@@ -981,7 +989,7 @@ impl Page {
 /// The Console's four sidebar groups, in display order.
 const GROUPS: [(&str, &[Page]); 4] = [
     ("Application", &[Page::About, Page::Advanced]),
-    ("Display", &[Page::Graphing]),
+    ("Display", &[Page::Graphing, Page::Spectrum]),
     (
         "System",
         &[
@@ -1296,6 +1304,7 @@ struct Pages {
     about: about::AboutPage,
     advanced: advanced::AdvancedPage,
     graphing: graphing::GraphingPage,
+    spectrum: spectrum::SpectrumPage,
     overview: overview::OverviewPage,
     inputs: inputs::InputsPage,
     outputs: outputs::OutputsPage,
@@ -1332,7 +1341,13 @@ pub struct SettingsScreen {
     /// runner answers a request and then delivers the reply, so this is full
     /// exactly once, in `session_result`, before the page that asked sees it.
     refresh: std::rc::Rc<std::cell::RefCell<Option<Refresh>>>,
+    /// Told of every change to the app-side settings, so the runner can use
+    /// them without a restart (the spectrum analyser's engine options).
+    on_config: Option<std::rc::Rc<ConfigHook>>,
 }
+
+/// What hears about a change to the app-side settings.
+type ConfigHook = dyn Fn(&AppConfig);
 
 impl SettingsScreen {
     pub fn new(state: &DeviceState, data: SettingsData, config: AppConfig) -> Self {
@@ -1341,6 +1356,7 @@ impl SettingsScreen {
                 about: about::AboutPage,
                 advanced: advanced::AdvancedPage::default(),
                 graphing: graphing::GraphingPage::new(config.clone()),
+                spectrum: spectrum::SpectrumPage::default(),
                 overview: overview::OverviewPage::default(),
                 inputs: inputs::InputsPage::default(),
                 outputs: outputs::OutputsPage::default(),
@@ -1367,6 +1383,7 @@ impl SettingsScreen {
             connected: true,
             config_path: None,
             refresh: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            on_config: None,
         };
         s.select_row_for(state);
         s
@@ -1374,6 +1391,12 @@ impl SettingsScreen {
 
     pub fn connected(mut self, c: bool) -> Self {
         self.connected = c;
+        self
+    }
+
+    /// Hear about every change to the app-side settings as it is saved.
+    pub fn on_config(mut self, f: impl Fn(&AppConfig) + 'static) -> Self {
+        self.on_config = Some(std::rc::Rc::new(f));
         self
     }
 
@@ -1407,6 +1430,7 @@ impl SettingsScreen {
                 n if n == "about" => Page::About,
                 n if n == "advanced" => Page::Advanced,
                 n if n == "graphing" => Page::Graphing,
+                n if n == "spectrumanalyser" || n == "spectrum" || n == "rta" => Page::Spectrum,
                 n if n == "overview" || n == "pins" => Page::Overview,
                 n if n == "inputs" => Page::Inputs,
                 n if n == "outputs" => Page::Outputs,
@@ -1471,6 +1495,7 @@ impl SettingsScreen {
             Page::About => &mut self.pages.about,
             Page::Advanced => &mut self.pages.advanced,
             Page::Graphing => &mut self.pages.graphing,
+            Page::Spectrum => &mut self.pages.spectrum,
             Page::Overview => &mut self.pages.overview,
             Page::Inputs => &mut self.pages.inputs,
             Page::Outputs => &mut self.pages.outputs,
@@ -1488,6 +1513,7 @@ impl SettingsScreen {
             Page::About => &self.pages.about,
             Page::Advanced => &self.pages.advanced,
             Page::Graphing => &self.pages.graphing,
+            Page::Spectrum => &self.pages.spectrum,
             Page::Overview => &self.pages.overview,
             Page::Inputs => &self.pages.inputs,
             Page::Outputs => &self.pages.outputs,
@@ -1683,6 +1709,9 @@ impl SettingsScreen {
             PageEvent::Config(c) => {
                 self.config = *c;
                 self.pages.graphing.adopt(self.config.clone());
+                if let Some(f) = &self.on_config {
+                    f(&self.config);
+                }
                 let result = match &self.config_path {
                     Some(p) => self.config.save_to(p).map(|()| p.clone()),
                     None => self.config.save(),
@@ -1944,6 +1973,7 @@ impl Screen for SettingsScreen {
                 Page::About => self.pages.about.popup_result(choice, &cx),
                 Page::Advanced => self.pages.advanced.popup_result(choice, &cx),
                 Page::Graphing => self.pages.graphing.popup_result(choice, &cx),
+                Page::Spectrum => self.pages.spectrum.popup_result(choice, &cx),
                 Page::Overview => self.pages.overview.popup_result(choice, &cx),
                 Page::Inputs => self.pages.inputs.popup_result(choice, &cx),
                 Page::Outputs => self.pages.outputs.popup_result(choice, &cx),
@@ -2021,6 +2051,7 @@ impl Screen for SettingsScreen {
                         Page::About => self.pages.about.dialog_result(outcome, &cx),
                         Page::Advanced => self.pages.advanced.dialog_result(outcome, &cx),
                         Page::Graphing => self.pages.graphing.dialog_result(outcome, &cx),
+                        Page::Spectrum => self.pages.spectrum.dialog_result(outcome, &cx),
                         Page::Overview => self.pages.overview.dialog_result(outcome, &cx),
                         Page::Inputs => self.pages.inputs.dialog_result(outcome, &cx),
                         Page::Outputs => self.pages.outputs.dialog_result(outcome, &cx),
@@ -2168,6 +2199,7 @@ impl SettingsScreen {
                     Page::About => self.pages.about.act(cursor, action, &cx),
                     Page::Advanced => self.pages.advanced.act(cursor, action, &cx),
                     Page::Graphing => self.pages.graphing.act(cursor, action, &cx),
+                    Page::Spectrum => self.pages.spectrum.act(cursor, action, &cx),
                     Page::Overview => self.pages.overview.act(cursor, action, &cx),
                     Page::Inputs => self.pages.inputs.act(cursor, action, &cx),
                     Page::Outputs => self.pages.outputs.act(cursor, action, &cx),
@@ -2285,6 +2317,7 @@ pub mod demo {
             cs_dirty: false,
             cs: None,
             sample_rate_hz: Some(48_000),
+            rta: None,
         }
     }
 }
@@ -2353,7 +2386,7 @@ pub(crate) mod tests {
     fn every_page_is_in_a_sidebar_group() {
         // `Page` has no reflection, so the count is the guard: a variant added
         // without a group would leave this stale.
-        assert_eq!(every_page().len(), 12);
+        assert_eq!(every_page().len(), 13);
         for page in every_page() {
             assert!(!page.title().is_empty());
             assert!(!page.short().is_empty());
@@ -2387,7 +2420,13 @@ pub(crate) mod tests {
     fn the_sidebar_lists_the_consoles_groups_in_order() {
         let (mut s, st) = screen(Page::Global);
         let f = frame(&mut s, &st, 120, 40);
-        let at = |t: &str| f.find(t).unwrap_or_else(|| panic!("missing {t}\n{f}"));
+        // The sidebar column alone: a page may say CONTROL too.
+        let side: String = f
+            .lines()
+            .map(|l| l.chars().take(20).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = |t: &str| side.find(t).unwrap_or_else(|| panic!("missing {t}\n{f}"));
         assert!(at("APPLICATION") < at("DISPLAY"));
         assert!(at("DISPLAY") < at("SYSTEM"));
         assert!(at("SYSTEM") < at("CONTROL"));
@@ -2485,9 +2524,11 @@ pub(crate) mod tests {
         s.handle(key(KeyCode::Down), &st);
         assert_eq!(s.page(), Page::Graphing, "stepped over DISPLAY");
         s.handle(key(KeyCode::Down), &st);
+        assert_eq!(s.page(), Page::Spectrum);
+        s.handle(key(KeyCode::Down), &st);
         assert_eq!(s.page(), Page::Overview, "stepped over SYSTEM");
         s.handle(key(KeyCode::Up), &st);
-        assert_eq!(s.page(), Page::Graphing);
+        assert_eq!(s.page(), Page::Spectrum);
     }
 
     #[test]

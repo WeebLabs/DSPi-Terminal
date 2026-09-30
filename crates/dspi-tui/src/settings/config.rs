@@ -61,6 +61,65 @@ impl Default for Graphing {
     }
 }
 
+/// Settings > Display > Spectrum Analyser, with the Console's defaults
+/// (`DSPi_ConsoleApp.swift:107-121`).
+///
+/// The last three belong to the device, but the analyser forgets them at every
+/// power cycle, so this file is the only place they can live; the runner
+/// pushes them on connect. The first five are how the Terminal draws.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Spectrum {
+    /// 30..100 %, in steps of 5. A terminal cell has no opacity, so below
+    /// [`Spectrum::DIM_BELOW`] the curves are drawn dim and otherwise at full
+    /// strength.
+    pub strength_pct: u8,
+    pub peak_hold: bool,
+    pub smoothing: bool,
+    /// The dB axis: -60, -90 or -120 dBFS at the bottom...
+    pub floor_db: i32,
+    /// ...and 0, +6 or +12 dBFS at the top.
+    pub ceiling_db: i32,
+    /// The transform size as an FFT order; `None` is the device's default.
+    pub transform_order: Option<u8>,
+    pub averaging_ms: u16,
+    pub peak_decay_db_s: u8,
+}
+
+impl Default for Spectrum {
+    fn default() -> Self {
+        Self {
+            strength_pct: 100,
+            peak_hold: true,
+            smoothing: true,
+            floor_db: -90,
+            ceiling_db: 6,
+            transform_order: None,
+            averaging_ms: 300,
+            peak_decay_db_s: 12,
+        }
+    }
+}
+
+impl Spectrum {
+    pub const FLOORS: [i32; 3] = [-60, -90, -120];
+    pub const CEILINGS: [i32; 3] = [0, 6, 12];
+    pub const AVERAGING_MS: [u16; 6] = [0, 50, 125, 300, 1000, 3000];
+    pub const PEAK_DECAYS: [u8; 4] = [0, 4, 12, 30];
+    /// The strength below which curves are drawn dim: the middle of the
+    /// Console's 30..100 % slider.
+    pub const DIM_BELOW: u8 = 65;
+
+    /// The device-side half, in the shape the engine pushes.
+    pub fn engine_options(&self) -> dspi_session::rta::Options {
+        dspi_session::rta::Options {
+            fft_order: self.transform_order,
+            avg_ms: self.averaging_ms,
+            peak_decay_db_s: self.peak_decay_db_s,
+        }
+    }
+}
+
 /// Which volume the sidebar's slider drives when the app starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -104,6 +163,7 @@ pub struct AppConfig {
     pub graphing: Graphing,
     pub volume: Volume,
     pub advanced: Advanced,
+    pub spectrum: Spectrum,
     /// `console`, `amber`, `dark` or `mono`; `--theme` overrides it.
     #[serde(default)]
     pub theme: Option<String>,
@@ -192,6 +252,12 @@ mod tests {
         assert_eq!(c.graphing.min_hz, 15.0);
         assert_eq!(c.graphing.max_hz, 20_000.0);
         assert_eq!(c.volume.mode, VolumeChoice::User);
+        let s = &c.spectrum;
+        assert_eq!(s.strength_pct, 100);
+        assert!(s.peak_hold && s.smoothing);
+        assert_eq!((s.floor_db, s.ceiling_db), (-90, 6));
+        assert_eq!(s.transform_order, None, "the device's own default");
+        assert_eq!((s.averaging_ms, s.peak_decay_db_s), (300, 12));
     }
 
     #[test]
@@ -205,6 +271,8 @@ mod tests {
         c.graphing.db_range = 30.0;
         c.volume.mode = VolumeChoice::Master;
         c.advanced.show_debug_info = true;
+        c.spectrum.transform_order = Some(9);
+        c.spectrum.floor_db = -120;
         c.save_to(&path).expect("write");
         let back = AppConfig::load_from(&path);
         assert_eq!(back, c);
