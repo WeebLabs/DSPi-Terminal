@@ -208,6 +208,9 @@ impl Repr {
                     .to_le_bytes()
                     .to_vec()
             }
+            (Repr::U8, Value::Mask(m)) => {
+                vec![u8::try_from(*m).map_err(|_| mismatch("a mask 0x0-0xFF", v))?]
+            }
             (Repr::U8, _) => vec![v.as_u8().ok_or(mismatch("a whole number 0-255", v))?],
             (Repr::U16Le, Value::Mask(m)) => (*m as u16).to_le_bytes().to_vec(),
             (Repr::U16Le, _) => (v.as_f32().ok_or(mismatch("a whole number", v))? as u16)
