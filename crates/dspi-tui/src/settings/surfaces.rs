@@ -190,16 +190,9 @@ pub struct SurfacesPage {
     /// True on Auxiliary Outputs, which shows the aux slots and nothing else;
     /// false on Control Surfaces, which shows everything but them.
     aux_page: bool,
-    /// The live switch and level each aux output shows: the last read, then
-    /// every notification and every write of ours since.
+    /// The live switch and level each aux output shows, taken from
+    /// `DeviceState::cs_aux_states` on every look.
     aux: dspi_session::surfaces::CsAuxStates,
-    /// The last block read from the device, so a poll that brought nothing new
-    /// does not undo a newer notification.
-    aux_read: Option<dspi_session::surfaces::CsAuxStates>,
-    /// The last `NOTIFY_EVT_CS_AUX` taken on, and whether the page has looked
-    /// at all yet: the event standing when it first looks predates it.
-    aux_event: Option<(u8, u8, u16)>,
-    aux_seen: bool,
     /// A refused live switch or level, per slot.
     aux_messages: BTreeMap<usize, String>,
 }
@@ -238,14 +231,7 @@ impl SurfacesPage {
             popup: None,
             dialog: None,
             aux_page: false,
-            aux: data
-                .cs
-                .as_ref()
-                .and_then(|c| c.aux.clone())
-                .unwrap_or_default(),
-            aux_read: data.cs.as_ref().and_then(|c| c.aux.clone()),
-            aux_event: None,
-            aux_seen: false,
+            aux: Default::default(),
             aux_messages: BTreeMap::new(),
         }
     }
@@ -301,13 +287,6 @@ impl SurfacesPage {
         // Remote buttons are applied with the receiver's slot.
         if self.applying.is_none() {
             self.live.ir = cs.ir.clone();
-        }
-        // A fresh read of the live aux values wins over what the page last
-        // showed; the same read again does not, so a notification that came
-        // in after it stands.
-        if cs.aux.is_some() && cs.aux != self.aux_read {
-            self.aux_read = cs.aux.clone();
-            self.aux = cs.aux.clone().unwrap_or_default();
         }
         // Everything the device reports about itself rather than holds for us:
         // slot health, the panel's own state, and the group and macro tables a
@@ -2839,9 +2818,9 @@ impl SettingsPage for SurfacesPage {
         }
     }
 
-    fn session_result(&mut self, tag: u32, reply: SessionReply, cx: &Cx<'_>) -> PageEvent {
+    fn session_result(&mut self, tag: u32, reply: SessionReply, _cx: &Cx<'_>) -> PageEvent {
         if is_live_aux_tag(tag) {
-            return self.aux_result(tag, reply, cx);
+            return self.aux_result(tag, reply);
         }
         match tag & TAG_MASK {
             TAG_DISPLAY_CFG | TAG_DISPLAY_PAGE => {

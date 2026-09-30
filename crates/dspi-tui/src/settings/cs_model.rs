@@ -770,10 +770,6 @@ pub struct CsData {
     pub status: CsStatusPacket,
     pub ext: CsExtStatusPacket,
     pub display_status: CsDisplayStatus,
-    /// Every slot's live aux state and level (caps v18, config.h:138-140).
-    /// `None` on a firmware without auxiliary outputs. Runtime values, never
-    /// part of the saved configuration.
-    pub aux: Option<CsAuxStates>,
 }
 
 impl CsData {
@@ -814,13 +810,7 @@ impl CsData {
                 let pages = (0..max_pages)
                     .map(|p| s.read_display_page(p).unwrap_or_default())
                     .collect();
-                // The live switch and level are nobody's record: one read of
-                // the whole block, on open and on every Settings poll.
-                let aux = aux_supported(&caps)
-                    .then(|| s.read_aux_states().ok())
-                    .flatten();
                 Ok(CsData {
-                    aux,
                     nouns,
                     bindings,
                     names,
@@ -1060,29 +1050,6 @@ pub fn target_name(state: &DeviceState, nd: &CsNounDesc, t: u8) -> String {
     }
 }
 
-/// Tube type names by `tube_type`, 0 Custom and 1..`TUBE_TYPE_MAX` (tube.h:
-/// 35-36). The rows exist only in `tube.c:49-66`; the names are the Console's
-/// (`TUBE_TYPE_ROWS`, Constants.swift:364-381).
-pub const TUBE_TYPE_NAMES: [&str; 17] = [
-    "Custom",
-    "12AX7 / ECC83",
-    "5751",
-    "12AT7 / ECC81",
-    "12AY7",
-    "12AU7 / ECC82",
-    "6SN7",
-    "6SL7",
-    "6DJ8 / ECC88 / 6922",
-    "EF86 / 6267",
-    "6SJ7",
-    "EL84 / 6BQ5",
-    "EL34",
-    "6L6 / 5881",
-    "6V6",
-    "KT88 / 6550",
-    "300B / 2A3",
-];
-
 /// The Console's `enumValueLabel`: what one position of an enum noun reads as.
 pub(crate) fn enum_value_label(cx: &Cx<'_>, cs: &CsData, n: u8, value: i32) -> String {
     match n {
@@ -1125,12 +1092,9 @@ pub(crate) fn enum_value_label(cx: &Cx<'_>, cs: &CsData, n: u8, value: i32) -> S
             .get(value.max(0) as usize)
             .map(|s| (*s).to_string())
             .unwrap_or_else(|| format!("Mode {value}")),
-        // The Console's enum label for the tube type (`tubeTypeName`,
-        // Constants.swift:364-389; rows from tube.c:49-66, 0 is Custom).
-        noun::TUBE_TYPE => TUBE_TYPE_NAMES
-            .get(value.max(0) as usize)
-            .map(|s| (*s).to_string())
-            .unwrap_or_else(|| format!("Type {value}")),
+        // The Console's enum label for the tube type (`tubeTypeName`),
+        // from the one tube table (dspi-session `tube.rs`); 0 is Custom.
+        noun::TUBE_TYPE => dspi_session::tube::type_name(value.clamp(0, 255) as u8),
         // The Console labels neither of these on its Control Surfaces page;
         // these are the words its Subharmonic Synthesizer window and limiter
         // popover use for the same values (subharm.h:71-74; limiter.h:33,
@@ -3033,14 +2997,6 @@ pub mod demo {
                 model: 6,
                 ..Default::default()
             },
-            // The trigger is on; the lamp is on at its boot level.
-            aux: Some({
-                let mut a = CsAuxStates::default();
-                a.state[10] = 1;
-                a.state[11] = 1;
-                a.level_q8[11] = 50 * 256;
-                a
-            }),
             caps: CsCaps::from(&caps),
         }
     }
@@ -3050,6 +3006,15 @@ pub mod demo {
     pub fn state() -> DeviceState {
         let mut s = super::super::demo::state();
         s.caps.cs = Some(caps());
+        // The trigger is on; the lamp is on at its boot level. `DeviceState`
+        // holds the live aux values (`refresh_cs_aux`, runtime.rs).
+        s.cs_aux_states = Some({
+            let mut a = CsAuxStates::default();
+            a.state[10] = 1;
+            a.state[11] = 1;
+            a.level_q8[11] = 50 * 256;
+            a
+        });
         s
     }
 
@@ -3539,10 +3504,37 @@ mod tests {
     #[test]
     fn the_new_enums_have_labels_the_size_of_their_headers() {
         use dspi_proto::generated::{limiter, subharm, tube};
-        assert_eq!(TUBE_TYPE_NAMES.len(), tube::TUBE_TYPE_MAX as usize + 1);
-        assert_eq!(TUBE_TYPE_NAMES[0], "Custom");
-        assert_eq!(TUBE_TYPE_NAMES[1], "12AX7 / ECC83");
-        assert_eq!(TUBE_TYPE_NAMES[16], "300B / 2A3");
+        assert_eq!(
+            dspi_session::tube::TYPES.len(),
+            tube::TUBE_TYPE_MAX as usize
+        );
+        let cs = demo::data();
+        let (st, d, cfg) = (
+            demo::state(),
+            demo::settings_data(),
+            super::super::AppConfig::default(),
+        );
+        let cx = Cx {
+            state: &st,
+            data: &d,
+            config: &cfg,
+            connected: true,
+            global_dirty: false,
+        };
+        assert_eq!(enum_value_label(&cx, &cs, noun::TUBE_TYPE, 0), "Custom");
+        assert_eq!(
+            enum_value_label(&cx, &cs, noun::TUBE_TYPE, 1),
+            "12AX7 / ECC83"
+        );
+        assert_eq!(
+            enum_value_label(&cx, &cs, noun::TUBE_TYPE, 16),
+            "300B / 2A3"
+        );
+        assert_eq!(enum_value_label(&cx, &cs, noun::LIMITER_LINK, 0), "Off");
+        assert_eq!(
+            enum_value_label(&cx, &cs, noun::SUBHARM_SELECT, 1),
+            "Percussive"
+        );
         assert_eq!(subharm::SUBHARM_SELECT_MODE_MAX, 2);
         assert_eq!(limiter::LIMITER_LINK_GROUP_MAX, 4);
     }

@@ -297,27 +297,12 @@ impl SurfacesPage {
         format!("Also driven by {}.", parts.join(" and "))
     }
 
-    /// Take on an aux change from the notification stream
-    /// (`NOTIFY_EVT_CS_AUX`, notify.h:78-83). `DeviceState` keeps the last
-    /// event, so a change of it is a new event. The first look only notes
-    /// it: an event from before Settings opened is older than the read the
-    /// page opened with.
+    /// The live values, as `DeviceState` holds them: read whole on opening
+    /// Settings and on each Settings poll (`refresh_cs_aux`, runtime.rs), and
+    /// patched slot by slot by every `NOTIFY_EVT_CS_AUX` (notify.h:78-83),
+    /// which the device also sends for this page's own writes.
     pub(super) fn observe_aux(&mut self, cx: &Cx<'_>) {
-        let now = cx.state.cs_aux;
-        let first = !self.aux_seen;
-        self.aux_seen = true;
-        if first || now == self.aux_event {
-            self.aux_event = now;
-            return;
-        }
-        self.aux_event = now;
-        if let Some((slot, state, level)) = now {
-            let s = slot as usize;
-            if s < self.aux.state.len() {
-                self.aux.state[s] = state;
-                self.aux.level_q8[s] = level;
-            }
-        }
+        self.aux = cx.state.cs_aux_states.clone().unwrap_or_default();
     }
 
     /// The aux card's own rows. `None` leaves the action to the shared
@@ -354,12 +339,12 @@ impl SurfacesPage {
         })
     }
 
-    /// Switch an output now: shown at once, confirmed by the status packet.
+    /// Switch an output now. The status packet says whether it took, and the
+    /// device's own notification moves the switch.
     fn write_aux_state(&mut self, slot: usize, on: bool) -> PageEvent {
         if slot >= self.aux.state.len() {
             return PageEvent::Handled;
         }
-        self.aux.state[slot] = u8::from(on);
         self.aux_messages.remove(&slot);
         PageEvent::Session(SessionRequest::new(
             TAG_AUX_STATE | slot as u32,
@@ -373,7 +358,6 @@ impl SurfacesPage {
             return PageEvent::Handled;
         }
         let q8 = level_q8(percent);
-        self.aux.level_q8[slot] = q8;
         self.aux_messages.remove(&slot);
         PageEvent::Session(SessionRequest::new(
             TAG_AUX_LEVEL | slot as u32,
@@ -381,16 +365,12 @@ impl SurfacesPage {
         ))
     }
 
-    /// A live write's answer. A refusal puts the device's own values back
-    /// (the request re-read them on its way home) and says why, in the
-    /// Console's words for status 0x26.
-    pub(super) fn aux_result(&mut self, tag: u32, reply: SessionReply, cx: &Cx<'_>) -> PageEvent {
+    /// A live write's answer. A refusal says why, in the Console's words for
+    /// status 0x26; the values shown are the device's and did not move.
+    pub(super) fn aux_result(&mut self, tag: u32, reply: SessionReply) -> PageEvent {
         let slot = (tag & !TAG_MASK) as usize;
         match reply {
             SessionReply::Err(why) => {
-                if let Some(a) = cx.data.cs.as_ref().and_then(|c| c.aux.clone()) {
-                    self.aux = a;
-                }
                 self.aux_messages.insert(slot, why.clone());
                 PageEvent::Status(why)
             }
@@ -614,7 +594,7 @@ mod tests {
             PageEvent::Session(r) => assert_eq!(r.tag, TAG_AUX_STATE | 10),
             other => panic!("{other:?}"),
         }
-        assert!(!p.aux.is_on(10), "shown at once");
+        assert!(p.aux_messages.is_empty());
         assert!(!p.dirty(10), "the binding did not change");
 
         let (mut s, st) = screen(m::demo::settings_data());
@@ -645,7 +625,6 @@ mod tests {
         let PageEvent::Session(req) = ev else {
             panic!("{ev:?}");
         };
-        assert_eq!(p.aux.level_q8[11], 75 * 256);
 
         let mut caps = crate::shell::fixture::caps();
         caps.cs = Some(m::demo::caps());
@@ -690,7 +669,6 @@ mod tests {
         );
         let ev = p.session_result(TAG_AUX_LEVEL | 11, SessionReply::Err(why.clone()), &c);
         assert_eq!(ev, PageEvent::Status(why.clone()));
-        assert_eq!(p.aux.level_q8[11], 50 * 256, "the device's level is back");
         assert!(text(&p, &c).contains(&why), "{}", text(&p, &c));
     }
 
@@ -718,28 +696,53 @@ mod tests {
         assert_eq!(caption.as_deref(), Some(NOT_LIVE));
     }
 
-    /// A notification moves the switch and level; the first look only notes
-    /// what came before Settings opened.
+    /// The page shows `DeviceState`'s aux block, which B2's runtime reads
+    /// whole and every `NOTIFY_EVT_CS_AUX` patches slot by slot.
     #[test]
     fn a_notification_moves_the_switch_and_the_level() {
+        use dspi_session::Notification;
+        use dspi_session::notify::{decode, evt};
+
         let (d, mut st, cfg) = (
             m::demo::settings_data(),
             m::demo::state(),
             AppConfig::default(),
         );
         let mut p = page(&d);
-        st.cs_aux = Some((11, 0, 0));
+        p.expanded.insert(11);
         p.observe(&cx(&d, &st, &cfg));
-        assert!(p.aux.is_on(11), "a stale event is not taken on");
-        st.cs_aux = Some((11, 1, 20 * 256));
-        p.observe(&cx(&d, &st, &cfg));
+        assert!(p.aux.is_on(10) && p.aux.is_on(11));
+        assert_eq!(p.aux.level_q8[11], 50 * 256);
+
+        // The lamp dims to 20 % from a knob, and the trigger goes off.
+        for (seq, packet) in [
+            [2, evt::CS_AUX, 0, 1, 11, 1, 0x00, 0x14, 5],
+            [2, evt::CS_AUX, 0, 2, 10, 0, 0x00, 0x00, 5],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (_, event) = decode(packet).unwrap();
+            st.apply(&Notification {
+                seq: seq as u8,
+                event,
+                lost: false,
+            });
+        }
+        let c = cx(&d, &st, &cfg);
+        p.observe(&c);
         assert_eq!(p.aux.level_q8[11], 20 * 256);
-        st.cs_aux = Some((10, 0, 0));
-        p.observe(&cx(&d, &st, &cfg));
         assert!(!p.aux.is_on(10));
-        // A poll that read the same block again does not undo it.
-        p.observe(&cx(&d, &st, &cfg));
-        assert!(!p.aux.is_on(10));
+        let Row::Number { value, .. } = p
+            .build(&c)
+            .into_iter()
+            .find(|(i, _)| *i == Some(Item::AuxLevel(11)))
+            .map(|(_, r)| r)
+            .expect("the level row")
+        else {
+            panic!("not a number");
+        };
+        assert_eq!(value, 20.0);
     }
 
     // ------------------------------------------------------------ the extras
