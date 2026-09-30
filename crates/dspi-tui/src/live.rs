@@ -17,6 +17,7 @@ use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers
 use dspi_cmd::{Candidate, Context};
 use dspi_proto::dsp;
 use dspi_proto::value::Value;
+use dspi_session::notify::Notification;
 use dspi_session::{Applied, DeviceState, Notifications, Outcome, Session, Source};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -486,6 +487,40 @@ enum PendingAction {
     SwitchDevice(String),
 }
 
+/// How long the runner waits for a deferred preset load, save or factory
+/// reset to finish before going on without it: the Console's wait for a
+/// save to land (`waitForPresetActivation`, Commands.swift:4213).
+const DEFERRED_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// The pause given to a deferred action there is no way to watch: the
+/// Console's wait after a load before it re-reads (Commands.swift:4196).
+const DEFERRED_SETTLE: Duration = Duration::from_millis(100);
+
+/// What one batch of notifications asks of the runner.
+#[derive(Debug, Default)]
+struct NoteEffects {
+    /// The shadow is out of date: read the whole packet again.
+    reread: bool,
+    /// The slot a `PRESET_LOADED` named.
+    loaded: Option<u8>,
+    /// A `BULK_INVALIDATED` from a preset operation.
+    preset_bulk: bool,
+    /// The last section someone else changed, for the echo line.
+    changed_elsewhere: Option<(&'static str, Source)>,
+}
+
+/// The device's active preset slot (`REQ_PRESET_GET_ACTIVE`,
+/// vendor_commands.c:2814-2818), or `None` when it cannot be asked.
+fn read_active_slot(session: &mut Session) -> Option<u8> {
+    session
+        .with_transport(|t| {
+            t.control_in(dspi_proto::generated::opcodes::REQ_PRESET_GET_ACTIVE, 0, 1)
+        })
+        .ok()
+        .and_then(|b| b.first().copied())
+        .filter(|&s| (s as usize) < presets::SLOTS)
+}
+
 /// The shortest gap between two writes of one value while a key is held: the
 /// Console's cap on drag traffic, 30 writes a second
 /// (`PeqGraphEditor.swift`, Console 9c33a44).
@@ -504,7 +539,8 @@ pub const WRITE_INTERVAL: Duration = Duration::from_millis(33);
 struct WriteGate {
     /// When each value was last written.
     sent: std::collections::HashMap<String, Instant>,
-    /// The newest line for a value inside its interval, and when it may go.
+    /// The newest line for a value inside its interval (with a band's
+    /// bypass flag when it has one), and when it may go.
     held: Vec<(String, String, Instant)>,
 }
 
@@ -825,13 +861,34 @@ impl Live {
         self.shell.model.echo = text.into();
     }
 
-    /// Re-read the bulk packet and refresh the model.
-    pub fn refresh(&mut self, session: &mut Session) {
-        match session.snapshot() {
-            Ok(b) => self.state.replace_bulk(b),
-            Err(e) => self.note(e.to_string()),
+    /// Echo a write the way the grammar types it, so what the echo line shows
+    /// can be typed back: output and slot indices are 0-based there.
+    fn echo_set(&mut self, path: &str, indices: &[u8], value: Value) {
+        if let Some(d) = dspi_proto::registry::by_path(path) {
+            let cmd = dspi_cmd::Command::Set {
+                path: d.path,
+                indices: indices.to_vec(),
+                value,
+            };
+            self.echo(dspi_cmd::format(&cmd, &self.ctx));
         }
+    }
+
+    /// Re-read the bulk packet and refresh the model. False when the read
+    /// failed, which leaves the old shadow in place.
+    pub fn refresh(&mut self, session: &mut Session) -> bool {
+        let ok = match session.snapshot() {
+            Ok(b) => {
+                self.state.replace_bulk(b);
+                true
+            }
+            Err(e) => {
+                self.note(e.to_string());
+                false
+            }
+        };
         self.sync_model();
+        ok
     }
 
     /// Write one registry parameter, echoing the canonical command.
@@ -862,6 +919,34 @@ impl Live {
             return;
         }
         self.hazard_confirmed = false;
+        // Anything the device has said goes in first, so a preset loaded
+        // elsewhere is the baseline before this write lands on it.
+        self.absorb_pending_notes(session);
+        // The deferred preset and reset actions have their own flows, which
+        // wait for the device to finish before re-reading.
+        match (path, indices.first()) {
+            ("preset.load", Some(&slot)) => {
+                self.load_preset(session, slot);
+                return;
+            }
+            ("preset.save", Some(&slot)) => {
+                if self.save_slot(session, slot) {
+                    if Some(slot) == self.state.caps.active_preset {
+                        self.state.mark_saved();
+                    }
+                    self.echo_set(path, indices, value);
+                    self.refresh_presets(session);
+                } else {
+                    self.note("Save Failed");
+                }
+                return;
+            }
+            ("dev.reset", _) => {
+                self.factory_reset(session);
+                return;
+            }
+            _ => {}
+        }
         // Enabling an output goes through the Core 1 interlock, which may
         // need the Console's confirmation before the other side is freed.
         if path == "out.enable"
@@ -969,22 +1054,71 @@ impl Live {
         }
     }
 
+    /// The band a line switches the bypass flag of, keyed as
+    /// [`Self::gate_key`] keys the band's `eq` line.
+    fn band_flag_key(&self, line: &str) -> Option<String> {
+        let tokens = dspi_cmd::tokenize(line);
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        match dspi_cmd::parse(&refs, &self.ctx).ok()? {
+            dspi_cmd::Command::Set {
+                path: "eq.bypass",
+                indices,
+                ..
+            } => {
+                let (&channel, &band) = (indices.first()?, indices.get(1)?);
+                Some(format!("eq {channel} {band}"))
+            }
+            _ => None,
+        }
+    }
+
     /// Run the lines a screen asked for, holding back any value written less
     /// than [`WRITE_INTERVAL`] ago (see [`WriteGate`]).
+    ///
+    /// Order is kept. A band's `eq` line and the bypass flag after it are one
+    /// unit, held or sent together: the device applies the packet's bypass
+    /// byte (vendor_commands.c:545-550), which `eq` always sends clear, so a
+    /// flag sent ahead of a held `eq` would be undone when the `eq` went. A
+    /// line that is never held sends every held write first, so it cannot
+    /// overtake one.
     fn run_screen_commands(&mut self, session: &mut Session, lines: &str) {
         let now = self.now();
-        let mut run: Vec<&str> = Vec::new();
-        for line in lines.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let lines: Vec<&str> = lines
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut run: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            i += 1;
+            if line.starts_with('#') {
+                run.push(line.to_string());
+                continue;
+            }
             let Some(key) = self.gate_key(line) else {
-                run.push(line);
+                for (k, held, _) in std::mem::take(&mut self.gate.held) {
+                    self.gate.sent.insert(k, now);
+                    run.push(held);
+                }
+                run.push(line.to_string());
                 continue;
             };
+            let mut unit = line.to_string();
+            while let Some(next) = lines.get(i)
+                && self.band_flag_key(next).as_deref() == Some(key.as_str())
+            {
+                unit.push('\n');
+                unit.push_str(next);
+                i += 1;
+            }
             self.gate.held.retain(|(k, _, _)| *k != key);
             match self.gate.sent.get(&key).map(|at| *at + WRITE_INTERVAL) {
-                Some(due) if now < due => self.gate.held.push((key, line.to_string(), due)),
+                Some(due) if now < due => self.gate.held.push((key, unit, due)),
                 _ => {
                     self.gate.sent.insert(key, now);
-                    run.push(line);
+                    run.push(unit);
                 }
             }
         }
@@ -1011,14 +1145,22 @@ impl Live {
             .retain(|_, at| now.saturating_duration_since(*at) < WRITE_INTERVAL);
     }
 
+    /// Leave the device as the person would expect to find it, before quitting
+    /// or opening another one: every held write sent, and the sub solo off.
+    /// Solo mutes the program on the masked outputs and is runtime state the
+    /// device keeps until told (config.h:201), so the Console switches it off
+    /// when its window closes; quitting closes the panel too.
+    pub fn release(&mut self, session: &mut Session) {
+        self.flush_writes(session, true);
+        if self.state.subharm_solo == Some(true) {
+            self.set(session, "sub.solo", &[], Value::Bool(false));
+        }
+    }
+
     fn enable_output(&mut self, session: &mut Session, index: u8, enable: bool) {
         match session.enable_output(index, enable) {
             Ok(dspi_session::EnableOutcome::Done) => {
-                self.echo(format!(
-                    ":out.enable {} {}",
-                    index + 1,
-                    if enable { "on" } else { "off" }
-                ));
+                self.echo_set("out.enable", &[index], Value::Bool(enable));
                 self.refresh(session);
             }
             Ok(dspi_session::EnableOutcome::NeedsConfirm(c)) => {
@@ -1040,6 +1182,12 @@ impl Live {
 
     fn undo(&mut self, session: &mut Session, redo: bool) {
         self.flush_writes(session, true);
+        // A reversal can be a limiter write, which in INDEPENDENT mode is
+        // output configuration: keep the baseline it moves away from, as
+        // `set` does, or undoing past a save would read as saved. Taken when
+        // the limiters are clean, the baseline is what they are now, so doing
+        // this for a reversal that is not a limiter write changes nothing.
+        self.state.begin_limiter_edit();
         let result = if redo { session.redo() } else { session.undo() };
         match result {
             Ok(Some(u)) => {
@@ -1121,6 +1269,7 @@ impl Live {
                     gain_db: gain,
                     qp,
                 };
+                self.absorb_pending_notes(session);
                 match session.write_band(&packet) {
                     Ok(Outcome::Rejected { .. }) => self.note("the band was not applied as sent"),
                     Ok(_) => {
@@ -1391,23 +1540,25 @@ impl Live {
             self.note("No active preset slot");
             return false;
         };
-        match session.write("preset.save", &[slot], Value::Trigger) {
-            Ok(Outcome::Rejected { .. }) | Err(_) => {
-                self.note("Save Failed");
-                false
-            }
-            Ok(_) => {
-                self.state.mark_saved();
-                self.echo(format!(":preset.save {}", slot + 1));
-                self.sync_model();
-                true
-            }
+        if !self.save_slot(session, slot) {
+            self.note("Save Failed");
+            return false;
         }
+        self.state.mark_saved();
+        self.echo_set("preset.save", &[slot], Value::Trigger);
+        self.sync_model();
+        true
     }
 
-    fn load_preset(&mut self, session: &mut Session, slot: u8) {
-        // The status byte tells a corrupt slot from a refused one; the
-        // registry's trigger path keeps only success.
+    /// Load a preset slot, wait for the device to finish, and take what it
+    /// loaded as the new baseline. False when it did not load.
+    ///
+    /// The load is deferred: the device answers at once and loads after its
+    /// fade and DAC mute hold (vendor_commands.c:2698-2716,
+    /// main.c:1182-1186, 2880-2928), so a re-read straight away would see the
+    /// old state. The end is its `BULK_INVALIDATED` (flash_storage.c:4375).
+    fn load_preset(&mut self, session: &mut Session, slot: u8) -> bool {
+        self.flush_writes(session, true);
         let status = session.with_transport(|t| {
             t.control_in(
                 dspi_proto::generated::opcodes::REQ_PRESET_LOAD,
@@ -1415,18 +1566,32 @@ impl Live {
                 1,
             )
         });
-        match status.map(|b| b.first().copied().unwrap_or(0)) {
-            // PRESET_ERR_CRC (config.h): the Console's own words.
-            Ok(3) => self.note("Load Failed: Preset data is corrupted."),
-            Ok(0) => {
-                self.state.caps.active_preset = Some(slot);
-                self.refresh(session);
-                self.state.mark_saved();
-                self.echo(format!(":preset.load {}", slot + 1));
-                self.sync_model();
-            }
-            Ok(_) | Err(_) => self.note("Load Failed"),
+        // The request answers only accepted or a bad slot.
+        if !matches!(status.map(|b| b.first().copied()), Ok(Some(0))) {
+            self.note("Load Failed");
+            return false;
         }
+        self.wait_for_bulk(Source::Preset);
+        if !self.refresh(session) {
+            self.state.stale = true;
+            return false;
+        }
+        // A slot that fails its CRC check still sends PRESET_LOADED and
+        // BULK_INVALIDATED, but the device keeps its active slot and its live
+        // state (flash_storage.c:4316-4327); that is the only sign.
+        let active = read_active_slot(session);
+        if let Some(a) = active.filter(|a| *a != slot) {
+            self.state.caps.active_preset = Some(a);
+            // PRESET_ERR_CRC: the Console's own words.
+            self.note("Load Failed: Preset data is corrupted.");
+            self.sync_model();
+            return false;
+        }
+        self.state.caps.active_preset = Some(slot);
+        self.state.mark_saved();
+        self.echo_set("preset.load", &[slot], Value::Trigger);
+        self.sync_model();
+        true
     }
 
     fn strip_path(&self, i: usize) -> Option<&'static str> {
@@ -1454,6 +1619,12 @@ impl Live {
 
     /// Turn a shell event into device traffic or a state change.
     pub fn handle_event(&mut self, session: &mut Session, ev: ShellEvent) {
+        // Anything but a screen's writes or the volume slider sends the held
+        // writes first, so a toggle, a reset or a preset action lands after
+        // the values the person moved before it.
+        if !matches!(ev, ShellEvent::Command(_) | ShellEvent::VolumeChanged(_)) {
+            self.flush_writes(session, true);
+        }
         match ev {
             ShellEvent::Select(sel) => self.select(sel),
             ShellEvent::GraphPartner => {
@@ -1721,6 +1892,7 @@ impl Live {
     }
 
     fn finish_dialog(&mut self, session: &mut Session, kind: AppDialog, outcome: DialogOutcome) {
+        self.flush_writes(session, true);
         match (kind, outcome) {
             (AppDialog::Unsaved { then }, DialogOutcome::Button(0)) => {
                 if self.save_active_preset(session) {
@@ -1734,8 +1906,9 @@ impl Live {
                 DialogOutcome::Button(1),
             ) => {
                 let source = self.state.caps.active_preset.unwrap_or(0);
-                self.load_preset(session, source);
-                self.copy_preset_to(session, dest);
+                if self.load_preset(session, source) {
+                    self.copy_preset_to(session, dest);
+                }
             }
             (AppDialog::Unsaved { then }, DialogOutcome::Button(1)) => {
                 self.run_pending(session, then)
@@ -1780,7 +1953,7 @@ impl Live {
             (AppDialog::Core1 { index }, DialogOutcome::Button(0)) => {
                 match session.enable_output_confirmed(index) {
                     Ok(dspi_session::EnableOutcome::Done) => {
-                        self.echo(format!(":out.enable {} on", index + 1));
+                        self.echo_set("out.enable", &[index], Value::Bool(true));
                         self.refresh(session);
                     }
                     Ok(_) => self.note("The device kept the output as it was"),
@@ -1860,23 +2033,15 @@ impl Live {
                 // (config.h:201-204).
                 match self.state.caps.active_preset {
                     Some(slot) => {
-                        self.load_preset(session, slot);
-                        self.note("Parameters reverted successfully");
+                        if self.load_preset(session, slot) {
+                            self.note("Parameters reverted successfully");
+                        }
                     }
                     None => self
                         .note("No saved parameters found.  The device is using factory defaults."),
                 }
             }
-            (AppDialog::FactoryReset, DialogOutcome::Button(0)) => {
-                match session.write("dev.reset", &[], Value::Trigger) {
-                    Ok(_) => {
-                        self.refresh(session);
-                        self.state.mark_saved();
-                        self.note("Factory reset complete");
-                    }
-                    Err(_) => self.note("Failed to reset parameters"),
-                }
-            }
+            (AppDialog::FactoryReset, DialogOutcome::Button(0)) => self.factory_reset(session),
             (AppDialog::Bootloader, DialogOutcome::Button(0)) => {
                 // The device answers, waits 100 ms and resets; there is nothing
                 // to acknowledge and every later transfer will fail, which is
@@ -1977,6 +2142,8 @@ impl Live {
         let n = caps.num_channels as usize;
         self.peaks = vec![PeakHold::default(); n];
         self.popout_pinned = None;
+        // A held write was for the old device.
+        self.gate = WriteGate::default();
         self.state = state;
         // The Console discards Settings drafts and device facts on a different
         // serial; the pages re-read on their next open.
@@ -2068,16 +2235,35 @@ impl Live {
             ));
             return;
         }
-        match session.write("preset.save", &[dest], Value::Trigger) {
-            Ok(Outcome::Rejected { .. }) | Err(_) => {
-                self.note("Save Failed");
-                return;
-            }
-            Ok(_) => {}
+        // Each save is waited for: the device keeps one pending save, so the
+        // second would otherwise replace the first before it was written.
+        if !self.save_slot(session, dest) || !self.save_slot(session, source) {
+            self.note("Save Failed");
+            self.refresh_presets(session);
+            return;
         }
-        let _ = session.write("preset.save", &[source], Value::Trigger);
         self.refresh_presets(session);
-        self.echo(format!(":preset.save {}", dest + 1));
+        self.echo_set("preset.save", &[dest], Value::Trigger);
+    }
+
+    /// Reset the device to factory defaults, wait for it to finish, and take
+    /// the result as the new baseline. The reset is deferred behind the same
+    /// fade as a load (vendor_commands.c:2396-2403, main.c:3130-3132) and
+    /// ends with a `BULK_INVALIDATED` from the factory source
+    /// (flash_storage.c:4947-4953).
+    fn factory_reset(&mut self, session: &mut Session) {
+        self.flush_writes(session, true);
+        if session.write("dev.reset", &[], Value::Trigger).is_err() {
+            self.note("Failed to reset parameters");
+            return;
+        }
+        self.wait_for_bulk(Source::Factory);
+        if self.refresh(session) {
+            self.state.mark_saved();
+            self.note("Factory reset complete");
+        } else {
+            self.state.stale = true;
+        }
     }
 
     fn clear_preset(&mut self, session: &mut Session, slot: u8) {
@@ -2128,7 +2314,9 @@ impl Live {
     fn run_pending(&mut self, session: &mut Session, then: PendingAction) {
         match then {
             PendingAction::Quit => self.should_quit = true,
-            PendingAction::LoadPreset(slot) => self.load_preset(session, slot),
+            PendingAction::LoadPreset(slot) => {
+                self.load_preset(session, slot);
+            }
             PendingAction::SwitchDevice(serial) => self.switch_to = Some(serial),
             PendingAction::CopyTo(dest) => self.copy_preset_to(session, dest),
         }
@@ -2398,76 +2586,12 @@ impl Live {
         self.poll_screen(session, now);
         self.tick_analyser(session, now);
 
-        let mut reread = false;
-        let mut loaded_elsewhere = false;
-        let mut changed_elsewhere: Option<(&'static str, Source)> = None;
-        if let Some(n) = notifications {
-            self.shared.borrow_mut().log.active = true;
-            let at = now.duration_since(self.started).as_secs_f64();
-            for note in n.drain() {
-                // The monitor is fed from this drain rather than from a reader
-                // of its own: two readers on one endpoint would each see half
-                // the events, and the log has to keep running while the panel
-                // is closed so opening it shows what just happened.
-                self.shared.borrow_mut().log.push(at, &note);
-                match self.state.apply(&note) {
-                    Applied::Section { name, source } => {
-                        if !source.is_ours() {
-                            changed_elsewhere = Some((name, source));
-                            if matches!(name, "user_volume" | "master_volume")
-                                && let Some(from) = self.shown_volume
-                            {
-                                self.ease_from = Some((now, from));
-                            }
-                        }
-                    }
-                    Applied::NeedsReread { source } => {
-                        reread = true;
-                        if source == Source::Preset {
-                            loaded_elsewhere = true;
-                        }
-                    }
-                    Applied::PresetLoaded { slot } => {
-                        self.state.caps.active_preset = Some(slot);
-                        reread = true;
-                        loaded_elsewhere = true;
-                        self.note(format!("Preset {} loaded", slot + 1));
-                    }
-                    Applied::InputFormat { channels } => {
-                        self.note(format!("{channels} input channels active"));
-                    }
-                    // The ADAT link changing state (NOTIFY_EVT_ADAT_STATE and
-                    // NOTIFY_EVT_ADAT_INPUT_STATE, notify.h) moves the Stats
-                    // panel's ADAT sections on the next tick rather than at
-                    // the next two-second poll.
-                    Applied::Status(
-                        dspi_session::notify::Event::AdatState { .. }
-                        | dspi_session::notify::Event::AdatInputState { .. },
-                    ) => self.last_stats_poll = now - Duration::from_secs(3),
-                    Applied::Status(_) | Applied::Nothing => {}
-                }
-            }
-            if n.is_disconnected() {
-                self.state.connected = false;
-            }
-        }
-        if reread || self.state.stale {
-            self.refresh(session);
-            self.state.stale = false;
-        }
-        // A preset the device loaded is the new baseline, as a preset this
-        // host loaded is; otherwise the marker compares against the old one.
-        if loaded_elsewhere {
-            self.state.mark_saved();
-        }
+        self.absorb_notes(session, notifications, now);
         if self
             .devices_checked
             .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5))
         {
             self.refresh_devices();
-        }
-        if let Some((name, source)) = changed_elsewhere {
-            self.echo(format!("{} {}", name.replace('_', " "), source.describe()));
         }
         if let Some(until) = self.status_until
             && now >= until
@@ -2484,6 +2608,185 @@ impl Live {
             self.select(Selection::Overview);
         }
         self.sync_model();
+    }
+
+    /// Fold one notification into the state, and note what it asks of the
+    /// runner in `fx`.
+    fn take_note(&mut self, note: &Notification, now: Instant, fx: &mut NoteEffects) {
+        let at = now.duration_since(self.started).as_secs_f64();
+        // The monitor is fed from this drain rather than from a reader of its
+        // own: two readers on one endpoint would each see half the events,
+        // and the log has to keep running while the panel is closed so
+        // opening it shows what just happened.
+        self.shared.borrow_mut().log.push(at, note);
+        match self.state.apply(note) {
+            Applied::Section { name, source } => {
+                if !source.is_ours() {
+                    fx.changed_elsewhere = Some((name, source));
+                    if matches!(name, "user_volume" | "master_volume")
+                        && let Some(from) = self.shown_volume
+                    {
+                        self.ease_from = Some((now, from));
+                    }
+                }
+            }
+            Applied::NeedsReread { source } => {
+                fx.reread = true;
+                fx.preset_bulk |= source == Source::Preset;
+            }
+            Applied::PresetLoaded { slot } => {
+                fx.reread = true;
+                fx.loaded = Some(slot);
+            }
+            Applied::InputFormat { channels } => {
+                self.note(format!("{channels} input channels active"));
+            }
+            // The ADAT link changing state (NOTIFY_EVT_ADAT_STATE and
+            // NOTIFY_EVT_ADAT_INPUT_STATE, notify.h) moves the Stats panel's
+            // ADAT sections on the next tick rather than at the next
+            // two-second poll.
+            Applied::Status(
+                dspi_session::notify::Event::AdatState { .. }
+                | dspi_session::notify::Event::AdatInputState { .. },
+            ) => self.last_stats_poll = now - Duration::from_secs(3),
+            Applied::Status(_) | Applied::Nothing => {}
+        }
+    }
+
+    /// Everything the device has said since the last look: fold it in,
+    /// re-read when it asks, and take a preset it loaded as the new baseline.
+    ///
+    /// Run on every tick, and before every write of ours, so a preset loaded
+    /// elsewhere becomes the baseline before an edit of ours can land on top
+    /// of it and be counted as saved.
+    fn absorb_notes(
+        &mut self,
+        session: &mut Session,
+        notifications: Option<&Notifications>,
+        now: Instant,
+    ) {
+        let mut fx = NoteEffects::default();
+        if let Some(n) = notifications {
+            self.shared.borrow_mut().log.active = true;
+            for note in n.drain() {
+                self.take_note(&note, now, &mut fx);
+            }
+            if n.is_disconnected() {
+                self.state.connected = false;
+            }
+        }
+        let mut fresh = false;
+        if fx.reread || self.state.stale {
+            // A failed read leaves the shadow untrusted, so the next tick
+            // tries again.
+            fresh = self.refresh(session);
+            self.state.stale = !fresh;
+        }
+        // A preset the device loaded is the new baseline, as a preset this
+        // host loaded is; otherwise the marker compares against the old one.
+        // A slot that fails its CRC check still announces itself, but the
+        // device keeps its active slot and its live state
+        // (flash_storage.c:4316-4327), so the slot is taken from the device.
+        match fx.loaded {
+            Some(slot) if fresh => {
+                let active = read_active_slot(session);
+                self.state.caps.active_preset = active.or(Some(slot));
+                if active.is_none_or(|a| a == slot) {
+                    self.state.mark_saved();
+                    self.note(format!("Preset {} loaded", slot as u16 + 1));
+                } else {
+                    self.note(format!("Preset {} failed to load", slot as u16 + 1));
+                }
+            }
+            None if fresh && fx.preset_bulk => self.state.mark_saved(),
+            _ => {}
+        }
+        if let Some((name, source)) = fx.changed_elsewhere {
+            self.echo(format!("{} {}", name.replace('_', " "), source.describe()));
+        }
+    }
+
+    /// Fold in what the reader has queued, before a write of ours.
+    fn absorb_pending_notes(&mut self, session: &mut Session) {
+        if let Some(n) = self.notes.take() {
+            self.absorb_notes(session, Some(&n), Instant::now());
+            self.notes = Some(n);
+        }
+    }
+
+    /// Wait for a deferred device action to finish: the device answers the
+    /// request at once and does the work later in its main loop, ending with
+    /// a `BULK_INVALIDATED` from `source` (notify.c:235-247).
+    ///
+    /// The notifications that arrive meanwhile are folded in as a tick would,
+    /// and the rest stay queued for the tick. Without a notification reader
+    /// there is nothing to wait on, so this waits as long as the Console does
+    /// after a load (Commands.swift:4196).
+    fn wait_for_bulk(&mut self, source: Source) -> bool {
+        let Some(n) = self.notes.take() else {
+            std::thread::sleep(DEFERRED_SETTLE);
+            return false;
+        };
+        let deadline = Instant::now() + DEFERRED_TIMEOUT;
+        let mut fx = NoteEffects::default();
+        let mut done = false;
+        while let Some(left) = deadline.checked_duration_since(Instant::now())
+            && let Some(note) = n.next(left)
+        {
+            done = matches!(
+                note.event,
+                dspi_session::notify::Event::BulkInvalidated { source: s } if s == source
+            );
+            self.take_note(&note, Instant::now(), &mut fx);
+            if done {
+                break;
+            }
+        }
+        self.notes = Some(n);
+        done
+    }
+
+    /// Wait for the device to report `slot` as its active preset, which is
+    /// how a deferred save is seen to be taken: `preset_save` makes the slot
+    /// it wrote the active one (flash_storage.c:4295-4297). The Console waits
+    /// the same way between the two saves of a copy
+    /// (`waitForPresetActivation`, Commands.swift:4213-4225).
+    ///
+    /// A device that cannot be asked is given the settle time instead.
+    fn wait_for_active(&mut self, session: &mut Session, slot: u8) -> bool {
+        let deadline = Instant::now() + DEFERRED_TIMEOUT;
+        loop {
+            match read_active_slot(session) {
+                Some(a) if a == slot => return true,
+                None => {
+                    std::thread::sleep(DEFERRED_SETTLE);
+                    return true;
+                }
+                Some(_) if Instant::now() >= deadline => return false,
+                Some(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// Save the live state into `slot`, and wait for the device to take it.
+    ///
+    /// The device keeps one pending save (vendor_commands.c:2679-2694) and
+    /// takes it on a later pass of its main loop (main.c:3058-3067), so a
+    /// second save sent before then replaces the first, which is never
+    /// written. A save of the slot already active cannot be seen landing by
+    /// the active slot, so it is given the settle time.
+    fn save_slot(&mut self, session: &mut Session, slot: u8) -> bool {
+        let already = read_active_slot(session) == Some(slot);
+        match session.write("preset.save", &[slot], Value::Trigger) {
+            Ok(Outcome::Rejected { .. }) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        if already {
+            std::thread::sleep(DEFERRED_SETTLE);
+            true
+        } else {
+            self.wait_for_active(session, slot)
+        }
     }
 
     /// Read the spectrum analyser's caps, and push the Settings page's
@@ -2640,6 +2943,7 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
             // write goes out on time.
             live.flush_writes(session, false);
             if let Some(serial) = live.switch_to.take() {
+                live.release(session);
                 match open_device(&serial) {
                     Ok((next, state)) => {
                         *session = next;
@@ -2651,6 +2955,7 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
                 }
             }
             if live.should_quit {
+                live.release(session);
                 return Ok(());
             }
         }
@@ -3414,6 +3719,17 @@ mod tests {
         assert!(l.state.limiter_unsaved());
         l.run_command(&mut s, "save-output-config");
         assert!(!l.state.limiter_unsaved());
+
+        // Undo past the save moves the limiters off the saved configuration,
+        // so the save bar has to come back. The mock's bulk read does not
+        // follow writes, so the device's side is patched in by hand.
+        l.handle_event(&mut s, ShellEvent::Undo);
+        assert!(l.state.limiter_baseline.is_some(), "the saved baseline");
+        l.state
+            .bulk
+            .patch(section_at("limiter") + 4, &0.0f32.to_le_bytes());
+        assert!(l.state.limiter_unsaved());
+        assert!(!l.state.has_unsaved_changes(), "the preset is untouched");
     }
 
     /// The gain-reduction meter is read on the meter tick only while an
@@ -4018,5 +4334,335 @@ mod tests {
         assert_eq!(l.gate.held.len(), 1);
         l.flush_writes(&mut s, true);
         assert!(l.gate.held.is_empty());
+    }
+
+    /// The writes that reach the wire, by opcode, in order.
+    fn sent_ops(log: &LogHandle) -> Vec<u8> {
+        use dspi_transport::mock::Direction;
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|x| x.direction == Direction::Out)
+            .map(|x| x.opcode)
+            .collect()
+    }
+
+    /// A held arrow on a bypassed band: the band's `eq` line sends it active
+    /// (vendor_commands.c:545-550), so its bypass flag is held with it and
+    /// goes after it, never ahead of it.
+    #[test]
+    fn a_held_bypassed_band_keeps_its_bypass_after_the_band() {
+        let (mut l, mut s, log) = answering();
+        let t0 = Instant::now();
+        l.clock = Some(t0);
+        log.lock().unwrap().clear();
+        let band = |g: &str| format!("eq in.1 1 peak 1000 1 {g}\neq.bypass in.1 1 on");
+        l.handle_event(&mut s, ShellEvent::Command(band("3")));
+        l.clock = Some(t0 + Duration::from_millis(10));
+        l.handle_event(&mut s, ShellEvent::Command(band("3.5")));
+        assert_eq!(l.gate.held.len(), 1, "the band and its flag, held as one");
+        l.flush_writes(&mut s, false);
+        l.clock = Some(t0 + WRITE_INTERVAL + Duration::from_millis(1));
+        l.flush_writes(&mut s, false);
+        let ops: Vec<u8> = sent_ops(&log)
+            .into_iter()
+            .filter(|o| [op::REQ_SET_EQ_PARAM, op::REQ_SET_BAND_BYPASS].contains(o))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                op::REQ_SET_EQ_PARAM,
+                op::REQ_SET_BAND_BYPASS,
+                op::REQ_SET_EQ_PARAM,
+                op::REQ_SET_BAND_BYPASS
+            ],
+            "the flag always follows its band"
+        );
+    }
+
+    /// A write that is never held (a toggle, a reset, a menu action) sends
+    /// the held ones first, so it cannot overtake them.
+    #[test]
+    fn a_write_that_is_not_held_goes_after_the_held_ones() {
+        let (mut l, mut s, log) = answering();
+        l.clock = Some(Instant::now());
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -3".into()));
+        log.lock().unwrap().clear();
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -4\nbypass on".into()));
+        assert!(l.gate.held.is_empty());
+        let ops = sent_ops(&log);
+        let pre = ops.iter().position(|o| *o == op::REQ_SET_PREAMP_CH);
+        let byp = ops.iter().position(|o| *o == op::REQ_SET_BYPASS);
+        assert!(pre.is_some() && pre < byp, "{ops:02X?}");
+
+        // The same from the shell: the volume reset is not a screen's line.
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -5".into()));
+        assert_eq!(l.gate.held.len(), 1);
+        log.lock().unwrap().clear();
+        l.handle_event(&mut s, ShellEvent::VolumeReset);
+        let ops = sent_ops(&log);
+        let pre = ops.iter().position(|o| *o == op::REQ_SET_PREAMP_CH);
+        let vol = ops.iter().position(|o| *o == op::REQ_SET_USER_VOLUME);
+        assert!(pre.is_some() && pre < vol, "{ops:02X?}");
+    }
+
+    /// A held write is sent before the Terminal lets go of the device, and is
+    /// never carried over to the next one.
+    #[test]
+    fn held_writes_go_before_letting_go_and_not_to_the_next_device() {
+        let (mut l, mut s, log) = answering();
+        l.clock = Some(Instant::now());
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -3".into()));
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -4".into()));
+        log.lock().unwrap().clear();
+        l.release(&mut s);
+        assert!(sent_ops(&log).contains(&op::REQ_SET_PREAMP_CH));
+        assert!(l.gate.held.is_empty());
+
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -5".into()));
+        assert_eq!(l.gate.held.len(), 1);
+        let state = l.state.clone();
+        l.adopt(&mut s, state);
+        assert!(
+            l.gate.held.is_empty(),
+            "the held write was the old device's"
+        );
+    }
+
+    // -- the deferred preset actions ------------------------------------------
+
+    /// `[version, event, flags, seq, byte]`: a PRESET_LOADED or a
+    /// BULK_INVALIDATED (notify.h:37-41, 96-97).
+    fn event(id: u8, seq: u8, byte: u8) -> Vec<u8> {
+        vec![2, id, 0, seq, byte]
+    }
+
+    const PRESET_LOADED: u8 = 0x04;
+    const BULK_INVALIDATED: u8 = 0x03;
+    const FROM_PRESET: u8 = 3;
+    const FROM_FACTORY: u8 = 4;
+
+    /// A runner whose device answers the active slot in turn from `active`,
+    /// and whose notification reader holds `notes`.
+    fn presets_rig(active: &[u8], notes: &[Vec<u8>]) -> (Live, Session, LogHandle) {
+        use dspi_transport::mock::Reply;
+        let mock = MockTransport::new()
+            .window(op::REQ_GET_ALL_PARAMS_CHUNK, packet())
+            .data(op::REQ_GET_STATUS, vec![0; 41])
+            .data(op::REQ_PRESET_LOAD, vec![0])
+            .reply(
+                op::REQ_PRESET_GET_ACTIVE,
+                Reply::Sequence(active.iter().map(|a| Reply::Data(vec![*a])).collect()),
+            )
+            .answering_everything(vec![0; 64]);
+        let log = mock.log_handle();
+        let session = Session::new(Box::new(mock), caps()).unwrap();
+        let state = DeviceState::new(
+            caps(),
+            dspi_proto::wire::BulkPacket::decode(packet()).unwrap(),
+        );
+        let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut live = Live::new(state, theme, Performance::lite(), Box::new(StandInScreens));
+        let reader = MockTransport::new();
+        for n in notes {
+            reader.push_notification(n.clone());
+        }
+        live.notes = Some(Notifications::start(reader.notifications().unwrap()));
+        (live, session, log)
+    }
+
+    fn dirty(l: &mut Live) {
+        let (_, g, _) = dspi_proto::generated::SECTIONS[1];
+        l.state.bulk.patch(g, &(-6.0f32).to_le_bytes());
+        l.sync_model();
+        assert!(l.state.has_unsaved_changes());
+    }
+
+    /// Copy To with Discard reloads the source first. The load is deferred
+    /// behind a fade, so the saves wait for it to finish, and the second
+    /// save waits for the first to be taken: the device keeps one pending
+    /// save slot (vendor_commands.c:2679-2694).
+    #[test]
+    fn copy_to_after_discard_waits_for_the_load_and_for_each_save() {
+        use dspi_transport::mock::Direction;
+        // The fixture's active slot is 2; the copy goes to 5.
+        let (mut l, mut s, log) = presets_rig(
+            &[2, 2, 2, 2, 5, 5, 2],
+            &[
+                event(PRESET_LOADED, 1, 2),
+                event(BULK_INVALIDATED, 2, FROM_PRESET),
+            ],
+        );
+        dirty(&mut l);
+        l.copy_preset_to(&mut s, 5);
+        assert!(matches!(l.dialog, Some((AppDialog::Unsaved { .. }, _))));
+        l.handle_key(&mut s, key(KeyCode::Char('d')));
+
+        let sent: Vec<(u8, u16)> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.direction == Direction::In)
+            .map(|e| (e.opcode, e.value))
+            .collect();
+        let at = |opcode: u8, value: u16| {
+            sent.iter()
+                .position(|x| *x == (opcode, value))
+                .unwrap_or_else(|| panic!("{opcode:02X} {value} not sent: {sent:02X?}"))
+        };
+        let load = at(op::REQ_PRESET_LOAD, 2);
+        let to_dest = at(op::REQ_PRESET_SAVE, 5);
+        let to_source = at(op::REQ_PRESET_SAVE, 2);
+        assert!(
+            sent[load..to_dest]
+                .iter()
+                .any(|x| x.0 == op::REQ_GET_ALL_PARAMS_CHUNK),
+            "the load is re-read before the first save"
+        );
+        let confirmed = sent[to_dest..to_source]
+            .iter()
+            .filter(|x| x.0 == op::REQ_PRESET_GET_ACTIVE)
+            .count();
+        assert!(confirmed >= 2, "the first save is seen taken: {sent:02X?}");
+        assert!(!l.state.has_unsaved_changes());
+        assert_eq!(l.state.caps.active_preset, Some(2));
+    }
+
+    /// A slot that fails its CRC check still announces the load, but the
+    /// device keeps its active slot (flash_storage.c:4316-4327): that is the
+    /// failure, and the baseline stays where it was.
+    #[test]
+    fn a_load_the_device_did_not_take_is_reported_as_corrupt() {
+        let (mut l, mut s, _) = presets_rig(
+            &[2],
+            &[
+                event(PRESET_LOADED, 1, 5),
+                event(BULK_INVALIDATED, 2, FROM_PRESET),
+            ],
+        );
+        let before = l.state.saved.clone();
+        assert!(!l.load_preset(&mut s, 5));
+        assert_eq!(
+            l.shell.model.status.as_deref(),
+            Some("Load Failed: Preset data is corrupted.")
+        );
+        assert_eq!(l.state.caps.active_preset, Some(2));
+        assert_eq!(l.state.saved, before);
+    }
+
+    /// The factory reset is deferred too: the re-read and the new baseline
+    /// wait for its BULK_INVALIDATED (flash_storage.c:4947-4953).
+    #[test]
+    fn a_factory_reset_waits_for_the_device_before_rebaselining() {
+        let (mut l, mut s, _) = presets_rig(&[2], &[]);
+        let queue = {
+            // A reader whose event arrives only after a while, as the reset's
+            // does after the fade.
+            let reader = MockTransport::new();
+            let q = reader.notify_queue();
+            l.notes = Some(Notifications::start(reader.notifications().unwrap()));
+            q
+        };
+        let delay = Duration::from_millis(200);
+        let pusher = std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            queue
+                .lock()
+                .unwrap()
+                .push_back(event(BULK_INVALIDATED, 1, FROM_FACTORY));
+        });
+        dirty(&mut l);
+        let start = Instant::now();
+        l.factory_reset(&mut s);
+        assert!(start.elapsed() >= delay, "returned before the reset ended");
+        pusher.join().unwrap();
+        assert!(!l.state.has_unsaved_changes());
+        assert_eq!(
+            l.shell.model.status.as_deref(),
+            Some("Factory reset complete")
+        );
+    }
+
+    /// A preset loaded elsewhere and not yet seen becomes the baseline
+    /// before a write of ours goes out, so the write is not counted as part
+    /// of the preset.
+    #[test]
+    fn a_preset_loaded_elsewhere_is_taken_before_our_next_write() {
+        use dspi_transport::mock::Direction;
+        let (mut l, mut s, log) = presets_rig(
+            &[4],
+            &[
+                event(PRESET_LOADED, 1, 4),
+                event(BULK_INVALIDATED, 2, FROM_PRESET),
+            ],
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        l.run_command(&mut s, "bypass on");
+        let ops: Vec<u8> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.direction == Direction::In || e.opcode == op::REQ_SET_BYPASS)
+            .map(|e| e.opcode)
+            .collect();
+        let active = ops.iter().position(|o| *o == op::REQ_PRESET_GET_ACTIVE);
+        let write = ops.iter().position(|o| *o == op::REQ_SET_BYPASS);
+        assert!(active.is_some() && active < write, "{ops:02X?}");
+        assert_eq!(l.state.caps.active_preset, Some(4));
+    }
+
+    /// A re-read that fails leaves the shadow marked untrusted, so the next
+    /// tick tries again.
+    #[test]
+    fn a_failed_reread_keeps_the_shadow_stale() {
+        let mock = MockTransport::new().data(op::REQ_GET_STATUS, vec![0; 41]);
+        let mut s = Session::new(Box::new(mock), caps()).unwrap();
+        let (mut l, _, _) = live();
+        l.state.stale = true;
+        l.tick(&mut s, None);
+        assert!(l.state.stale);
+    }
+
+    /// The echo line shows what the grammar accepts, so it can be typed back:
+    /// output and slot indices are 0-based there.
+    #[test]
+    fn the_echo_for_outputs_and_slots_is_what_the_grammar_takes() {
+        let (mut l, mut s, _) = answering();
+        l.run_command(&mut s, "out.enable 2 off");
+        assert_eq!(l.shell.model.echo, "out.enable 2 off");
+        l.echo_set("preset.save", &[4], Value::Trigger);
+        assert_eq!(l.shell.model.echo, "preset.save 4");
+        let tokens = dspi_cmd::tokenize(&l.shell.model.echo);
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        assert!(matches!(
+            dspi_cmd::parse(&refs, &l.ctx),
+            Ok(dspi_cmd::Command::Set { indices, .. }) if indices == vec![4]
+        ));
+    }
+
+    /// Quitting or switching device with the sub solo on switches it off, as
+    /// closing the panel does.
+    #[test]
+    fn letting_go_of_the_device_switches_the_sub_solo_off() {
+        let (mut l, mut s, log) = beta4(
+            packet(),
+            MockTransport::new().data(op::REQ_GET_SUBHARM_SOLO, vec![0]),
+        );
+        l.release(&mut s);
+        assert!(
+            !sent_ops(&log).contains(&op::REQ_SET_SUBHARM_SOLO),
+            "solo is not on"
+        );
+        l.state.subharm_solo = Some(true);
+        l.release(&mut s);
+        let offs: Vec<Vec<u8>> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.opcode == op::REQ_SET_SUBHARM_SOLO)
+            .map(|e| e.payload.clone())
+            .collect();
+        assert_eq!(offs, vec![vec![0]]);
+        assert_eq!(l.state.subharm_solo, Some(false));
     }
 }

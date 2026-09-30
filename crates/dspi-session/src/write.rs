@@ -111,6 +111,75 @@ pub struct JournalEntry {
     /// Whether this can be undone. Flash writes, pin moves and the bootloader
     /// jump cannot, so they are confirmed up front instead.
     pub undoable: bool,
+    /// What the device also changed on its own because of this write, as it
+    /// was before: see [`side_effects`]. Undo puts these back after `before`,
+    /// in order; redo needs only `after`, since writing it again makes the
+    /// device do the same thing again.
+    pub companions: Vec<Companion>,
+}
+
+/// One value a write moved besides its own, as it was before the write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Companion {
+    pub path: &'static str,
+    pub indices: Vec<u8>,
+    pub before: Value,
+}
+
+/// The tube's voicing: the type and the four character values its rows set.
+/// Choosing a type loads its row into the four (tube.c:138-150); moving any
+/// of the four sets the type back to Custom (tube.c:113-119, 154-165).
+const TUBE_VOICING: [&str; 5] = [
+    "tube.type",
+    "tube.bias",
+    "tube.asym",
+    "tube.hardness",
+    "tube.sag",
+];
+
+/// The settings a limiter link group shares (limiter.c:151-155).
+const LIMITER_SHARED: [&str; 3] = ["limit.on", "limit.threshold", "limit.release"];
+
+/// The values a write to `path` at `indices` can change besides its own, in
+/// the order undo should put them back.
+///
+/// - A tube voicing write moves the rest of the voicing (see
+///   [`TUBE_VOICING`]).
+/// - A limiter link change on one output adopts the group's enable,
+///   threshold and release (limiter.c:180-186).
+/// - A limiter write to every output (`LIMITER_ALL_OUTPUTS`, limiter.h:21)
+///   has no single value to read before it, so each output's own value is
+///   kept; a link write to every output also re-gangs the groups
+///   (limiter.c:177-179, 159-170), so the shared settings are kept too.
+pub fn side_effects(path: &str, indices: &[u8], num_outputs: u8) -> Vec<(&'static str, Vec<u8>)> {
+    if TUBE_VOICING.contains(&path) {
+        return TUBE_VOICING
+            .iter()
+            .filter(|p| **p != path)
+            .map(|p| (*p, Vec::new()))
+            .collect();
+    }
+    let Some(d) = by_path(path) else {
+        return Vec::new();
+    };
+    if d.target != Target::OutputOrAll {
+        return Vec::new();
+    }
+    let outputs: Vec<u8> = match indices.first() {
+        Some(&ALL_OUTPUTS) => (0..num_outputs).collect(),
+        Some(&o) if path == "limit.link" => vec![o],
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if indices.first() == Some(&ALL_OUTPUTS) {
+        out.extend(outputs.iter().map(|&o| (d.path, vec![o])));
+    }
+    if path == "limit.link" {
+        for p in LIMITER_SHARED {
+            out.extend(outputs.iter().map(|&o| (p, vec![o])));
+        }
+    }
+    out
 }
 
 pub struct Session {
@@ -243,10 +312,16 @@ impl Session {
         }
 
         let before = self.read(path, indices).ok();
+        // A replay is not an undo step, so what it moves need not be kept.
+        let companions = if self.replaying {
+            Vec::new()
+        } else {
+            self.read_companions(path, indices)
+        };
 
         if self.dry_run {
             let outcome = Outcome::Accepted;
-            self.record(d, indices, before, value, outcome.clone());
+            self.record(d, indices, before, companions, value, outcome.clone());
             return Ok(outcome);
         }
 
@@ -256,7 +331,7 @@ impl Session {
         // editing it, and writing it back.
         if matches!(d.wvalue, WValue::EqScalar(_)) {
             let outcome = self.write_eq_field(d, indices[0], indices[1], &value)?;
-            self.record(d, indices, before, value, outcome.clone());
+            self.record(d, indices, before, companions, value, outcome.clone());
             return Ok(outcome);
         }
 
@@ -277,7 +352,7 @@ impl Session {
         }
 
         let outcome = self.confirm(d, indices, &value)?;
-        self.record(d, indices, before, value, outcome.clone());
+        self.record(d, indices, before, companions, value, outcome.clone());
         Ok(outcome)
     }
 
@@ -497,6 +572,7 @@ impl Session {
         d: &ParamDesc,
         indices: &[u8],
         before: Option<Value>,
+        companions: Vec<Companion>,
         after: Value,
         outcome: Outcome,
     ) {
@@ -507,6 +583,7 @@ impl Session {
             after,
             outcome,
             undoable: matches!(d.hazard, Hazard::None | Hazard::Audible),
+            companions,
         };
         self.journal.push(entry.clone());
 
@@ -517,6 +594,23 @@ impl Session {
             self.redo_stack.clear();
             self.undo_stack.push(entry);
         }
+    }
+
+    /// Read the values a write is about to move besides its own (see
+    /// [`side_effects`]). One that cannot be read is left out: undo then
+    /// restores what it can.
+    fn read_companions(&mut self, path: &str, indices: &[u8]) -> Vec<Companion> {
+        side_effects(path, indices, self.caps.num_outputs)
+            .into_iter()
+            .filter_map(|(path, indices)| {
+                let before = self.read(path, &indices).ok()?;
+                Some(Companion {
+                    path,
+                    indices,
+                    before,
+                })
+            })
+            .collect()
     }
 
     /// Refuse a parameter this device does not have, with the reason.

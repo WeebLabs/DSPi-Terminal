@@ -30,18 +30,28 @@ impl PresetMenu {
     /// What a slot is called on its own: its name, or `Empty` when it has
     /// none. The Console's `presetDropdownLabel`.
     pub fn dropdown_label(shared: &SharedState, slot: u8) -> String {
-        if shared.occupied & (1 << slot) == 0 {
+        if !Self::occupied(shared, slot) {
             return "Empty".to_string();
         }
         match shared.preset_names.get(slot as usize) {
             Some(name) if !name.trim().is_empty() => name.trim().to_string(),
-            _ => format!("Preset {}", slot + 1),
+            _ => format!("Preset {}", slot as u16 + 1),
         }
+    }
+
+    /// Whether the directory says `slot` holds a preset. A slot number past
+    /// the mask, from a confused device, holds nothing.
+    fn occupied(shared: &SharedState, slot: u8) -> bool {
+        shared.occupied & 1u16.checked_shl(slot as u32).unwrap_or(0) != 0
     }
 
     /// `3: Living Room`, the Console's `presetLabel`.
     pub fn slot_label(shared: &SharedState, slot: u8) -> String {
-        format!("{}: {}", slot + 1, Self::dropdown_label(shared, slot))
+        format!(
+            "{}: {}",
+            slot as u16 + 1,
+            Self::dropdown_label(shared, slot)
+        )
     }
 
     /// The Preset row's popup: the slots, a rule, then the actions.
@@ -84,7 +94,7 @@ impl PresetMenu {
             push("Set as Default".into(), Some(PresetChoice::SetDefault));
         }
         push("Copy to...".into(), Some(PresetChoice::CopyTo));
-        if shared.occupied & (1 << active) != 0 {
+        if Self::occupied(shared, active) {
             push(
                 format!("Clear \"{}\"...", Self::slot_label(shared, active)),
                 Some(PresetChoice::Clear),
@@ -149,6 +159,16 @@ mod tests {
             occupied: 0b101,
             ..Default::default()
         }
+    }
+
+    /// A slot number from a confused device is labelled, not overflowed.
+    #[test]
+    fn a_slot_past_the_directory_is_empty() {
+        let s = shared();
+        assert_eq!(PresetMenu::slot_label(&s, 255), "256: Empty");
+        assert_eq!(PresetMenu::slot_label(&s, 16), "17: Empty");
+        let (p, _) = PresetMenu::popup(&s, 200, false);
+        assert!(!p.items.iter().any(|i| i.starts_with("Clear \"")));
     }
 
     #[test]

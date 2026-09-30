@@ -251,23 +251,48 @@ impl PresetSnapshot {
     /// Whether a live packet would capture to this snapshot, compared in
     /// place: this runs every frame, so it must not allocate.
     ///
-    /// `output_config_mode` is the live mode. In INDEPENDENT mode the limiter
-    /// section is the output configuration's, not the preset's, so it is left
-    /// out of the comparison, as the Console's diff leaves it out.
+    /// `output_config_mode` is the live mode. In INDEPENDENT mode the output
+    /// configuration (see [`Self::output_config`]) is not the preset's, so it
+    /// is left out of the comparison, as the Console's diff leaves it out.
     pub fn matches(&self, live: &[u8], output_config_mode: u8) -> bool {
         if live.len() != self.bytes.len() {
             return false;
         }
         let (_, hoff, hlen) = section("header");
         let (_, loff, _) = section("lg_sound_sync");
-        let (_, moff, mlen) = section("limiter");
-        let limiters = output_config_mode == output_config_mode::WITH_PRESET;
+        let with_preset = output_config_mode == output_config_mode::WITH_PRESET;
+        let io = Self::output_config();
         live.iter().zip(&self.bytes).enumerate().all(|(i, (a, b))| {
             let blanked = (i >= hoff && i < hoff + hlen)
                 || (i > loff && i < loff + 4)
-                || (!limiters && i >= moff && i < moff + mlen);
+                || (!with_preset && io.iter().any(|(o, n)| i >= *o && i < o + n));
             blanked || a == b
         })
+    }
+
+    /// The byte ranges of the output configuration: what a preset load takes
+    /// from the slot only in WITH_PRESET mode (`FlashOutputConfig`,
+    /// flash_storage.c:225-285, and the limiters, 3383-3441, both chosen by
+    /// `apply_output_config_from_mode`, flash_storage.c:3434). That is the
+    /// output pins, the I2S outputs and clocks, the ADAT output, the
+    /// limiters, and every field of the input block but the source itself:
+    /// the S/PDIF, I2S and ADAT input pins and enables, the I2S count, rate
+    /// and clock mode (bulk_params.h:203-233). The Console's diff gates the
+    /// same set on the mode (PresetSnapshot.swift:355-362, 555-630).
+    fn output_config() -> [(usize, usize); 5] {
+        let range = |name: &str| {
+            let (_, off, len) = section(name);
+            (off, len)
+        };
+        let (ioff, ilen) = range("input_config");
+        [
+            range("pins"),
+            range("i2s_config"),
+            range("adat_config"),
+            range("limiter"),
+            // `input_source` is the block's first byte.
+            (ioff + 1, ilen - 1),
+        ]
     }
 
     /// Every difference between two snapshots, described the way the
@@ -398,7 +423,10 @@ impl PresetSnapshot {
                 }
             }
         }
-        if differs("pins", a, b) {
+        // The output configuration counts only in WITH_PRESET mode, as the
+        // limiters below do (see `output_config`).
+        let with_preset = other.output_config_mode == output_config_mode::WITH_PRESET;
+        if with_preset && differs("pins", a, b) {
             line(&mut out, "Hardware", "Output pins".into());
         }
         for (secname, stride, label) in [("eq", 12usize, "EQ"), ("crossovers", 4usize, "Crossover")]
@@ -446,7 +474,7 @@ impl PresetSnapshot {
                 }
             }
         }
-        if differs("i2s_config", a, b) {
+        if with_preset && differs("i2s_config", a, b) {
             line(&mut out, "Hardware", "I2S configuration".into());
         }
         if differs("leveller", a, b) {
@@ -480,7 +508,8 @@ impl PresetSnapshot {
         if differs("master_volume", a, b) {
             line(&mut out, "Global", "Master volume".into());
         }
-        if differs("input_config", a, b) {
+        let (inputs_a, inputs_b) = (sec(a, "input_config"), sec(b, "input_config"));
+        if inputs_a[0] != inputs_b[0] || (with_preset && inputs_a[1..] != inputs_b[1..]) {
             line(&mut out, "Hardware", "Input configuration".into());
         }
         if differs("lg_sound_sync", a, b) {
@@ -492,7 +521,7 @@ impl PresetSnapshot {
         if differs("dac_hw_mute", a, b) {
             line(&mut out, "Hardware", "External mute".into());
         }
-        if differs("adat_config", a, b) {
+        if with_preset && differs("adat_config", a, b) {
             line(&mut out, "Hardware", "ADAT output".into());
         }
         if differs("psybass", a, b) {
@@ -1132,7 +1161,7 @@ impl DeviceState {
     pub fn update_meters(&mut self, m: Meters) {
         for (i, c) in m.clipped.iter().enumerate() {
             if *c {
-                self.clip_latched |= 1 << i;
+                self.clip_latched |= 1u32.checked_shl(i as u32).unwrap_or(0);
             }
         }
         self.meters = m;
@@ -1143,7 +1172,7 @@ impl DeviceState {
     }
 
     pub fn is_clipped(&self, channel: usize) -> bool {
-        self.clip_latched & (1 << channel) != 0
+        self.clip_latched & 1u32.checked_shl(channel as u32).unwrap_or(0) != 0
     }
 
     /// Apply one notification to the shadow.
@@ -1578,6 +1607,19 @@ mod tests {
 
     fn state() -> DeviceState {
         DeviceState::new(caps(), BulkPacket::decode(packet()).unwrap())
+    }
+
+    /// The clip latch is a 32-bit word: a channel past it, from a confused
+    /// device, is never latched rather than overflowing the shift.
+    #[test]
+    fn a_channel_past_the_clip_latch_is_not_clipped() {
+        let mut s = state();
+        s.update_meters(Meters {
+            clipped: vec![true; 40],
+            ..Meters::default()
+        });
+        assert!(s.is_clipped(31));
+        assert!(!s.is_clipped(32) && !s.is_clipped(39));
     }
 
     #[test]
@@ -2089,6 +2131,38 @@ mod tests {
         let (_, o, _) = section("limiter");
         s.bulk.patch(o + 12, &[0]).unwrap();
         assert_eq!(texts(&s), vec!["Limiter: Output 1 limiter: disabled"]);
+    }
+
+    /// The pins, the I2S and ADAT set-up and the input pins are output
+    /// configuration too: in INDEPENDENT mode they leave the preset clean,
+    /// as in the Console's diff, while the input source still counts.
+    #[test]
+    fn output_configuration_is_not_a_preset_change_in_independent_mode() {
+        for (name, at) in [
+            ("pins", 1),
+            ("i2s_config", 0),
+            ("adat_config", 1),
+            ("input_config", 1),
+        ] {
+            let mut s = beta4_state();
+            s.output_config_mode = output_config_mode::INDEPENDENT;
+            s.mark_saved();
+            let (_, o, _) = section(name);
+            let was = s.bulk.as_bytes()[o + at];
+            s.bulk.patch(o + at, &[was.wrapping_add(1)]).unwrap();
+            assert!(!s.has_unsaved_changes(), "{name}");
+            assert!(texts(&s).is_empty(), "{name}: {:?}", texts(&s));
+            s.output_config_mode = output_config_mode::WITH_PRESET;
+            assert!(s.has_unsaved_changes(), "{name} with the preset");
+            assert!(!texts(&s).is_empty(), "{name} with the preset");
+        }
+        let mut s = beta4_state();
+        s.output_config_mode = output_config_mode::INDEPENDENT;
+        s.mark_saved();
+        let (_, o, _) = section("input_config");
+        let was = s.bulk.as_bytes()[o];
+        s.bulk.patch(o, &[was ^ 1]).unwrap();
+        assert!(s.has_unsaved_changes(), "the input source is the preset's");
     }
 
     /// In INDEPENDENT mode the limiters are output configuration: no preset
