@@ -2824,7 +2824,7 @@ impl SettingsPage for SurfacesPage {
         };
         match outcome {
             DialogOutcome::Text(name) => {
-                self.names[slot] = name.chars().take(31).collect();
+                self.names[slot] = dspi_proto::packets::truncate_name(&name, 31).to_string();
                 PageEvent::Handled
             }
             DialogOutcome::Button(0) => self.remove(slot),
