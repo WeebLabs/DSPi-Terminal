@@ -1318,9 +1318,13 @@ pub fn factory_reset_dialog() -> Dialog {
     .default_button(1)
 }
 
+/// The bootloader handoff's confirm. The Terminal installs no firmware
+/// (PLAN-beta4 decision 4): it reboots the device into the RP2 bootloader and
+/// the user copies a .uf2 file themselves, so the dialog is named for what it
+/// does rather than after the Console's Firmware Update installer.
 pub fn firmware_dialog() -> Dialog {
     Dialog::confirm(
-        "Firmware Update",
+        "Reboot into Bootloader",
         "This will reboot the device into bootloader mode.\n\nAudio output will stop \
          immediately. The device will appear as a USB drive to which you can drag a .uf2 \
          firmware file.",

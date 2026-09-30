@@ -676,7 +676,8 @@ pattern.
 - **Import Device Configuration**: path, then the options checklist with
   provenance and the cross-platform warning, then progress, then the
   report.
-- **Firmware Update**: the critical confirm, then a progress dialog that
+- **Reboot into Bootloader** (the old Console's Firmware Update, renamed in
+  beta4; see section 11): the critical confirm, then a progress dialog that
   waits for the device to disappear and the `RPI-RP2` volume to appear, and
   tells the user where to copy the `.uf2`.
 

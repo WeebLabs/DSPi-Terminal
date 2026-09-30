@@ -183,7 +183,7 @@ pub const APP_VERBS: &[(&str, &str)] = &[
     ("commit", "Commit Parameters..."),
     ("revert", "Revert to Saved..."),
     ("factory-reset", "Factory Reset..."),
-    ("bootloader", "Firmware Update..."),
+    ("bootloader", "Reboot into Bootloader..."),
     ("device", "Device picker"),
     ("reconnect", "Reconnect to the device"),
     ("clear-favourites", "AutoEQ: clear favourites"),
@@ -1773,7 +1773,7 @@ impl Live {
                 let watch = actions::BootloaderWatch::new();
                 self.dialog = Some((
                     AppDialog::BootWait,
-                    Dialog::progress("Firmware Update", watch.status()),
+                    Dialog::progress("Reboot into Bootloader", watch.status()),
                 ));
                 self.boot = Some(watch);
             }
@@ -2401,7 +2401,7 @@ impl Live {
             if finished {
                 // A progress dialog has no buttons, so the wait becomes a
                 // report the person can dismiss once it has an answer.
-                *dialog = Dialog::report("Firmware Update", vec![status]);
+                *dialog = Dialog::report("Reboot into Bootloader", vec![status]);
             }
         }
         if finished {
@@ -3549,7 +3549,7 @@ mod tests {
         assert!(l.boot.is_some(), "the wait started");
         let (kind, d) = l.dialog.as_ref().expect("the progress dialog");
         assert!(matches!(kind, AppDialog::BootWait));
-        assert_eq!(d.title, "Firmware Update");
+        assert_eq!(d.title, "Reboot into Bootloader");
         match &d.kind {
             crate::widgets::DialogKind::Progress { status, .. } => {
                 assert_eq!(status, "Waiting for the device to disconnect...")
