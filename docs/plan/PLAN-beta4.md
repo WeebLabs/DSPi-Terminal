@@ -343,15 +343,16 @@ Generator, cut labels, tool keys `S` `D` `A`, the non-V32 refusal and the
 no-device state), B4 (the output limiter), B5 (the Subharmonic
 Synthesizer), B6 (the Tube Modeller), B7 (caps v14 to v20 and Auxiliary
 Outputs), B8 (the spectrum analyser engine, panel and settings) and B11
-(`.dspipreset` interoperability with both Consoles). B10's documentation
-and defect work is done on its branch: `DESIGN.md` section 11 records the
-beta4 deviations, `archive/audit.md` gives every defect its resolution,
-and D36, D40, D57 and D72 are fixed; 1213 tests pass.
+(`.dspipreset` interoperability with both Consoles), B9 (Graphing readout,
+grid and dashboard choices, Stats columns and fill history, held-key write
+coalescing, a pinned magnitude test, a 1-byte crossfeed mask) and B10
+(`DESIGN.md` section 11 records the beta4 deviations, `archive/audit.md`
+gives every defect its resolution, D36, D40, D57 and D72 fixed). 1227
+tests pass. R5 is done; R4 (grey ghosts) is dropped, recorded in
+`DESIGN.md` section 11.
 
-Open: B9 (graph, band list, Stats and dashboard refinements), which also
-owns coverage rows R4 and R5; T5, the analyser overlay on the response
-graph and the RTA strip, deferred by decision 3; audit D50 and the graph
-height half of D66; the deep audits `PLAN.md` phase 10 still owes, plus
+Open: T5, the analyser overlay on the response graph and the RTA strip,
+deferred by decision 3; audit D50 and the graph height half of D66; the deep audits `PLAN.md` phase 10 still owes, plus
 the analyser engine and the limiter; and the pull request to `main`.
 
 Hardware checkpoints still to run, all on beta4: HW-1, HW-2, HW-2b and

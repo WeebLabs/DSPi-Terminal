@@ -402,8 +402,8 @@ here are not the rows of the same name above). Ticked when merged on
 | R1 | Signal Generator rename; HC / LC labels; High Cut / Low Cut | Everywhere | B3 | yes |
 | R2 | Matrix and routing names from channel names | Matrix, output page | B3 | yes |
 | R3 | Refusal of non-V32 firmware; no-device empty state | Shell | B3 | yes |
-| R4 | Bypassed bands as grey ghosts | Graph | B9 | |
-| R5 | Stats three columns and buffer history; dashboard cards per row | Stats, overview | B9 | |
+| R4 | Bypassed bands as grey ghosts | Graph | B9 | dropped (DESIGN 11) |
+| R5 | Stats three columns and buffer history; dashboard cards per row | Stats, overview | B9 | yes |
 
 Not carried over, with reasons: the `STM32H723` platform (a separate
 firmware repository not in scope; the platform id is decoded generically so

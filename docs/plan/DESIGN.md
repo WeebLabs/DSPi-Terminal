@@ -617,9 +617,14 @@ line from `SIGGEN_STATE` notifications.
 ### 7.10 Stats panel (`T`)
 
 The Console's sections as `Label ......... value` rows under section
-headers, badges as status pills, the buffer fill rows as short meters with
-the min-max watermark drawn `▏ ▕`. `r` resets watermarks. Refresh every
-2 s, the footer says so.
+headers, badges as status pills. The Console's three columns (device,
+system, audio output and PDM; SPDIF DMA starvation and buffer fill; the
+inputs present) when each column can be at least 36 cells wide, so three
+from a 110-cell pane, two at 120x40 and one at 80x24. Each buffer fill row
+reads name, a sparkline of the last 8 samples coloured by health,
+`min-max%`, then the reading. The device section carries the firmware's
+Build and Build Date, "-" when it does not answer. `r` resets watermarks.
+Refresh every 2 s, the footer says so.
 
 ### 7.11 Interrupt Monitor panel (`I`)
 
@@ -925,6 +930,22 @@ Recorded as they were taken, so the document stays the spec.
   regenerated without being read, which pins nothing; a `contains`
   assertion names what the test is about and survives an unrelated change.
   The key-hint tests and the both-sizes fill tests cover layout breakage.
+
+- **Held-key writes are coalesced to one per value per 33 ms** (B9), the
+  Console's 30 writes a second for a drag, with the last value always
+  sent. Toggles and actions are never held; undo and `:` commands flush
+  anything held first.
+- **Grid Opacity is Off / Dim / Normal** (B9) rather than the Console's
+  0..200 % slider; Dim, the default, is the Console's 50 %. The readout
+  toggles govern the `h` / `l` cursor's status line.
+- **Cards per Row** caps the overview grid's own column count (B9); the
+  row name is the Terminal's, since the Console's popover has none.
+- **Stats shows Build and Build Date** (B9), which the Console's Stats does
+  not; its fill rows keep "Out 1/2" rather than naming the slot type.
+- **Settings changes reach the running screens at once** (B9); before,
+  Graphing changes waited for a restart.
+- **Grey ghosts for bypassed bands are not drawn** (B3): the Terminal's
+  graph draws a channel's combined curve, not each band's contribution.
 
 ## 12. The quiet redesign: one curve per graph, colour on demand
 
