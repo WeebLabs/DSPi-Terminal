@@ -30,6 +30,7 @@ pub mod panel;
 pub mod presets;
 pub mod psybass;
 pub mod signals;
+pub mod spectrum;
 pub mod stats;
 pub mod upmixer;
 
@@ -57,6 +58,7 @@ pub mod quick;
 pub use presets::{PresetChoice, PresetMenu};
 pub use psybass::PsybassPanel;
 pub use signals::SignalsPanel;
+pub use spectrum::SpectrumPanel;
 pub use stats::StatsPanel;
 pub use upmixer::UpmixerPanel;
 
@@ -92,6 +94,9 @@ pub struct SharedState {
     /// The main graph's window and zoom, mirrored by the runner each frame so
     /// the overview's cells draw on the same axes (DESIGN 12.2).
     pub graph: crate::graph::GraphSettings,
+    /// The spectrum analyser: its engine, its Settings values and the
+    /// channels chosen. The runner ticks the engine; views subscribe to it.
+    pub spectrum: spectrum::SpectrumState,
 }
 
 impl SharedState {

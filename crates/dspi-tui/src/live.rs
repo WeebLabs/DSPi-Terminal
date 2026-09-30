@@ -29,7 +29,7 @@ use crate::perf::Performance;
 use crate::screens::{
     self, AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
     MonitorPanel, OutputPage, Overview, PresetChoice, PresetMenu, PsybassPanel, Shared,
-    SignalsPanel, StatsPanel, UpmixerPanel, clipboard, panel, presets,
+    SignalsPanel, SpectrumPanel, StatsPanel, UpmixerPanel, clipboard, panel, presets,
 };
 use crate::settings::{AppConfig, SettingsData, SettingsScreen};
 use crate::shell::{
@@ -128,22 +128,30 @@ impl Default for ConsoleScreens {
 
 impl ConsoleScreens {
     pub fn new() -> Self {
+        let config = AppConfig::load();
+        let shared = screens::shared();
+        // The analyser's settings live with the engine, so a change on the
+        // Settings page reaches it without a restart.
+        shared
+            .borrow_mut()
+            .spectrum
+            .adopt_settings(&config.spectrum);
         Self {
-            shared: screens::shared(),
+            shared,
             settings: std::rc::Rc::new(std::cell::RefCell::new(SettingsData::default())),
-            config: AppConfig::load(),
+            config,
         }
     }
 }
 
-/// A beta4 tool whose panel is still to come (phases B5, B6 and B8).
+/// A beta4 tool whose panel is still to come (phases B5 and B6).
 ///
 /// The tool is shown only when the device reports its feature (the probe's
-/// `subharmonic_synth`, `tube_preamp` and `spectrum_analyser`); without it
-/// the Console's own unsupported notice stands in for the window
-/// (`SubharmonicSynthView.swift:252-257`, `TubeModellerView.swift:404-409`,
-/// `SpectrumAnalyserView.swift:859`). No panel is stubbed: both cases are the
-/// shell's plain [`Placeholder`], which the real panels replace.
+/// `subharmonic_synth` and `tube_preamp`); without it the Console's own
+/// unsupported notice stands in for the window
+/// (`SubharmonicSynthView.swift:252-257`, `TubeModellerView.swift:404-409`).
+/// No panel is stubbed: both cases are the shell's plain [`Placeholder`],
+/// which the real panels replace.
 pub fn pending_tool(state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
     let (feature, unsupported) = match tool {
         Tool::Subharm => (
@@ -151,14 +159,11 @@ pub fn pending_tool(state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
             "Requires firmware with wire format V29 or newer. Update the DSPi firmware to \
              use the Subharmonic Synthesizer.",
         ),
-        Tool::Tube => (
+        // Tool::Tube; the factory sends only these two here.
+        _ => (
             "tube_preamp",
             "Requires firmware with wire format V31 or newer. Update the DSPi firmware to \
              use the Tube Modeller.",
-        ),
-        _ => (
-            "spectrum_analyser",
-            "This firmware has no spectrum analyser.",
         ),
     };
     let body = if panel::has_feature(state, feature) {
@@ -180,7 +185,7 @@ impl Screens for ConsoleScreens {
 
     fn tool(&self, state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
         match tool {
-            Tool::Subharm | Tool::Tube | Tool::Spectrum => pending_tool(state, tool),
+            Tool::Subharm | Tool::Tube => pending_tool(state, tool),
             Tool::Matrix => Box::new(MatrixPanel::new(self.shared.clone())),
             Tool::Crossfeed => Box::new(CrossfeedPanel::new()),
             Tool::Loudness => Box::new(LoudnessPanel::new()),
@@ -191,15 +196,19 @@ impl Screens for ConsoleScreens {
             Tool::Stats => Box::new(StatsPanel::new(self.shared.clone())),
             Tool::Monitor => Box::new(MonitorPanel::new(self.shared.clone())),
             Tool::AutoEq => Box::new(AutoEqPanel::new(self.shared.clone())),
+            Tool::Spectrum => Box::new(SpectrumPanel::open(self.shared.clone(), state)),
         }
     }
 
     fn settings(&self, state: &DeviceState) -> Box<dyn Screen> {
-        Box::new(SettingsScreen::new(
-            state,
-            self.settings.borrow().clone(),
-            self.config.clone(),
-        ))
+        let mut config = self.config.clone();
+        config.spectrum = self.shared.borrow().spectrum.settings.clone();
+        let shared = self.shared.clone();
+        Box::new(
+            SettingsScreen::new(state, self.settings.borrow().clone(), config).on_config(
+                move |c: &AppConfig| shared.borrow_mut().spectrum.adopt_settings(&c.spectrum),
+            ),
+        )
     }
 
     fn shared(&self) -> Option<Shared> {
@@ -211,7 +220,9 @@ impl Screens for ConsoleScreens {
     }
 
     fn refresh_settings(&self, session: &mut Session) {
-        *self.settings.borrow_mut() = SettingsData::read(session);
+        let mut data = SettingsData::read(session);
+        data.rta = self.shared.borrow().spectrum.engine.caps().copied();
+        *self.settings.borrow_mut() = data;
     }
 }
 
@@ -544,6 +555,9 @@ pub struct Live {
     /// The serial of a device to open in place of this one. The event loop
     /// owns the transport, so the picker asks and the loop does it.
     pub switch_to: Option<String>,
+    /// A key is waiting: the loop sets this before a tick so the analyser
+    /// sits that tick out and the key's write goes first.
+    pub input_pending: bool,
 }
 
 impl Live {
@@ -601,6 +615,7 @@ impl Live {
             boot: None,
             rebuild: None,
             switch_to: None,
+            input_pending: false,
         };
         live.sync_model();
         live
@@ -1576,7 +1591,12 @@ impl Live {
             "autoeq" => self.open_tool(Tool::AutoEq),
             "subharm" => self.open_tool(Tool::Subharm),
             "tube" => self.open_tool(Tool::Tube),
-            "spectrum" => self.open_tool(Tool::Spectrum),
+            "spectrum" => {
+                if !self.shared.borrow().spectrum.engine.supported() {
+                    self.connect_analyser(session);
+                }
+                self.open_tool(Tool::Spectrum)
+            }
             "settings" => self.open_settings(session),
             _ => return false,
         }
@@ -2161,6 +2181,7 @@ impl Live {
         self.poll_upmix_status(session, now);
         self.poll_stats(session, now);
         self.poll_screen(session, now);
+        self.tick_analyser(session, now);
 
         let mut reread = false;
         let mut loaded_elsewhere = false;
@@ -2240,6 +2261,43 @@ impl Live {
             self.select(Selection::Overview);
         }
         self.sync_model();
+    }
+
+    /// Read the spectrum analyser's caps, and push the Settings page's
+    /// values on the next tick: the device forgets them at every power cycle.
+    /// Called on connect and after a device switch.
+    pub fn connect_analyser(&mut self, session: &mut Session) {
+        let absent = self
+            .state
+            .caps
+            .features
+            .iter()
+            .any(|f| f.name == "spectrum_analyser" && !f.present);
+        let mut app = self.shared.borrow_mut();
+        let engine = &mut app.spectrum.engine;
+        if absent {
+            engine.disconnect();
+        } else {
+            let _ = session.with_transport(|t| Ok(engine.connect(t)));
+        }
+    }
+
+    /// One analyser poll, inside its budget, after the meters so they are
+    /// never late for it. Skipped outright when a key is waiting.
+    fn tick_analyser(&mut self, session: &mut Session, now: Instant) {
+        if self.input_pending {
+            return;
+        }
+        let report = {
+            let mut app = self.shared.borrow_mut();
+            let engine = &mut app.spectrum.engine;
+            session
+                .with_transport(|t| Ok(engine.tick(t, now, dspi_session::rta::Budget::default())))
+                .unwrap_or_default()
+        };
+        if report.disconnected {
+            self.state.connected = false;
+        }
     }
 
     /// Move the bootloader handoff along, and close it out when it lands.
@@ -2325,6 +2383,7 @@ fn open_device(serial: &str) -> Result<(Session, DeviceState), String> {
 /// Run the live interface until the person quits.
 pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
     live.arm_notifications(session);
+    live.connect_analyser(session);
     live.refresh_devices();
     let perf = live.perf;
     live.refresh_presets(session);
@@ -2334,6 +2393,7 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
     let result = (|| -> io::Result<()> {
         loop {
             if last_poll.elapsed() >= perf.meter_interval {
+                live.input_pending = event::poll(Duration::ZERO)?;
                 let notes = live.notes.take();
                 live.tick(session, notes.as_ref());
                 live.notes = notes;
@@ -2359,6 +2419,7 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
                         *session = next;
                         live.adopt(session, state);
                         live.arm_notifications(session);
+                        live.connect_analyser(session);
                     }
                     Err(e) => live.note(format!("Could not open {serial}: {e}")),
                 }
@@ -2550,7 +2611,7 @@ mod tests {
         assert!(l.shell.detail.keys().iter().any(|k| k.key == "x"));
     }
 
-    /// `S`, `D` and `A` open the beta4 tools by their Console titles; until
+    /// `S` and `D` open the beta4 tools by their Console titles; until
     /// their panels land, the placeholder says what the device lacks, or
     /// that the panel is still to come when it has the feature.
     #[test]
@@ -2568,11 +2629,6 @@ mod tests {
                 "Tube Modeller",
                 "Requires firmware with wire format V31",
             ),
-            (
-                Tool::Spectrum,
-                "Spectrum Analyser",
-                "This firmware has no spectrum analyser.",
-            ),
         ] {
             l.handle_event(&mut s, ShellEvent::OpenTool(tool));
             assert!(matches!(l.shell.tool, Some((t, _)) if t == tool));
@@ -2584,14 +2640,12 @@ mod tests {
             }
             l.handle_event(&mut s, ShellEvent::CloseTool);
         }
-        let name = |t: Tool| match t {
-            Tool::Subharm => "subharmonic_synth",
-            Tool::Tube => "tube_preamp",
-            _ => "spectrum_analyser",
-        };
-        for tool in [Tool::Subharm, Tool::Tube, Tool::Spectrum] {
+        for (tool, name) in [
+            (Tool::Subharm, "subharmonic_synth"),
+            (Tool::Tube, "tube_preamp"),
+        ] {
             l.state.caps.features.push(dspi_session::probe::Feature {
-                name: name(tool).into(),
+                name: name.into(),
                 present: true,
                 evidence: "test".into(),
             });
@@ -3284,5 +3338,84 @@ mod tests {
             l.shell.model.echo,
             "user volume changed by the system volume"
         );
+    }
+
+    /// The analyser is read inside the loop's own tick, after the meters,
+    /// only while its panel watches; closing the panel stops the device, and
+    /// a waiting key makes it sit a tick out.
+    #[test]
+    fn the_analyser_is_polled_while_its_panel_is_open_and_stopped_after() {
+        use crate::screens::spectrum::demo;
+        use dspi_transport::mock::{Direction, Reply};
+        let centres = |r: std::ops::Range<usize>| -> Vec<u8> {
+            demo::CENTRES[r]
+                .iter()
+                .flat_map(|c| c.to_le_bytes())
+                .collect()
+        };
+        let mock = MockTransport::new()
+            .window(op::REQ_GET_ALL_PARAMS_CHUNK, packet())
+            .data(op::REQ_GET_STATUS, vec![0; 41])
+            .reply(
+                op::REQ_RTA_GET_CAPS,
+                Reply::Sequence(vec![
+                    Reply::Data(demo::caps().encode().to_vec()),
+                    Reply::Data(centres(0..32)),
+                    Reply::Data(centres(32..37)),
+                ]),
+            )
+            .data(op::REQ_RTA_GET_BANDS, demo::frame(0).encode().to_vec())
+            .data(op::REQ_RTA_CONTROL, vec![1]);
+        let log = mock.log_handle();
+        let mut s = Session::new(Box::new(mock), caps()).unwrap();
+        let state = DeviceState::new(
+            caps(),
+            dspi_proto::wire::BulkPacket::decode(packet()).unwrap(),
+        );
+        let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut l = Live::new(
+            state,
+            theme,
+            Performance::lite(),
+            Box::new(ConsoleScreens::new()),
+        );
+        l.connect_analyser(&mut s);
+        assert!(l.shared.borrow().spectrum.engine.supported());
+        let rta = |o: u8| (op::REQ_RTA_SET_CONFIG..=op::REQ_RTA_GET_BANDS_ALL).contains(&o);
+
+        // Nothing watches yet, so nothing is read.
+        log.lock().unwrap().clear();
+        l.tick(&mut s, None);
+        assert!(!log.lock().unwrap().iter().any(|x| rta(x.opcode)));
+
+        l.handle_event(&mut s, ShellEvent::OpenTool(Tool::Spectrum));
+        log.lock().unwrap().clear();
+        l.tick(&mut s, None);
+        let ops: Vec<u8> = log.lock().unwrap().iter().map(|x| x.opcode).collect();
+        let first_rta = ops.iter().position(|o| rta(*o)).expect("the analyser ran");
+        assert!(
+            first_rta > 0 && !rta(ops[0]),
+            "the meters go first: {ops:02X?}"
+        );
+        assert!(ops.contains(&op::REQ_RTA_GET_BANDS), "{ops:02X?}");
+
+        // A key waiting: the analyser sits this tick out.
+        l.input_pending = true;
+        log.lock().unwrap().clear();
+        l.tick(&mut s, None);
+        assert!(!log.lock().unwrap().iter().any(|x| rta(x.opcode)));
+        l.input_pending = false;
+
+        l.handle_event(&mut s, ShellEvent::CloseTool);
+        log.lock().unwrap().clear();
+        l.tick(&mut s, None);
+        let stops: Vec<(Direction, u16)> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|x| x.opcode == op::REQ_RTA_CONTROL)
+            .map(|x| (x.direction, x.value))
+            .collect();
+        assert_eq!(stops, vec![(Direction::In, 0)], "STOP, wValue 0");
     }
 }

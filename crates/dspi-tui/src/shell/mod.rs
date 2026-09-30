@@ -512,6 +512,17 @@ impl Shell {
                 if line.is_empty() {
                     return;
                 }
+                // A line the page runs itself, such as one that has to ask
+                // before it writes.
+                let run = {
+                    let (s, owner) = self.top();
+                    s.quick_run(&line, state).map(|ev| (ev, owner))
+                };
+                if let Some((ev, owner)) = run {
+                    self.absorb(ev, owner, out);
+                    self.quick_history.push(line);
+                    return;
+                }
                 let commands = {
                     let (s, _) = self.top();
                     s.quick(&line, state)

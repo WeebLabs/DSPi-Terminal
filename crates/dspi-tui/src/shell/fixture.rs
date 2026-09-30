@@ -450,3 +450,10 @@ pub fn state() -> DeviceState {
         BulkPacket::decode(packet()).expect("fixture packet"),
     )
 }
+
+/// Give the shared analyser an RP2350's caps and a picture of the first
+/// output, bins and all, so the Spectrum Analyser panel has something to draw
+/// without a device. `channels` picks what is chosen at the output tap.
+pub fn spectrum(shared: &crate::screens::Shared, channels: &[u8]) {
+    crate::screens::spectrum::demo::load(shared, dspi_session::rta::TAP_OUTPUT, channels);
+}
