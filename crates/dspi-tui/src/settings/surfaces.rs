@@ -41,7 +41,9 @@ use crate::widgets::{Action, Button, Dialog, DialogOutcome, KeyHelp, PopupList, 
 use super::cs_model::{self as m, CsData};
 use super::cs_model::{target_choice, target_choices};
 use super::{Cx, PageEvent, Row, SettingsData, SettingsPage};
-use dspi_session::surfaces::{CsBinding, CsDisplayCfg, CsDisplayPage, GPIO_UNUSED, IrCommand};
+use dspi_session::surfaces::{
+    CsBinding, CsDisplayCfg, CsDisplayPage, CsStatusPacket, GPIO_UNUSED, IrCommand,
+};
 
 pub const EMPTY_TITLE: &str = "No Controls Configured";
 pub const EMPTY_BODY: &str = "Wire a button, switch, knob, encoder, or LED to a spare GPIO and \
@@ -165,6 +167,13 @@ enum Item {
 /// moment the next one arms.
 type Learning = (usize, Option<(u8, u8, u32)>);
 
+/// A display record as it stood before a write replaced it.
+#[derive(Debug, Clone)]
+enum DisplayRecord {
+    Cfg(CsDisplayCfg),
+    Page(usize, CsDisplayPage),
+}
+
 pub struct SurfacesPage {
     cursor: usize,
     drafts: Vec<CsBinding>,
@@ -185,6 +194,11 @@ pub struct SurfacesPage {
     learning: Option<Learning>,
     /// The device's answer to the last display config or page write.
     display_status: Option<String>,
+    /// What each display write in flight replaced, by its session tag, so a
+    /// refusal can put it back. The config and each page apply as they are
+    /// edited, so this is also what marks them as not to be taken from a
+    /// re-read until the device has answered.
+    display_undo: BTreeMap<u32, DisplayRecord>,
     popup: Option<Item>,
     dialog: Option<Item>,
     /// True on Auxiliary Outputs, which shows the aux slots and nothing else;
@@ -228,6 +242,7 @@ impl SurfacesPage {
             applying: None,
             learning: None,
             display_status: None,
+            display_undo: BTreeMap::new(),
             popup: None,
             dialog: None,
             aux_page: false,
@@ -297,6 +312,26 @@ impl SurfacesPage {
         self.live.display_status = cs.display_status.clone();
         self.live.groups = cs.groups.clone();
         self.live.macros = cs.macros.clone();
+        // The display's config and pages have no staged edit: each applies
+        // as it is made. They follow the device on every read, except a
+        // record whose write the device has not answered yet, which the
+        // answer settles.
+        if !self.display_undo.contains_key(&TAG_DISPLAY_CFG) {
+            self.live.display_cfg = cs.display_cfg.clone();
+        }
+        self.live.max_pages = cs.max_pages;
+        if self.live.pages.len() != cs.pages.len() {
+            self.live.pages = cs.pages.clone();
+        } else {
+            for (i, page) in cs.pages.iter().enumerate() {
+                if !self
+                    .display_undo
+                    .contains_key(&(TAG_DISPLAY_PAGE | i as u32))
+                {
+                    self.live.pages[i] = page.clone();
+                }
+            }
+        }
     }
 
     /// A learn result arrives on the notification stream, not as the answer to
@@ -923,10 +958,7 @@ impl SurfacesPage {
                 "Step past the last position back to the first.".into(),
             );
         }
-        if b.component == m::ty::BUTTON
-            && (b.action == m::act::INC || b.action == m::act::DEC)
-            && b.event == 0
-        {
+        if m::repeat_allowed(b) {
             flag(
                 m::flag::REPEAT,
                 "Repeat While Held".into(),
@@ -1368,7 +1400,7 @@ impl SurfacesPage {
         }
 
         rows.push((None, Row::section("WIRING")));
-        let models: Vec<u8> = (1..=cs.caps.display_models.max(1)).collect();
+        let models = m::display_models(cs);
         rows.push((
             Some(Item::DispModel(slot)),
             Row::Pick {
@@ -1834,7 +1866,7 @@ impl SurfacesPage {
                     },
                 ));
                 rows.extend(self.target_rows(cx, slot));
-                let acts = m::valid_actions(cs, b.component, b.noun);
+                let acts = m::binding_actions(cs, b.component, b.noun, b.event);
                 if acts.len() > 1 {
                     let (title, detail) = if m::is_indicator(b.component) {
                         ("Indicates", "How the LED reflects the function.")
@@ -1859,12 +1891,16 @@ impl SurfacesPage {
                     ));
                 }
                 if b.component == m::ty::BUTTON {
+                    let gestures = m::binding_gestures(&b);
                     rows.push((
                         Some(Item::Event(slot)),
                         Row::Pick {
                             label: "Gesture".into(),
-                            choices: m::EVENT_NAMES.iter().map(|s| (*s).to_string()).collect(),
-                            selected: (b.event as usize).min(2),
+                            choices: gestures
+                                .iter()
+                                .map(|e| m::EVENT_NAMES[*e as usize].to_string())
+                                .collect(),
+                            selected: gestures.iter().position(|e| *e == b.event).unwrap_or(0),
                             caption: Some(
                                 "Which press gesture triggers this. Bind several to one button \
                                  GPIO for multiple functions."
@@ -2012,11 +2048,16 @@ impl SurfacesPage {
             let name = name.clone();
             let ir = ir.clone();
             m::run(session, move |s| {
-                let mut st = if binding_changed {
-                    s.write_binding(slot, &binding)?
-                } else {
-                    s.read_status()?
-                };
+                // Only this Apply's own writes are judged. `last_status` is
+                // sticky: it keeps the last refusal until another deferred
+                // write succeeds, and an aux SET that succeeds never clears
+                // it (vendor_commands.c:1496-1536), so reading it when the
+                // binding is unchanged could block a rename with another
+                // slot's old failure.
+                let mut st = CsStatusPacket::default();
+                if binding_changed {
+                    st = s.write_binding(slot, &binding)?;
+                }
                 if st.last_status != dspi_session::surfaces::status::SUCCESS {
                     return Ok(st);
                 }
@@ -2062,7 +2103,12 @@ impl SurfacesPage {
         self.apply(slot)
     }
 
+    /// The config shows the edit at once, as the Console's does, and keeps
+    /// what it replaced until the device answers: a refusal puts that back.
     fn write_display_cfg(&mut self, cfg: CsDisplayCfg) -> PageEvent {
+        self.display_undo
+            .entry(TAG_DISPLAY_CFG)
+            .or_insert_with(|| DisplayRecord::Cfg(self.live.display_cfg.clone()));
         self.live.display_cfg = cfg.clone();
         self.display_status = None;
         PageEvent::Session(SessionRequest::new(TAG_DISPLAY_CFG, move |session| {
@@ -2071,8 +2117,13 @@ impl SurfacesPage {
         }))
     }
 
+    /// The same for one page.
     fn write_page(&mut self, index: usize, page: CsDisplayPage) -> PageEvent {
         if index < self.live.pages.len() {
+            let before = self.live.pages[index].clone();
+            self.display_undo
+                .entry(TAG_DISPLAY_PAGE | index as u32)
+                .or_insert(DisplayRecord::Page(index, before));
             self.live.pages[index] = page.clone();
         }
         self.display_status = None;
@@ -2224,7 +2275,7 @@ impl SettingsPage for SurfacesPage {
             }
             (Item::ActionPick(slot), Action::Selected(c)) => {
                 let b = self.drafts[slot].clone();
-                let acts = m::valid_actions(&self.live, b.component, b.noun);
+                let acts = m::binding_actions(&self.live, b.component, b.noun, b.event);
                 if let Some(a) = acts.get(c).copied()
                     && a != b.action
                 {
@@ -2235,7 +2286,13 @@ impl SettingsPage for SurfacesPage {
                 PageEvent::Handled
             }
             (Item::Event(slot), Action::Selected(c)) => {
-                self.drafts[slot].event = c.min(2) as u8;
+                let b = &mut self.drafts[slot];
+                if let Some(e) = m::binding_gestures(b).get(c).copied() {
+                    b.event = e;
+                    // Repeat While Held is a short-press flag; its row goes
+                    // with the gesture, so the flag must too.
+                    m::sanitize_repeat(b);
+                }
                 PageEvent::Handled
             }
             (Item::Target(slot), Action::Selected(c)) => {
@@ -2475,16 +2532,17 @@ impl SettingsPage for SurfacesPage {
                 {
                     let mut cmd = self.ir_drafts[sub].clone();
                     cmd.noun = n;
+                    // A new noun starts on its first channel, as the Console
+                    // starts it; the group, if any, went with the old noun.
                     cmd.target = 0;
                     cmd.index = 0;
-                    // An aux noun needs an aux output, never slot 0 by default,
-                    // and takes no group.
+                    cmd.flags &= !m::flag::GROUP;
+                    // An aux noun needs an aux output, never slot 0 by default.
                     if self
                         .live
                         .noun_desc(n)
                         .is_some_and(|d| d.target_kind == m::target::AUX)
                     {
-                        cmd.flags &= !m::flag::GROUP;
                         cmd.target = m::target_addresses(&self.live, n, None)
                             .first()
                             .copied()
@@ -2589,7 +2647,7 @@ impl SettingsPage for SurfacesPage {
 
             // ------------------------------------------------------- display
             (Item::DispModel(slot), Action::Selected(c)) => {
-                let models: Vec<u8> = (1..=self.live.caps.display_models.max(1)).collect();
+                let models = m::display_models(&self.live);
                 if let Some(model) = models.get(c).copied() {
                     let b = &mut self.drafts[slot];
                     // The address stores 0 for "the model's usual one", so a
@@ -2679,12 +2737,13 @@ impl SettingsPage for SurfacesPage {
                 else {
                     return PageEvent::Handled;
                 };
+                let noun = m::display_page_nouns(&self.live)
+                    .first()
+                    .copied()
+                    .unwrap_or(m::noun::USER_VOLUME);
                 let page = CsDisplayPage {
-                    noun: m::display_page_nouns(&self.live)
-                        .first()
-                        .copied()
-                        .unwrap_or(m::noun::USER_VOLUME),
-                    target: 0,
+                    noun,
+                    target: first_address(&self.live, noun),
                     index: 0,
                     flags: page_flags::ACTIVE,
                 };
@@ -2697,7 +2756,7 @@ impl SettingsPage for SurfacesPage {
                 };
                 let mut p = self.live.pages[i].clone();
                 p.noun = n;
-                p.target = 0;
+                p.target = first_address(&self.live, n);
                 p.index = 0;
                 p.flags &= !page_flags::GROUP;
                 // A bar needs a range to plot inside; switching to a switch or
@@ -2838,12 +2897,24 @@ impl SettingsPage for SurfacesPage {
         }
         match tag & TAG_MASK {
             TAG_DISPLAY_CFG | TAG_DISPLAY_PAGE => {
+                let before = self.display_undo.remove(&tag);
                 return match reply {
                     SessionReply::Ok(_) => {
                         self.display_status = None;
                         PageEvent::Handled
                     }
                     SessionReply::Err(why) => {
+                        // Refused: the device still holds what it held, so
+                        // the row goes back to it.
+                        match before {
+                            Some(DisplayRecord::Cfg(cfg)) => self.live.display_cfg = cfg,
+                            Some(DisplayRecord::Page(i, page)) => {
+                                if let Some(p) = self.live.pages.get_mut(i) {
+                                    *p = page;
+                                }
+                            }
+                            None => {}
+                        }
                         self.display_status = Some(why.clone());
                         PageEvent::Status(why)
                     }
@@ -2903,6 +2974,16 @@ impl SettingsPage for SurfacesPage {
     }
 }
 
+/// Where a freshly picked noun starts: channel 0, or for an aux noun the first
+/// slot holding an aux output, since slot 0 rarely does and a page pointed at
+/// a slot without one is refused (control_surfaces.h:277-278).
+fn first_address(cs: &CsData, n: u8) -> u8 {
+    m::target_addresses(cs, n, None)
+        .first()
+        .copied()
+        .unwrap_or(0)
+}
+
 fn set_flag(flags: &mut u8, mask: u8, on: bool) {
     if on {
         *flags |= mask;
@@ -2913,13 +2994,40 @@ fn set_flag(flags: &mut u8, mask: u8, on: bool) {
 
 /// Reset a remote button's value and step for its action and noun kind,
 /// leaving the learned protocol, code, target and band alone.
+///
+/// The addressing stays as it was: a command on a group stays on that group,
+/// as a binding's does ([`m::sanitize_group_flags`]). The Console clears every
+/// flag here, which turns `target` from group N into channel N without a
+/// word. The other two flags are kept only where the firmware takes them:
+/// REPEAT on INC and DEC (control_surfaces.c:1837-1839), WRAP where it means
+/// something, on an enum INC or DEC.
 pub fn default_ir_operands(cs: &CsData, c: &IrCommand) -> IrCommand {
     let mut c = c.clone();
     let nd = cs.noun_desc(c.noun).copied().unwrap_or_default();
     let k = m::operand_kind(cs, c.noun);
     c.value = 0;
     c.step = 0;
-    c.flags = 0;
+    let steps = c.action == m::act::INC || c.action == m::act::DEC;
+    if !steps {
+        c.flags &= !m::flag::REPEAT;
+    }
+    if !(steps && k == m::kind::ENUM) {
+        c.flags &= !m::flag::WRAP;
+    }
+    if c.flags & m::flag::GROUP != 0 {
+        let usable = m::compatible_groups(cs, c.noun);
+        if c.action == m::act::TRIGGER || usable.is_empty() {
+            // No group fits any more: back to the noun's first address
+            // rather than reading the group index as a channel.
+            c.flags &= !m::flag::GROUP;
+            c.target = m::target_addresses(cs, c.noun, None)
+                .first()
+                .copied()
+                .unwrap_or(0);
+        } else if !usable.contains(&c.target) {
+            c.target = usable[0];
+        }
+    }
     match c.action {
         m::act::INC | m::act::DEC => {
             if k == m::kind::ENUM {
@@ -3965,5 +4073,226 @@ mod tests {
             .cloned()
             .expect("the SET");
         assert_eq!(sent.payload[22], 0);
+    }
+
+    /// `last_status` keeps the last refusal until another deferred write
+    /// succeeds, and an aux SET that succeeds leaves it alone (vendor_commands
+    /// .c:1496-1536). A rename with the binding unchanged used to read it
+    /// first and stop on another slot's old failure.
+    #[test]
+    fn a_rename_is_not_blocked_by_another_slots_old_refusal() {
+        use dspi_proto::generated::opcodes as op;
+        use dspi_proto::packets::CsStatusPacket;
+        use dspi_transport::MockTransport;
+        use dspi_transport::mock::{Direction, Reply};
+
+        let status = |slot: u8, code: u8| {
+            Reply::Data(
+                CsStatusPacket {
+                    last_status: code,
+                    last_slot: slot,
+                    max_bindings: 16,
+                    dirty: true,
+                    active_mask: 0b0001_1100_0001_1111,
+                    slot_status: vec![0; 16],
+                    ir_active_mask: 0b0001,
+                    ir_learn_state: 0,
+                    ir_cmd_status: vec![0; 16],
+                }
+                .encode(),
+            )
+        };
+        let mut caps = crate::shell::fixture::caps();
+        caps.cs = Some(m::demo::caps());
+        let t = MockTransport::new()
+            .data(op::REQ_SET_CS_NAME, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![
+                    // An aux output on slot 11 refused earlier and still says so.
+                    status(11, 0x26),
+                    status(1, 0),
+                ]),
+            );
+        let log = t.log_handle();
+        let mut session = dspi_session::Session::new(Box::new(t), caps).expect("session");
+
+        let (mut p, _, _) = page();
+        p.names[1] = "Mute Button".into();
+        let PageEvent::Session(req) = p.apply(1) else {
+            panic!("an apply is a session request");
+        };
+        assert_eq!((req.run)(&mut session), SessionReply::Ok("Applied".into()));
+        let first = log.lock().expect("log")[0].clone();
+        assert_eq!(
+            (first.direction, first.opcode),
+            (Direction::Out, op::REQ_SET_CS_NAME),
+            "the name goes first, with no status read ahead of it"
+        );
+    }
+
+    /// Changing the gesture takes Repeat While Held with it, and a momentary
+    /// binding offers only the short press (control_surfaces.c:1729-1741).
+    #[test]
+    fn the_gesture_and_the_action_never_combine_into_a_refusal() {
+        let (mut p, mut d, st) = page();
+        let cfg = AppConfig::default();
+        d.cs.as_mut().expect("cs").nouns[m::noun::USER_MUTE as usize].actions |=
+            m::act_bit(m::act::MOMENTARY);
+        p.live = d.cs.clone().expect("cs");
+        let c = cx(&d, &st, &cfg);
+        p.expanded.insert(1);
+
+        p.drafts[1].noun = m::noun::USER_VOLUME;
+        p.drafts[1].action = m::act::INC;
+        p.drafts[1].flags = m::flag::REPEAT;
+        let repeat_row = |p: &SurfacesPage| {
+            p.build(&c)
+                .iter()
+                .any(|(i, _)| *i == Some(Item::Flag(1, m::flag::REPEAT)))
+        };
+        assert!(repeat_row(&p));
+        p.act(index_of(&p, &c, Item::Event(1)), Action::Selected(1), &c);
+        assert_eq!(p.drafts[1].event, m::evt::LONG);
+        assert_eq!(
+            p.drafts[1].flags & m::flag::REPEAT,
+            0,
+            "cleared with its row"
+        );
+
+        // On a long press, no Hold; on Hold, only the short press.
+        p.drafts[1] = d.cs.as_ref().expect("cs").bindings[1].clone();
+        p.drafts[1].event = m::evt::LONG;
+        let acts = m::binding_actions(&p.live, m::ty::BUTTON, m::noun::USER_MUTE, m::evt::LONG);
+        assert!(!acts.contains(&m::act::MOMENTARY));
+        p.drafts[1].event = m::evt::PRESS;
+        let acts = m::binding_actions(&p.live, m::ty::BUTTON, m::noun::USER_MUTE, m::evt::PRESS);
+        let hold = acts.iter().position(|a| *a == m::act::MOMENTARY).unwrap();
+        p.act(
+            index_of(&p, &c, Item::ActionPick(1)),
+            Action::Selected(hold),
+            &c,
+        );
+        assert_eq!(p.drafts[1].action, m::act::MOMENTARY);
+        let gesture = p
+            .build(&c)
+            .into_iter()
+            .find(|(i, _)| *i == Some(Item::Event(1)))
+            .map(|(_, r)| r);
+        match gesture {
+            Some(Row::Pick { choices, .. }) => assert_eq!(choices, vec!["Press".to_string()]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Changing only a grouped remote key's action keeps it on its group:
+    /// clearing every flag used to turn group N into channel N.
+    #[test]
+    fn a_grouped_remote_key_keeps_its_group_when_its_action_changes() {
+        let (mut p, d, st) = page();
+        let cfg = AppConfig::default();
+        let c = cx(&d, &st, &cfg);
+        p.expanded.insert(3);
+        p.expanded_ir.insert(0);
+        p.ir_drafts[0] = IrCommand {
+            noun: m::noun::OUTPUT_MUTE,
+            action: m::act::TOGGLE,
+            flags: m::flag::GROUP | m::flag::REPEAT,
+            target: 0,
+            protocol: 1,
+            code: 0x20DF_40BF,
+            ..Default::default()
+        };
+        let acts = m::valid_actions(&p.live, m::ty::IR, m::noun::OUTPUT_MUTE);
+        let set = acts.iter().position(|a| *a == m::act::SET).unwrap();
+        p.act(
+            index_of(&p, &c, Item::IrAction(0)),
+            Action::Selected(set),
+            &c,
+        );
+        let cmd = &p.ir_drafts[0];
+        assert_eq!(cmd.action, m::act::SET);
+        assert_eq!(
+            cmd.flags & m::flag::GROUP,
+            m::flag::GROUP,
+            "still the group"
+        );
+        assert_eq!(cmd.target, 0, "group 0, Front Pair");
+        assert_eq!(cmd.flags & m::flag::REPEAT, 0, "REPEAT is INC and DEC only");
+    }
+
+    /// The display's config and pages follow each re-read, a refused write
+    /// puts the row back, and a page moved onto an aux noun points at an aux
+    /// output rather than slot 0.
+    #[test]
+    fn the_display_follows_the_device_and_a_refusal_rolls_back() {
+        let (mut p, d, st) = page();
+        let cfg = AppConfig::default();
+        let c = cx(&d, &st, &cfg);
+
+        let mut cs = d.cs.clone().expect("cs");
+        cs.display_cfg.brightness = 42;
+        cs.pages[1].flags |= page_flags::LARGE;
+        p.adopt(&cs);
+        assert_eq!(p.live.display_cfg.brightness, 42, "another host's change");
+        assert_eq!(p.live.pages[1], cs.pages[1]);
+
+        // A write shows at once and holds against a re-read until answered.
+        let mut edited = p.live.display_cfg.clone();
+        edited.brightness = 200;
+        let _ = p.write_display_cfg(edited);
+        p.adopt(&cs);
+        assert_eq!(p.live.display_cfg.brightness, 200);
+        p.session_result(
+            TAG_DISPLAY_CFG,
+            SessionReply::Err("That setting is out of range".into()),
+            &c,
+        );
+        assert_eq!(p.live.display_cfg.brightness, 42, "rolled back");
+
+        let before = p.live.pages[0].clone();
+        let _ = p.write_page(0, CsDisplayPage::default());
+        p.session_result(
+            TAG_DISPLAY_PAGE,
+            SessionReply::Err("That display page or setting is not valid".into()),
+            &c,
+        );
+        assert_eq!(p.live.pages[0], before);
+
+        p.expanded.insert(4);
+        let nouns = m::display_page_nouns(&p.live);
+        let aux = nouns.iter().position(|n| *n == m::noun::AUX).unwrap();
+        let ev = p.act(
+            index_of(&p, &c, Item::PageNoun(0)),
+            Action::Selected(aux),
+            &c,
+        );
+        assert!(matches!(ev, PageEvent::Session(_)));
+        assert_eq!(p.live.pages[0].noun, m::noun::AUX);
+        assert_eq!(p.live.pages[0].target, 10, "the first aux output");
+    }
+
+    /// `model_count` is one past the last model, so the picker stops at 8.
+    #[test]
+    fn the_model_picker_offers_only_real_models() {
+        let (mut p, d, st) = page();
+        let cfg = AppConfig::default();
+        let c = cx(&d, &st, &cfg);
+        p.expanded.insert(4);
+        let row = p
+            .build(&c)
+            .into_iter()
+            .find(|(i, _)| *i == Some(Item::DispModel(4)))
+            .map(|(_, r)| r);
+        match row {
+            Some(Row::Pick { choices, .. }) => {
+                assert_eq!(choices.len(), 8);
+                assert!(
+                    !choices.iter().any(|x| x.starts_with("Model ")),
+                    "{choices:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
