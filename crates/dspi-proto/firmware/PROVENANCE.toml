@@ -5,17 +5,24 @@
 # you exactly what changed.
 
 repository = "https://github.com/WeebLabs/DSPi"
-branch     = "release/v1.1.5"
-commit     = "9776c2f9feb5a1f8487180a351f8fbb1ec67e4ff"
-short      = "9776c2f"
-committed  = "2026-07-25 23:32:55 +0100"
-vendored   = "2026-07-27"
+branch     = "release/v1.1.6"
+commit     = "557bce7f150b2d1f9166272a2b6a0a2ef6888d60"
+short      = "557bce7"
+committed  = "2026-09-28 18:41:31 +0100"
+vendored   = "2026-09-29"
 
 files = [
-  "config.h",            # vendor opcodes, channel model, platform constants
-  "bulk_params.h",       # WireBulkParams V26 wire format
-  "control_surfaces.h",  # CS types, nouns, actions, status codes, caps
+  "config.h",            # vendor opcodes, channel model, platform constants, firmware version
+  "bulk_params.h",       # WireBulkParams V32 wire format
+  "control_surfaces.h",  # CS types, nouns, actions, units, status codes, caps v20
   "psybass.h",           # psychoacoustic bass ranges and defaults
   "upmix.h",             # upmixer config packet and parameter ids
   "siggen.h",            # test signal generator config, status, caps
+  "subharm.h",           # subharmonic synthesizer ranges, defaults, selectivity modes
+  "tube.h",              # tube preamp parameter ids, ranges and defaults
+  "limiter.h",           # output limiter parameter ids, read-only blocks, ranges
+  "rta.h",               # spectrum analyser wire structs and protocol constants
+  "rta_fft.h",           # analyser transform sizes, band count, level zero
+  "rta_bass.h",          # analyser bass band count
+  "notify.h",            # notification event ids and ParamSource tags
 ]

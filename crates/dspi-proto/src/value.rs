@@ -166,6 +166,9 @@ pub enum Repr {
     U8,
     U16Le,
     U32Le,
+    /// Unsigned 8.8 fixed point, little endian: 1.0 is 256. The auxiliary
+    /// output level is a percentage carried this way (config.h:141-145).
+    U16Q8,
     /// NUL-padded text of a fixed width.
     Text(usize),
     /// Opaque, already encoded by a dedicated codec.
@@ -178,7 +181,7 @@ impl Repr {
     pub fn len(self) -> usize {
         match self {
             Repr::Bool8 | Repr::U8 => 1,
-            Repr::U16Le => 2,
+            Repr::U16Le | Repr::U16Q8 => 2,
             Repr::F32 | Repr::U32Le => 4,
             Repr::Text(n) => n,
             Repr::Raw | Repr::None => 0,
@@ -193,11 +196,21 @@ impl Repr {
         Ok(match (self, v) {
             (Repr::None, _) => Vec::new(),
             (Repr::Bool8, _) => vec![v.as_bool().ok_or(mismatch("a yes/no value", v))? as u8],
+            (Repr::F32, Value::Mask(m)) => (*m as f32).to_le_bytes().to_vec(),
             (Repr::F32, _) => v
                 .as_f32()
                 .ok_or(mismatch("a number", v))?
                 .to_le_bytes()
                 .to_vec(),
+            (Repr::U16Q8, _) => {
+                let f = v.as_f32().ok_or(mismatch("a number", v))?;
+                ((f * 256.0).round().clamp(0.0, u16::MAX as f32) as u16)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            (Repr::U8, Value::Mask(m)) => {
+                vec![u8::try_from(*m).map_err(|_| mismatch("a mask 0x0-0xFF", v))?]
+            }
             (Repr::U8, _) => vec![v.as_u8().ok_or(mismatch("a whole number 0-255", v))?],
             (Repr::U16Le, Value::Mask(m)) => (*m as u16).to_le_bytes().to_vec(),
             (Repr::U16Le, _) => (v.as_f32().ok_or(mismatch("a whole number", v))? as u16)
@@ -231,6 +244,9 @@ impl Repr {
             Repr::Bool8 => Value::Bool(*bytes.first()? != 0),
             Repr::U8 => Value::Int(*bytes.first()? as i64),
             Repr::U16Le => Value::Int(u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]) as i64),
+            Repr::U16Q8 => {
+                Value::Float(u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]) as f32 / 256.0)
+            }
             Repr::U32Le => Value::Int(u32::from_le_bytes([
                 *bytes.first()?,
                 *bytes.get(1)?,

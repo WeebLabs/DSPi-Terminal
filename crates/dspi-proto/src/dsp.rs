@@ -159,7 +159,24 @@ pub fn coefficients(b: &Band) -> Coeffs {
         // as the shelf's linear gain.
         //
         // The one-pole TPT low pass is `g(1 + z^-1) / ((1+g) + (g-1)z^-1)`, and
-        // each type is a fixed mix of that low pass with the input.
+        // each type is a fixed mix of that low pass with the input: `lp` for
+        // LOWPASS1, `in - lp` for HIGHPASS1, `2*lp - in` for ALLPASS1, and the
+        // shelves adding `(A^2 - 1)` times one of the two.
+        FilterType::LowPass1 => {
+            // out = lp. `dsp_pipeline.c` sets svm1 = 1 with no prewarp, and its
+            // biquad fallback for the same type is `b = (sn, sn, 0)`,
+            // `a = (sn + 1 + cs, sn - 1 - cs, 0)`; dividing that through by
+            // `1 + cs` gives exactly `g(1 + z^-1) / ((1+g) + (g-1)z^-1)`.
+            let g = w_over_two_tan(w);
+            (g, g, 0.0, 1.0 + g, g - 1.0, 0.0)
+        }
+        FilterType::HighPass1 => {
+            // out = in - lp, which is `(1 - z^-1)` over the same denominator.
+            // The firmware's fallback `b = (1 + cs, -1 - cs, 0)` over the same
+            // `a` reduces to this once `1 + cs` is divided out.
+            let g = w_over_two_tan(w);
+            (1.0, -1.0, 0.0, 1.0 + g, g - 1.0, 0.0)
+        }
         FilterType::AllPass1 => {
             // out = 2*lp - in
             let g = w_over_two_tan(w);
@@ -226,14 +243,26 @@ fn magnitude_squared(c: &Coeffs, freq: f64) -> f64 {
     (num_r * num_r + num_i * num_i) / den
 }
 
+/// The biquads one band contributes: a single section for a PEQ type, the
+/// Butterworth cascade for a crossover type (`xover.rs`), nothing when the
+/// band is off or bypassed.
+fn sections_of(b: &Band) -> Vec<Coeffs> {
+    if b.bypass || matches!(b.filter_type, FilterType::Flat) {
+        Vec::new()
+    } else if b.filter_type.is_crossover() {
+        crate::xover::sections(b.filter_type.to_raw(), b.freq)
+    } else {
+        vec![coefficients(b)]
+    }
+}
+
 /// Combined response of a cascade at one frequency, in dB.
 pub fn response_at(freq: f64, bands: &[Band]) -> f64 {
     let mut power = 1.0f64;
     for b in bands {
-        if b.bypass || matches!(b.filter_type, FilterType::Flat) {
-            continue;
+        for c in sections_of(b) {
+            power *= magnitude_squared(&c, freq);
         }
-        power *= magnitude_squared(&coefficients(b), freq);
     }
     if power <= 0.0 {
         -200.0
@@ -367,6 +396,72 @@ mod tests {
         );
     }
 
+    /// D3: a 12 dB/oct shelf's Q is a live wire field, not an ignored one.
+    /// `config.h:905-911` says only the *first*-order shelves are monotonic
+    /// with no Q; the second-order pair prewarps by `sqrt(A)` around the RBJ
+    /// `alpha = sin(w)/(2Q)`, so raising Q puts a peak and a dip on the
+    /// transition while the two plateaux stay where they were.
+    #[test]
+    fn a_second_order_shelfs_q_shapes_its_transition() {
+        let shelf = |q: f32| {
+            [Band {
+                filter_type: FilterType::LowShelf,
+                freq: 105.0,
+                q,
+                gain_db: 8.8,
+                bypass: false,
+            }]
+        };
+        let gentle = shelf(0.707);
+        let resonant = shelf(3.0);
+
+        // Both settle at the same two plateaux, so this is a shape change and
+        // not a gain change.
+        for (f, want) in [(5.0, 8.8), (20_000.0, 0.0)] {
+            assert!(close(response_at(f, &gentle), want, 0.3), "{f} Hz gentle");
+            assert!(
+                close(response_at(f, &resonant), want, 0.3),
+                "{f} Hz resonant is {}",
+                response_at(f, &resonant)
+            );
+        }
+        // A high Q overshoots below the corner and undershoots above it.
+        assert!(
+            response_at(60.0, &resonant) > response_at(60.0, &gentle) + 1.0,
+            "{} vs {}",
+            response_at(60.0, &resonant),
+            response_at(60.0, &gentle)
+        );
+        assert!(
+            response_at(190.0, &resonant) < response_at(190.0, &gentle) - 1.0,
+            "{} vs {}",
+            response_at(190.0, &resonant),
+            response_at(190.0, &gentle)
+        );
+
+        // The first-order shelf beside it ignores Q entirely, which is what
+        // keeps it out of `uses_q`.
+        let first = |q: f32| {
+            [Band {
+                filter_type: FilterType::LowShelf1,
+                freq: 105.0,
+                q,
+                gain_db: 8.8,
+                bypass: false,
+            }]
+        };
+        for f in [20.0, 60.0, 105.0, 190.0, 10_000.0] {
+            assert!(
+                close(
+                    response_at(f, &first(0.707)),
+                    response_at(f, &first(3.0)),
+                    1e-9
+                ),
+                "{f} Hz moved on a first-order shelf"
+            );
+        }
+    }
+
     #[test]
     fn a_low_pass_is_minus_three_db_at_its_corner() {
         let b = [Band {
@@ -487,6 +582,58 @@ mod tests {
         }
     }
 
+    /// The Console moved `magnitudeSquared` to the sin^2(w/2) form because
+    /// its cos form, with a 1e-15 cut-off on the denominator, drew the peak of
+    /// a 10 Hz, Q 20 bell at 0 dB (Console 9c33a44). This evaluation keeps the
+    /// cos form with a 1e-20 cut-off, which clears those sections: pin that
+    /// narrow low peaks reach their gain, and that the two forms agree across
+    /// the plotted range. The graph is drawn at 48 kHz only, so the 96 kHz
+    /// cases are the same `w`: 20 Hz at 96 kHz is 10 Hz here.
+    #[test]
+    fn narrow_low_peaks_reach_their_gain() {
+        fn sin_squared_form(c: &Coeffs, freq: f64) -> f64 {
+            let s = (std::f64::consts::PI * freq / SAMPLE_RATE).sin();
+            let phi = s * s;
+            let sb = c.b0 + c.b1 + c.b2;
+            let sa = 1.0 + c.a1 + c.a2;
+            let num = sb * sb - 4.0 * (c.b0 * c.b1 + c.b1 * c.b2 + 4.0 * c.b0 * c.b2) * phi
+                + 16.0 * c.b0 * c.b2 * phi * phi;
+            let den =
+                sa * sa - 4.0 * (c.a1 + c.a1 * c.a2 + 4.0 * c.a2) * phi + 16.0 * c.a2 * phi * phi;
+            num.max(0.0) / den
+        }
+        // 20 Hz Q 10 at 48 kHz; 20 Hz Q 10 and 10 Hz Q 20 at 96 kHz; and
+        // narrower still.
+        for (freq, q) in [
+            (20.0f32, 10.0f32),
+            (10.0, 10.0),
+            (10.0, 20.0),
+            (10.0, 100.0),
+            (10.0, 1000.0),
+        ] {
+            for gain in [12.0f32, -12.0] {
+                let b = peaking(freq, q, gain);
+                let db = response_at(freq as f64, &[b]);
+                assert!(
+                    close(db, gain as f64, 1e-6),
+                    "{freq} Hz Q{q} {gain} dB drew {db} at its centre"
+                );
+                let c = coefficients(&b);
+                for hz in frequencies() {
+                    let ours = 10.0 * magnitude_squared(&c, hz).log10();
+                    let rbj = 10.0 * sin_squared_form(&c, hz).log10();
+                    // The sin^2 form is itself the less exact of the two at
+                    // the narrowest peaks (0.002 dB short at Q 1000, where
+                    // this one is within 1e-8), so compare to 0.01 dB.
+                    assert!(
+                        close(ours, rbj, 0.01),
+                        "{freq} Hz Q{q} at {hz} Hz: {ours} against {rbj}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn frequencies_at_or_above_nyquist_are_ignored_safely() {
         let b = [peaking(24_000.0, 2.0, 12.0)];
@@ -569,6 +716,84 @@ mod first_order_tests {
             "corner should sit near half the 12 dB gain, got {mid}"
         );
     }
+
+    fn first_order(t: FilterType, freq: f32) -> [Band; 1] {
+        [Band {
+            filter_type: t,
+            freq,
+            // A first-order section derives its own damping; the firmware never
+            // reads Q or gain for these, so absurd values must not move the
+            // curve.
+            q: 5.0,
+            gain_db: 9.0,
+            bypass: false,
+        }]
+    }
+
+    /// The firmware's one-pole TPT section (`dsp_pipeline.c`, `f->first_order`
+    /// with `g = tan(pi*f/fs)` and no prewarp for the pass types) is the exact
+    /// bilinear image of the analogue one-pole, so its response at `f` is the
+    /// analogue response at `tan(pi*f/fs) / tan(pi*fc/fs)`. That relation is
+    /// computed here from the structure rather than from the biquad the code
+    /// under test builds, so an error in either one shows up.
+    #[test]
+    fn the_first_order_pass_filters_match_the_firmwares_one_pole() {
+        let fc = 1000.0f64;
+        let gc = (std::f64::consts::PI * fc / SAMPLE_RATE).tan();
+
+        for f in [50.0, 250.0, 1000.0, 4000.0, 15_000.0] {
+            let x = (std::f64::consts::PI * f / SAMPLE_RATE).tan() / gc;
+            let lp = -10.0 * (1.0 + x * x).log10();
+            let hp = 20.0 * x.log10() - 10.0 * (1.0 + x * x).log10();
+
+            let got_lp = response_at(f, &first_order(FilterType::LowPass1, fc as f32));
+            let got_hp = response_at(f, &first_order(FilterType::HighPass1, fc as f32));
+            assert!(
+                close(got_lp, lp, 1e-6),
+                "low pass at {f} Hz: expected {lp}, got {got_lp}"
+            );
+            assert!(
+                close(got_hp, hp, 1e-6),
+                "high pass at {f} Hz: expected {hp}, got {got_hp}"
+            );
+        }
+    }
+
+    /// The two hand-checkable anchors: a first-order corner is 3.0103 dB down
+    /// (the analogue `1/sqrt(2)`), and the pair is power-complementary at every
+    /// frequency, so an LP and an HP at the same corner sum to unity.
+    #[test]
+    fn the_first_order_pass_filters_are_three_db_down_and_complementary() {
+        let lp = first_order(FilterType::LowPass1, 1000.0);
+        let hp = first_order(FilterType::HighPass1, 1000.0);
+        assert!(close(response_at(1000.0, &lp), -3.010_299_96, 1e-6));
+        assert!(close(response_at(1000.0, &hp), -3.010_299_96, 1e-6));
+
+        for f in [20.0, 300.0, 1000.0, 7000.0, 19_000.0] {
+            let sum =
+                10f64.powf(response_at(f, &lp) / 10.0) + 10f64.powf(response_at(f, &hp) / 10.0);
+            assert!(close(sum, 1.0, 1e-9), "power sum at {f} Hz was {sum}");
+        }
+    }
+
+    /// Q and gain are not parameters of these sections. The firmware reads
+    /// neither, so offering them would show a control that does nothing.
+    #[test]
+    fn the_first_order_pass_filters_ignore_q_and_gain() {
+        let plain = [Band {
+            filter_type: FilterType::LowPass1,
+            freq: 800.0,
+            q: 0.707,
+            gain_db: 0.0,
+            bypass: false,
+        }];
+        let loud = first_order(FilterType::LowPass1, 800.0);
+        assert!(close(
+            response_at(2000.0, &plain),
+            response_at(2000.0, &loud),
+            1e-12
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -593,10 +818,9 @@ fn phase_of(c: &Coeffs, freq: f64) -> f64 {
 pub fn phase_at(freq: f64, bands: &[Band]) -> f64 {
     let mut radians = 0.0;
     for b in bands {
-        if b.bypass || matches!(b.filter_type, FilterType::Flat) {
-            continue;
+        for c in sections_of(b) {
+            radians += phase_of(&c, freq);
         }
-        radians += phase_of(&coefficients(b), freq);
     }
     let deg = radians.to_degrees();
     // Wrap into +/-180 so the plot does not run off its axis.
@@ -633,6 +857,31 @@ pub fn unwrap_phase(wrapped: &[f64]) -> Vec<f64> {
         out.push(p + offset);
     }
     out
+}
+
+#[cfg(test)]
+mod crossover_band_tests {
+    use super::*;
+
+    #[test]
+    fn a_crossover_typed_band_shapes_the_curve() {
+        // LR4 high pass (raw 35) at 80 Hz: -6 dB at the corner, flat above,
+        // falling 24 dB per octave below.
+        let b = Band {
+            filter_type: FilterType::from_raw(35),
+            freq: 80.0,
+            q: 0.707,
+            gain_db: 0.0,
+            bypass: false,
+        };
+        assert!((response_at(80.0, &[b]) + 6.0).abs() < 0.3);
+        assert!(response_at(2000.0, &[b]).abs() < 0.1);
+        let octave = response_at(40.0, &[b]) - response_at(20.0, &[b]);
+        assert!((octave - 24.0).abs() < 1.5, "{octave}");
+        assert!(phase_at(80.0, &[b]).abs() > 1.0, "the phase moves too");
+        let off = Band { bypass: true, ..b };
+        assert_eq!(response_at(40.0, &[off]), 0.0);
+    }
 }
 
 #[cfg(test)]
@@ -720,6 +969,42 @@ mod phase_tests {
     fn unwrapping_leaves_a_smooth_curve_alone() {
         let smooth = vec![0.0, -10.0, -20.0, -30.0];
         assert_eq!(unwrap_phase(&smooth), smooth);
+    }
+
+    /// The bilinear image of the analogue one-pole has phase `-atan(x)` for the
+    /// low pass and `90 - atan(x)` degrees for the high pass, with
+    /// `x = tan(pi*f/fs) / tan(pi*fc/fs)`. At the corner that is exactly -45 and
+    /// +45 degrees, which is the hand-checkable anchor.
+    #[test]
+    fn the_first_order_pass_filters_have_the_one_poles_phase() {
+        let fc = 1000.0f64;
+        let gc = (std::f64::consts::PI * fc / SAMPLE_RATE).tan();
+        let band = |t| {
+            [Band {
+                filter_type: t,
+                freq: fc as f32,
+                q: 0.707,
+                gain_db: 0.0,
+                bypass: false,
+            }]
+        };
+
+        assert!((phase_at(fc, &band(FilterType::LowPass1)) + 45.0).abs() < 1e-6);
+        assert!((phase_at(fc, &band(FilterType::HighPass1)) - 45.0).abs() < 1e-6);
+
+        for f in [80.0, 400.0, 5000.0, 18_000.0] {
+            let x = (std::f64::consts::PI * f / SAMPLE_RATE).tan() / gc;
+            let lp = -x.atan().to_degrees();
+            let hp = 90.0 - x.atan().to_degrees();
+            assert!(
+                (phase_at(f, &band(FilterType::LowPass1)) - lp).abs() < 1e-6,
+                "low pass phase at {f} Hz"
+            );
+            assert!(
+                (phase_at(f, &band(FilterType::HighPass1)) - hp).abs() < 1e-6,
+                "high pass phase at {f} Hz"
+            );
+        }
     }
 
     #[test]

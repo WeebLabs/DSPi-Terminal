@@ -8,6 +8,7 @@
 //! The same function serves the TUI's `:` line and, indirectly, the generated
 //! shell completions, so the two can never disagree.
 
+use dspi_proto::packets::{FieldKind, FieldSpec, spec_for_path};
 use dspi_proto::registry::{Kind, REGISTRY, Target, by_path};
 
 use crate::{Context, VERBS};
@@ -98,6 +99,11 @@ pub fn complete(tokens: &[&str], partial: &str, ctx: &Context) -> Vec<Candidate>
             (Target::Channel, 0) | (Target::ChannelBand, 0) => channel_candidates(ctx),
             (Target::ChannelBand, 1) => band_candidates(ctx),
             (Target::Output, 0) => index_candidates(ctx.num_outputs, "output"),
+            (Target::OutputOrAll, 0) => {
+                let mut v = index_candidates(ctx.num_outputs, "output");
+                v.push(Candidate::new("all", "every output", CandidateKind::Band));
+                v
+            }
             (Target::Input, 0) => index_candidates(ctx.num_inputs, "input"),
             (Target::Crosspoint, 0) => index_candidates(ctx.num_inputs, "input"),
             (Target::Crosspoint, 1) => index_candidates(ctx.num_outputs, "output"),
@@ -113,6 +119,14 @@ pub fn complete(tokens: &[&str], partial: &str, ctx: &Context) -> Vec<Candidate>
         return out;
     }
 
+    // A packet takes named fields rather than one value, and it keeps taking
+    // them, so completion carries on past the first instead of stopping.
+    if matches!(d.kind, Kind::Packet) && position >= arity {
+        let mut out = packet_candidates(d.path, &rest[arity.min(rest.len())..], partial);
+        out.retain(|c| c.kind == CandidateKind::Hint || keep(c));
+        return out;
+    }
+
     // On to the value.
     if position == arity {
         let mut out = value_candidates(d);
@@ -121,6 +135,55 @@ pub fn complete(tokens: &[&str], partial: &str, ctx: &Context) -> Vec<Candidate>
     }
 
     Vec::new()
+}
+
+/// What can follow inside a packet's `key=value` tail.
+///
+/// Before the `=` the choices are the fields not yet given; after it they are
+/// that field's own values, so a user never has to know a noun's spelling or
+/// which flags exist.
+fn packet_candidates(path: &str, given: &[&str], partial: &str) -> Vec<Candidate> {
+    let Some(spec) = spec_for_path(path) else {
+        return Vec::new();
+    };
+
+    if let Some((key, _)) = partial.split_once('=') {
+        let key = key.to_ascii_lowercase();
+        let Some(f) = spec.field(&key) else {
+            return Vec::new();
+        };
+        return field_value_candidates(&key, f);
+    }
+
+    // Fields already given, and the ones the command carries as its indices,
+    // are not offered again.
+    let used: Vec<String> = given
+        .iter()
+        .filter_map(|t| t.split_once('='))
+        .map(|(k, _)| k.to_ascii_lowercase())
+        .collect();
+
+    spec.fields
+        .iter()
+        .filter(|f| !used.iter().any(|u| u == f.name) && !spec.index_fields.contains(&f.name))
+        .map(|f| Candidate::new(format!("{}=", f.name), f.help, CandidateKind::Parameter))
+        .collect()
+}
+
+/// The values one field accepts, already prefixed with its key so the
+/// suggestion can be inserted whole.
+fn field_value_candidates(key: &str, f: &FieldSpec) -> Vec<Candidate> {
+    match f.kind {
+        FieldKind::Bool => ["on", "off"]
+            .iter()
+            .map(|v| Candidate::new(format!("{key}={v}"), f.help, CandidateKind::Choice))
+            .collect(),
+        FieldKind::Enum(table) | FieldKind::Flags(table) => table
+            .iter()
+            .map(|(name, _)| Candidate::new(format!("{key}={name}"), f.help, CandidateKind::Choice))
+            .collect(),
+        _ => vec![Candidate::new("", f.help, CandidateKind::Hint)],
+    }
 }
 
 fn parameter_candidates() -> Vec<Candidate> {
@@ -342,5 +405,72 @@ mod tests {
     fn shell_names_complete_for_the_completions_verb() {
         let shells = values(&["completions"], "");
         assert!(shells.contains(&"zsh".to_string()));
+    }
+
+    // ------------------------------------------------------------- packets
+
+    /// A packet's fields are the whole reason it is typable: without these
+    /// suggestions a user would have to know 57 noun spellings by heart.
+    #[test]
+    fn a_packet_offers_its_field_names() {
+        let fields = values(&["cs.binding", "3"], "");
+        assert!(fields.contains(&"type=".to_string()));
+        assert!(fields.contains(&"noun=".to_string()));
+        assert!(fields.contains(&"gpio=".to_string()));
+    }
+
+    /// Completion carries on past the first field, because a packet keeps
+    /// taking them.
+    #[test]
+    fn a_packet_keeps_completing_after_the_first_field() {
+        let fields = values(&["cs.binding", "3", "type=encoder"], "");
+        assert!(fields.contains(&"noun=".to_string()));
+        assert!(
+            !fields.contains(&"type=".to_string()),
+            "a field already given is not offered again"
+        );
+    }
+
+    #[test]
+    fn a_field_value_completes_after_the_equals() {
+        let types = values(&["cs.binding", "3"], "type=");
+        assert!(types.contains(&"type=encoder".to_string()));
+        assert!(types.contains(&"type=display".to_string()));
+
+        let nouns = values(&["cs.binding", "3"], "noun=user_");
+        assert!(nouns.contains(&"noun=user_volume".to_string()));
+        assert!(!nouns.contains(&"noun=master_volume".to_string()));
+
+        let flags = values(&["cs.binding", "3"], "flags=");
+        assert!(flags.contains(&"flags=accel".to_string()));
+    }
+
+    #[test]
+    fn a_boolean_field_offers_on_and_off() {
+        let v = values(&["mix", "0", "4"], "invert=");
+        assert_eq!(v, vec!["invert=on", "invert=off"]);
+    }
+
+    #[test]
+    fn a_numeric_field_offers_its_help_as_a_hint() {
+        assert!(
+            hint(&["mix", "0", "4"], "gain=").unwrap().contains("dB"),
+            "a number has nothing to insert, so it explains itself instead"
+        );
+    }
+
+    /// The crosspoint's indices are already on the line, so offering them as
+    /// fields would invite typing the route twice.
+    #[test]
+    fn the_index_fields_are_not_offered_as_keys() {
+        let fields = values(&["mix", "0", "4"], "");
+        assert!(fields.contains(&"enabled=".to_string()));
+        assert!(!fields.contains(&"input=".to_string()));
+        assert!(!fields.contains(&"output=".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_field_offers_nothing_rather_than_guessing() {
+        assert!(complete(&["cs.binding", "3"], "nonsense=", &ctx()).is_empty());
     }
 }

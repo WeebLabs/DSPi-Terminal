@@ -31,7 +31,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      26   // V26: upmixer presence bell claims the upmix section reserved byte (int8, dB*2; struct sizes unchanged). V25: append upmixer section (44 bytes; RP2350 stereo upmixer, zeroed/ignored on RP2040). V24: ADAT input config (pin/enable/clock mode) claimed from the input-config reserved bytes (struct size unchanged). V23: append psybass section (24 bytes; psychoacoustic bass enhancement). V22: Linkwitz Transform target Q carried in the EQ WireBandParams reserved[2] bytes (uint16 LE, Q*512; zero for non-LT types; struct size unchanged). V21: I2S clock master/slave mode in the input-config section (claims one reserved byte; size unchanged). V20: crossfeed output_pair_mask replaces WireCrossfeedParams reserved byte; struct sizes unchanged. V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
+#define WIRE_FORMAT_VERSION      32   // V32: append output limiter section (108 bytes; per-output enable, link group, threshold, release; both platforms). V31: append tube preamp section (48 bytes; biased asymmetric waveshaper with sag and a damping-factor output stage, both platforms). V30: subharmonic synthesizer section grows 16 to 36 bytes (third band top_db, selectivity mode/depth/hold, sub ceiling, pair link); solo is runtime-only and stays off the wire. V29: append subharmonic synthesizer section (16 bytes; dbx-style octave divider, both platforms). V28: fourth selectable SPDIF input; input-config spdif_rx_pin_ext grows 2 to 3 entries, shifting the fields below it down one byte and consuming that section's last reserved byte (section size unchanged). V27: upmixer centre mode gains OFF (2), a surrounds-only setting that leaves L/R bit-exact; enum widening only, no struct or offset changes. V26: upmixer presence bell claims the upmix section reserved byte (int8, dB*2; struct sizes unchanged). V25: append upmixer section (44 bytes; RP2350 stereo upmixer, zeroed/ignored on RP2040). V24: ADAT input config (pin/enable/clock mode) claimed from the input-config reserved bytes (struct size unchanged). V23: append psybass section (24 bytes; psychoacoustic bass enhancement). V22: Linkwitz Transform target Q carried in the EQ WireBandParams reserved[2] bytes (uint16 LE, Q*512; zero for non-LT types; struct size unchanged). V21: I2S clock master/slave mode in the input-config section (claims one reserved byte; size unchanged). V20: crossfeed output_pair_mask replaces WireCrossfeedParams reserved byte; struct sizes unchanged. V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -210,14 +210,16 @@ typedef struct __attribute__((packed)) {
     // wire layout/size is unchanged and the format version need not bump.
     uint8_t  i2s_input_channels;     // Active I2S input channels: 2/4/6/8 (0 = absent)
     uint8_t  i2s_rx_pin_ext[3];      // I2S RX data GPIOs for stereo pairs 1..3 (0 = unset)
-    // Optional SPDIF inputs 2/3, claimed from the reserved bytes with the same
-    // 0 = "absent, keep live value" convention as the I2S fields above (so the
-    // wire layout/size is unchanged and the format version need not bump).
-    // The enable mask is stored PLUS ONE for that reason: old hosts push zeros
-    // here, and plain encoding 0 would read as "disable both".
-    uint8_t  spdif_rx_pin_ext[2];    // SPDIF RX 2/3 GPIOs (0 = absent, keep live)
-    uint8_t  spdif_rx_enabled_ext_p1;// SPDIF 2/3 enable mask + 1 (0 = absent;
-                                     // 1 = both disabled, 2 = SPDIF2, 3 = both, ...)
+    // Optional SPDIF inputs 2..4, claimed from the reserved bytes with the same
+    // 0 = "absent, keep live value" convention as the I2S fields above.  The
+    // enable mask is stored PLUS ONE for that reason: a host that pushes zeros
+    // here means "absent", and plain encoding 0 would read as "disable all".
+    // V28 widened the pin array from 2 to 3 entries (SPDIF 4), shifting every
+    // field below it down one byte and consuming the section's last reserved
+    // byte; the section is now full.
+    uint8_t  spdif_rx_pin_ext[3];    // SPDIF RX 2/3/4 GPIOs (0 = absent, keep live)
+    uint8_t  spdif_rx_enabled_ext_p1;// SPDIF 2/3/4 enable mask + 1 (0 = absent;
+                                     // 1 = all disabled, 2 = SPDIF2, 3 = 2+3, ...)
     uint8_t  i2s_clock_mode;         // I2S clock: 0=master, 1=slave.  Valid from wire V21;
                                      // pre-V21 readers see this as a reserved (zero) byte,
                                      // which decodes as master (the correct legacy default).
@@ -228,8 +230,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  adat_input_pin;         // ADAT RX GPIO (0 = absent, keep live)
     uint8_t  adat_input_enabled_p1;  // enable + 1 (0 absent, 1 disabled, 2 enabled)
     uint8_t  adat_clock_mode_p1;     // clock mode + 1 (0 absent, 1 master, 2 slave)
-    uint8_t  reserved[1];            // Future expansion (pad to 16 bytes)
-} WireInputConfig;                   // 16 bytes
+} WireInputConfig;                   // 16 bytes (full; no reserved bytes left)
 
 // ============================================================================
 // Section 16: LG Sound Sync (16 bytes) — V8+
@@ -374,6 +375,77 @@ typedef struct __attribute__((packed)) {
 } WireUpmixParams;                   // 44 bytes
 
 // ============================================================================
+// Section 23: Subharmonic Synthesizer (36 bytes); V29+ (V30 tail extension)
+// ============================================================================
+//
+// dbx-style octave divider (see subharm.h and
+// Documentation/Features/subharmonic_synth_spec.md).  One global parameter
+// set applied to the output channels selected by output_mask.  `solo` is
+// deliberately absent: it is runtime-only, so no saved blob can restore it.
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;                // 0/1
+    uint8_t  reserved0;              // Zero
+    uint16_t output_mask;            // Bit k: subharm processes output channel k
+    float    low_db;                 // 24-36 Hz band level, -30..+6 dB (-30 = off)
+    float    high_db;                // 36-56 Hz band level, -30..+6 dB (-30 = off)
+    float    boost_db;               // LF boost bell, 0..+6 dB
+    // V30 additions
+    float    top_db;                 // 56-80 Hz band level, -30..+6 dB (-30 = off)
+    float    select_depth;           // Selectivity depth, 0..100 %
+    float    select_hold_ms;         // Selectivity hold time, 50..400 ms
+    float    ceiling_db;             // Sub ceiling, -40..0 dBFS (0 = off)
+    uint8_t  select_mode;            // SUBHARM_SELECT_* (0-2)
+    uint8_t  link_pairs;             // 0/1: synthesize each pair from its mono sum
+    uint8_t  reserved1[2];           // Zero
+} WireSubharmParams;                 // 36 bytes
+
+// ============================================================================
+// Section 24: Tube Preamp (48 bytes); V31+
+// ============================================================================
+//
+// One global parameter set, applied to the channels output_mask selects
+// (see tube.h and Documentation/Features/tube_preamp_spec.md).  Apply copies
+// the character fields verbatim: re-running the tube_type row lookup here
+// would overwrite a saved Custom voicing.
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;                // 0/1
+    uint8_t  tube_type;              // 0 = custom, 1..TUBE_TYPE_MAX
+    uint8_t  rectifier;              // 0..TUBE_RECT_MAX
+    uint8_t  xfmr_enabled;           // 0/1: output stage
+    uint16_t output_mask;            // Bit k: tube processes output channel k
+    uint8_t  reserved[2];            // Zero
+    float    drive_db;               // Gain into the shaper, -30..24 dB
+    float    bias_pct;               // Operating point, -100..+100 %
+    float    asym_db;                // Negative-knee offset, -12..+12 dB
+    float    hardness_pct;           // Cubic to quintic knee blend, 0..100
+    float    sag_pct;                // Supply sag depth, 0..100 %
+    float    xfmr_damping;           // Output-stage damping factor, 1..20
+    float    xfmr_res_hz;            // Speaker resonance (bell centre), 30..150 Hz
+    float    mix_pct;                // Dry/wet blend, 0..100 %
+    float    trim_db;                // Wet-path level, -12..+12 dB
+    float    reserved_f;             // Zero; holds the section at 48 bytes
+} WireTubeParams;                    // 48 bytes
+
+// ============================================================================
+// Section 25: Output Limiter (108 bytes); V32+
+// ============================================================================
+//
+// One record per output (see limiter.h and
+// Documentation/Features/output_limiter_spec.md).  Entries past
+// num_output_channels are zero on GET and ignored on SET.
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;                // 0/1
+    uint8_t  link_group;             // 0 = unlinked, 1..4
+    uint8_t  reserved[2];            // Zero
+    float    threshold_db;           // Ceiling, -30..0 dBFS
+    float    release_ms;             // 10..1000 ms
+} WireLimiterOutput;                 // 12 bytes
+
+typedef struct __attribute__((packed)) {
+    WireLimiterOutput outputs[WIRE_MAX_OUTPUT_CHANNELS];
+} WireLimiterParams;                 // 108 bytes
+
+// ============================================================================
 // Complete Packet
 // ============================================================================
 typedef struct __attribute__((packed)) {
@@ -399,7 +471,10 @@ typedef struct __attribute__((packed)) {
     WireAdatConfig      adat_config;     //    8
     WirePsybassParams   psybass;         //   24  (V23+)
     WireUpmixParams     upmix;           //   44  (V25+)
-} WireBulkParams;                        // Total: 5944 bytes (V25 appends the 44-byte upmixer section)
+    WireSubharmParams   subharm;         //   36  (V29+; 36 bytes at V30)
+    WireTubeParams      tube;            //   48  (V31+)
+    WireLimiterParams   limiter;         //  108  (V32+)
+} WireBulkParams;                        // Total: 6136 bytes (V32 appends the 108-byte limiter section)
 
 #define WIRE_BULK_PARAMS_SIZE  sizeof(WireBulkParams)
 
@@ -410,17 +485,17 @@ typedef struct __attribute__((packed)) {
 // whose length != sizeof(WireBulkParams).
 #define WIRE_BULK_PARAMS_MIN_SIZE   WIRE_BULK_PARAMS_SIZE
 
-// Buffer size for USB stream transfer (must be power of 2, >= WIRE_BULK_PARAMS_SIZE).
-// V25 is 5944 bytes (17-channel EQ/names/crossover + ADAT + leveller masks + psybass + upmixer); 8192 is the next power of 2.
-// Shared by both platforms (the wire format is platform-independent).
-#define WIRE_BULK_BUF_SIZE     8192
+// Shared bulk transfer buffer size.  Every writer bounds itself by
+// sizeof(WireBulkParams); the RTA bands-all response is asserted to fit.
+#define WIRE_BULK_BUF_SIZE     WIRE_BULK_PARAMS_SIZE
 
 // Collect current live DSP state into wire format
 void bulk_params_collect(WireBulkParams *out);
 
 // Apply wire format to live DSP state.  Returns 0 on success, nonzero on error.
 // Caller must recalculate filters and delays after this returns.
-// If apply_pins is true, output pin assignments from the payload are applied.
+// If apply_pins is true (output_config_mode WITH_PRESET), the output pin
+// assignments and the output limiter settings from the payload are applied.
 int bulk_params_apply(const WireBulkParams *in, bool apply_pins);
 
 #endif // BULK_PARAMS_H

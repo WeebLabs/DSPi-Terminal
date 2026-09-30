@@ -12,6 +12,7 @@
 
 use crate::Dir;
 use crate::generated::opcodes as op;
+use crate::generated::{limiter, ranges, tube};
 use crate::value::{Repr, Unit, Value, ValueError};
 
 /// Which panel owns a parameter.
@@ -64,22 +65,45 @@ pub enum Target {
     CsSlot,
     /// Learned IR command sub-slot.
     CsIrSlot,
+    /// Control-surface target group, `CS_MAX_GROUPS` 8.
+    CsGroup,
+    /// Control-surface macro, `CS_MAX_MACROS` 8.
+    CsMacro,
+    /// A macro plus one of its steps, `CS_MAX_MACRO_STEPS` 8.
+    CsMacroStep,
+    /// Display page slot, `CS_MAX_DISPLAY_PAGES` 16.
+    CsDisplayPage,
     /// Legacy 3-channel gain/mute space, superseded by the matrix mixer.
     LegacyChannel,
     /// One of the upmixer's parameter ids.
     UpmixParam,
-    /// Optional S/PDIF input index.
+    /// S/PDIF input index, `0..=3` (config.h:448-453).
     SpdifInput,
+    /// One of the *optional* S/PDIF inputs, `1..=3`: input 0 is always on and
+    /// `REQ_SET_SPDIF_INPUT_ENABLE` rejects it (config.h:454).
+    SpdifExtraInput,
     /// I2S RX stereo pair.
     I2sPair,
+    /// An output, `0 .. num_outputs`, or on a write `LIMITER_ALL_OUTPUTS`
+    /// (`0xFF`, limiter.h:21), which reaches every output at once. A read of
+    /// `0xFF` stalls on the device, so the session refuses it first.
+    OutputOrAll,
+    /// A channel at the spectrum analyser's current tap: an input when the tap
+    /// is `RTA_TAP_INPUT`, an output when it is `RTA_TAP_OUTPUT` (rta.h:30-31).
+    /// The device stalls on one past the tap's width (config.h:151).
+    TapChannel,
 }
+
+/// `LIMITER_ALL_OUTPUTS` (limiter.h:21): the output byte that addresses every
+/// output in one limiter SET.
+pub const ALL_OUTPUTS: u8 = crate::generated::limiter::LIMITER_ALL_OUTPUTS as u8;
 
 impl Target {
     /// How many index components a caller must supply.
     pub fn arity(self) -> usize {
         match self {
             Target::None => 0,
-            Target::ChannelBand | Target::Crosspoint => 2,
+            Target::ChannelBand | Target::Crosspoint | Target::CsMacroStep => 2,
             _ => 1,
         }
     }
@@ -107,8 +131,21 @@ pub enum WValue {
     /// The value itself rides in `wValue`; there is no data stage. This is how
     /// the write-as-read opcodes carry their parameters.
     ValueOnly,
+    /// `(role << 8) | value` on a write, and the bare role on a read.
+    ///
+    /// `REQ_SET_I2S_BCK_PIN` takes the clock role in `wValue`'s high byte
+    /// (config.h:334-336, :485), so master and slave are one opcode with two
+    /// parameters rather than two opcodes.
+    RoleValue(u8),
+    /// `(step << 8) | macro`, used by the macro-step write. Indices are given
+    /// macro first, so the packing is deliberately reversed here.
+    MacroStep,
     /// A fixed constant, e.g. the caps header selector.
     Fixed(u16),
+    /// `(output << 8) | index`, the limiter's packing (limiter.h:11,
+    /// config.h:233-236): the parameter index is fixed by the row and the
+    /// output comes from the target, `0xFF` for every output on a write.
+    OutputIndex(u8),
 }
 
 /// What could go wrong if this is written carelessly.
@@ -290,6 +327,35 @@ impl ParamDesc {
         self.get.is_some()
     }
 
+    /// How this parameter's value travels in the data stage.
+    ///
+    /// Normally the kind decides, but three indexed opcodes carry a float for
+    /// every parameter they address, the booleans, choices and masks
+    /// included: the upmixer's (upmix.h:185-186), the tube preamp's
+    /// (config.h:228-231, tube.h:15) and the limiter's (config.h:233-236). A
+    /// one-byte payload there is a short payload, which the upmixer stalls on
+    /// and the tube and limiter silently ignore. The auxiliary output level is
+    /// an 8.8 fixed-point percentage (config.h:141-145), and the crossfeed
+    /// output mask a single byte of pair bits (config.h:581-583), where the
+    /// kind would send the two bytes the other masks take.
+    pub fn repr(&self) -> Repr {
+        if matches!(self.kind, Kind::Status | Kind::Packet | Kind::Trigger) {
+            return self.kind.repr();
+        }
+        match self.set.or(self.get) {
+            Some(
+                op::REQ_UPMIX_SET_PARAM
+                | op::REQ_UPMIX_GET_PARAM
+                | op::REQ_SET_TUBE_PARAM
+                | op::REQ_GET_TUBE_PARAM
+                | op::REQ_LIMITER,
+            ) => Repr::F32,
+            Some(op::REQ_SET_CS_AUX_LEVEL | op::REQ_GET_CS_AUX_LEVEL) => Repr::U16Q8,
+            Some(op::REQ_SET_CROSSFEED_OUTPUTS | op::REQ_GET_CROSSFEED_OUTPUTS) => Repr::U8,
+            _ => self.kind.repr(),
+        }
+    }
+
     /// Whether a write must be confirmed by reading the value back.
     ///
     /// Deferred writes return "accepted" before validation runs, and a bad DAC
@@ -367,9 +433,22 @@ const FILTER_TYPE: &[(u8, &str)] = &[
     (9, "lowshelf1"),
     (10, "highshelf1"),
     (11, "linkwitz"),
+    // config.h:924-925, new in v1.1.6. The codes match the Console's file codes
+    // LP1 / HP1 so a filter file round-trips between the two apps.
+    (12, "lowpass1"),
+    (13, "highpass1"),
 ];
-const CENTER_MODE: &[(u8, &str)] = &[(0, "passive"), (1, "logic")];
+/// Upmixer centre mode. Wire V27 widened this to three: `UPMIX_CENTER_OFF = 2`
+/// leaves L/R bit-exact and produces surrounds only (bulk_params.h:34).
+const CENTER_MODE: &[(u8, &str)] = &[(0, "passive"), (1, "logic"), (2, "off")];
 const SURROUND_MODE: &[(u8, &str)] = &[(0, "off"), (1, "passive"), (2, "logic")];
+
+/// `SUBHARM_SELECT_*` (subharm.h:71-73).
+const SUBHARM_SELECT: &[(u8, &str)] = &[(0, "all"), (1, "percussive"), (2, "sustained")];
+/// Rectifier styles, `0..=TUBE_RECT_MAX` (tube.h:37-39).
+const TUBE_RECTIFIER: &[(u8, &str)] = &[(0, "solid-state"), (1, "gz34"), (2, "5u4"), (3, "5y3")];
+/// `RTA_CTL_*` (rta.h:40-42).
+const RTA_CONTROL: &[(u8, &str)] = &[(0, "stop"), (1, "start"), (2, "reset")];
 
 use Dir::{In as DIn, Out as DOut, WriteAsRead as DWar};
 use Group::*;
@@ -633,7 +712,7 @@ pub static REGISTRY: &[ParamDesc] = &[
         Float {
             unit: Unit::Ms,
             min: 0.0,
-            max: 42.0,
+            max: 85.0,
         },
         Tg::Channel,
         Some(op::REQ_SET_DELAY),
@@ -738,7 +817,7 @@ pub static REGISTRY: &[ParamDesc] = &[
         Float {
             unit: Unit::Ms,
             min: 0.0,
-            max: 42.0,
+            max: 85.0,
         },
         Tg::Output,
         Some(op::REQ_SET_OUTPUT_DELAY),
@@ -748,6 +827,118 @@ pub static REGISTRY: &[ParamDesc] = &[
         Hz::None,
         Ps::LiveOnly,
         Rq::Always,
+    ),
+    // Output limiter (config.h:233-236, limiter.h:11-36). One opcode both
+    // ways, `wValue = (output << 8) | index`, a float for every index. A write
+    // to one member of a link group moves the whole group (limiter.c:143-194),
+    // and output 0xFF writes every output.
+    p(
+        "limit.on",
+        "Output Limiter",
+        "A brickwall limiter on this output; the first one on adds 32 samples of latency everywhere",
+        Matrix,
+        Simple,
+        Bool,
+        Tg::OutputOrAll,
+        Some(op::REQ_LIMITER),
+        Some(op::REQ_LIMITER),
+        DOut,
+        Wv::OutputIndex(limiter::LIMITER_PARAM_ENABLED as u8),
+        Hz::Audible,
+        Ps::LiveOnly,
+        Rq::Feature("output_limiter"),
+    ),
+    p(
+        "limit.threshold",
+        "Threshold",
+        "The ceiling, in dBFS. No sample leaves this output above it.",
+        Matrix,
+        Advanced,
+        Float {
+            unit: Unit::Db,
+            min: ranges::LIMITER_THRESHOLD_MIN,
+            max: ranges::LIMITER_THRESHOLD_MAX,
+        },
+        Tg::OutputOrAll,
+        Some(op::REQ_LIMITER),
+        Some(op::REQ_LIMITER),
+        DOut,
+        Wv::OutputIndex(limiter::LIMITER_PARAM_THRESHOLD_DB as u8),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("output_limiter"),
+    ),
+    p(
+        "limit.release",
+        "Release",
+        "How fast the gain recovers after a peak",
+        Matrix,
+        Advanced,
+        Float {
+            unit: Unit::Ms,
+            min: ranges::LIMITER_RELEASE_MIN,
+            max: ranges::LIMITER_RELEASE_MAX,
+        },
+        Tg::OutputOrAll,
+        Some(op::REQ_LIMITER),
+        Some(op::REQ_LIMITER),
+        DOut,
+        Wv::OutputIndex(limiter::LIMITER_PARAM_RELEASE_MS as u8),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("output_limiter"),
+    ),
+    p(
+        "limit.link",
+        "Link group",
+        "Outputs in the same group limit together; 0 is unlinked",
+        Matrix,
+        Advanced,
+        Int {
+            unit: Unit::None,
+            min: 0,
+            max: limiter::LIMITER_LINK_GROUP_MAX as i64,
+        },
+        Tg::OutputOrAll,
+        Some(op::REQ_LIMITER),
+        Some(op::REQ_LIMITER),
+        DOut,
+        Wv::OutputIndex(limiter::LIMITER_PARAM_LINK_GROUP as u8),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("output_limiter"),
+    ),
+    p(
+        "limit.meter",
+        "Limiter gain reduction",
+        "Gain reduction on every output, in hundredths of a dB",
+        Matrix,
+        Advanced,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_LIMITER),
+        DIn,
+        Wv::Fixed(limiter::LIMITER_GET_METER),
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Feature("output_limiter"),
+    ),
+    p(
+        "limit.status",
+        "Limiter status",
+        "Whether the lookahead delay is in the signal path",
+        Matrix,
+        Expert,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_LIMITER),
+        DIn,
+        Wv::Fixed(limiter::LIMITER_GET_STATUS),
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Feature("output_limiter"),
     ),
     p(
         "out.pin",
@@ -1556,6 +1747,529 @@ pub static REGISTRY: &[ParamDesc] = &[
         Ps::ReadOnly,
         Rq::Rp2350,
     ),
+    // Subharmonic synthesizer (config.h:181-210, subharm.h). Every SET but
+    // solo is notified at its WireSubharmParams offset (bulk_params.h:378-400).
+    p(
+        "sub.on",
+        "Subharmonic Synthesizer",
+        "Generates a subharmonic at half the frequency of the source's bass",
+        Spatial,
+        Simple,
+        Bool,
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM),
+        Some(op::REQ_GET_SUBHARM),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.low",
+        "24 - 36 Hz",
+        "Level of the sub derived from 48 to 72 Hz; the floor turns the band off",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Db,
+            min: ranges::SUBHARM_LEVEL_MIN,
+            max: ranges::SUBHARM_LEVEL_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_LOW),
+        Some(op::REQ_GET_SUBHARM_LOW),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.high",
+        "36 - 56 Hz",
+        "Level of the sub derived from 72 to 112 Hz; the floor turns the band off",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Db,
+            min: ranges::SUBHARM_LEVEL_MIN,
+            max: ranges::SUBHARM_LEVEL_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_HIGH),
+        Some(op::REQ_GET_SUBHARM_HIGH),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.top",
+        "56 - 80 Hz",
+        "Level of the sub derived from 112 to 160 Hz; the floor turns the band off",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Db,
+            min: ranges::SUBHARM_LEVEL_MIN,
+            max: ranges::SUBHARM_LEVEL_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_TOP),
+        Some(op::REQ_GET_SUBHARM_TOP),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.boost",
+        "70 Hz bell",
+        "A gentle bell that fills the gap between the sub and the mid-bass",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Db,
+            min: ranges::SUBHARM_BOOST_MIN,
+            max: ranges::SUBHARM_BOOST_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_BOOST),
+        Some(op::REQ_GET_SUBHARM_BOOST),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.mask",
+        "Subharmonic outputs",
+        "Which outputs get the synthesized sub",
+        Spatial,
+        Expert,
+        Mask,
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_MASK),
+        Some(op::REQ_GET_SUBHARM_MASK),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.select",
+        "Selectivity",
+        "Weight the sub toward percussive or sustained material",
+        Spatial,
+        Advanced,
+        Choice(SUBHARM_SELECT),
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_SELECT),
+        Some(op::REQ_GET_SUBHARM_SELECT),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.depth",
+        "Depth",
+        "How far the unselected material is gated",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Percent,
+            min: ranges::SUBHARM_DEPTH_MIN,
+            max: ranges::SUBHARM_DEPTH_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_DEPTH),
+        Some(op::REQ_GET_SUBHARM_DEPTH),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.hold",
+        "Hold",
+        "Burst length, or how long a note must ring before it counts as sustained",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Ms,
+            min: ranges::SUBHARM_HOLD_MIN,
+            max: ranges::SUBHARM_HOLD_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_HOLD),
+        Some(op::REQ_GET_SUBHARM_HOLD),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.ceiling",
+        "Sub ceiling",
+        "A soft limit on the synthesized sub; 0 dBFS is off",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Db,
+            min: ranges::SUBHARM_CEILING_MIN,
+            max: ranges::SUBHARM_CEILING_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_CEILING),
+        Some(op::REQ_GET_SUBHARM_CEILING),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.link",
+        "Link output pairs",
+        "One sub per pair, from its mono sum",
+        Spatial,
+        Advanced,
+        Bool,
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_LINK),
+        Some(op::REQ_GET_SUBHARM_LINK),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    // Solo is runtime only: never persisted, not on the wire and never
+    // notified (config.h:201), so a panel that shows it has to poll.
+    p(
+        "sub.solo",
+        "Solo",
+        "Hear only the synthesized sub; never saved",
+        Spatial,
+        Advanced,
+        Bool,
+        Tg::None,
+        Some(op::REQ_SET_SUBHARM_SOLO),
+        Some(op::REQ_GET_SUBHARM_SOLO),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.headroom",
+        "Headroom cost",
+        "Worst-case gain the synthesizer adds, as a float in dB",
+        Spatial,
+        Advanced,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_GET_SUBHARM_HEADROOM),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    p(
+        "sub.meter",
+        "Sub meters",
+        "Peak of the synthesized sub on every output",
+        Spatial,
+        Advanced,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_GET_SUBHARM_METER),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Feature("subharmonic_synth"),
+    ),
+    // Tube preamp (config.h:228-231, tube.h:15-73). One indexed pair of
+    // opcodes, and every value is a float on the wire, the enable, the mask and
+    // the two choices included (see `ParamDesc::repr`).
+    p(
+        "tube.on",
+        "Tube Modeller",
+        "Valve-style harmonic colour, supply sag and an output stage",
+        Spatial,
+        Simple,
+        Bool,
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_ENABLED),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.mask",
+        "Tube outputs",
+        "Which outputs the tube stage processes",
+        Spatial,
+        Expert,
+        Mask,
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_OUTPUT_MASK),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.type",
+        "Tube",
+        "The tube style, 1 to 16; 0 is Custom",
+        Spatial,
+        Advanced,
+        Int {
+            unit: Unit::None,
+            min: 0,
+            max: tube::TUBE_TYPE_MAX as i64,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_TUBE_TYPE),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.drive",
+        "Drive",
+        "Gain into the shaper",
+        Spatial,
+        Simple,
+        Float {
+            unit: Unit::Db,
+            min: ranges::TUBE_DRIVE_MIN,
+            max: ranges::TUBE_DRIVE_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_DRIVE_DB),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.bias",
+        "Bias",
+        "The operating point",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Percent,
+            min: ranges::TUBE_BIAS_MIN,
+            max: ranges::TUBE_BIAS_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_BIAS_PCT),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.asym",
+        "Asymmetry",
+        "Offset of the negative knee",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Db,
+            min: ranges::TUBE_ASYM_MIN,
+            max: ranges::TUBE_ASYM_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_ASYM_DB),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.hardness",
+        "Knee Hardness",
+        "Cubic to quintic knee blend",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Percent,
+            min: ranges::TUBE_HARDNESS_MIN,
+            max: ranges::TUBE_HARDNESS_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_HARDNESS_PCT),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.sag",
+        "Sag",
+        "Depth of the supply sag",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Percent,
+            min: ranges::TUBE_SAG_MIN,
+            max: ranges::TUBE_SAG_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_SAG_PCT),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.rectifier",
+        "Rectifier",
+        "The rectifier the supply sag models",
+        Spatial,
+        Advanced,
+        Choice(TUBE_RECTIFIER),
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_RECTIFIER),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.xfmr",
+        "Output stage",
+        "A valve amplifier's loose grip on the speaker",
+        Spatial,
+        Advanced,
+        Bool,
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_XFMR_ENABLED),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.damping",
+        "Damping Factor",
+        "How tightly the output stage holds the speaker",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::None,
+            min: ranges::TUBE_XFMR_DAMPING_MIN,
+            max: ranges::TUBE_XFMR_DAMPING_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_XFMR_DAMPING),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.resonance",
+        "Speaker Resonance",
+        "Centre of the output stage's bass bump",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Hz,
+            min: ranges::TUBE_XFMR_RES_MIN,
+            max: ranges::TUBE_XFMR_RES_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_XFMR_RES_HZ),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.mix",
+        "Mix",
+        "Blend of the dry and tube signals",
+        Spatial,
+        Simple,
+        Float {
+            unit: Unit::Percent,
+            min: ranges::TUBE_MIX_MIN,
+            max: ranges::TUBE_MIX_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_MIX_PCT),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
+    p(
+        "tube.trim",
+        "Output Trim",
+        "Level of the tube path",
+        Spatial,
+        Advanced,
+        Float {
+            unit: Unit::Db,
+            min: ranges::TUBE_TRIM_MIN,
+            max: ranges::TUBE_TRIM_MAX,
+        },
+        Tg::None,
+        Some(op::REQ_SET_TUBE_PARAM),
+        Some(op::REQ_GET_TUBE_PARAM),
+        DOut,
+        Wv::Fixed(tube::TUBE_PARAM_TRIM_DB),
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("tube_preamp"),
+    ),
     // ----------------------------------------------------------------- input
     p(
         "in.source",
@@ -1596,7 +2310,7 @@ pub static REGISTRY: &[ParamDesc] = &[
     p(
         "in.spdif.pin",
         "S/PDIF input GPIO",
-        "Which pin the optical or coaxial receiver uses",
+        "Which pin one optical or coaxial receiver uses",
         Input,
         Expert,
         Int {
@@ -1616,12 +2330,17 @@ pub static REGISTRY: &[ParamDesc] = &[
     p(
         "in.spdif.enable",
         "Extra S/PDIF inputs",
-        "Turn on the optional second and third receivers",
+        "Turn on the optional second, third and fourth receivers",
         Input,
         Expert,
         Bool,
-        Tg::SpdifInput,
+        // Index 1..3 only: input 0 is always enabled (config.h:454).
+        Tg::SpdifExtraInput,
         Some(op::REQ_SET_SPDIF_INPUT_ENABLE),
+        // The readback is the whole 6-byte config, {count, enable_mask,
+        // gpio[0..3]}, whose bit 0 is input 1 and is always set. A scalar read
+        // of one byte therefore sees `count`, not this input's state; Phase 2B
+        // gives it a codec that picks the right bit.
         Some(op::REQ_GET_SPDIF_INPUT_CONFIG),
         DWar,
         Wv::ValueIndex,
@@ -1850,6 +2569,27 @@ pub static REGISTRY: &[ParamDesc] = &[
         Some(op::REQ_GET_I2S_BCK_PIN),
         DWar,
         Wv::ValueOnly,
+        Hz::Reconfig,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "i2s.bck.slave",
+        "I2S slave bit clock GPIO",
+        "Bit clock pin the slave role listens on while clock pins are split",
+        System,
+        Expert,
+        Int {
+            unit: Unit::Gpio,
+            min: 0,
+            max: 29,
+        },
+        Tg::None,
+        Some(op::REQ_SET_I2S_BCK_PIN),
+        Some(op::REQ_GET_I2S_BCK_PIN),
+        DWar,
+        // Role 1 is the slave pair; role 0 is `i2s.bck` above (config.h:485).
+        Wv::RoleValue(1),
         Hz::Reconfig,
         Ps::LiveOnly,
         Rq::Always,
@@ -2150,6 +2890,24 @@ pub static REGISTRY: &[ParamDesc] = &[
         Ps::ReadOnly,
         Rq::Always,
     ),
+    // Provenance for people only; nothing may gate on it (config.h:326).
+    // Firmware before it stalls.
+    p(
+        "dev.build",
+        "Build",
+        "The exact source this firmware was built from",
+        System,
+        Advanced,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_GET_BUILD_INFO),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Always,
+    ),
     // --------------------------------------------------------------- presets
     p(
         "preset.save",
@@ -2234,6 +2992,10 @@ pub static REGISTRY: &[ParamDesc] = &[
     p(
         "preset.dir",
         "Preset directory",
+        // 7 bytes, not the 6 the old spec claimed: {occupied u16 LE, startup_mode,
+        // default_slot, last_active, output_config_mode, master_volume_mode}
+        // (vendor_commands.c:2391-2411). Nothing decodes it yet; Phase 2B gives
+        // it a codec.
         "Which slots are in use, and the storage policy",
         Presets,
         Advanced,
@@ -2392,10 +3154,205 @@ pub static REGISTRY: &[ParamDesc] = &[
         Ps::ReadOnly,
         Rq::Always,
     ),
-    // ---------------------------------------------------------- test signals
+    // Auxiliary outputs, caps v18 (config.h:131-145). Immediate, runtime
+    // only and never dirty; a refused SET still ACKs, so the verdict is in
+    // REQ_GET_CS_STATUS (control_surfaces.h:714-715).
+    p(
+        "cs.aux",
+        "Auxiliary output",
+        "Switch the auxiliary output in this slot on or off",
+        Surfaces,
+        Advanced,
+        Bool,
+        Tg::CsSlot,
+        Some(op::REQ_SET_CS_AUX_STATE),
+        Some(op::REQ_GET_CS_AUX_STATE),
+        DOut,
+        Wv::Target,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.aux.level",
+        "Auxiliary output level",
+        "Level of the dimmable auxiliary output in this slot",
+        Surfaces,
+        Advanced,
+        Float {
+            unit: Unit::Percent,
+            min: 0.0,
+            max: 100.0,
+        },
+        Tg::CsSlot,
+        Some(op::REQ_SET_CS_AUX_LEVEL),
+        Some(op::REQ_GET_CS_AUX_LEVEL),
+        DOut,
+        Wv::Target,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.aux.all",
+        "Auxiliary outputs",
+        "The state and level of every auxiliary output",
+        Surfaces,
+        Expert,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_GET_CS_AUX_STATE),
+        DIn,
+        Wv::Fixed(0xFFFF),
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Always,
+    ),
+    // Groups and macros, caps v9 (config.h:136-146). Availability is reported
+    // by the caps header's max_groups / max_macros / max_macro_steps, not by a
+    // separate probe, which is why these are `Always`: a firmware without them
+    // answers zero and the UI offers nothing.
+    p(
+        "cs.group",
+        "Channel group",
+        "A named set of channels a control drives as one",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::CsGroup,
+        Some(op::REQ_SET_CS_GROUP),
+        Some(op::REQ_GET_CS_GROUP),
+        DOut,
+        Wv::Target,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.macro",
+        "Macro",
+        "A named sequence of steps one control can fire",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::CsMacro,
+        // The SET takes the 36-byte header alone; the GET answers the whole
+        // 132-byte macro, steps included (control_surfaces.h:488-496).
+        Some(op::REQ_SET_CS_MACRO),
+        Some(op::REQ_GET_CS_MACRO),
+        DOut,
+        Wv::Target,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.macro.step",
+        "Macro step",
+        "One action in a macro, with its delay",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::CsMacroStep,
+        Some(op::REQ_SET_CS_MACRO_STEP),
+        // A step has no GET of its own: it reads back inside the whole macro,
+        // whose wValue is the macro index alone. Steps are written before the
+        // header so a concurrent fire never sees a step_count it cannot reach.
+        Some(op::REQ_GET_CS_MACRO),
+        DOut,
+        Wv::MacroStep,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.macro.fire",
+        "Run a macro",
+        "Run one macro now; a running macro is cancelled at its next step",
+        Surfaces,
+        Advanced,
+        Trigger,
+        Tg::CsMacro,
+        Some(op::REQ_CS_MACRO_FIRE),
+        None,
+        DWar,
+        Wv::Target,
+        Hz::Audible,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.ext.status",
+        "Group and macro status",
+        "Which groups and macros are valid, and what is running",
+        Surfaces,
+        Advanced,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_GET_CS_EXT_STATUS),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Always,
+    ),
+    // I2C display, caps v10-v13 (config.h:150-157).
+    p(
+        "cs.display",
+        "Display settings",
+        "How the attached I2C display behaves",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::None,
+        Some(op::REQ_SET_CS_DISPLAY_CFG),
+        // The GET prepends {max_pages, model_count, reserved[2]} to the same
+        // 12-byte record the SET takes, so the read is 16 bytes.
+        Some(op::REQ_GET_CS_DISPLAY_CFG),
+        DOut,
+        Wv::Zero,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.display.page",
+        "Display page",
+        "What one page of the display shows",
+        Surfaces,
+        Advanced,
+        Packet,
+        Tg::CsDisplayPage,
+        Some(op::REQ_SET_CS_DISPLAY_PAGE),
+        Some(op::REQ_GET_CS_DISPLAY_PAGE),
+        DOut,
+        Wv::Target,
+        Hz::Deferred,
+        Ps::LiveOnly,
+        Rq::Always,
+    ),
+    p(
+        "cs.display.status",
+        "Display status",
+        "Whether the display is live, and what it is showing",
+        Surfaces,
+        Advanced,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_GET_CS_DISPLAY_STATUS),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Always,
+    ),
+    // ------------------------------------------------------ signal generator
     p(
         "sig.config",
-        "Test signal",
+        "Signal generator",
         "What the generator produces",
         Diagnostics,
         Advanced,
@@ -2412,7 +3369,7 @@ pub static REGISTRY: &[ParamDesc] = &[
     p(
         "sig.control",
         "Start or stop",
-        "Run or halt the test signal",
+        "Run or halt the signal generator",
         Diagnostics,
         Advanced,
         Choice(&[(0, "stop"), (1, "start"), (2, "stop-now")]),
@@ -2440,6 +3397,121 @@ pub static REGISTRY: &[ParamDesc] = &[
         Hz::None,
         Ps::ReadOnly,
         Rq::Feature("test_signals"),
+    ),
+    // Spectrum analyser (config.h:146-154, rta.h:27-129). Polled, never
+    // pushed, off at boot and never persisted; any band or bin read starts it
+    // and it stops 5 s after the last one (rta.h:28).
+    p(
+        "rta.config",
+        "Analyser configuration",
+        "Tap, channels, transform size, averaging and peak decay",
+        Diagnostics,
+        Expert,
+        Packet,
+        Tg::None,
+        Some(op::REQ_RTA_SET_CONFIG),
+        Some(op::REQ_RTA_GET_CONFIG),
+        DOut,
+        Wv::Zero,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("spectrum_analyser"),
+    ),
+    p(
+        "rta.caps",
+        "Analyser capabilities",
+        "What this analyser can measure, and its band centres from wValue 1",
+        Diagnostics,
+        Expert,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_RTA_GET_CAPS),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Feature("spectrum_analyser"),
+    ),
+    p(
+        "rta.bands",
+        "Analyser bands",
+        "The latest band levels and peaks for one channel",
+        Diagnostics,
+        Expert,
+        Status,
+        Tg::TapChannel,
+        None,
+        Some(op::REQ_RTA_GET_BANDS),
+        DIn,
+        Wv::Target,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Feature("spectrum_analyser"),
+    ),
+    p(
+        "rta.bands.all",
+        "Analyser bands, every channel",
+        "The latest band frames of every selected and live channel",
+        Diagnostics,
+        Expert,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_RTA_GET_BANDS_ALL),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Feature("spectrum_analyser"),
+    ),
+    p(
+        "rta.bins",
+        "Analyser bins",
+        "The latest full-resolution frame, read from a byte offset",
+        Diagnostics,
+        Expert,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_RTA_GET_BINS),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Feature("spectrum_analyser"),
+    ),
+    p(
+        "rta.status",
+        "Analyser status",
+        "Whether the analyser is running, and how busy it is",
+        Diagnostics,
+        Expert,
+        Status,
+        Tg::None,
+        None,
+        Some(op::REQ_RTA_GET_STATUS),
+        DIn,
+        Wv::Zero,
+        Hz::None,
+        Ps::ReadOnly,
+        Rq::Feature("spectrum_analyser"),
+    ),
+    p(
+        "rta.control",
+        "Analyser run state",
+        "Stop or start the analyser, or reset its averaging",
+        Diagnostics,
+        Expert,
+        Choice(RTA_CONTROL),
+        Tg::None,
+        Some(op::REQ_RTA_CONTROL),
+        None,
+        DWar,
+        Wv::ValueOnly,
+        Hz::None,
+        Ps::LiveOnly,
+        Rq::Feature("spectrum_analyser"),
     ),
     // ----------------------------------------------------------- diagnostics
     p(
@@ -2609,7 +3681,7 @@ pub static REGISTRY: &[ParamDesc] = &[
 ///
 /// The coverage test accepts these and nothing else, so dropping an opcode here
 /// is a decision that has to be written down rather than an oversight.
-/// Currently empty: every one of the firmware's 190 opcodes is reachable from a
+/// Currently empty: every one of the firmware's 244 opcodes is reachable from a
 /// registry row. Keep it that way. If a future opcode genuinely cannot be
 /// driven by a host, add it here with the reason rather than letting the
 /// coverage test be weakened.
@@ -2708,6 +3780,156 @@ mod tests {
         assert_eq!(by_path("out.gain").unwrap().target.arity(), 1);
         assert_eq!(by_path("vol.user").unwrap().target.arity(), 0);
         assert_eq!(by_path("mix").unwrap().target.arity(), 2);
+        // A macro step is addressed by macro and by step number.
+        assert_eq!(by_path("cs.macro.step").unwrap().target.arity(), 2);
+    }
+
+    /// The twelve opcodes v1.1.6 added, and the direction each is dispatched
+    /// on. `REQ_CS_MACRO_FIRE` is the only write-as-read of the group.
+    #[test]
+    fn the_v1_1_6_control_surface_opcodes_are_all_reachable() {
+        let rows: &[(&str, Option<u8>, Option<u8>, Dir)] = &[
+            ("cs.group", Some(0x20), Some(0x21), Dir::Out),
+            ("cs.macro", Some(0x22), Some(0x23), Dir::Out),
+            ("cs.macro.step", Some(0x24), Some(0x23), Dir::Out),
+            ("cs.macro.fire", Some(0x25), None, Dir::WriteAsRead),
+            ("cs.ext.status", None, Some(0x26), Dir::In),
+            ("cs.display", Some(0x27), Some(0x28), Dir::Out),
+            ("cs.display.page", Some(0x29), Some(0x2A), Dir::Out),
+            ("cs.display.status", None, Some(0x2B), Dir::In),
+        ];
+        for (path, set, get, dir) in rows {
+            let d = by_path(path).unwrap_or_else(|| panic!("{path} is not registered"));
+            assert_eq!(d.set, *set, "{path} set opcode");
+            assert_eq!(d.get, *get, "{path} get opcode");
+            assert_eq!(d.dir, *dir, "{path} direction");
+            assert_eq!(d.group, Group::Surfaces, "{path} belongs on the CS screen");
+        }
+    }
+
+    /// `REQ_SET_CS_MACRO_STEP` packs `(step << 8) | macro`, the reverse of the
+    /// usual order, so the indices are given macro first and swapped here.
+    #[test]
+    fn a_macro_step_packs_the_step_into_the_high_byte() {
+        let d = by_path("cs.macro.step").unwrap();
+        assert_eq!(d.wvalue, WValue::MacroStep);
+    }
+
+    /// The optional S/PDIF inputs are 1..3; input 0 is always on and cannot be
+    /// disabled, so it must not share the pin command's index space.
+    #[test]
+    fn the_two_spdif_index_spaces_are_distinct() {
+        assert_eq!(by_path("in.spdif.pin").unwrap().target, Target::SpdifInput);
+        assert_eq!(
+            by_path("in.spdif.enable").unwrap().target,
+            Target::SpdifExtraInput
+        );
+    }
+
+    /// V27 widened the upmixer centre mode, and v1.1.6 added two PEQ types.
+    /// A choice list that has not grown rejects a value the device accepts.
+    #[test]
+    fn the_choice_lists_match_the_firmwares_ranges() {
+        let center = by_path("up.center_mode").unwrap();
+        assert!(center.kind.validate(&Value::Choice(2)).is_ok(), "OFF is 2");
+        assert!(center.kind.validate(&Value::Choice(3)).is_err());
+
+        let ty = by_path("eq.type").unwrap();
+        assert!(ty.kind.validate(&Value::Choice(12)).is_ok(), "LOWPASS1");
+        assert!(ty.kind.validate(&Value::Choice(13)).is_ok(), "HIGHPASS1");
+        assert!(ty.kind.validate(&Value::Choice(14)).is_err());
+    }
+
+    /// The three indexed opcodes carry a float for every parameter, the
+    /// booleans and choices included (upmix.h:185-186, config.h:228-236).
+    #[test]
+    fn indexed_parameters_always_travel_as_floats() {
+        for path in [
+            "up.on",
+            "up.center_mode",
+            "tube.on",
+            "tube.mask",
+            "tube.type",
+            "tube.rectifier",
+            "limit.on",
+            "limit.link",
+        ] {
+            assert_eq!(by_path(path).unwrap().repr(), Repr::F32, "{path}");
+        }
+        // Every other scalar keeps the width its kind implies.
+        assert_eq!(by_path("sub.on").unwrap().repr(), Repr::Bool8);
+        assert_eq!(by_path("sub.mask").unwrap().repr(), Repr::U16Le);
+        assert_eq!(by_path("sub.select").unwrap().repr(), Repr::U8);
+        assert_eq!(by_path("sub.low").unwrap().repr(), Repr::F32);
+        assert_eq!(by_path("cs.aux.level").unwrap().repr(), Repr::U16Q8);
+    }
+
+    /// The crossfeed output mask is "uint8 pair mask" (config.h:582-583),
+    /// one byte on the wire where the other masks take two.
+    #[test]
+    fn the_crossfeed_output_mask_travels_as_one_byte() {
+        let d = by_path("cf.outputs").unwrap();
+        assert_eq!(d.repr(), Repr::U8);
+        assert_eq!(d.repr().encode(&Value::Mask(0x0B)).unwrap(), vec![0x0B]);
+        assert!(d.repr().encode(&Value::Mask(0x100)).is_err());
+        assert_eq!(d.repr().decode(&[0x05]), Some(Value::Int(5)));
+    }
+
+    /// Tube parameter ids come from tube.h:16-32, in wire order.
+    #[test]
+    fn the_tube_rows_address_every_parameter_once() {
+        let mut ids: Vec<u16> = REGISTRY
+            .iter()
+            .filter(|d| d.set == Some(op::REQ_SET_TUBE_PARAM))
+            .map(|d| match d.wvalue {
+                WValue::Fixed(i) => i,
+                other => panic!("{} packs {other:?}", d.path),
+            })
+            .collect();
+        ids.sort_unstable();
+        let want: Vec<u16> = (0..tube::TUBE_NUM_PARAMS).collect();
+        assert_eq!(ids, want);
+    }
+
+    /// `(output << 8) | index` for the four limiter parameters
+    /// (limiter.h:12-18); the two read-only blocks sit at 0x80 and 0x81
+    /// (limiter.h:19-20).
+    #[test]
+    fn the_limiter_rows_pack_output_and_index() {
+        for (path, idx) in [
+            ("limit.on", 0u8),
+            ("limit.threshold", 1),
+            ("limit.release", 2),
+            ("limit.link", 3),
+        ] {
+            let d = by_path(path).unwrap();
+            assert_eq!(d.wvalue, WValue::OutputIndex(idx), "{path}");
+            assert_eq!(d.target, Target::OutputOrAll, "{path}");
+            assert_eq!((d.set, d.get), (Some(0x81), Some(0x81)), "{path}");
+        }
+        assert_eq!(by_path("limit.meter").unwrap().wvalue, WValue::Fixed(0x80));
+        assert_eq!(by_path("limit.status").unwrap().wvalue, WValue::Fixed(0x81));
+        assert_eq!(ALL_OUTPUTS, 0xFF);
+    }
+
+    /// Ranges come from the headers, not from the Console or the survey: the
+    /// subharm levels reach +12 dB (subharm.h:64-65) although the wire
+    /// section's comments still say +6 (bulk_params.h:388-392).
+    #[test]
+    fn the_new_ranges_are_the_headers() {
+        let range = |p: &str| match by_path(p).unwrap().kind {
+            Kind::Float { min, max, .. } => (min, max),
+            other => panic!("{p} is {other:?}"),
+        };
+        assert_eq!(range("sub.low"), (-30.0, 12.0));
+        assert_eq!(range("sub.top"), (-30.0, 12.0));
+        assert_eq!(range("sub.boost"), (0.0, 6.0));
+        assert_eq!(range("sub.hold"), (50.0, 400.0));
+        assert_eq!(range("sub.ceiling"), (-40.0, 0.0));
+        assert_eq!(range("tube.drive"), (-30.0, 24.0));
+        assert_eq!(range("tube.resonance"), (30.0, 150.0));
+        assert_eq!(range("limit.threshold"), (-30.0, 0.0));
+        assert_eq!(range("limit.release"), (10.0, 1000.0));
     }
 
     #[test]

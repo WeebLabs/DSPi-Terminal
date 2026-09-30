@@ -1,0 +1,227 @@
+//! What a screen is, from the shell's point of view.
+//!
+//! The detail region, every tool panel and every Settings page implement
+//! this. The shell owns focus, the frame, dialogs and popups; a screen owns
+//! what is inside its rectangle and reports what the person asked for.
+
+use crossterm::event::KeyEvent;
+use dspi_session::{DeviceState, Session};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+
+use super::model::Selection;
+use crate::theme::Theme;
+use crate::widgets::{Dialog, KeyHelp, PopupList};
+
+/// A page grammar's answer to the command bar (DESIGN 13): what the line
+/// would do, the rest of a verb the person has started, and the commands to
+/// run when they press Enter. Empty `commands` with a hint means the line is
+/// not complete yet.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Quick {
+    /// One line saying what the input means, or what could come next.
+    pub hint: String,
+    /// The rest of the verb the input starts, offered as a ghost; `Tab`
+    /// accepts it.
+    pub ghost: Option<String>,
+    /// The shared-grammar commands the line runs, when it is complete.
+    pub commands: Vec<String>,
+    /// True when the page did not recognise the line at all: the bar then
+    /// asks the shared `:` grammar's completer for the hint and the ghost,
+    /// so prediction never goes dark (DESIGN 13).
+    pub fallthrough: bool,
+}
+
+/// What a session request answered, back to the screen that asked.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionReply {
+    /// Done, with a line for the echo line or a status row.
+    Ok(String),
+    /// Failed, with the reason.
+    Err(String),
+    /// Bytes the request read, for the screen to decode.
+    Bytes(Vec<u8>),
+}
+
+/// Work a screen needs the session for: a typed write with its own status
+/// protocol (control surfaces), a read the bulk packet lacks. The runner
+/// executes it, refreshes the state, and hands the reply back through
+/// [`Screen::session_result`] with the same `tag`.
+#[derive(Clone)]
+pub struct SessionRequest {
+    pub tag: u32,
+    pub run: std::rc::Rc<dyn Fn(&mut Session) -> SessionReply>,
+}
+
+impl SessionRequest {
+    pub fn new(tag: u32, run: impl Fn(&mut Session) -> SessionReply + 'static) -> Self {
+        Self {
+            tag,
+            run: std::rc::Rc::new(run),
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SessionRequest(tag {})", self.tag)
+    }
+}
+
+impl PartialEq for SessionRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.tag == other.tag
+    }
+}
+
+/// What a screen wants after handling a key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScreenEvent {
+    /// The key was not for this screen; the shell may use it.
+    Unhandled,
+    /// Handled; nothing for the shell to do.
+    Handled,
+    /// Open a popup list; the screen gets `PopupList` results back through
+    /// `Screen::popup_result`.
+    Popup(PopupList),
+    /// Open a dialog; results come back through `Screen::dialog_result`.
+    Dialog(Dialog),
+    /// A command in the shared grammar, to run through the session. Several
+    /// commands may be joined with newlines.
+    Command(String),
+    /// Select a channel (or the overview) in the sidebar.
+    Select(Selection),
+    /// Run something against the session and hear back.
+    Session(SessionRequest),
+    /// Something to say on the echo line.
+    Status(String),
+    /// The screen wants to close (a tool panel or Settings).
+    Close,
+}
+
+pub trait Screen {
+    /// The panel title, drawn by the shell when the screen fills the pane.
+    fn title(&self) -> String;
+
+    /// Draw from the live state; a screen keeps only its own cursor and
+    /// edit state, never a copy of the device's.
+    fn draw(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+        state: &DeviceState,
+        focused: bool,
+    );
+
+    fn handle(&mut self, key: KeyEvent, state: &DeviceState) -> ScreenEvent;
+
+    /// Keys for the key line and the help overlay.
+    fn keys(&self) -> &'static [KeyHelp];
+
+    /// Contextual actions for the right side of the echo line, as the
+    /// Console's filter-list footer offers them: `(label, enabled)`. A label
+    /// of `|` draws a divider.
+    fn actions(&self, _state: &DeviceState) -> Vec<(String, bool)> {
+        Vec::new()
+    }
+
+    /// A popup this screen opened has closed with a choice (or none).
+    fn popup_result(&mut self, _choice: Option<usize>, _state: &DeviceState) -> ScreenEvent {
+        ScreenEvent::Handled
+    }
+
+    /// A dialog this screen opened has closed.
+    fn dialog_result(
+        &mut self,
+        _outcome: crate::widgets::DialogOutcome,
+        _state: &DeviceState,
+    ) -> ScreenEvent {
+        ScreenEvent::Handled
+    }
+
+    /// A session request this screen made has an answer.
+    fn session_result(
+        &mut self,
+        _tag: u32,
+        _reply: SessionReply,
+        _state: &DeviceState,
+    ) -> ScreenEvent {
+        ScreenEvent::Handled
+    }
+
+    /// Called every tick with the elapsed time, for screens with motion.
+    fn tick(&mut self, _dt_ms: u32) {}
+
+    /// Called about once a second while the screen is on top, with the
+    /// session, for screens that show device status the notification
+    /// stream does not carry (control-surface display and macro state).
+    fn poll(&mut self, _session: &mut Session, _state: &DeviceState) {}
+
+    /// The page grammar behind the `;` command bar, called on every edit.
+    /// `None` means this page has no grammar of its own; the bar then says
+    /// so and runs the line through the shared `:` grammar as typed.
+    fn quick(&self, _line: &str, _state: &DeviceState) -> Option<Quick> {
+        None
+    }
+
+    /// Enter on the command bar, for a line the page acts on itself rather
+    /// than as commands: one the Console confirms first, which opens its
+    /// dialog. `None` runs the line's commands as usual.
+    fn quick_run(&mut self, _line: &str, _state: &DeviceState) -> Option<ScreenEvent> {
+        None
+    }
+}
+
+/// A screen with nothing in it yet: names the selection and its keys.
+pub struct Placeholder {
+    pub title: String,
+    pub body: String,
+}
+
+impl Placeholder {
+    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+        }
+    }
+}
+
+impl Screen for Placeholder {
+    fn title(&self) -> String {
+        self.title.clone()
+    }
+
+    fn draw(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+        _state: &DeviceState,
+        _focused: bool,
+    ) {
+        if area.height == 0 {
+            return;
+        }
+        buf.set_string(area.x + 1, area.y, &self.title, theme.title());
+        for (i, line) in
+            crate::widgets::text::wrap(&self.body, area.width.saturating_sub(2) as usize, 6)
+                .iter()
+                .enumerate()
+        {
+            if 1 + i as u16 >= area.height {
+                break;
+            }
+            buf.set_string(area.x + 1, area.y + 1 + i as u16, line, theme.label());
+        }
+    }
+
+    fn handle(&mut self, _key: KeyEvent, _state: &DeviceState) -> ScreenEvent {
+        ScreenEvent::Unhandled
+    }
+
+    fn keys(&self) -> &'static [KeyHelp] {
+        &[]
+    }
+}

@@ -27,11 +27,19 @@ const HEADERS: &[&str] = &[
     "psybass.h",
     "upmix.h",
     "siggen.h",
+    "subharm.h",
+    "tube.h",
+    "limiter.h",
+    "rta.h",
+    "rta_fft.h",
+    "rta_bass.h",
+    "notify.h",
 ];
 
 /// Prefixes we lift into generated `u16` constants, with the module they land in.
 const DEFINE_GROUPS: &[(&str, &str)] = &[
     ("REQ_", "opcodes"),
+    ("VENDOR_EP_", "usb"),
     ("WIRE_", "wire"),
     ("CS_", "cs"),
     ("PIN_CONFIG_", "status"),
@@ -42,10 +50,42 @@ const DEFINE_GROUPS: &[(&str, &str)] = &[
     ("FILTER_", "filter"),
     ("XOVER_", "filter"),
     ("MAX_XOVER_", "filter"),
+    ("SUBHARM_", "subharm"),
+    ("TUBE_", "tube"),
+    ("LIMITER_", "limiter"),
+    ("RTA_", "rta"),
+    ("NOTIFY_", "notify"),
+    ("PARAM_SRC_", "notify"),
+    // The version this header set describes (config.h:659-667). Used only to
+    // name the firmware a refused device should be updated to.
+    ("FW_VERSION_", "firmware"),
+];
+
+/// Enumerators lifted alongside the defines. Some headers carry protocol ids
+/// as `enum` members rather than `#define`s (the tube and limiter parameter
+/// indices, the notification source tags, the control-surface component types
+/// and nouns), so the scanner reads those enums too, but only for these
+/// prefixes: an enumerator anywhere else is internal and stays internal.
+const ENUM_PREFIXES: &[&str] = &[
+    "TUBE_PARAM_",
+    "TUBE_NUM_PARAMS",
+    "LIMITER_PARAM_",
+    "LIMITER_NUM_PARAMS",
+    "PARAM_SRC_",
+    "CS_TYPE_",
+    "CS_NOUN_",
 ];
 
 /// Float ranges and defaults, lifted as `f32`.
-const FLOAT_PREFIXES: &[&str] = &["PSYBASS_", "UPMIX_", "LOUDNESS_", "LEVELLER_"];
+const FLOAT_PREFIXES: &[&str] = &[
+    "PSYBASS_",
+    "UPMIX_",
+    "LOUDNESS_",
+    "LEVELLER_",
+    "SUBHARM_",
+    "TUBE_",
+    "LIMITER_",
+];
 
 fn main() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("firmware");
@@ -63,6 +103,19 @@ fn main() {
         let path = dir.join(header);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read vendored header {}: {e}", path.display()));
+
+        for (name, v) in scan_enums(&text) {
+            match ints.get(&name) {
+                Some((prev, _, _)) if *prev != v => conflicts.push(name.clone()),
+                Some(_) => {}
+                None => {
+                    let group = group_for(&name).unwrap_or_else(|| {
+                        panic!("enum prefix of {name} has no DEFINE_GROUPS entry")
+                    });
+                    ints.insert(name, (v, group.to_string(), header.to_string()));
+                }
+            }
+        }
 
         for raw in text.lines() {
             let Some((name, value)) = parse_define(raw) else {
@@ -165,6 +218,57 @@ fn parse_define(line: &str) -> Option<(String, &str)> {
         return None;
     }
     Some((name.to_string(), value))
+}
+
+/// The members of every `enum { ... }` block whose names match
+/// [`ENUM_PREFIXES`], with their values.
+///
+/// Handles exactly what C gives an enumerator: an explicit integer literal, or
+/// nothing, meaning one more than the member before. An initializer this
+/// scanner cannot read as a literal breaks the chain, so the members after it
+/// are skipped until the next explicit literal rather than guessed at.
+fn scan_enums(text: &str) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    let mut in_enum = false;
+    let mut next: Option<i64> = None;
+
+    for raw in text.lines() {
+        let line = raw.split("//").next().unwrap_or("");
+        let line = line.split("/*").next().unwrap_or("").trim();
+        if !in_enum {
+            let head = line.strip_prefix("typedef ").unwrap_or(line);
+            if (head.starts_with("enum ") || head.starts_with("enum{")) && line.contains('{') {
+                in_enum = true;
+                next = Some(0);
+            }
+            continue;
+        }
+
+        let (body, closes) = match line.find('}') {
+            Some(i) => (&line[..i], true),
+            None => (line, false),
+        };
+        for member in body.split(',') {
+            let member = member.trim();
+            if member.is_empty() {
+                continue;
+            }
+            let (name, value) = match member.split_once('=') {
+                Some((n, v)) => (n.trim(), parse_int(v.trim())),
+                None => (member, next),
+            };
+            next = value.map(|v| v + 1);
+            if let Some(v) = value
+                && ENUM_PREFIXES.iter().any(|p| name.starts_with(p))
+            {
+                out.push((name.to_string(), v));
+            }
+        }
+        if closes {
+            in_enum = false;
+        }
+    }
+    out
 }
 
 fn group_for(name: &str) -> Option<&'static str> {
@@ -277,6 +381,13 @@ fn emit_wire_layout(ints: &BTreeMap<String, (i64, String, String)>, out: &mut St
         ("adat_config", 8),
         ("psybass", 24),
         ("upmix", 44),
+        // V29, grown at V30: WireSubharmParams (bulk_params.h:378-400).
+        ("subharm", 36),
+        // V31: WireTubeParams (bulk_params.h:403-427).
+        ("tube", 48),
+        // V32: WireLimiterParams, one 12-byte WireLimiterOutput per slot of
+        // the output wire array (bulk_params.h:430-446).
+        ("limiter", 12 * n_out),
     ];
 
     let mut offset = 0i64;

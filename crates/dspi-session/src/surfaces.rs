@@ -8,180 +8,75 @@
 //!
 //! The macOS Console's Settings tab is the behavioural reference, including the
 //! apply-live-then-save preview model and the three-valued IR learn loop.
+//!
+//! # Every SET here is a deferred preview
+//!
+//! A control-surface write returns before the firmware has validated it: the
+//! main loop applies it a tick later and reports the outcome through
+//! `REQ_GET_CS_STATUS`, tagged with the slot it was for. Nothing reaches flash
+//! until [`Surfaces::save`], and [`Surfaces::revert`] puts back what is stored.
+//! So a write is not done when the transfer returns; it is done when
+//! [`Surfaces::wait_applied`] sees the pending flag clear.
+
+use std::time::Duration;
 
 use dspi_proto::generated::opcodes as op;
-use dspi_transport::{Result as TResult, Transport};
+use dspi_transport::{Result as TResult, Transport, TransportError};
 
-/// One binding, 24 bytes, identical on the wire and in flash.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Binding {
-    pub component: u8,
-    pub noun: u8,
-    pub action: u8,
-    pub flags: u8,
-    pub gpio: [u8; 2],
-    pub event: u8,
-    pub target: u8,
-    pub index: u8,
-    pub value: i16,
-    pub step: i16,
-    pub range_min: i16,
-    pub range_max: i16,
+use crate::probe::ControlSurfaceCaps;
+
+/// The wire vocabulary, re-exported so a caller of this module does not have
+/// to reach into `dspi-proto` for the records it hands back. The codecs
+/// themselves live there, so there is exactly one decoder per record.
+pub use dspi_proto::packets::{
+    CsAuxStates, CsBinding, CsDisplayCfg, CsDisplayCfgReply, CsDisplayPage, CsDisplayStatus,
+    CsExtStatusPacket, CsGroup, CsMacro, CsMacroHeaderWire, CsMacroStep, CsNounDesc,
+    CsStatusPacket, GPIO_UNUSED, IrCommand, IrLearnResult, PacketError,
+};
+
+/// The names this app has always used for three of them.
+pub type Binding = CsBinding;
+pub type NounCaps = CsNounDesc;
+pub type Status = CsStatusPacket;
+pub type LearnResult = IrLearnResult;
+
+/// Status codes a deferred apply reports (control_surfaces.h:607-637).
+pub mod status {
+    pub const SUCCESS: u8 = 0x00;
+    /// Accepted, the apply has not run yet. Poll again.
+    pub const PENDING: u8 = 0x16;
+    /// Another SET of the same kind was still waiting for the main loop, so
+    /// this one was dropped, not queued (vendor_commands.c:1412-1417).
+    pub const BUSY: u8 = 0x1B;
+    /// A value or its length is out of range (control_surfaces.h:689).
+    pub const INVALID_VALUE: u8 = 0x14;
+    /// Not an auxiliary output, or a level for an on/off one
+    /// (control_surfaces.h:714-715).
+    pub const INVALID_AUX: u8 = 0x26;
 }
 
-/// A GPIO slot a component does not use.
-pub const GPIO_UNUSED: u8 = 0xFF;
+/// The highest auxiliary output level, 100 % in 8.8: the SET clamps there
+/// (config.h:141-142), and `CS_NOUN_AUX_LEVEL` is 0..100 %
+/// (control_surfaces.h:238-239).
+pub const AUX_LEVEL_MAX_Q8: u16 = 100 * 256;
 
-impl Binding {
-    pub const WIRE_LEN: usize = 24;
+/// `wValue` that reads every slot's aux state and level in one transfer
+/// (config.h:138-140).
+pub const AUX_STATE_ALL: u16 = 0xFFFF;
 
-    pub fn is_empty(&self) -> bool {
-        self.component == 0
-    }
-
-    pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() < Self::WIRE_LEN {
-            return None;
-        }
-        Some(Self {
-            component: b[0],
-            noun: b[1],
-            action: b[2],
-            flags: b[3],
-            gpio: [b[4], b[5]],
-            event: b[6],
-            target: b[7],
-            index: b[8],
-            value: i16::from_le_bytes([b[10], b[11]]),
-            step: i16::from_le_bytes([b[12], b[13]]),
-            range_min: i16::from_le_bytes([b[14], b[15]]),
-            range_max: i16::from_le_bytes([b[16], b[17]]),
-        })
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut b = vec![0u8; Self::WIRE_LEN];
-        b[0] = self.component;
-        b[1] = self.noun;
-        b[2] = self.action;
-        b[3] = self.flags;
-        b[4] = self.gpio[0];
-        b[5] = self.gpio[1];
-        b[6] = self.event;
-        b[7] = self.target;
-        b[8] = self.index;
-        b[10..12].copy_from_slice(&self.value.to_le_bytes());
-        b[12..14].copy_from_slice(&self.step.to_le_bytes());
-        b[14..16].copy_from_slice(&self.range_min.to_le_bytes());
-        b[16..18].copy_from_slice(&self.range_max.to_le_bytes());
-        b
-    }
-}
-
-/// A learned remote button, 16 bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct IrCommand {
-    pub noun: u8,
-    pub action: u8,
-    pub flags: u8,
-    pub target: u8,
-    pub index: u8,
-    pub protocol: u8,
-    pub value: i16,
-    pub step: i16,
-    pub code: u32,
-}
-
-impl IrCommand {
-    pub const WIRE_LEN: usize = 16;
-
-    /// `protocol == NONE` marks the sub-slot empty.
-    pub fn is_empty(&self) -> bool {
-        self.protocol == 0
-    }
-
-    pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() < Self::WIRE_LEN {
-            return None;
-        }
-        Some(Self {
-            noun: b[0],
-            action: b[1],
-            flags: b[2],
-            target: b[3],
-            index: b[4],
-            protocol: b[5],
-            value: i16::from_le_bytes([b[6], b[7]]),
-            step: i16::from_le_bytes([b[8], b[9]]),
-            code: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
-        })
-    }
-}
-
-/// What a component type can do, from the device's capability table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TypeCaps {
-    /// Bit mask of the actions this component can drive.
-    pub actions: u16,
-    pub pin_count: u8,
-    pub pin_class: u8,
-}
-
-/// What a parameter accepts, from the device's noun table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NounCaps {
-    pub kind: u8,
-    pub enum_count: u8,
-    /// Zero means the noun is unavailable on this platform.
-    pub actions: u16,
-    pub min_q: i16,
-    pub max_q: i16,
-    pub unit: u8,
-    pub target_kind: u8,
-    pub target_count: u8,
-    pub flags: u8,
-}
-
-impl NounCaps {
-    pub const WIRE_LEN: usize = 12;
-
-    /// A noun with no actions is not available here, which is how the firmware
-    /// reports a platform difference such as ADAT on an RP2040.
-    pub fn is_available(&self) -> bool {
-        self.actions != 0
-    }
-
-    pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() < Self::WIRE_LEN {
-            return None;
-        }
-        Some(Self {
-            kind: b[0],
-            enum_count: b[1],
-            actions: u16::from_le_bytes([b[2], b[3]]),
-            min_q: i16::from_le_bytes([b[4], b[5]]),
-            max_q: i16::from_le_bytes([b[6], b[7]]),
-            unit: b[8],
-            target_kind: b[9],
-            target_count: b[10],
-            flags: b[11],
-        })
-    }
-}
-
-/// Live status of the whole feature.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Status {
-    pub last_status: u8,
-    pub last_slot: u8,
-    pub max_bindings: u8,
-    /// Live configuration differs from what is in flash.
-    pub dirty: bool,
-    pub active_mask: u16,
-    pub slot_status: Vec<u8>,
-    pub ir_active_mask: u8,
-    pub ir_learn_state: u8,
-    pub ir_status: Vec<u8>,
+/// What `last_slot` in the status packet is tagged with
+/// (control_surfaces.h:592-596, :767-782).
+///
+/// One poll has to say which kind of SET just landed, so each kind claims its
+/// own high bits. The display's config and its page 0 deliberately share
+/// `0x50`, which is only unambiguous because a host never has two display SETs
+/// in flight; this module writes them one at a time for that reason.
+pub mod tag {
+    pub const IR: u8 = 0x80;
+    pub const GROUP: u8 = 0x40;
+    pub const MACRO: u8 = 0x60;
+    pub const DISPLAY: u8 = 0x50;
+    pub const SAVE: u8 = 0xFF;
 }
 
 pub mod learn {
@@ -197,13 +92,19 @@ pub mod learn {
     pub const READ: u16 = 2;
 }
 
-/// What a learn attempt produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LearnResult {
-    pub state: u8,
-    pub protocol: u8,
-    pub code: u32,
+#[derive(Debug, thiserror::Error)]
+pub enum SurfaceError {
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+
+    #[error("could not read the device's answer: {0}")]
+    Packet(#[from] PacketError),
+
+    #[error("the device is still applying {tag} after {polls} checks")]
+    Timeout { tag: String, polls: usize },
 }
+
+pub type Result<T> = std::result::Result<T, SurfaceError>;
 
 /// A status code, as a sentence rather than a number to look up.
 pub fn explain_status(code: u8) -> String {
@@ -213,6 +114,10 @@ pub fn explain_status(code: u8) -> String {
         0x02 => "that GPIO is already in use".into(),
         0x03 => "that output or slot does not exist".into(),
         0x04 => "disable the output first".into(),
+        // `PIN_CONFIG_INVALID_PARAM`, config.h:612: a non-pin field out
+        // of range. A display record with a bad I2C address or
+        // brightness reaches it (control_surfaces.h:607).
+        0x05 => "that setting is out of range".into(),
         0x10 => "no such binding slot".into(),
         0x11 => "not a component this firmware knows".into(),
         0x12 => "not a parameter this firmware knows".into(),
@@ -222,23 +127,614 @@ pub fn explain_status(code: u8) -> String {
         0x16 => "accepted, not applied yet".into(),
         0x17 => "that channel or band does not exist".into(),
         0x18 => "not a gesture a button can carry".into(),
-        0x19 => "that LED clashes with another on the same PWM slice".into(),
+        // Caps v18 widened the clash to the dimmable outputs; the Console's
+        // words (`statusMessage`, DSPi_ConsoleApp.swift:7581).
+        0x19 => "this PWM pin conflicts with another dimmable LED or output".into(),
         0x1A => "another binding already uses that pin and gesture".into(),
         0x1B => "still applying a previous change; try again shortly".into(),
         0x1C => "could not write to flash".into(),
         0x1D => "another slot already holds the IR receiver".into(),
         0x1E => "set up an IR receiver first".into(),
+        // Caps v9 and v10 additions, control_surfaces.h:629-637.
+        0x1F => "that group is empty, out of range, or the wrong kind for this parameter".into(),
+        0x20 => "no such macro, or its step count is wrong".into(),
+        0x21 => "that macro step is not a valid action".into(),
+        0x22 => "another slot already holds the display".into(),
+        0x23 => "those two pins are not a valid I2C pair".into(),
+        0x24 => "the I2C control interface already has that instance".into(),
+        0x25 => "that display page or setting is not valid".into(),
+        // Caps v18, control_surfaces.h:714-715, in the Console's words
+        // (`statusMessage`, DSPi_ConsoleApp.swift:7593).
+        0x26 => {
+            "the target isn't an auxiliary output, or a level control needs a dimmable one".into()
+        }
         other => format!("refused with status 0x{other:02X}"),
     }
 }
 
+/// Which write a `last_slot` tag refers to, in words.
+///
+/// Without this a status packet reports "slot 0x86" for what is really IR
+/// sub-slot 6, and the four namespaces are indistinguishable.
+pub fn explain_slot_tag(slot: u8) -> String {
+    match slot {
+        tag::SAVE => "the save".into(),
+        0x80..=0x8F => format!("IR command {}", slot & 0x0F),
+        0x60..=0x67 => format!("macro {}", slot & 0x07),
+        // The config and page 0 share this byte; the config is the likelier
+        // reading, and this module never has both in flight at once.
+        tag::DISPLAY => "the display settings".into(),
+        0x51..=0x5F => format!("display page {}", slot & 0x0F),
+        0x40..=0x47 => format!("group {}", slot & 0x07),
+        0x00..=0x0F => format!("binding slot {slot}"),
+        other => format!("slot 0x{other:02X}"),
+    }
+}
+
+/// What this device says it has, so nothing here is sized by a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub max_bindings: u8,
+    pub max_ir_commands: u8,
+    pub max_groups: u8,
+    pub max_macros: u8,
+    pub max_macro_steps: u8,
+    pub noun_count: u8,
+    /// Not in the caps header: it arrives in the display config reply, so it
+    /// starts at the header's `CS_MAX_DISPLAY_PAGES` and is refreshed by
+    /// [`Surfaces::read_display_cfg`].
+    pub max_display_pages: u8,
+}
+
+impl Default for Limits {
+    /// The v1.1.6 constants, for a device that has not been asked yet
+    /// (control_surfaces.h:272-283, :329).
+    fn default() -> Self {
+        Self {
+            max_bindings: 16,
+            max_ir_commands: 16,
+            max_groups: 8,
+            max_macros: 8,
+            max_macro_steps: 8,
+            noun_count: 57,
+            max_display_pages: 16,
+        }
+    }
+}
+
+impl From<&ControlSurfaceCaps> for Limits {
+    fn from(c: &ControlSurfaceCaps) -> Self {
+        Self {
+            max_bindings: c.max_bindings,
+            max_ir_commands: c.max_ir_commands,
+            max_groups: c.max_groups,
+            max_macros: c.max_macros,
+            max_macro_steps: c.max_macro_steps,
+            noun_count: c.noun_count,
+            ..Self::default()
+        }
+    }
+}
+
+/// The control-surface write path, bound to one transport.
+///
+/// Holds the tag of the write in flight so [`wait_applied`](Self::wait_applied)
+/// can tell this write's outcome from someone else's: a knob turned on the
+/// device also lands in `last_status`.
+pub struct Surfaces<'t> {
+    t: &'t mut dyn Transport,
+    limits: Limits,
+    /// The `last_slot` tag the write in flight will report under.
+    pending: Option<u8>,
+    poll_interval: Duration,
+    busy_backoff: Duration,
+    max_polls: usize,
+}
+
+impl<'t> Surfaces<'t> {
+    /// The Console's budget: 25 polls at 20 ms.
+    const DEFAULT_POLLS: usize = 25;
+
+    pub fn new(t: &'t mut dyn Transport, limits: Limits) -> Self {
+        Self {
+            t,
+            limits,
+            pending: None,
+            poll_interval: Duration::from_millis(20),
+            busy_backoff: Duration::from_millis(60),
+            max_polls: Self::DEFAULT_POLLS,
+        }
+    }
+
+    /// Shorten the wait, for tests that have no real main loop to wait for.
+    pub fn with_poll(mut self, interval: Duration, max_polls: usize) -> Self {
+        self.poll_interval = interval;
+        self.busy_backoff = interval;
+        self.max_polls = max_polls;
+        self
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    // ------------------------------------------------------------- the wait
+
+    fn expect(&mut self, slot: u8) {
+        self.pending = Some(slot);
+    }
+
+    /// Poll `REQ_GET_CS_STATUS` until the deferred apply resolves.
+    ///
+    /// `PENDING` means the main loop has not run it yet, and is waited out.
+    /// `BUSY` is final: the firmware's handoff is one deep, so a SET that
+    /// arrives while another of its kind is still unapplied is dropped, not
+    /// queued (vendor_commands.c:1412-1417, 1444-1449, 1473-1478). Waiting on
+    /// would only hear the other SET's result under this slot's tag, so the
+    /// BUSY is returned and [`send`](Self::send) decides what to do about it.
+    /// Giving up names the slot, because "timed out" without saying which
+    /// write is not something a user can act on.
+    pub fn wait_applied(&mut self) -> Result<CsStatusPacket> {
+        for _ in 0..self.max_polls {
+            std::thread::sleep(self.poll_interval);
+            let st = self.read_status()?;
+
+            let mine = self.pending.is_none_or(|tag| st.last_slot == tag);
+            if mine && st.last_status != status::PENDING {
+                self.pending = None;
+                return Ok(st);
+            }
+        }
+        Err(SurfaceError::Timeout {
+            tag: explain_slot_tag(self.pending.take().unwrap_or(0)),
+            polls: self.max_polls,
+        })
+    }
+
+    /// Send one deferred SET and wait for its outcome.
+    ///
+    /// A `BUSY` answer means the device dropped this SET because another one
+    /// of the same kind, most likely from another host, was still waiting for
+    /// the main loop. That SET's result will land under its own slot, so this
+    /// waits until the status stops reading `BUSY` or `PENDING` and sends this
+    /// one again, once. A second `BUSY` is reported as it is: the conflict,
+    /// not someone else's result.
+    fn send(
+        &mut self,
+        request: u8,
+        wvalue: u16,
+        payload: &[u8],
+        tag: u8,
+    ) -> Result<CsStatusPacket> {
+        self.t.control_out(request, wvalue, payload)?;
+        self.expect(tag);
+        let st = self.wait_applied()?;
+        if st.last_status != status::BUSY {
+            return Ok(st);
+        }
+        self.wait_idle()?;
+        self.t.control_out(request, wvalue, payload)?;
+        self.expect(tag);
+        self.wait_applied()
+    }
+
+    /// Wait, within the poll budget, for the SET ahead of a dropped one to be
+    /// applied: the main loop overwrites `last_status` with its result, which
+    /// is neither `BUSY` nor `PENDING`. Running out of polls is not an error
+    /// here; the re-send then answers `BUSY` again and that is reported.
+    fn wait_idle(&mut self) -> Result<()> {
+        for _ in 0..self.max_polls {
+            std::thread::sleep(self.busy_backoff);
+            let st = self.read_status()?;
+            if st.last_status != status::BUSY && st.last_status != status::PENDING {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------- bindings
+
+    /// Apply one binding. `CS_TYPE_NONE` clears the slot.
+    pub fn write_binding(&mut self, slot: u8, b: &CsBinding) -> Result<CsStatusPacket> {
+        self.send(op::REQ_SET_CS_BINDING, slot as u16, &b.encode(), slot)
+    }
+
+    /// Set a slot's label. A single NUL clears it.
+    ///
+    /// An empty payload is `INVALID_VALUE`, so clearing means sending one zero
+    /// byte rather than nothing (control_surfaces.h:350-357).
+    pub fn write_name(&mut self, slot: u8, name: &str) -> Result<CsStatusPacket> {
+        // Truncated to 31 bytes plus the implicit terminator, as the firmware
+        // does on its side. Truncation is on a character boundary so a
+        // multi-byte name never becomes invalid UTF-8 on the device.
+        let mut bytes: Vec<u8> = Vec::new();
+        for c in name.chars() {
+            if bytes.len() + c.len_utf8() > 31 {
+                break;
+            }
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+        if bytes.is_empty() {
+            bytes.push(0);
+        }
+        self.send(op::REQ_SET_CS_NAME, slot as u16, &bytes, slot)
+    }
+
+    /// Apply one IR sub-slot. An all-zero record clears it.
+    pub fn write_ir_command(&mut self, sub_slot: u8, c: &IrCommand) -> Result<CsStatusPacket> {
+        self.send(
+            op::REQ_SET_CS_IR_CMD,
+            sub_slot as u16,
+            &c.encode(),
+            tag::IR | sub_slot,
+        )
+    }
+
+    // --------------------------------------------------------------- groups
+
+    /// Apply one group. An all-zero record clears it.
+    ///
+    /// This re-validates every binding that references a group, so a binding
+    /// whose group just emptied goes down with its reason in `slot_status`
+    /// rather than the write being refused (control_surfaces.h:689-694).
+    pub fn write_group(&mut self, index: u8, g: &CsGroup) -> Result<CsStatusPacket> {
+        self.send(
+            op::REQ_SET_CS_GROUP,
+            index as u16,
+            &g.encode(),
+            tag::GROUP | index,
+        )
+    }
+
+    // --------------------------------------------------------------- macros
+
+    /// Write a whole macro: every step first, then the header.
+    ///
+    /// That order is the firmware's own instruction ("hosts should write steps
+    /// first and the header last so a concurrent fire never sees `step_count`
+    /// exceed the written steps", control_surfaces.h:488-491). The header is
+    /// what makes the steps live, so writing it first would leave a window in
+    /// which firing the macro runs steps that are still the old ones.
+    pub fn write_macro(
+        &mut self,
+        index: u8,
+        header: &CsMacroHeaderWire,
+        steps: &[CsMacroStep],
+    ) -> Result<CsStatusPacket> {
+        // Every record is still written after a refusal, as the Console does
+        // (`setCsMacro`, Commands.swift:3263-3277), and the first refusal is
+        // what the caller hears: each step answers under the macro's own tag,
+        // so the header's success would otherwise hide a rejected step.
+        let mut first_refusal = None;
+        for (i, step) in steps.iter().enumerate() {
+            let st = self.write_macro_step(index, i as u8, step)?;
+            if st.last_status != status::SUCCESS && first_refusal.is_none() {
+                first_refusal = Some(st);
+            }
+        }
+        let st = self.send(
+            op::REQ_SET_CS_MACRO,
+            index as u16,
+            &header.encode(),
+            tag::MACRO | index,
+        )?;
+        Ok(first_refusal.unwrap_or(st))
+    }
+
+    /// Apply one step. `wValue` packs the step above the macro index.
+    pub fn write_macro_step(
+        &mut self,
+        index: u8,
+        step: u8,
+        value: &CsMacroStep,
+    ) -> Result<CsStatusPacket> {
+        let wvalue = ((step as u16) << 8) | index as u16;
+        self.send(
+            op::REQ_SET_CS_MACRO_STEP,
+            wvalue,
+            &value.encode(),
+            tag::MACRO | index,
+        )
+    }
+
+    /// Clear one step: an all-zero record is the empty step the sequencer
+    /// skips.
+    pub fn clear_macro_step(&mut self, index: u8, step: u8) -> Result<CsStatusPacket> {
+        self.write_macro_step(index, step, &CsMacroStep::default())
+    }
+
+    /// Run a macro now, returning the accept status.
+    ///
+    /// Not deferred, unlike every other control-surface write: the reply is the
+    /// accept or reject, and the sequence then runs on the device. Firing while
+    /// another macro runs cancels that one at its next step boundary.
+    pub fn fire_macro(&mut self, index: u8) -> Result<u8> {
+        let d = self.t.control_in(op::REQ_CS_MACRO_FIRE, index as u16, 1)?;
+        Ok(d.first().copied().unwrap_or(status::SUCCESS))
+    }
+
+    /// Cancel the running macro. `wValue` 0xFFFF is the cancel selector
+    /// (config.h:141).
+    pub fn cancel_macro(&mut self) -> Result<u8> {
+        let d = self.t.control_in(op::REQ_CS_MACRO_FIRE, 0xFFFF, 1)?;
+        Ok(d.first().copied().unwrap_or(status::SUCCESS))
+    }
+
+    // -------------------------------------------------------------- display
+
+    pub fn write_display_cfg(&mut self, cfg: &CsDisplayCfg) -> Result<CsStatusPacket> {
+        self.send(op::REQ_SET_CS_DISPLAY_CFG, 0, &cfg.encode(), tag::DISPLAY)
+    }
+
+    /// Apply one page. An all-zero record clears the slot.
+    pub fn write_display_page(&mut self, page: u8, p: &CsDisplayPage) -> Result<CsStatusPacket> {
+        self.send(
+            op::REQ_SET_CS_DISPLAY_PAGE,
+            page as u16,
+            &p.encode(),
+            tag::DISPLAY | page,
+        )
+    }
+
+    // ---------------------------------------------------- auxiliary outputs
+
+    /// Switch the auxiliary output in `slot` on or off, answering the device's
+    /// verdict.
+    ///
+    /// Not deferred and not a preview: the handler applies it at once, never
+    /// writes flash and never raises the unsaved flag (config.h:136-137). It is
+    /// also not refused on the wire. `config.h` says the SET stalls on a slot
+    /// that is not an aux output, but the handler only records
+    /// `CS_STATUS_INVALID_AUX` in the status packet and the data stage is
+    /// acknowledged all the same (vendor_commands.c:1496-1531, 4506-4512), so
+    /// the status packet is the only place a refusal shows.
+    pub fn set_aux_state(&mut self, slot: u8, on: bool) -> Result<u8> {
+        let before = self.read_status()?;
+        self.t
+            .control_out(op::REQ_SET_CS_AUX_STATE, slot as u16, &[u8::from(on)])?;
+        self.aux_outcome(slot, before, |s| s.is_on(slot as usize) == on)
+    }
+
+    /// Set a dimmable output's level, 8.8 percent, clamped to 100 %
+    /// (config.h:141-142). On an on/off output the device refuses it with
+    /// `CS_STATUS_INVALID_AUX`.
+    pub fn set_aux_level(&mut self, slot: u8, level_q8: u16) -> Result<u8> {
+        let level = level_q8.min(AUX_LEVEL_MAX_Q8);
+        let before = self.read_status()?;
+        self.t
+            .control_out(op::REQ_SET_CS_AUX_LEVEL, slot as u16, &level.to_le_bytes())?;
+        self.aux_outcome(slot, before, |s| {
+            s.level_q8.get(slot as usize).copied() == Some(level)
+        })
+    }
+
+    /// What an aux SET came to.
+    ///
+    /// A rejection writes `last_status` and `last_slot`; a success writes
+    /// neither (vendor_commands.c:1502-1536), so the previous write's failure
+    /// can still be standing when this one worked. A failure is reported only
+    /// when the packet names this slot with one of the two aux refusals and
+    /// either it is new since the write or the output did not take the value.
+    fn aux_outcome(
+        &mut self,
+        slot: u8,
+        before: CsStatusPacket,
+        took: impl Fn(&CsAuxStates) -> bool,
+    ) -> Result<u8> {
+        let after = self.read_status()?;
+        let refused = after.last_slot == slot
+            && matches!(
+                after.last_status,
+                status::INVALID_AUX | status::INVALID_VALUE
+            );
+        if !refused {
+            return Ok(status::SUCCESS);
+        }
+        let fresh = (after.last_status, after.last_slot) != (before.last_status, before.last_slot);
+        if fresh || !took(&self.read_aux_states()?) {
+            return Ok(after.last_status);
+        }
+        Ok(status::SUCCESS)
+    }
+
+    /// Every slot's live aux state and level, one 48-byte read (config.h:
+    /// 138-140). Slots without a running aux output read zero.
+    pub fn read_aux_states(&mut self) -> Result<CsAuxStates> {
+        let d = self.t.control_in(
+            op::REQ_GET_CS_AUX_STATE,
+            AUX_STATE_ALL,
+            CsAuxStates::SIZE as u16,
+        )?;
+        Ok(CsAuxStates::decode(&d)?)
+    }
+
+    // ---------------------------------------------------------------- reads
+
+    pub fn read_status(&mut self) -> Result<CsStatusPacket> {
+        Ok(read_status(
+            self.t,
+            self.limits.max_bindings,
+            self.limits.max_ir_commands,
+        )?)
+    }
+
+    pub fn read_binding(&mut self, slot: u8) -> Result<CsBinding> {
+        let d = self
+            .t
+            .control_in(op::REQ_GET_CS_BINDING, slot as u16, CsBinding::SIZE as u16)?;
+        Ok(CsBinding::decode(&d)?)
+    }
+
+    pub fn read_name(&mut self, slot: u8) -> Result<String> {
+        Ok(read_name(self.t, slot)?)
+    }
+
+    pub fn read_ir_command(&mut self, sub_slot: u8) -> Result<IrCommand> {
+        let d = self.t.control_in(
+            op::REQ_GET_CS_IR_CMD,
+            sub_slot as u16,
+            IrCommand::SIZE as u16,
+        )?;
+        Ok(IrCommand::decode(&d)?)
+    }
+
+    pub fn read_group(&mut self, index: u8) -> Result<CsGroup> {
+        let d = self
+            .t
+            .control_in(op::REQ_GET_CS_GROUP, index as u16, CsGroup::SIZE as u16)?;
+        Ok(CsGroup::decode(&d)?)
+    }
+
+    /// Read a whole macro: the 132-byte record carries its steps, which the
+    /// SET path can only write one at a time.
+    pub fn read_macro(&mut self, index: u8) -> Result<CsMacro> {
+        let d = self
+            .t
+            .control_in(op::REQ_GET_CS_MACRO, index as u16, CsMacro::SIZE as u16)?;
+        Ok(CsMacro::decode(&d)?)
+    }
+
+    pub fn read_ext_status(&mut self) -> Result<CsExtStatusPacket> {
+        let d = self
+            .t
+            .control_in(op::REQ_GET_CS_EXT_STATUS, 0, CsExtStatusPacket::SIZE as u16)?;
+        Ok(CsExtStatusPacket::decode(&d)?)
+    }
+
+    /// Read the display config, with the limits the reply prepends.
+    ///
+    /// `max_pages` is only available here, so this also refreshes the limit the
+    /// page loop uses.
+    pub fn read_display_cfg(&mut self) -> Result<CsDisplayCfgReply> {
+        let d = self.t.control_in(
+            op::REQ_GET_CS_DISPLAY_CFG,
+            0,
+            CsDisplayCfgReply::SIZE as u16,
+        )?;
+        let reply = CsDisplayCfgReply::decode(&d)?;
+        if reply.max_pages > 0 {
+            self.limits.max_display_pages = reply.max_pages;
+        }
+        Ok(reply)
+    }
+
+    pub fn read_display_page(&mut self, page: u8) -> Result<CsDisplayPage> {
+        let d = self.t.control_in(
+            op::REQ_GET_CS_DISPLAY_PAGE,
+            page as u16,
+            CsDisplayPage::SIZE as u16,
+        )?;
+        Ok(CsDisplayPage::decode(&d)?)
+    }
+
+    pub fn read_display_status(&mut self) -> Result<CsDisplayStatus> {
+        let d = self.t.control_in(
+            op::REQ_GET_CS_DISPLAY_STATUS,
+            0,
+            CsDisplayStatus::SIZE as u16,
+        )?;
+        Ok(CsDisplayStatus::decode(&d)?)
+    }
+
+    // ------------------------------------------------------------ whole sets
+
+    pub fn read_all_bindings(&mut self) -> Result<Vec<(CsBinding, String)>> {
+        let mut out = Vec::with_capacity(self.limits.max_bindings as usize);
+        for slot in 0..self.limits.max_bindings {
+            let b = self.read_binding(slot)?;
+            let name = self.read_name(slot)?;
+            out.push((b, name));
+        }
+        Ok(out)
+    }
+
+    pub fn read_all_ir_commands(&mut self) -> Result<Vec<IrCommand>> {
+        (0..self.limits.max_ir_commands)
+            .map(|i| self.read_ir_command(i))
+            .collect()
+    }
+
+    pub fn read_all_groups(&mut self) -> Result<Vec<CsGroup>> {
+        (0..self.limits.max_groups)
+            .map(|i| self.read_group(i))
+            .collect()
+    }
+
+    pub fn read_all_macros(&mut self) -> Result<Vec<CsMacro>> {
+        (0..self.limits.max_macros)
+            .map(|i| self.read_macro(i))
+            .collect()
+    }
+
+    /// Every page slot, sized by the config reply rather than by a constant.
+    pub fn read_all_pages(&mut self) -> Result<Vec<CsDisplayPage>> {
+        let pages = self.read_display_cfg()?.max_pages;
+        (0..pages).map(|i| self.read_display_page(i)).collect()
+    }
+
+    /// One noun's descriptor, so a caller can tolerate a single stall rather
+    /// than losing the whole table to it.
+    pub fn read_noun(&mut self, noun: u8) -> Result<CsNounDesc> {
+        Ok(read_noun_caps(self.t, noun)?)
+    }
+
+    /// Every noun descriptor. A noun whose `actions` mask is zero is not
+    /// available on this platform, which is how the firmware reports a
+    /// difference like ADAT on an RP2040; it must not be offered.
+    pub fn read_all_nouns(&mut self) -> Result<Vec<CsNounDesc>> {
+        (0..self.limits.noun_count)
+            .map(|noun| Ok(read_noun_caps(self.t, noun)?))
+            .collect()
+    }
+
+    // ---------------------------------------------------------- persistence
+
+    /// Persist the previewed configuration.
+    ///
+    /// Bindings apply live but do not survive a power cycle until this runs,
+    /// which is a real feature: an assignment can be tried and backed out of.
+    pub fn save(&mut self) -> Result<CsStatusPacket> {
+        self.t.control_in(op::REQ_CS_SAVE, 0, 1)?;
+        self.expect(tag::SAVE);
+        self.wait_applied()
+    }
+
+    /// Discard the preview and reload what is in flash.
+    pub fn revert(&mut self) -> Result<CsStatusPacket> {
+        self.t.control_in(op::REQ_CS_REVERT, 0, 1)?;
+        self.expect(tag::SAVE);
+        self.wait_applied()
+    }
+
+    // --------------------------------------------------------------- IR learn
+
+    /// Arm the receiver, answering the device's own verdict.
+    ///
+    /// `control_surfaces.h:798`: the opcode "returns PIN_CONFIG_SUCCESS or
+    /// CS_STATUS_NO_IR (arm without a live IR component)". Dropping that byte
+    /// leaves a refused arm looking like a live one that never hears a button.
+    pub fn arm_learn(&mut self) -> Result<u8> {
+        Ok(arm_learn(self.t)?)
+    }
+
+    pub fn cancel_learn(&mut self) -> Result<u8> {
+        Ok(cancel_learn(self.t)?)
+    }
+
+    pub fn read_learn(&mut self) -> Result<IrLearnResult> {
+        Ok(read_learn(self.t)?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport-level reads, for callers that hold a bare transport.
+// ---------------------------------------------------------------------------
+
 /// Read one binding slot.
 pub fn read_binding(t: &mut dyn Transport, slot: u8) -> TResult<Binding> {
-    let d = t.control_in(
-        op::REQ_GET_CS_BINDING,
-        slot as u16,
-        Binding::WIRE_LEN as u16,
-    )?;
+    let d = t.control_in(op::REQ_GET_CS_BINDING, slot as u16, Binding::SIZE as u16)?;
     Ok(Binding::decode(&d).unwrap_or_default())
 }
 
@@ -255,54 +751,42 @@ pub fn read_ir_command(t: &mut dyn Transport, sub_slot: u8) -> TResult<IrCommand
     let d = t.control_in(
         op::REQ_GET_CS_IR_CMD,
         sub_slot as u16,
-        IrCommand::WIRE_LEN as u16,
+        IrCommand::SIZE as u16,
     )?;
     Ok(IrCommand::decode(&d).unwrap_or_default())
 }
 
 /// Read one noun's descriptor from the device's capability table.
 pub fn read_noun_caps(t: &mut dyn Transport, noun: u8) -> TResult<NounCaps> {
-    let d = t.control_in(op::REQ_GET_CS_CAPS, noun as u16, NounCaps::WIRE_LEN as u16)?;
-    Ok(NounCaps::decode(&d).unwrap_or(NounCaps {
-        kind: 0,
-        enum_count: 0,
-        actions: 0,
-        min_q: 0,
-        max_q: 0,
-        unit: 0,
-        target_kind: 0,
-        target_count: 0,
-        flags: 0,
-    }))
+    let d = t.control_in(op::REQ_GET_CS_CAPS, noun as u16, NounCaps::SIZE as u16)?;
+    Ok(NounCaps::decode(&d).unwrap_or_default())
 }
 
+/// Read `CsStatusPacket`, whose length follows the caps header.
+///
+/// 41 bytes on v1.1.6 (control_surfaces.h:594-605). It was 22 before caps v6,
+/// when `ir_active_mask` was one byte and there were eight IR sub-slots, so
+/// both counts must come from the caps header rather than from constants.
 pub fn read_status(t: &mut dyn Transport, max_bindings: u8, max_ir: u8) -> TResult<Status> {
-    let len = 6 + max_bindings as usize + 2 + max_ir as usize;
+    let len = Status::wire_len(max_bindings, max_ir);
     let d = t.control_in(op::REQ_GET_CS_STATUS, 0, len as u16)?;
-
-    let slots = 6 + max_bindings as usize;
-    Ok(Status {
-        last_status: d[0],
-        last_slot: d[1],
-        max_bindings: d[2],
-        dirty: d[3] != 0,
-        active_mask: u16::from_le_bytes([d[4], d[5]]),
-        slot_status: d[6..slots.min(d.len())].to_vec(),
-        ir_active_mask: d.get(slots).copied().unwrap_or(0),
-        ir_learn_state: d.get(slots + 1).copied().unwrap_or(0),
-        ir_status: d.get(slots + 2..).unwrap_or(&[]).to_vec(),
-    })
+    Status::decode_sized(&d, max_bindings, max_ir).map_err(|e| TransportError::Usb(e.to_string()))
 }
 
-/// Start listening for a remote button.
-pub fn arm_learn(t: &mut dyn Transport) -> TResult<()> {
-    t.control_in(op::REQ_CS_IR_LEARN, learn::ARM, 1)?;
-    Ok(())
+/// Start listening for a remote button, answering `PIN_CONFIG_SUCCESS` or
+/// `CS_STATUS_NO_IR` (control_surfaces.h:798).
+pub fn arm_learn(t: &mut dyn Transport) -> TResult<u8> {
+    Ok(t.control_in(op::REQ_CS_IR_LEARN, learn::ARM, 1)?
+        .first()
+        .copied()
+        .unwrap_or(status::SUCCESS))
 }
 
-pub fn cancel_learn(t: &mut dyn Transport) -> TResult<()> {
-    t.control_in(op::REQ_CS_IR_LEARN, learn::CANCEL, 1)?;
-    Ok(())
+pub fn cancel_learn(t: &mut dyn Transport) -> TResult<u8> {
+    Ok(t.control_in(op::REQ_CS_IR_LEARN, learn::CANCEL, 1)?
+        .first()
+        .copied()
+        .unwrap_or(status::SUCCESS))
 }
 
 /// Poll for a learn result.
@@ -311,18 +795,11 @@ pub fn cancel_learn(t: &mut dyn Transport) -> TResult<()> {
 /// The read returns eight bytes carrying the state, the decoded protocol and the
 /// code. Poll it until the state leaves `ARMED`.
 pub fn read_learn(t: &mut dyn Transport) -> TResult<LearnResult> {
-    let d = t.control_in(op::REQ_CS_IR_LEARN, learn::READ, 8)?;
-    Ok(LearnResult {
-        state: d[0],
-        protocol: d[1],
-        code: u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
-    })
+    let d = t.control_in(op::REQ_CS_IR_LEARN, learn::READ, LearnResult::SIZE as u16)?;
+    Ok(LearnResult::decode(&d).unwrap_or_default())
 }
 
 /// Persist the previewed configuration.
-///
-/// Bindings apply live but do not survive a power cycle until this runs, which
-/// is a real feature: an assignment can be tried and backed out of.
 pub fn save(t: &mut dyn Transport) -> TResult<u8> {
     Ok(t.control_in(op::REQ_CS_SAVE, 0, 1)?[0])
 }
@@ -336,6 +813,22 @@ pub fn revert(t: &mut dyn Transport) -> TResult<u8> {
 mod tests {
     use super::*;
     use dspi_transport::MockTransport;
+    use dspi_transport::mock::{Direction, Reply};
+
+    /// The v1.1.6 status packet, answering for one slot tag and code.
+    fn status_bytes(last_slot: u8, last_status: u8) -> Vec<u8> {
+        let mut d = vec![last_status, last_slot, 16, 1, 0x01, 0x00];
+        d.extend([0u8; 16]);
+        d.extend(0u16.to_le_bytes());
+        d.push(learn::IDLE);
+        d.extend([0u8; 16]);
+        assert_eq!(d.len(), 41);
+        d
+    }
+
+    fn surfaces(t: &mut MockTransport) -> Surfaces<'_> {
+        Surfaces::new(t, Limits::default()).with_poll(Duration::ZERO, 6)
+    }
 
     #[test]
     fn a_binding_round_trips_through_the_wire() {
@@ -343,86 +836,589 @@ mod tests {
             component: 4,
             noun: 0,
             action: 1,
-            flags: 2,
             gpio: [27, 28],
-            event: 0,
-            target: 3,
-            index: 5,
-            value: -120,
             step: 256,
-            range_min: -600,
-            range_max: 0,
+            ..Default::default()
         };
         let bytes = b.encode();
-        assert_eq!(
-            bytes.len(),
-            Binding::WIRE_LEN,
-            "the wire size is fixed at 24"
-        );
-        assert_eq!(Binding::decode(&bytes), Some(b));
+        assert_eq!(bytes.len(), Binding::SIZE);
+        assert_eq!(Binding::decode(&bytes).unwrap(), b);
     }
 
     #[test]
-    fn reserved_bytes_are_written_as_zero() {
-        let bytes = Binding {
-            component: 1,
-            ..Default::default()
+    fn a_short_read_decodes_to_a_default_rather_than_garbage() {
+        let mut t = MockTransport::new().data(op::REQ_GET_CS_BINDING, vec![0u8; 24]);
+        assert!(read_binding(&mut t, 0).unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------ the deferred wait
+
+    /// The whole point of the write path: a SET returns before the firmware
+    /// has run it, so the outcome only exists after the pending flag clears.
+    #[test]
+    fn a_write_waits_for_pending_to_clear() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_BINDING, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                // Pending once, then the real answer.
+                Reply::Sequence(vec![
+                    Reply::Data(status_bytes(3, status::PENDING)),
+                    Reply::Data(status_bytes(3, status::SUCCESS)),
+                ]),
+            );
+
+        let st = {
+            let mut s = surfaces(&mut t);
+            s.write_binding(
+                3,
+                &Binding {
+                    component: 1,
+                    gpio: [16, GPIO_UNUSED],
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(st.last_status, status::SUCCESS);
+        assert_eq!(st.last_slot, 3);
+
+        // The wire: one OUT with the 24-byte record, then two status polls.
+        let log = t.log();
+        assert_eq!(log[0].direction, Direction::Out);
+        assert_eq!(log[0].opcode, op::REQ_SET_CS_BINDING);
+        assert_eq!(log[0].value, 3, "the slot rides in wValue");
+        assert_eq!(log[0].payload.len(), 24);
+        assert_eq!(log[0].payload[0], 1, "type");
+        assert_eq!(log[0].payload[4], 16, "gpio[0]");
+        assert_eq!(log[0].payload[5], GPIO_UNUSED, "gpio[1]");
+        assert_eq!(log[1].opcode, op::REQ_GET_CS_STATUS);
+        assert_eq!(log[2].opcode, op::REQ_GET_CS_STATUS);
+        assert_eq!(log.len(), 3);
+    }
+
+    /// BUSY means the device dropped this SET because another of its kind
+    /// was still waiting (vendor_commands.c:1412-1417). The other SET's result
+    /// lands next, possibly under this very tag, so it must not be taken for
+    /// ours: the write waits for the device to settle and is sent again.
+    #[test]
+    fn a_busy_write_is_sent_again_once_the_device_settles() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_GROUP, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![
+                    Reply::Data(status_bytes(tag::GROUP | 2, status::BUSY)),
+                    // The other host's SET, applied under the same tag.
+                    Reply::Data(status_bytes(tag::GROUP | 2, 0x1F)),
+                    // Ours, re-sent.
+                    Reply::Data(status_bytes(tag::GROUP | 2, status::PENDING)),
+                    Reply::Data(status_bytes(tag::GROUP | 2, status::SUCCESS)),
+                ]),
+            );
+
+        let st = {
+            let mut s = surfaces(&mut t);
+            s.write_group(
+                2,
+                &CsGroup {
+                    target_kind: 2,
+                    member_mask: 0b1010,
+                    name: "Front Pair".into(),
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(st.last_status, status::SUCCESS);
+        let writes: Vec<_> = t
+            .log()
+            .into_iter()
+            .filter(|e| e.direction == Direction::Out)
+            .collect();
+        assert_eq!(writes.len(), 2, "the dropped SET is sent once more");
+        assert_eq!(writes[0], writes[1]);
+        assert_eq!(writes[0].payload.len(), 40);
+        assert_eq!(writes[0].payload[0], 2, "target_kind");
+        assert_eq!(&writes[0].payload[4..8], &[0x0A, 0, 0, 0], "member_mask LE");
+    }
+
+    /// A second BUSY is the conflict itself, and is reported as that rather
+    /// than waited on until another host's result turns up under this tag.
+    #[test]
+    fn a_write_still_busy_after_its_retry_reports_the_conflict() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_BINDING, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![
+                    Reply::Data(status_bytes(3, status::BUSY)),
+                    Reply::Data(status_bytes(9, status::SUCCESS)),
+                    Reply::Data(status_bytes(3, status::BUSY)),
+                ]),
+            );
+        let st = {
+            let mut s = surfaces(&mut t);
+            s.write_binding(3, &Binding::default()).unwrap()
+        };
+        assert_eq!(st.last_status, status::BUSY);
+        let sets = t
+            .log()
+            .iter()
+            .filter(|e| e.direction == Direction::Out)
+            .count();
+        assert_eq!(sets, 2, "one retry, not a loop");
+    }
+
+    /// A knob turned on the device also lands in `last_status`. Without the
+    /// tag check the host would read someone else's result as its own.
+    #[test]
+    fn another_slots_result_is_not_mistaken_for_this_one() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_BINDING, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![
+                    Reply::Data(
+                        // Slot 7's outcome, from a write this host did not make.
+                        status_bytes(7, status::SUCCESS),
+                    ),
+                    Reply::Data(status_bytes(3, status::SUCCESS)),
+                ]),
+            );
+
+        let st = {
+            let mut s = surfaces(&mut t);
+            s.write_binding(3, &Binding::default()).unwrap()
+        };
+        assert_eq!(st.last_slot, 3, "waited for slot 3, not slot 7");
+    }
+
+    /// Giving up has to say which write is stuck; "timed out" alone is not
+    /// something a user can act on.
+    #[test]
+    fn giving_up_names_the_slot() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_IR_CMD, vec![])
+            .data(
+                op::REQ_GET_CS_STATUS,
+                status_bytes(tag::IR | 6, status::PENDING),
+            );
+
+        let e = {
+            let mut s = surfaces(&mut t);
+            s.write_ir_command(6, &IrCommand::default()).unwrap_err()
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("IR command 6"), "{msg}");
+        assert!(matches!(e, SurfaceError::Timeout { .. }));
+    }
+
+    #[test]
+    fn every_slot_namespace_explains_itself() {
+        assert_eq!(explain_slot_tag(0), "binding slot 0");
+        assert_eq!(explain_slot_tag(15), "binding slot 15");
+        assert_eq!(explain_slot_tag(tag::IR | 6), "IR command 6");
+        assert_eq!(explain_slot_tag(tag::GROUP | 3), "group 3");
+        assert_eq!(explain_slot_tag(tag::MACRO | 5), "macro 5");
+        assert_eq!(explain_slot_tag(tag::DISPLAY), "the display settings");
+        assert_eq!(explain_slot_tag(tag::DISPLAY | 4), "display page 4");
+        assert_eq!(explain_slot_tag(tag::SAVE), "the save");
+    }
+
+    /// The four namespaces have to stay disjoint, or one poll of `last_slot`
+    /// cannot say which kind of write just landed.
+    #[test]
+    fn the_slot_tags_do_not_collide() {
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..16u8 {
+            assert!(seen.insert(n), "binding {n}");
+            assert!(seen.insert(tag::IR | n), "ir {n}");
         }
-        .encode();
-        assert_eq!(bytes[9], 0, "reserved");
-        assert!(bytes[18..].iter().all(|b| *b == 0), "reserved2");
+        for n in 0..8u8 {
+            assert!(seen.insert(tag::GROUP | n), "group {n}");
+            assert!(seen.insert(tag::MACRO | n), "macro {n}");
+        }
+        // The display's config and its page 0 deliberately share 0x50.
+        for n in 1..16u8 {
+            assert!(seen.insert(tag::DISPLAY | n), "page {n}");
+        }
+        assert!(seen.insert(tag::DISPLAY));
+        assert!(seen.insert(tag::SAVE));
+    }
+
+    // ------------------------------------------------------------- the writes
+
+    /// A single NUL clears a name: an empty payload is INVALID_VALUE.
+    #[test]
+    fn clearing_a_name_sends_one_nul() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_NAME, vec![])
+            .data(op::REQ_GET_CS_STATUS, status_bytes(2, status::SUCCESS));
+        {
+            let mut s = surfaces(&mut t);
+            s.write_name(2, "").unwrap();
+            s.write_name(2, "Sub Level").unwrap();
+        }
+        let log = t.log();
+        assert_eq!(log[0].payload, vec![0u8]);
+        assert_eq!(log[2].payload, b"Sub Level".to_vec());
     }
 
     #[test]
-    fn an_empty_slot_is_recognisable() {
-        assert!(Binding::default().is_empty());
-        assert!(
-            !Binding {
-                component: 1,
+    fn a_long_name_is_truncated_so_the_terminator_survives() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_NAME, vec![])
+            .data(op::REQ_GET_CS_STATUS, status_bytes(0, status::SUCCESS));
+        {
+            let mut s = surfaces(&mut t);
+            s.write_name(0, &"x".repeat(60)).unwrap();
+        }
+        assert_eq!(t.log()[0].payload.len(), 31);
+    }
+
+    /// Steps before the header, because the header is what makes them live: a
+    /// macro fired mid-edit must never see a count reaching past the steps
+    /// actually written.
+    #[test]
+    fn a_macro_writes_its_steps_before_its_header() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_MACRO_STEP, vec![])
+            .data(op::REQ_SET_CS_MACRO, vec![])
+            .data(
+                op::REQ_GET_CS_STATUS,
+                status_bytes(tag::MACRO | 1, status::SUCCESS),
+            );
+
+        let steps = vec![
+            CsMacroStep {
+                noun: 7,
+                action: 5,
+                value: 1,
                 ..Default::default()
-            }
-            .is_empty()
+            },
+            CsMacroStep {
+                noun: 6,
+                action: 5,
+                value: 2,
+                pre_delay: 50,
+                ..Default::default()
+            },
+        ];
+        {
+            let mut s = surfaces(&mut t);
+            s.write_macro(
+                1,
+                &CsMacroHeaderWire {
+                    name: "Night".into(),
+                    step_count: 2,
+                },
+                &steps,
+            )
+            .unwrap();
+        }
+
+        let writes: Vec<_> = t
+            .log()
+            .into_iter()
+            .filter(|e| e.direction == Direction::Out)
+            .collect();
+        assert_eq!(writes.len(), 3);
+        assert_eq!(writes[0].opcode, op::REQ_SET_CS_MACRO_STEP);
+        assert_eq!(writes[0].value, 1, "step 0, macro 1");
+        assert_eq!(writes[1].opcode, op::REQ_SET_CS_MACRO_STEP);
+        assert_eq!(
+            writes[1].value, 0x0101,
+            "step 1 packs above the macro index"
+        );
+        assert_eq!(
+            writes[2].opcode,
+            op::REQ_SET_CS_MACRO,
+            "the header goes last"
+        );
+        assert_eq!(writes[2].payload[32], 2, "step_count");
+    }
+
+    /// Every step answers under the macro's own tag, so a rejected step is
+    /// only visible in its own answer: the header's success after it must not
+    /// read as the macro having been applied.
+    #[test]
+    fn a_rejected_macro_step_is_the_macros_answer() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_MACRO_STEP, vec![])
+            .data(op::REQ_SET_CS_MACRO, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![
+                    Reply::Data(status_bytes(tag::MACRO | 1, status::SUCCESS)),
+                    Reply::Data(status_bytes(tag::MACRO | 1, 0x21)),
+                    Reply::Data(status_bytes(tag::MACRO | 1, status::SUCCESS)),
+                ]),
+            );
+        let st = {
+            let mut s = surfaces(&mut t);
+            s.write_macro(
+                1,
+                &CsMacroHeaderWire {
+                    name: "Night".into(),
+                    step_count: 2,
+                },
+                &[CsMacroStep::default(), CsMacroStep::default()],
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            st.last_status, 0x21,
+            "the step's refusal, not the header's success"
+        );
+        let writes = t
+            .log()
+            .iter()
+            .filter(|e| e.direction == Direction::Out)
+            .count();
+        assert_eq!(
+            writes, 3,
+            "the header is still written, as the Console does"
         );
     }
 
     #[test]
-    fn a_short_read_decodes_to_nothing_rather_than_garbage() {
-        assert!(Binding::decode(&[0; 10]).is_none());
-        assert!(IrCommand::decode(&[0; 4]).is_none());
-        assert!(NounCaps::decode(&[0; 3]).is_none());
+    fn clearing_a_step_writes_an_all_zero_record() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_MACRO_STEP, vec![])
+            .data(
+                op::REQ_GET_CS_STATUS,
+                status_bytes(tag::MACRO, status::SUCCESS),
+            );
+        {
+            let mut s = surfaces(&mut t);
+            s.clear_macro_step(0, 3).unwrap();
+        }
+        assert_eq!(t.log()[0].payload, vec![0u8; 12]);
+        assert_eq!(t.log()[0].value, 0x0300);
     }
 
-    /// A noun with no actions is how the firmware reports a platform
-    /// difference, such as ADAT on an RP2040. Offering it would produce a
-    /// binding the device silently refuses.
+    /// Firing is immediate, not deferred: the reply is the accept status.
     #[test]
-    fn a_noun_with_no_actions_is_unavailable() {
-        let mut caps = NounCaps::decode(&[0; 12]).unwrap();
-        assert!(!caps.is_available());
-        caps.actions = 0b101;
-        assert!(caps.is_available());
+    fn firing_a_macro_answers_at_once() {
+        let mut t = MockTransport::new().data(op::REQ_CS_MACRO_FIRE, vec![status::SUCCESS]);
+        let (fired, cancelled) = {
+            let mut s = surfaces(&mut t);
+            (s.fire_macro(2).unwrap(), s.cancel_macro().unwrap())
+        };
+        assert_eq!(fired, status::SUCCESS);
+        assert_eq!(cancelled, status::SUCCESS);
+        let log = t.log();
+        assert_eq!(log[0].value, 2);
+        assert_eq!(log[1].value, 0xFFFF, "0xFFFF cancels");
+        assert!(log.iter().all(|e| e.direction == Direction::In));
     }
 
     #[test]
-    fn noun_caps_decode_their_range_and_targets() {
-        // drive: continuous, dB, 0..18, untargeted.
-        let bytes = [0u8, 0, 0b0000_1111, 0, 0, 0, 0x40, 0x12, 1, 0, 0, 0];
-        let c = NounCaps::decode(&bytes).unwrap();
-        assert!(c.is_available());
-        assert_eq!(c.unit, 1);
-        assert_eq!(c.max_q, 0x1240);
+    fn a_display_page_write_is_tagged_with_its_page() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_DISPLAY_PAGE, vec![])
+            .data(
+                op::REQ_GET_CS_STATUS,
+                status_bytes(tag::DISPLAY | 4, status::SUCCESS),
+            );
+        {
+            let mut s = surfaces(&mut t);
+            s.write_display_page(
+                4,
+                &CsDisplayPage {
+                    noun: 17,
+                    target: 2,
+                    index: 0,
+                    flags: 0x05,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(t.log()[0].value, 4);
+        assert_eq!(t.log()[0].payload, vec![17, 2, 0, 0x05]);
     }
 
     #[test]
-    fn an_ir_command_with_no_protocol_is_an_empty_slot() {
-        assert!(IrCommand::default().is_empty());
-        let learned =
-            IrCommand::decode(&[0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xBF, 0x40, 0xDF, 0x20])
-                .unwrap();
-        assert!(!learned.is_empty());
-        assert_eq!(learned.protocol, 1);
-        assert_eq!(learned.code, 0x20DF40BF);
+    fn the_display_config_write_is_twelve_bytes() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_DISPLAY_CFG, vec![])
+            .data(
+                op::REQ_GET_CS_STATUS,
+                status_bytes(tag::DISPLAY, status::SUCCESS),
+            );
+        {
+            let mut s = surfaces(&mut t);
+            s.write_display_cfg(&CsDisplayCfg {
+                mode: 1,
+                home_page: 2,
+                dwell: 50,
+                overlay_hold: 20,
+                brightness: 128,
+                flags: 0x03,
+                edit_timeout: 100,
+            })
+            .unwrap();
+        }
+        assert_eq!(t.log()[0].value, 0);
+        assert_eq!(
+            t.log()[0].payload,
+            vec![
+                0x01, 0x02, 0x32, 0x00, 0x14, 0x00, 0x80, 0x03, 0x64, 0x00, 0x00, 0x00
+            ]
+        );
     }
+
+    /// Save and revert are write-as-read: they mutate while travelling on the
+    /// IN path, and report under the 0xFF tag.
+    #[test]
+    fn save_and_revert_wait_under_the_save_tag() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_CS_SAVE, vec![0])
+            .data(op::REQ_CS_REVERT, vec![0])
+            .data(
+                op::REQ_GET_CS_STATUS,
+                status_bytes(tag::SAVE, status::SUCCESS),
+            );
+        {
+            let mut s = surfaces(&mut t);
+            assert_eq!(s.save().unwrap().last_slot, tag::SAVE);
+            assert_eq!(s.revert().unwrap().last_slot, tag::SAVE);
+        }
+        assert!(t.log().iter().all(|e| e.direction == Direction::In));
+    }
+
+    // -------------------------------------------------------------- the reads
+
+    /// Written, then read back: a control-surface write pushes no
+    /// notification, so a re-read is the only confirmation there is.
+    #[test]
+    fn a_binding_reads_back_after_it_is_written() {
+        let stored = Binding {
+            component: 4,
+            noun: 1,
+            action: 1,
+            flags: 0x08,
+            gpio: [27, 28],
+            step: 256,
+            ..Default::default()
+        };
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_BINDING, vec![])
+            .data(op::REQ_GET_CS_STATUS, status_bytes(0, status::SUCCESS))
+            .data(op::REQ_GET_CS_BINDING, stored.encode().to_vec());
+
+        let back = {
+            let mut s = surfaces(&mut t);
+            s.write_binding(0, &stored).unwrap();
+            s.read_binding(0).unwrap()
+        };
+        assert_eq!(back, stored);
+    }
+
+    #[test]
+    fn the_page_loop_is_sized_by_the_config_reply() {
+        let reply = CsDisplayCfgReply {
+            max_pages: 4,
+            model_count: 9,
+            cfg: CsDisplayCfg {
+                mode: 1,
+                dwell: 30,
+                overlay_hold: 20,
+                edit_timeout: 100,
+                ..Default::default()
+            },
+        };
+        let mut t = MockTransport::new()
+            .data(op::REQ_GET_CS_DISPLAY_CFG, reply.encode().to_vec())
+            .data(op::REQ_GET_CS_DISPLAY_PAGE, vec![0u8; 4]);
+
+        let pages = {
+            let mut s = surfaces(&mut t);
+            s.read_all_pages().unwrap()
+        };
+        assert_eq!(pages.len(), 4, "not the header's 16");
+    }
+
+    #[test]
+    fn the_read_loops_are_sized_by_the_caps_header() {
+        let caps = ControlSurfaceCaps {
+            caps_version: 13,
+            max_bindings: 2,
+            type_count: 9,
+            noun_count: 3,
+            max_ir_commands: 2,
+            max_groups: 1,
+            max_macros: 1,
+            max_macro_steps: 8,
+            max_pages: 16,
+            display_models: 8,
+            types: Vec::new(),
+        };
+        let mut t = MockTransport::new()
+            .data(op::REQ_GET_CS_BINDING, vec![0u8; 24])
+            .data(op::REQ_GET_CS_NAME, vec![0u8; 32])
+            .data(op::REQ_GET_CS_IR_CMD, vec![0u8; 16])
+            .data(op::REQ_GET_CS_GROUP, vec![0u8; 40])
+            .data(op::REQ_GET_CS_MACRO, vec![0u8; 132])
+            .data(op::REQ_GET_CS_CAPS, vec![0u8; 12]);
+
+        let mut s = Surfaces::new(&mut t, Limits::from(&caps));
+        assert_eq!(s.read_all_bindings().unwrap().len(), 2);
+        assert_eq!(s.read_all_ir_commands().unwrap().len(), 2);
+        assert_eq!(s.read_all_groups().unwrap().len(), 1);
+        assert_eq!(s.read_all_macros().unwrap().len(), 1);
+        assert_eq!(s.read_all_nouns().unwrap().len(), 3);
+    }
+
+    /// A noun with no actions is unavailable on this platform, which is how
+    /// the firmware reports a difference like ADAT on an RP2040.
+    #[test]
+    fn an_unavailable_noun_is_visible_as_such() {
+        let mut t = MockTransport::new().data(op::REQ_GET_CS_CAPS, vec![0u8; 12]);
+        let nouns = {
+            let mut s = Surfaces::new(
+                &mut t,
+                Limits {
+                    noun_count: 1,
+                    ..Limits::default()
+                },
+            );
+            s.read_all_nouns().unwrap()
+        };
+        assert!(!nouns[0].is_available());
+    }
+
+    #[test]
+    fn the_extended_status_reports_the_running_macro() {
+        let mut ext = vec![0u8; 24];
+        ext[0] = 8;
+        ext[1] = 8;
+        ext[2] = 8;
+        ext[3] = 3;
+        let mut t = MockTransport::new().data(op::REQ_GET_CS_EXT_STATUS, ext);
+        let st = {
+            let mut s = surfaces(&mut t);
+            s.read_ext_status().unwrap()
+        };
+        assert!(st.is_running());
+        assert_eq!(st.macro_running, 3);
+    }
+
+    #[test]
+    fn the_display_status_says_whether_the_panel_is_live() {
+        let mut d = vec![0u8; 8];
+        d[0] = 2; // live
+        d[1] = 3; // page 3
+        let mut t = MockTransport::new().data(op::REQ_GET_CS_DISPLAY_STATUS, d);
+        let st = {
+            let mut s = surfaces(&mut t);
+            s.read_display_status().unwrap()
+        };
+        assert!(st.is_live());
+        assert_eq!(st.current_page, 3);
+    }
+
+    // ------------------------------------------------------------- IR learn
 
     /// The learn opcode is three-valued: arm, cancel and read. Treating it as
     /// two would leave the result unreadable.
@@ -434,8 +1430,11 @@ mod tests {
             v
         });
 
-        arm_learn(&mut t).unwrap();
-        let r = read_learn(&mut t).unwrap();
+        let r = {
+            let mut s = surfaces(&mut t);
+            s.arm_learn().unwrap();
+            s.read_learn().unwrap()
+        };
         assert_eq!(r.state, learn::DONE);
         assert_eq!(r.protocol, 1);
         assert_eq!(r.code, 0x20DF40BF);
@@ -444,36 +1443,61 @@ mod tests {
         assert_eq!(values, vec![learn::ARM, learn::READ]);
     }
 
+    /// `REQ_CS_IR_LEARN` answers a status byte, and a refused arm is the whole
+    /// reason to read it: without it the page waits for a button on a receiver
+    /// the device never armed (control_surfaces.h:798).
+    #[test]
+    fn arming_a_learn_reports_the_devices_verdict() {
+        use crate::surfaces::status;
+        let mut t = MockTransport::new().data(op::REQ_CS_IR_LEARN, vec![status::SUCCESS]);
+        assert_eq!(surfaces(&mut t).arm_learn().unwrap(), status::SUCCESS);
+
+        // CS_STATUS_NO_IR: arming with no live receiver.
+        let mut t = MockTransport::new().data(op::REQ_CS_IR_LEARN, vec![0x1E]);
+        assert_eq!(surfaces(&mut t).arm_learn().unwrap(), 0x1E);
+        assert_eq!(explain_status(0x1E), "set up an IR receiver first");
+
+        let mut t = MockTransport::new().data(op::REQ_CS_IR_LEARN, vec![status::SUCCESS]);
+        assert_eq!(surfaces(&mut t).cancel_learn().unwrap(), status::SUCCESS);
+    }
+
     #[test]
     fn a_learn_that_times_out_is_distinguishable_from_one_still_waiting() {
         assert_ne!(learn::TIMEOUT, learn::ARMED);
         assert_ne!(learn::DONE, learn::ARMED);
     }
 
+    // --------------------------------------------------------------- status
+
     #[test]
     fn status_decodes_the_dirty_flag_and_per_slot_results() {
-        let mut d = vec![0x02, 3, 16, 1, 0x05, 0x00];
-        d.extend([0u8; 16]);
-        d[6 + 3] = 0x1A; // slot 3 refused: pin and gesture already in use
-        d.push(0b11); // ir active
-        d.push(learn::IDLE);
-        d.extend([0u8; 8]);
+        let mut d = status_bytes(3, 0x02);
+        d[6 + 3] = 0x1A;
+        d[22..24].copy_from_slice(&0x8003u16.to_le_bytes());
+        d[40] = 0x1E;
 
         let mut t = MockTransport::new().data(op::REQ_GET_CS_STATUS, d);
-        let s = read_status(&mut t, 16, 8).unwrap();
+        let s = read_status(&mut t, 16, 16).unwrap();
 
         assert!(s.dirty, "unsaved changes must be visible");
         assert_eq!(s.max_bindings, 16);
-        assert_eq!(s.active_mask, 0b101);
-        assert_eq!(s.slot_status[3], 0x1A);
-        assert_eq!(s.ir_active_mask, 0b11);
+        assert_eq!(s.slot_health(3), 0x1A);
+        assert_eq!(s.ir_active_mask, 0x8003);
+        assert!(
+            s.is_ir_active(15),
+            "sub-slot 15 has no bit in an 8-bit mask"
+        );
+        assert_eq!(s.ir_cmd_status[15], 0x1E);
     }
 
     /// Every status code needs a sentence; a bare number sends the user to a
     /// header file.
     #[test]
     fn every_status_code_explains_itself() {
-        for code in [0x00u8, 0x02, 0x13, 0x15, 0x1A, 0x1D, 0x1E] {
+        for code in [
+            0x00u8, 0x02, 0x05, 0x13, 0x15, 0x1A, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24,
+            0x25, 0x26,
+        ] {
             let msg = explain_status(code);
             // The bar is "reads as English", not a length: "applied" is a
             // perfectly good answer for success.
@@ -500,11 +1524,125 @@ mod tests {
             .data(op::REQ_CS_REVERT, vec![0]);
         assert_eq!(save(&mut t).unwrap(), 0);
         assert_eq!(revert(&mut t).unwrap(), 0);
-        // Both are write-as-read: they mutate but travel on the IN path.
-        assert!(
-            t.log()
-                .iter()
-                .all(|e| e.direction == dspi_transport::mock::Direction::In)
+        assert!(t.log().iter().all(|e| e.direction == Direction::In));
+    }
+
+    /// The 48-byte aux block with one slot set.
+    fn aux_block(slot: usize, on: bool, level: u16) -> Vec<u8> {
+        let mut a = CsAuxStates::default();
+        a.state[slot] = u8::from(on);
+        a.level_q8[slot] = level;
+        a.encode().to_vec()
+    }
+
+    /// An aux SET is immediate: one OUT with the byte, then the status packet
+    /// read either side of it, and no pending wait.
+    #[test]
+    fn an_aux_switch_is_one_write_and_its_status() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_STATE, vec![])
+            .data(op::REQ_GET_CS_STATUS, status_bytes(0, status::SUCCESS));
+        let code = surfaces(&mut t).set_aux_state(10, true).unwrap();
+        assert_eq!(code, status::SUCCESS);
+        let log = t.log();
+        let set = log
+            .iter()
+            .find(|e| e.opcode == op::REQ_SET_CS_AUX_STATE)
+            .expect("the SET");
+        assert_eq!(set.direction, Direction::Out);
+        assert_eq!(set.value, 10, "the slot rides in wValue");
+        assert_eq!(set.payload, vec![1]);
+        assert_eq!(log.len(), 3, "status, SET, status: {log:?}");
+    }
+
+    /// The level is 8.8 percent, little-endian, and never past 100 %.
+    #[test]
+    fn an_aux_level_is_clamped_to_one_hundred_percent() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_LEVEL, vec![])
+            .data(op::REQ_GET_CS_STATUS, status_bytes(0, status::SUCCESS));
+        surfaces(&mut t).set_aux_level(11, 30_000).unwrap();
+        let set = t
+            .log()
+            .into_iter()
+            .find(|e| e.opcode == op::REQ_SET_CS_AUX_LEVEL)
+            .expect("the SET");
+        assert_eq!(set.payload, AUX_LEVEL_MAX_Q8.to_le_bytes().to_vec());
+        assert_eq!(set.payload, vec![0x00, 0x64], "25600 LE");
+    }
+
+    /// A refused aux SET is acknowledged on the wire all the same; only the
+    /// status packet says so, under the slot it was for.
+    #[test]
+    fn a_refused_aux_write_reports_invalid_aux() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_LEVEL, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![
+                    Reply::Data(status_bytes(0, status::SUCCESS)),
+                    Reply::Data(status_bytes(10, status::INVALID_AUX)),
+                ]),
+            );
+        let code = surfaces(&mut t).set_aux_level(10, 128 * 256).unwrap();
+        assert_eq!(code, status::INVALID_AUX);
+        assert_eq!(
+            explain_status(code),
+            "the target isn't an auxiliary output, or a level control needs a dimmable one"
+        );
+    }
+
+    /// A success writes nothing to the status packet, so a refusal left by
+    /// the previous write to the same slot is still there. The readback
+    /// settles it: the output took the value, so this write worked.
+    #[test]
+    fn a_standing_refusal_is_not_taken_for_this_writes() {
+        let refused = status_bytes(10, status::INVALID_AUX);
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_STATE, vec![])
+            .data(op::REQ_GET_CS_STATUS, refused.clone())
+            .data(op::REQ_GET_CS_AUX_STATE, aux_block(10, true, 0));
+        assert_eq!(
+            surfaces(&mut t).set_aux_state(10, true).unwrap(),
+            status::SUCCESS
+        );
+        // The same standing status, but the output did not move: refused.
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_STATE, vec![])
+            .data(op::REQ_GET_CS_STATUS, refused)
+            .data(op::REQ_GET_CS_AUX_STATE, aux_block(10, false, 0));
+        assert_eq!(
+            surfaces(&mut t).set_aux_state(10, true).unwrap(),
+            status::INVALID_AUX
+        );
+        // Another slot's refusal is not this write's.
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_STATE, vec![])
+            .data(op::REQ_GET_CS_STATUS, status_bytes(3, status::INVALID_AUX));
+        assert_eq!(
+            surfaces(&mut t).set_aux_state(10, false).unwrap(),
+            status::SUCCESS
+        );
+    }
+
+    /// Every slot's state and level in one transfer, wValue 0xFFFF.
+    #[test]
+    fn the_aux_block_is_one_read_of_every_slot() {
+        let mut t =
+            MockTransport::new().data(op::REQ_GET_CS_AUX_STATE, aux_block(11, true, 0x3200));
+        let a = surfaces(&mut t).read_aux_states().unwrap();
+        assert!(a.is_on(11) && !a.is_on(10));
+        assert_eq!(a.level_percent(11), 50.0);
+        assert_eq!(t.log()[0].value, AUX_STATE_ALL);
+    }
+
+    /// Caps v18 widened the PWM clash to the dimmable outputs, and the
+    /// Console's message says so.
+    #[test]
+    fn the_pwm_clash_names_the_dimmable_outputs() {
+        assert_eq!(
+            explain_status(0x19),
+            "this PWM pin conflicts with another dimmable LED or output"
         );
     }
 }

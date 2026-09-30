@@ -5,10 +5,26 @@
 
 pub mod autoeq;
 pub mod filterfile;
+pub mod notify;
+pub mod pins;
 pub mod preset_file;
 pub mod probe;
+pub mod readout;
+pub mod rta;
+pub mod runtime;
+pub mod state;
 pub mod surfaces;
+pub mod tube;
+pub mod undo;
 pub mod write;
 
+pub use notify::{Event, Notification, Notifications, Source};
+pub use pins::{PinClaim, PinConstraint, PinMap, PinRole};
 pub use probe::{Capabilities, Meters, probe, read_bulk, read_meters};
-pub use write::{Crosspoint, JournalEntry, Outcome, OutputStrip, Session, WriteError};
+pub use readout::Readout;
+pub use state::{Applied, DeviceState, PresetSnapshot};
+pub use undo::Undone;
+pub use write::{
+    Core1Conflict, Crosspoint, EnableOutcome, JournalEntry, Outcome, OutputStrip, Session,
+    WriteError,
+};

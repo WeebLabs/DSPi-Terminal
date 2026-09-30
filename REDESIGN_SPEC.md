@@ -7,10 +7,12 @@ document is wrong and the code is right; the divergences are listed in section
 18. The largest is section 3.2 mechanism 2: bulk writes turned out to be
 strictly version-locked rather than tolerant, which the spec had backwards.
 
-**Firmware baseline: `release/v1.1.5` @ `9776c2f` (2026-07-25), in sync with
-`origin/release/v1.1.5`.** All protocol facts here were read from committed
-content on that branch: 190 vendor opcodes, wire format **V26**,
-`WireBulkParams` **5944 bytes**, CS caps v4, FW version 1.1.5.
+**Firmware baseline: `release/v1.1.6` @ `112f35b` (2026-08-24).** All protocol
+facts here were read from committed content on that branch: 202 vendor opcodes,
+wire format **V28**, `WireBulkParams` **5944 bytes**, CS caps v13, FW version
+1.1.6. The previous baseline was `release/v1.1.5` @ `9776c2f` (190 opcodes, V26,
+caps v4); what moved between them is recorded in `docs/plan/survey-firmware.md`
+section 1.27 and in `docs/firmware-notes.md` sections 11 to 16.
 
 We track the release branch, not `main`. Every future firmware bump re-pins this
 line and re-runs the procedure in section 3.4.
@@ -19,8 +21,8 @@ Companion references, pinned:
 
 | Repository | Branch | Commit | Used for |
 |---|---|---|---|
-| `WeebLabs/DSPi` | `release/v1.1.5` | `9776c2f` | **Protocol source of truth** |
-| `WeebLabs/DSPi-Console` (macOS) | `release/v1.1.5` | working tree | Bode math, graph behaviour, Control Surfaces UX, AutoEQ pattern, multi-device model |
+| `WeebLabs/DSPi` | `release/v1.1.6` | `112f35b` | **Protocol source of truth** |
+| `WeebLabs/DSPi-Console` (macOS) | `release/v1.1.6` | working tree | Bode math, graph behaviour, Control Surfaces UX, AutoEQ pattern, multi-device model |
 | `WeebLabs/DSPi-Console-Windows` | `master` | `81ae00b` (2026-07-27) | `.dspipreset` schema |
 
 The Windows Console is under active development, so its pin is the one most
@@ -135,7 +137,7 @@ at `9776c2f`, these files disagree:
 | File | Last commit on the branch | States |
 |---|---|---|
 | `Documentation/commands.md` | `f7143dc`, 2026-07-12 | wire **V14**, 3664 bytes, 121 opcodes, "Master L / Master R" channels |
-| `firmware/DSPi/bulk_params.h` | `1b84765`, 2026-07-19 | wire **V26**, **5944 bytes** |
+| `firmware/DSPi/bulk_params.h` | `1b84765`, 2026-07-19 | wire **V26**, **5944 bytes** (V28 at v1.1.6) |
 | `firmware/DSPi/config.h` | `4ab5922`, 2026-07-19 | **190** opcodes |
 
 The code moved on 19 July; the doc last moved on 12 July. That is normal and
@@ -159,7 +161,7 @@ An app built from that document would need a rewrite on day one. So:
 
 ## 2. Product goals
 
-1. **Nothing is unreachable.** All 190 opcodes driveable, including control
+1. **Nothing is unreachable.** All 202 opcodes driveable, including control
    surfaces, IR learn, upmixer, psychoacoustic bass, signal generator, ADAT in
    and out, I2S slave mode, multi-input S/PDIF, UART and I2C control interfaces,
    and DAC hardware mute.
@@ -199,10 +201,10 @@ the last eleven wire versions, taken from the `WIRE_FORMAT_VERSION` history in
 | **Whole-model change** | V16: unified channel model, inputs became first-class channels with PEQ and metering, "master" removed, 8 inputs on RP2350 | Everything. Hardcoded `master_l`, `ch - 2` output mapping, 2-row matrix |
 | **New section appended** | V17 ADAT out, V23 psybass (24 B), V25 upmixer (44 B) | Fixed-size struct parse; packet size assertions |
 | **Struct grew** | V18: leveller 16 to 20 bytes | Every offset after it |
-| **Reserved bytes claimed** | V19 loudness mask, V20 crossfeed pair mask, V21 I2S clock mode, V22 Linkwitz `qp`, V24 ADAT input, V26 upmix presence | Silent misparse; writing zeros over real settings |
-| **New opcodes** | 121 documented to 190 defined | Feature invisible in the app |
-| **New enum values** | Filter types 6 to 12; crossover families | Unknown value clamped to Flat, **destroying a user's tuning** |
-| **New capability tiers** | CS caps v1 to v4: 9 nouns to 49, 8 slots to 16, IR added | Hardcoded noun tables |
+| **Reserved bytes claimed** | V19 loudness mask, V20 crossfeed pair mask, V21 I2S clock mode, V22 Linkwitz `qp`, V24 ADAT input, V26 upmix presence, V28 the last input-config byte | Silent misparse; writing zeros over real settings |
+| **New opcodes** | 121 documented to 202 defined | Feature invisible in the app |
+| **New enum values** | Filter types 6 to 14; crossover families; V27 upmix centre OFF | Unknown value clamped to Flat, **destroying a user's tuning** |
+| **New capability tiers** | CS caps v1 to v13: 9 nouns to 57, 8 slots to 16, IR, groups, macros and a display added | Hardcoded noun tables |
 | **Platform divergence** | RP2040 7 channels / RP2350 17 | Arrays sized wrong |
 
 An architecture that absorbs all eight classes without a refactor is the bar.
@@ -1447,15 +1449,15 @@ right, M3 through M7 are largely mechanical.
 1. **`.dspipreset` cross-platform import.** How the Windows implementation maps an
    8-input document onto a 2-input RP2040 needs reading before we implement, so we
    match rather than invent. (12.1)
-2. **Wire format V26 field map.** `commands.md` documents V14. The full V26
-   section table must be derived from `bulk_params.h` during M1 and written up in
-   `docs/wire-format.md` here. Budget real time for this; it is the single largest
-   unknown in M1.
+2. ~~**Wire format V26 field map.**~~ Closed: `docs/wire-format.md` carries the
+   full section table, now regenerated for V28. The V28 lesson is recorded there
+   and in `docs/firmware-notes.md` section 11: a section can change shape without
+   changing size, so offsets must be pinned by name, not inferred from a total.
 3. **`.dspipreset` schema drift.** Pinned at `DSPi-Console-Windows@81ae00b`
    (`master`, 2026-07-27). That repo is under active development, so re-check
    before M6 and record any schema change in `docs/interchange-notes.md`.
 4. **Console branch tracking.** This spec and the macOS Console both sit on
-   `release/v1.1.5`. If the Consoles and the firmware ever diverge onto different
+   `release/v1.1.6`. If the Consoles and the firmware ever diverge onto different
    release branches, decide explicitly which `dspi-term` follows. The answer
    should be the firmware, with interchange formats tracked separately.
 
@@ -1484,11 +1486,13 @@ reset the stored Linkwitz `Qp` on every ordinary edit.
 appended. A 16-bit mask cannot represent channel 17's clip flag, which is the
 PDM subwoofer.
 
-**First-order shelves and crossovers follow the firmware, not the textbook.**
-The device runs a one-pole TPT state-variable filter prewarping by `A` rather
-than `sqrt(A)`; an independently derived shelf settled at half the requested
-gain. Crossovers likewise: the prewarp, pole ordering and high-pass pole
-reciprocation all had to come from `crossover.c`.
+**First-order sections follow the firmware, not the textbook.** The device runs
+a one-pole TPT state-variable filter; the shelves prewarp by `A` rather than
+`sqrt(A)`, and an independently derived shelf settled at half the requested
+gain. `FILTER_LOWPASS1` (12) and `FILTER_HIGHPASS1` (13), added at v1.1.6, are
+the same one-pole with no prewarp at all, taking `lp` and `in - lp`; they read
+neither `Q` nor `gain_db`. Crossovers likewise: the prewarp, pole ordering and
+high-pass pole reciprocation all had to come from `crossover.c`.
 
 **`.dspipreset` channels match by id and are never remapped** (open item 1). The
 reference implementation reports what a device lacks rather than translating an
@@ -1514,6 +1518,6 @@ was right, but the implementation took the count from the bulk header's
 bands. The two extra rows were editable and did nothing. `max_bands` is now
 measured with a four-transfer binary search, so a firmware that grows its PEQ is
 picked up without a change here. Separately, reading the EQ through
-`GET_EQ_PARAM` costs five transfers per band — 24 seconds for a whole RP2350 —
+`GET_EQ_PARAM` costs five transfers per band (24 seconds for a whole RP2350)
 against 20 ms for the same table decoded out of one bulk snapshot. See
 `docs/firmware-notes.md` §9 and §10.

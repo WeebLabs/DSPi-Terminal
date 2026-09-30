@@ -42,8 +42,24 @@ fn main() -> ExitCode {
                 return ExitCode::from(exit::USAGE);
             }
         },
-        None => dspi_tui::theme::Palette::Amber,
+        // The config file's `theme`, then the calm palette.
+        None => dspi_tui::settings::AppConfig::load()
+            .theme
+            .as_deref()
+            .and_then(dspi_tui::theme::Palette::parse)
+            .unwrap_or(dspi_tui::theme::Palette::Calm),
     };
+
+    // A script beats every other reading of the arguments: `-f` is explicit,
+    // and a non-terminal standard input with nothing else to do can only mean
+    // someone is piping commands in.
+    let script = flag_value(&flags, "-f").or_else(|| flag_value(&flags, "--file"));
+    if script.is_some() {
+        return ExitCode::from(cmd_script(serial, script, &flags, json));
+    }
+    if wants_stdin_script(&flags, std::io::IsTerminal::is_terminal(&std::io::stdin())) {
+        return ExitCode::from(cmd_script(serial, None, &flags, json));
+    }
 
     let code = match flags.first().copied() {
         Some("--help" | "-h") => {
@@ -58,18 +74,27 @@ fn main() -> ExitCode {
         Some("params") => cmd_params(),
         Some("completions") => cmd_completions(&positional(&flags)),
         Some("doctor") | Some("--doctor") => doctor::run(),
-        Some("raw") => cmd_raw(serial, &positional(&flags)),
+        Some("raw") => cmd_raw(serial, &positional(&flags), json),
         Some("autoeq") => cmd_autoeq(serial, &positional(&flags), &flags),
         Some("--install-udev") => doctor::install_udev(),
-        Some("screenshot") => cmd_screenshot(serial, &positional(&flags)),
+        Some("screenshot") => cmd_screenshot(serial, &positional(&flags), &flags),
         Some("export") => cmd_export(serial, &positional(&flags)),
         Some("import") => cmd_import(serial, &positional(&flags), &flags),
         Some("dump") => cmd_dump(serial, json),
+        Some("watch") => cmd_watch(serial, json),
         // No arguments opens the interface; arguments run one command and exit.
-        None => cmd_tui(serial, flags.contains(&"--lite"), palette),
-        Some(other) if other.starts_with("--") => {
-            cmd_tui(serial, flags.contains(&"--lite"), palette)
-        }
+        None => cmd_tui(
+            serial,
+            flags.contains(&"--lite"),
+            flags.contains(&"--no-animation"),
+            palette,
+        ),
+        Some(other) if other.starts_with("--") => cmd_tui(
+            serial,
+            flags.contains(&"--lite"),
+            flags.contains(&"--no-animation"),
+            palette,
+        ),
         // Everything else is a command in the shared grammar, so the CLI and the
         // TUI's ':' line accept exactly the same syntax.
         Some(_) => cmd_run(serial, &flags, json),
@@ -94,9 +119,10 @@ fn version() {
         dspi_proto::generated::provenance::SHORT,
     );
     println!(
-        "wire format V{}, {} vendor opcodes",
+        "wire format V{}, {} vendor opcodes, for firmware {}",
         dspi_proto::generated::wire::WIRE_FORMAT_VERSION,
         dspi_proto::generated::ALL_OPCODES.len(),
+        dspi_proto::packets::FirmwareVersion::expected(),
     );
 }
 
@@ -108,6 +134,11 @@ dspi - terminal control for DSPi audio processors
 USAGE:
     dspi                     open the interface
     dspi dump                connect and print the full device state
+    dspi screenshot [w] [h] [screen]
+                             render one frame of the interface as text
+                             (--ansi for colour; --fixture, or no device,
+                             draws the built-in example device)
+    dspi watch               print the device's notifications as they arrive
     dspi list                list every connected DSPi
     dspi params              list every parameter this build knows
     dspi get <path> [i..]    read one parameter
@@ -121,9 +152,16 @@ USAGE:
                              (--map-legacy for pre-2026 channel names)
     dspi completions <shell> generate shell completions
     dspi doctor              diagnose connection problems
-    dspi raw <op> <len> [v]  issue any vendor opcode and hex-dump the reply
+    dspi undo                put back the value the last change replaced
+    dspi redo                re-apply the change undo reversed
+    dspi raw <op> <len> [v]  read any vendor opcode and hex-dump the reply
+    dspi raw out <op> <v> <hex...>
+                             write any vendor opcode with a payload
+    dspi raw war <op> <v>    issue a write-as-read and print its status byte
     dspi autoeq search <q>   find a headphone correction profile
     dspi autoeq apply <id>   apply one to the input channels
+    dspi -f <script>         run one command per line, `#` starts a comment
+    dspi < script            the same, from standard input
     dspi --install-udev      install the Linux udev rule (needs root)
     dspi --version           show app and protocol versions
 
@@ -134,12 +172,20 @@ EXAMPLES:
     dspi set bass.drive 12
     dspi eq usb.1 3 peak 2856 3.58 -8.6
     dspi ch.delay i2s.1.l 5
+    dspi raw out 0x42 0 08 03 01 00
+    printf 'vol.user -18\\nbass.on on\\n' | dspi
 
 OPTIONS:
     --device <serial>        target a specific device
     --json                   machine-readable output
+    --no-animation           no connect reveal or easing
     --lite                   reduce redraw rate, for a Pi or a slow link
-    --theme amber|dark       colour scheme; amber is the default
+    --theme <name>           calm (default), console, amber, dark or mono
+    --dry-run                report what would be written, write nothing
+    --quiet                  do not echo each change
+    --keep-going             in a script, carry on past a failing line
+    --force                  agree to a change that needs a decision, such as
+                             an output enable that turns another one off
 "
     );
 }
@@ -213,6 +259,9 @@ fn cmd_dump(serial: Option<&str>, json: bool) -> u8 {
         "{} channels: {} in, {} out, {} bands each",
         caps.num_channels, caps.num_inputs, caps.num_outputs, caps.max_bands
     );
+    if let Some(b) = &caps.build_info {
+        println!("build {}  {}", b.describe, b.date);
+    }
     if let Some(p) = caps.active_preset {
         println!("active preset: {p}");
     }
@@ -246,7 +295,7 @@ fn cmd_dump(serial: Option<&str>, json: bool) -> u8 {
     }
     if let Some(sg) = &caps.siggen {
         println!(
-            "test signals: {} types, {} outputs, multitone max {}",
+            "signal generator: {} types, {} outputs, multitone max {}",
             sg.type_count, sg.output_channels, sg.multitone_max
         );
     }
@@ -565,20 +614,9 @@ fn import_preset(text: &str, path: &str, flags: &[&str]) -> u8 {
 
     let report = preset_file::apply(&mut session, &doc, options);
 
-    println!(
-        "\n{} {} channels, {} bands, {} crossover bands, {} crosspoints",
-        if session.dry_run {
-            "Would apply"
-        } else {
-            "Applied"
-        },
-        report.channels_applied,
-        report.bands_applied,
-        report.crossover_bands_applied,
-        report.crosspoints_applied
-    );
-    if !report.skipped.is_empty() {
-        println!("Skipped: {}", report.skipped.join("; "));
+    println!();
+    for line in report.lines(session.dry_run) {
+        println!("{line}");
     }
     exit::OK
 }
@@ -644,67 +682,80 @@ fn legacy_channel(name: &str, caps: &dspi_session::Capabilities) -> Option<u8> {
     }
 }
 
-fn cmd_screenshot(serial: Option<&str>, args: &[&str]) -> u8 {
+fn cmd_screenshot(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
     let width: u16 = args.first().and_then(|a| a.parse().ok()).unwrap_or(120);
     let height: u16 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(40);
-    let panel = args.get(2).copied().unwrap_or("dashboard");
+    let screen = args.get(2).copied().unwrap_or("overview");
+    let ansi = flags.contains(&"--ansi");
 
-    let session = match connect(serial) {
-        Ok(s) => s,
-        Err(c) => return c,
+    // Without a device (or with --fixture) the frame comes from the same
+    // fixture the gallery and the tests use, so documentation needs no
+    // hardware.
+    let fixture = flags.contains(&"--fixture") || open(serial).is_err();
+    let (mut session, state) = if fixture {
+        let state = if screen == "settings" {
+            dspi_tui::settings::demo::state()
+        } else {
+            dspi_tui::shell::fixture::state()
+        };
+        let mock = dspi_transport::MockTransport::new().answering_everything(vec![0u8; 64]);
+        let Some(session) = Session::new(Box::new(mock), state.caps.clone()) else {
+            return exit::TRANSPORT;
+        };
+        (session, state)
+    } else {
+        let mut session = match connect(serial) {
+            Ok(s) => s,
+            Err(c) => return c,
+        };
+        let bulk = match session.snapshot() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("dspi: could not read the device state: {e}");
+                return exit::TRANSPORT;
+            }
+        };
+        let state = dspi_session::DeviceState::new(session.capabilities().clone(), bulk);
+        (session, state)
     };
     let theme = dspi_tui::Theme::new(
-        dspi_tui::theme::Palette::Amber,
-        dspi_tui::theme::ColorDepth::TrueColor,
-        dspi_tui::app::detect_glyphs(),
+        dspi_tui::theme::Palette::Calm,
+        if ansi {
+            dspi_tui::theme::ColorDepth::detect()
+        } else {
+            dspi_tui::theme::ColorDepth::TrueColor
+        },
+        dspi_tui::perf::detect_glyphs(),
     );
-    let mut app = dspi_tui::App::from_session(theme, &session);
-    let mut session = session;
-    load_bands(&mut session, &mut app);
-    if let Ok(m) = session.meters() {
-        app.apply_meters(&m);
+    let mut live = dspi_tui::live::Live::new(
+        state,
+        theme,
+        dspi_tui::perf::Performance::lite(),
+        Box::new(dspi_tui::live::ConsoleScreens::new()),
+    );
+    live.refresh_presets(&mut session);
+    live.tick(&mut session, None);
+    if !live.show(&mut session, screen) {
+        eprintln!("dspi: unknown screen {screen}; see `dspi screenshot --help`");
+        return exit::USAGE;
     }
-    app.rebuild_fields();
-    app.load_fields(&mut session);
-    app.load_matrix(&mut session);
-    app.load_surfaces(&mut session);
-
-    app.panel = match panel {
-        "cursor" => {
-            // Park the cursor on 1 kHz so the readout is exercised.
-            app.cursor = Some(dspi_proto::dsp::POINTS / 2 + 20);
-            dspi_tui::app::Panel::Filters
-        }
-        "grid" => {
-            app.grid_mode = true;
-            dspi_tui::app::Panel::Main
-        }
-        "surfaces" => dspi_tui::app::Panel::Surfaces,
-        "main" => dspi_tui::app::Panel::Main,
-        "matrix" => dspi_tui::app::Panel::Matrix,
-        "input" => dspi_tui::app::Panel::Input,
-        "dynamics" => dspi_tui::app::Panel::Dynamics,
-        "spatial" => dspi_tui::app::Panel::Spatial,
-        "system" => dspi_tui::app::Panel::System,
-        "presets" => dspi_tui::app::Panel::Presets,
-        "filters" => dspi_tui::app::Panel::Filters,
-        "meters" => {
-            app.meters_expanded = true;
-            dspi_tui::app::Panel::Main
-        }
-        _ => dspi_tui::app::Panel::Main,
+    live.tick(&mut session, None);
+    let frame = if ansi {
+        dspi_tui::render_frame_ansi(width, height, |area, buf| live.draw(area, buf))
+    } else {
+        dspi_tui::render_frame(width, height, |area, buf| live.draw(area, buf))
     };
-
-    // The panel changed after the initial load, so refresh for the new one.
-    app.rebuild_fields();
-    app.load_fields(&mut session);
-
-    println!("{}", dspi_tui::render_to_string(&app, width, height));
+    println!("{frame}");
     exit::OK
 }
 
-fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) -> u8 {
-    let session = match connect(serial) {
+fn cmd_tui(
+    serial: Option<&str>,
+    lite: bool,
+    no_animation: bool,
+    palette: dspi_tui::theme::Palette,
+) -> u8 {
+    let mut session = match connect(serial) {
         Ok(s) => s,
         Err(c) => return c,
     };
@@ -712,19 +763,35 @@ fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) 
     let theme = dspi_tui::Theme::new(
         palette,
         dspi_tui::theme::ColorDepth::detect(),
-        dspi_tui::app::detect_glyphs(),
+        dspi_tui::perf::detect_glyphs(),
     );
-    let mut app = dspi_tui::App::from_session(theme, &session);
-    if lite {
-        app.perf = dspi_tui::app::Performance::lite();
+    let mut perf = if lite {
+        dspi_tui::perf::Performance::lite()
+    } else {
+        dspi_tui::perf::Performance::detect()
+    };
+    if no_animation {
+        perf.animate = false;
     }
 
-    // Seed the curves from what the device is actually doing, so the first frame
-    // shows the user's tuning rather than a flat line.
-    let mut session = session;
-    load_bands(&mut session, &mut app);
+    // One chunked read seeds everything the bulk packet covers, so the first
+    // frame shows the person's tuning rather than a flat line.
+    let bulk = match session.snapshot() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("dspi: could not read the device state: {e}");
+            return exit::TRANSPORT;
+        }
+    };
+    let state = dspi_session::DeviceState::new(session.capabilities().clone(), bulk);
+    let live = dspi_tui::live::Live::new(
+        state,
+        theme,
+        perf,
+        Box::new(dspi_tui::live::ConsoleScreens::new()),
+    );
 
-    match dspi_tui::run(app, &mut session) {
+    match dspi_tui::live::run(live, &mut session) {
         Ok(()) => exit::OK,
         Err(e) => {
             eprintln!("dspi: {e}");
@@ -733,35 +800,149 @@ fn cmd_tui(serial: Option<&str>, lite: bool, palette: dspi_tui::theme::Palette) 
     }
 }
 
-/// Read every band on every channel, from one bulk snapshot.
+/// Print notifications as the device pushes them, until interrupted.
 ///
-/// The EQ table is a section of the bulk packet, so the whole thing arrives in
-/// six transfers. Asking `GET_EQ_PARAM` for each field instead costs five
-/// transfers per band — 850 of them on an RP2350 — and took 24 seconds on real
-/// hardware against 20 ms for the snapshot.
-///
-/// Falls back to the scalar path if the snapshot fails, so a device whose wire
-/// format this build does not know still populates what it can.
-fn load_bands(session: &mut Session, app: &mut dspi_tui::App) {
-    let snapshot = session.snapshot().ok();
-    for ch in 0..app.channels.len() {
-        for band in 0..app.channels[ch].bands.len() {
-            let read = match &snapshot {
-                Some(s) => s.band(ch as u8, band as u8),
-                None => session.read_band(ch as u8, band as u8).ok(),
-            };
-            if let Some(p) = read {
-                app.channels[ch].bands[band] = dspi_proto::dsp::Band {
-                    filter_type: p.filter_type,
-                    freq: p.freq,
-                    q: p.q,
-                    gain_db: p.gain_db,
-                    bypass: p.bypass,
-                };
-            }
+/// This is the Console's Interrupt Monitor as a one-shot: turn the OS volume
+/// slider and watch `user_volume` arrive with source `UAC1`. With `--json`,
+/// one object per line.
+fn cmd_watch(serial: Option<&str>, json: bool) -> u8 {
+    let mut session = match connect(serial) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let source = match session.with_transport(|t| Ok(t.notifications())) {
+        Ok(Some(s)) => s,
+        _ => {
+            eprintln!("dspi: this transport has no notification endpoint");
+            return exit::TRANSPORT;
         }
-        app.recompute(ch);
+    };
+    let notes = dspi_session::Notifications::start(source);
+    if !json {
+        println!(
+            "watching {} (Ctrl-C to stop)",
+            session.capabilities().serial
+        );
     }
+    let started = std::time::Instant::now();
+    loop {
+        if notes.is_disconnected() {
+            eprintln!("dspi: device disconnected");
+            return exit::TRANSPORT;
+        }
+        let Some(n) = notes.next(std::time::Duration::from_millis(500)) else {
+            continue;
+        };
+        let t = started.elapsed().as_secs_f64();
+        if json {
+            let (name, detail) = describe_event(&n.event);
+            println!(
+                "{{\"t\":{t:.3},\"seq\":{},\"lost\":{},\"event\":\"{name}\",\"detail\":\"{}\"}}",
+                n.seq,
+                n.lost,
+                detail.replace('"', "'")
+            );
+        } else {
+            let (name, detail) = describe_event(&n.event);
+            let lost = if n.lost { "  (packets lost)" } else { "" };
+            println!("{t:8.3}  #{:<3}  {name:<18} {detail}{lost}", n.seq);
+        }
+    }
+}
+
+/// A one-line description of a notification, naming the bulk field it
+/// touched where it can.
+fn describe_event(e: &dspi_session::Event) -> (&'static str, String) {
+    use dspi_session::Event;
+    match e {
+        Event::Idle => ("idle", String::new()),
+        Event::MasterVolume(db) => ("master_volume", format!("{db:.1} dB (legacy)")),
+        Event::ParamChanged {
+            offset,
+            source,
+            bytes,
+        } => {
+            let section = dspi_proto::wire::BulkPacket::section_at(*offset as usize).unwrap_or("?");
+            let value = match bytes.len() {
+                4 => format!(
+                    "{}",
+                    f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                ),
+                1 => format!("{}", bytes[0]),
+                _ => hex_string(bytes),
+            };
+            (
+                "param_changed",
+                format!(
+                    "{section}+{} = {value} [{}]",
+                    *offset as usize - section_offset(section),
+                    source.describe()
+                ),
+            )
+        }
+        Event::BulkInvalidated { source } => ("bulk_invalidated", source.describe().to_string()),
+        Event::PresetLoaded { slot } => ("preset_loaded", format!("slot {}", slot + 1)),
+        Event::InputFormat { channels } => ("input_format", format!("{channels} channels")),
+        Event::SiggenState {
+            state,
+            reason,
+            signal_type,
+            channel,
+        } => (
+            "siggen_state",
+            format!("state {state} reason {reason} type {signal_type} channel {channel}"),
+        ),
+        Event::AdatState {
+            enabled,
+            active,
+            pin,
+        } => (
+            "adat_state",
+            format!("enabled {enabled} active {active} pin {pin}"),
+        ),
+        Event::I2sSlaveState { state, rate_hz } => {
+            ("i2s_slave_state", format!("state {state} {rate_hz} Hz"))
+        }
+        Event::IrLearn {
+            state,
+            protocol,
+            code,
+        } => (
+            "cs_ir_learn",
+            format!("state {state} protocol {protocol} code 0x{code:08X}"),
+        ),
+        Event::AdatInputState {
+            state,
+            rate_hz,
+            clock_mode,
+        } => (
+            "adat_input_state",
+            format!("state {state} {rate_hz} Hz clock {clock_mode}"),
+        ),
+        Event::CsAux {
+            slot,
+            state,
+            level_q8,
+            source,
+        } => (
+            "cs_aux",
+            format!(
+                "slot {slot} {} level {:.1}% [{}]",
+                if *state != 0 { "on" } else { "off" },
+                *level_q8 as f32 / 256.0,
+                source.describe()
+            ),
+        ),
+        Event::Unknown { id, bytes } => ("unknown", format!("0x{id:02X} {}", hex_string(bytes))),
+    }
+}
+
+fn section_offset(name: &str) -> usize {
+    dspi_proto::generated::SECTIONS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, o, _)| *o)
+        .unwrap_or(0)
 }
 
 /// Search the AutoEQ database, or apply a profile.
@@ -942,13 +1123,24 @@ fn cmd_autoeq(serial: Option<&str>, args: &[&str], flags: &[&str]) -> u8 {
 /// This is the escape hatch that means a firmware feature shipping before app
 /// support is still reachable on the day it lands, and it is the fastest way to
 /// see what a device actually returns when a decode looks wrong.
-fn cmd_raw(serial: Option<&str>, args: &[&str]) -> u8 {
-    let parse_num = |s: &str| -> Option<u32> {
-        s.strip_prefix("0x")
-            .and_then(|h| u32::from_str_radix(h, 16).ok())
-            .or_else(|| s.parse().ok())
-    };
+/// All three directions the protocol actually uses. An IN read is the default
+/// because it is the safe one; `out` and `war` are spelled out because they
+/// change the device.
+fn cmd_raw(serial: Option<&str>, args: &[&str], json: bool) -> u8 {
+    match args.first().copied() {
+        Some("out") => raw_out(serial, &args[1..], json),
+        Some("war") => raw_war(serial, &args[1..], json),
+        _ => raw_in(serial, args, json),
+    }
+}
 
+fn parse_num(s: &str) -> Option<u32> {
+    s.strip_prefix("0x")
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+        .or_else(|| s.parse().ok())
+}
+
+fn raw_in(serial: Option<&str>, args: &[&str], json: bool) -> u8 {
     let (Some(op_s), Some(len_s)) = (args.first(), args.get(1)) else {
         eprintln!("dspi: raw needs an opcode and a length, e.g. `dspi raw 0x87 32`");
         eprintln!("      an optional third argument is wValue.");
@@ -967,6 +1159,18 @@ fn cmd_raw(serial: Option<&str>, args: &[&str]) -> u8 {
 
     match t.control_in(opcode as u8, value, len as u16) {
         Ok(d) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "opcode": opcode,
+                        "wValue": value,
+                        "length": d.len(),
+                        "bytes": hex_string(&d),
+                    })
+                );
+                return exit::OK;
+            }
             for (i, chunk) in d.chunks(16).enumerate() {
                 let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
                 let ascii: String = chunk
@@ -989,6 +1193,137 @@ fn cmd_raw(serial: Option<&str>, args: &[&str]) -> u8 {
             exit::TRANSPORT
         }
     }
+}
+
+/// `dspi raw out <op> <wValue> <hex bytes...>`
+fn raw_out(serial: Option<&str>, args: &[&str], json: bool) -> u8 {
+    let (Some(op_s), Some(val_s)) = (args.first(), args.get(1)) else {
+        eprintln!("dspi: raw out needs an opcode, a wValue and the payload,");
+        eprintln!("      e.g. `dspi raw out 0x42 0 08 03 01 00`");
+        return exit::USAGE;
+    };
+    let (Some(opcode), Some(value)) = (parse_num(op_s), parse_num(val_s)) else {
+        eprintln!("dspi: opcode and wValue must be numbers");
+        return exit::USAGE;
+    };
+    let payload = match parse_hex(&args[2..]) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("dspi: {e}");
+            return exit::USAGE;
+        }
+    };
+
+    let mut t = match open(serial) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
+
+    match t.control_out(opcode as u8, value as u16, &payload) {
+        Ok(()) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "opcode": opcode,
+                        "wValue": value,
+                        "sent": payload.len(),
+                        "bytes": hex_string(&payload),
+                    })
+                );
+            } else {
+                println!("Sent {} bytes to 0x{opcode:02X}.", payload.len());
+            }
+            exit::OK
+        }
+        Err(e) => {
+            eprintln!("dspi: {e}");
+            exit::TRANSPORT
+        }
+    }
+}
+
+/// `dspi raw war <op> <wValue>`
+///
+/// Write-as-read: a mutation issued as a one-byte IN with the parameters in
+/// `wValue`. Several of the pin and clock setters are only reachable this way,
+/// and the byte that comes back is the status code, not data.
+fn raw_war(serial: Option<&str>, args: &[&str], json: bool) -> u8 {
+    let Some(opcode) = args.first().and_then(|s| parse_num(s)) else {
+        eprintln!("dspi: raw war needs an opcode and a wValue, e.g. `dspi raw war 0xC2 0x010E`");
+        return exit::USAGE;
+    };
+    let value = args.get(1).and_then(|v| parse_num(v)).unwrap_or(0) as u16;
+
+    let mut t = match open(serial) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
+
+    match t.control_in(opcode as u8, value, 1) {
+        Ok(d) => {
+            let status = d.first().copied().unwrap_or(0);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "opcode": opcode,
+                        "wValue": value,
+                        "status": status,
+                    })
+                );
+            } else {
+                println!("status 0x{status:02X}");
+            }
+            // The status byte is the device's verdict, so a non-zero one is a
+            // refusal and a script needs to see it as one.
+            if status == 0 {
+                exit::OK
+            } else {
+                exit::REJECTED
+            }
+        }
+        Err(e) => {
+            eprintln!("dspi: {e}");
+            exit::TRANSPORT
+        }
+    }
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Hex bytes, however the user chose to space them: `DE AD BE EF`, `deadbeef`,
+/// `0xDE,0xAD` all mean the same four or two bytes.
+fn parse_hex(args: &[&str]) -> Result<Vec<u8>, String> {
+    let joined: String = args
+        .join("")
+        .chars()
+        .filter(|c| !matches!(c, ',' | ':' | '-' | '_' | ' '))
+        .collect();
+    let joined = joined.replace("0x", "").replace("0X", "");
+
+    if joined.is_empty() {
+        return Err("raw out needs at least one payload byte".into());
+    }
+    if !joined.len().is_multiple_of(2) {
+        return Err(format!(
+            "`{joined}` is {} hex digits; bytes come in pairs",
+            joined.len()
+        ));
+    }
+    (0..joined.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&joined[i..i + 2], 16)
+                .map_err(|_| format!("`{}` is not a hex byte", &joined[i..i + 2]))
+        })
+        .collect()
 }
 
 fn cmd_completions(args: &[&str]) -> u8 {
@@ -1039,7 +1374,132 @@ fn cmd_run(serial: Option<&str>, flags: &[&str], json: bool) -> u8 {
         }
     };
 
-    run(&mut s, cmd, json, flags.contains(&"--quiet"))
+    run(&mut s, cmd, json, flags.contains(&"--quiet"), force(flags))
+}
+
+fn force(flags: &[&str]) -> bool {
+    flags.contains(&"--force")
+}
+
+// ---------------------------------------------------------------------------
+// Batching
+// ---------------------------------------------------------------------------
+
+/// Run a file, or standard input, one command per line.
+///
+/// The device is opened once for the whole script rather than once per line,
+/// which is the point: a hundred `eq` lines against a fresh connection each
+/// time would spend all of its time probing.
+fn cmd_script(serial: Option<&str>, path: Option<&str>, flags: &[&str], json: bool) -> u8 {
+    let text = match path {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("dspi: could not read {p}: {e}");
+                return exit::USAGE;
+            }
+        },
+        None => {
+            let mut buf = String::new();
+            if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                eprintln!("dspi: could not read standard input: {e}");
+                return exit::USAGE;
+            }
+            buf
+        }
+    };
+
+    let lines = script_lines(&text);
+    if lines.is_empty() {
+        return exit::OK;
+    }
+
+    let mut s = match connect(serial) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    if flags.contains(&"--dry-run") {
+        s.dry_run = true;
+    }
+
+    let ctx = context_for(&s);
+    let quiet = flags.contains(&"--quiet");
+    let keep_going = flags.contains(&"--keep-going");
+    let force = force(flags);
+    let mut first_failure = exit::OK;
+
+    for (n, line) in lines.iter().enumerate() {
+        let toks = dspi_cmd::tokenize(line);
+        let refs: Vec<&str> = toks.iter().map(String::as_str).collect();
+        let code = match dspi_cmd::parse(&refs, &ctx) {
+            Ok(cmd) => run(&mut s, cmd, json, quiet, force),
+            Err(e) => {
+                eprintln!("dspi: line {}: {e}", n + 1);
+                exit::USAGE
+            }
+        };
+
+        if code != exit::OK {
+            // The first failure is the one worth reporting: everything after it
+            // may only have failed because of it.
+            if first_failure == exit::OK {
+                first_failure = code;
+            }
+            if !keep_going {
+                eprintln!("dspi: stopped at line {} (`{line}`)", n + 1);
+                return first_failure;
+            }
+        }
+    }
+    first_failure
+}
+
+/// The runnable lines of a script: comments and blank lines dropped.
+fn script_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(strip_comment)
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Everything before an unquoted `#`.
+///
+/// Quotes matter: a preset called "Studio #2" is a name, not a comment.
+fn strip_comment(line: &str) -> &str {
+    let mut quoted = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '#' if !quoted => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Flags that mean "do something other than run commands", so that a piped
+/// standard input does not turn `dspi --version` into an empty script.
+const NOT_A_SCRIPT: &[&str] = &[
+    "--help",
+    "-h",
+    "--version",
+    "-V",
+    "--doctor",
+    "--install-udev",
+    "--lite",
+];
+
+/// Should this invocation read commands from standard input?
+///
+/// Only when there is nothing else to do and stdin is not a terminal, so
+/// `dspi < script.dspi` and `generate | dspi` work while an interactive `dspi`
+/// still opens the interface.
+fn wants_stdin_script(flags: &[&str], stdin_is_terminal: bool) -> bool {
+    !stdin_is_terminal
+        && positional_all(flags).is_empty()
+        && !flags.iter().any(|f| NOT_A_SCRIPT.contains(f))
 }
 
 fn context_for(s: &Session) -> Context {
@@ -1052,10 +1512,29 @@ fn context_for(s: &Session) -> Context {
     }
 }
 
-fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool) -> u8 {
+fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool, force: bool) -> u8 {
     match cmd {
         Command::Get { path, indices } => {
             let d = by_path(path).expect("the parser only returns known paths");
+            // A status or packet row is read at its own length and decoded;
+            // a scalar read of one would be its first byte.
+            match s.read_whole(path, &indices) {
+                Ok(Some(r)) => {
+                    if json {
+                        println!("{}", serde_json::json!({ "path": path, "value": r.json }));
+                    } else {
+                        for line in &r.lines {
+                            println!("{line}");
+                        }
+                    }
+                    return exit::OK;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("dspi: {e}");
+                    return write_exit(&e);
+                }
+            }
             match s.read(path, &indices) {
                 Ok(v) => {
                     if json {
@@ -1081,6 +1560,29 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool) -> u8 {
             value,
         } => {
             let d = by_path(path).expect("the parser only returns known paths");
+
+            // Turning an output on can need the other side of Core 1 turned
+            // off, which is a decision rather than a retry, so it is only made
+            // when the user says so.
+            if force && path == "out.enable" && value.as_bool() == Some(true) {
+                return match s.enable_output_confirmed(indices[0]) {
+                    Ok(dspi_session::EnableOutcome::Rejected) => {
+                        eprintln!("dspi: output {} did not come on.", indices[0]);
+                        exit::REJECTED
+                    }
+                    Ok(_) => {
+                        if !quiet {
+                            println!("{path} {} on", indices[0]);
+                        }
+                        exit::OK
+                    }
+                    Err(e) => {
+                        eprintln!("dspi: {e}");
+                        write_exit(&e)
+                    }
+                };
+            }
+
             match s.write(path, &indices, value.clone()) {
                 Ok(Outcome::Rejected { sent, actual }) => {
                     eprintln!(
@@ -1107,6 +1609,9 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool) -> u8 {
                 }
                 Err(e) => {
                     eprintln!("dspi: {e}");
+                    if let dspi_session::WriteError::Core1Conflict { confirm, .. } = &e {
+                        eprintln!("      Re-run with --force to {confirm}.");
+                    }
                     write_exit(&e)
                 }
             }
@@ -1119,6 +1624,7 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool) -> u8 {
             freq,
             q,
             gain,
+            qp,
         } => {
             // One transfer for the whole band, which is how the firmware stores
             // it; setting fields one at a time would be six round trips.
@@ -1130,7 +1636,7 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool) -> u8 {
                 freq,
                 q,
                 gain_db: gain,
-                qp: None,
+                qp,
             };
             match s.write_band(&packet) {
                 Ok(Outcome::Rejected { .. }) => {
@@ -1154,6 +1660,48 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool) -> u8 {
             }
         }
 
+        // `dspi undo` on a fresh process has nothing to undo, and says so:
+        // the journal lives with the connection. The interface is where these
+        // earn their keep; the CLI form exists so a script can walk one back
+        // inside a batch.
+        Command::Verb { name, .. } if name == "undo" => match s.undo() {
+            Ok(None) => {
+                println!("Nothing to undo.");
+                exit::OK
+            }
+            Ok(Some(undone)) => {
+                for reason in &undone.skipped {
+                    println!("Skipped: {reason}.");
+                }
+                match undone.command {
+                    Some(line) => println!("{line}"),
+                    None => println!("Nothing to undo."),
+                }
+                exit::OK
+            }
+            Err(e) => {
+                eprintln!("dspi: {e}");
+                write_exit(&e)
+            }
+        },
+
+        Command::Verb { name, .. } if name == "redo" => match s.redo() {
+            Ok(None) => {
+                println!("Nothing to redo.");
+                exit::OK
+            }
+            Ok(Some(done)) => {
+                if let Some(line) = done.command {
+                    println!("{line}");
+                }
+                exit::OK
+            }
+            Err(e) => {
+                eprintln!("dspi: {e}");
+                write_exit(&e)
+            }
+        },
+
         Command::Verb { name, .. } => {
             eprintln!("dspi: `{name}` is not usable here");
             exit::USAGE
@@ -1162,31 +1710,48 @@ fn run(s: &mut Session, cmd: Command, json: bool, quiet: bool) -> u8 {
 }
 
 fn cmd_params() -> u8 {
-    for d in REGISTRY {
-        let arity = d.target.arity();
-        let args = match arity {
-            0 => String::new(),
-            1 => " <index>".into(),
-            _ => " <index> <index>".into(),
-        };
-        let range = match d.kind {
-            Kind::Float { unit, min, max } => {
-                format!("{min} to {max}{}", unit.suffix())
-            }
-            Kind::Int { unit, min, max } => format!("{min} to {max}{}", unit.suffix()),
-            Kind::Bool => "on | off".into(),
-            Kind::Choice(v) => v.iter().map(|(_, n)| *n).collect::<Vec<_>>().join(" | "),
-            Kind::Trigger => "(action)".into(),
-            _ => String::new(),
-        };
-        println!(
-            "{:<22}{:<18}{}",
-            format!("{}{args}", d.path),
-            range,
-            d.plain
-        );
+    for line in params_lines() {
+        println!("{line}");
     }
     exit::OK
+}
+
+/// One line per registry row: the address, its range and what it does.
+///
+/// The columns are 22 and 18 wide, and an entry longer than its column is
+/// followed by two spaces rather than run into the next one: a long list of
+/// choices read "all | percussive | sustainedWeight the sub...". Widening
+/// the column to the longest entry instead would push every description
+/// past 130 characters for the sake of the filter types.
+fn params_lines() -> Vec<String> {
+    let rows: Vec<(String, String, &str)> = REGISTRY
+        .iter()
+        .map(|d| {
+            let args = match d.target.arity() {
+                0 => "",
+                1 => " <index>",
+                _ => " <index> <index>",
+            };
+            let range = match d.kind {
+                Kind::Float { unit, min, max } => {
+                    format!("{min} to {max}{}", unit.suffix())
+                }
+                Kind::Int { unit, min, max } => format!("{min} to {max}{}", unit.suffix()),
+                Kind::Bool => "on | off".into(),
+                Kind::Choice(v) => v.iter().map(|(_, n)| *n).collect::<Vec<_>>().join(" | "),
+                Kind::Trigger => "(action)".into(),
+                _ => String::new(),
+            };
+            (format!("{}{args}", d.path), range, d.plain)
+        })
+        .collect();
+    rows.into_iter()
+        .map(|(a, r, plain)| {
+            let aw = 22.max(a.len() + 2);
+            let rw = 18.max(r.len() + 2);
+            format!("{a:<aw$}{r:<rw$}{plain}")
+        })
+        .collect()
 }
 
 /// Every positional token, including the first, for the shared grammar.
@@ -1253,7 +1818,11 @@ fn write_exit(e: &dspi_session::WriteError) -> u8 {
         | W::ReadOnly { .. }
         | W::WrongArity { .. }
         | W::BadTarget(..)
+        | W::PlatformRange { .. }
         | W::Unavailable { .. } => exit::USAGE,
+        // Nothing was written and the old value stands, which is the same
+        // thing a script needs to know about a silent rejection.
+        W::Core1Conflict { .. } => exit::REJECTED,
         W::Transport(_) => exit::TRANSPORT,
     }
 }
@@ -1281,5 +1850,159 @@ fn fail(e: TransportError) -> u8 {
     match e {
         TransportError::NotFound | TransportError::SerialNotFound(_) => exit::NO_DEVICE,
         _ => exit::TRANSPORT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- params -------------------------------------------------------------
+
+    /// A long list of choices once ran straight into the description:
+    /// "all | percussive | sustainedWeight the sub...".
+    #[test]
+    fn params_keep_two_spaces_between_columns() {
+        let lines = params_lines();
+        assert_eq!(lines.len(), REGISTRY.len());
+        for (line, d) in lines.iter().zip(REGISTRY) {
+            let address = line.split("  ").next().unwrap();
+            assert!(address.starts_with(d.path), "{line}");
+            assert!(line.ends_with(d.plain), "{line}");
+            let before = &line[..line.len() - d.plain.len()];
+            assert!(
+                before.ends_with("  "),
+                "no gap before the description: {line}"
+            );
+        }
+        let sub = lines.iter().find(|l| l.starts_with("sub.select ")).unwrap();
+        assert!(sub.contains("all | percussive | sustained  "), "{sub}");
+        let rect = lines.iter().find(|l| l.contains("5y3")).unwrap();
+        assert!(rect.contains("solid-state | gz34 | 5u4 | 5y3  "), "{rect}");
+    }
+
+    // -- scripts ------------------------------------------------------------
+
+    #[test]
+    fn a_script_drops_blank_lines_and_comments() {
+        let text = "\
+# a tuning for the small room
+vol.user -18
+
+  bass.on on   # and a little weight
+";
+        assert_eq!(script_lines(text), vec!["vol.user -18", "bass.on on"]);
+    }
+
+    /// A `#` inside quotes is part of a name, not the start of a comment; a
+    /// preset called "Studio #2" must survive.
+    #[test]
+    fn a_hash_inside_quotes_is_not_a_comment() {
+        assert_eq!(
+            strip_comment(r#"preset.name 3 "Studio #2""#).trim(),
+            r#"preset.name 3 "Studio #2""#
+        );
+        assert_eq!(strip_comment("vol.user -18 # loud").trim(), "vol.user -18");
+        assert_eq!(strip_comment("# nothing here").trim(), "");
+    }
+
+    #[test]
+    fn a_script_of_nothing_but_comments_has_no_lines() {
+        assert!(script_lines("# one\n\n   # two\n").is_empty());
+    }
+
+    /// Every line has to be a line the parser accepts, or a script silently
+    /// does something other than what it reads as.
+    #[test]
+    fn every_script_line_parses_with_the_shared_grammar() {
+        let ctx = dspi_cmd::Context {
+            channel_slugs: (0..17).map(|i| format!("ch.{i}")).collect(),
+            num_inputs: 8,
+            num_outputs: 9,
+            max_bands: 10,
+        };
+        let text = "\
+# set up the sub
+vol.user -18
+eq ch.0 3 peak 2856 3.58 -8.6
+get out.gain 0
+undo
+";
+        let lines = script_lines(text);
+        assert_eq!(lines.len(), 4);
+        for line in &lines {
+            let toks = dspi_cmd::tokenize(line);
+            let refs: Vec<&str> = toks.iter().map(String::as_str).collect();
+            dspi_cmd::parse(&refs, &ctx).unwrap_or_else(|e| panic!("`{line}` does not parse: {e}"));
+        }
+    }
+
+    /// Piping commands in is a script; asking for the version is not, even
+    /// with standard input redirected from a file.
+    #[test]
+    fn only_an_otherwise_empty_invocation_reads_standard_input() {
+        assert!(wants_stdin_script(&[], false));
+        assert!(wants_stdin_script(&["--json"], false));
+        assert!(wants_stdin_script(&["--device", "ABC"], false));
+
+        // A terminal on standard input means a person, so open the interface.
+        assert!(!wants_stdin_script(&[], true));
+        // Anything with something else to do keeps doing it.
+        assert!(!wants_stdin_script(&["--version"], false));
+        assert!(!wants_stdin_script(&["--help"], false));
+        assert!(!wants_stdin_script(&["--lite"], false));
+        assert!(!wants_stdin_script(&["dump"], false));
+        assert!(!wants_stdin_script(&["vol.user", "-18"], false));
+    }
+
+    // -- raw ----------------------------------------------------------------
+
+    /// However the user spaced the bytes, they mean the same payload.
+    #[test]
+    fn hex_payloads_are_read_however_they_are_spaced() {
+        let want = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        assert_eq!(parse_hex(&["DE", "AD", "BE", "EF"]).unwrap(), want);
+        assert_eq!(parse_hex(&["deadbeef"]).unwrap(), want);
+        assert_eq!(parse_hex(&["0xDE,0xAD", "0xBE:0xEF"]).unwrap(), want);
+        assert_eq!(parse_hex(&["08", "00"]).unwrap(), vec![8, 0]);
+    }
+
+    /// A half-typed byte is a mistake worth naming, not something to pad.
+    #[test]
+    fn an_odd_number_of_hex_digits_is_refused() {
+        let e = parse_hex(&["DEA"]).unwrap_err();
+        assert!(e.contains("pairs"), "{e}");
+        assert!(parse_hex(&[]).is_err());
+        assert!(parse_hex(&["ZZ"]).is_err());
+    }
+
+    #[test]
+    fn opcodes_are_accepted_in_hex_or_decimal() {
+        assert_eq!(parse_num("0x42"), Some(0x42));
+        assert_eq!(parse_num("66"), Some(66));
+        assert_eq!(parse_num("0xFFFF"), Some(0xFFFF));
+        assert_eq!(parse_num("nonsense"), None);
+    }
+
+    #[test]
+    fn bytes_render_back_as_the_hex_they_came_from() {
+        assert_eq!(hex_string(&[0xDE, 0xAD]), "DEAD");
+        assert_eq!(hex_string(&[]), "");
+    }
+
+    // -- flags --------------------------------------------------------------
+
+    #[test]
+    fn flag_values_are_read_and_their_values_are_not_positional() {
+        let flags = ["set", "vol.user", "-18", "--device", "ABC123", "--json"];
+        assert_eq!(flag_value(&flags, "--device"), Some("ABC123"));
+        assert_eq!(flag_value(&flags, "--nothing"), None);
+        assert_eq!(positional_all(&flags), vec!["set", "vol.user", "-18"]);
+    }
+
+    #[test]
+    fn force_is_off_unless_it_is_asked_for() {
+        assert!(!force(&["out.enable", "8", "on"]));
+        assert!(force(&["out.enable", "8", "on", "--force"]));
     }
 }

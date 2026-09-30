@@ -12,7 +12,8 @@
 pub mod complete;
 pub mod shell;
 
-use dspi_proto::registry::{Kind, ParamDesc, Target, by_path};
+use dspi_proto::packets::{FieldKind, PacketSpec, spec_for_path};
+use dspi_proto::registry::{ALL_OUTPUTS, Kind, ParamDesc, Target, by_path};
 use dspi_proto::value::Value;
 
 pub use complete::{Candidate, complete};
@@ -114,6 +115,8 @@ pub enum Command {
         freq: f32,
         q: f32,
         gain: f32,
+        /// Linkwitz Transform target Q, when the band carries one.
+        qp: Option<f32>,
     },
     /// A non-parameter verb: list, dump, doctor, and so on.
     Verb { name: String, args: Vec<String> },
@@ -129,6 +132,9 @@ pub const VERBS: &[(&str, &str)] = &[
     ("eq", "Set a whole filter band at once"),
     ("doctor", "Diagnose connection problems"),
     ("completions", "Generate shell completions"),
+    ("undo", "Put back the value the last change replaced"),
+    ("redo", "Re-apply the change undo reversed"),
+    ("raw", "Issue any vendor opcode directly"),
 ];
 
 /// Parse a token list into a command.
@@ -181,23 +187,232 @@ fn parse_set(tokens: &[&str], ctx: &Context) -> Result<Command, ParseError> {
         });
     }
 
-    if rest.len() < want + 1 {
+    // Too few tokens is two different mistakes: indices missing, or the
+    // indices all present and the value missing. `set vol.user` used to be
+    // told it "needs 0 index(es)", which named the wrong gap.
+    if rest.len() < want {
         return Err(ParseError::WrongArity {
             path: d.path.into(),
             want,
-            got: rest.len().saturating_sub(want.min(rest.len())),
+            got: rest.len(),
         });
+    }
+    if rest.len() == want {
+        return Err(ParseError::MissingValue(d.path.into()));
     }
 
     let indices = parse_indices(d, &rest[..want], ctx)?;
-    let raw = rest[want..].join(" ");
-    let value = parse_value(d, &raw)?;
+
+    // A crosspoint has a short positional form the screens emit,
+    // `mix <in> <out> on|off [gain] [inv]`; the general key=value packet
+    // form still applies when a token names its field.
+    let raw_tokens = &rest[want..];
+    if d.path == "mix" && !raw_tokens.iter().any(|t| t.contains('=')) {
+        return Ok(Command::Set {
+            path: d.path,
+            value: parse_crosspoint(&indices, raw_tokens)?,
+            indices,
+        });
+    }
+
+    // A packet is built from named fields, so it needs the tokens as tokens:
+    // joining them first would lose a quoted name with a space in it.
+    let value = if matches!(d.kind, Kind::Packet) {
+        parse_packet(d, &indices, raw_tokens)?
+    } else {
+        parse_value(d, &raw_tokens.join(" "))?
+    };
 
     Ok(Command::Set {
         path: d.path,
         indices,
         value,
     })
+}
+
+/// A crossover type by its file code: `lr4lp`, `bw2hp`, `bes4lp`. The codes
+/// are regenerated from `dspi_proto::xover` so this table cannot drift from
+/// the one the filter files use.
+fn crossover_from_token(token: &str) -> Option<u8> {
+    let want = token.to_ascii_lowercase();
+    (dspi_proto::xover::XOVER_FIRST..=dspi_proto::xover::XOVER_LAST)
+        .find(|t| crossover_token(*t).as_deref() == Some(want.as_str()))
+}
+
+fn crossover_token(raw: u8) -> Option<String> {
+    dspi_proto::xover::meta(raw).map(|m| {
+        format!(
+            "{}{}{}",
+            m.family.short(),
+            m.order,
+            if m.high_pass { "hp" } else { "lp" }
+        )
+    })
+}
+
+/// `mix <input> <output> on|off [gain dB] [inv]`
+///
+/// The 8-byte `MatrixRoutePacket` (config.h:845-851): input, output, enabled,
+/// phase_invert, then the gain as a little-endian float.
+fn parse_crosspoint(indices: &[u8], tokens: &[&str]) -> Result<Value, ParseError> {
+    let bad = |value: &str, expected: &str| ParseError::BadValue {
+        path: "mix".into(),
+        value: value.into(),
+        expected: expected.into(),
+    };
+    let Some(&on) = tokens.first() else {
+        return Err(ParseError::MissingValue("mix".into()));
+    };
+    let enabled = match on.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => true,
+        "off" | "false" | "no" | "0" => false,
+        other => return Err(bad(other, "on or off")),
+    };
+    let gain: f32 = match tokens.get(1) {
+        None => 0.0,
+        Some(t) => t.parse().map_err(|_| bad(t, "a gain in dB"))?,
+    };
+    let invert = match tokens.get(2) {
+        None => false,
+        Some(t) => match t.to_ascii_lowercase().as_str() {
+            "inv" | "invert" | "inverted" => true,
+            "norm" | "normal" => false,
+            other => return Err(bad(other, "inv or norm")),
+        },
+    };
+    let mut bytes = vec![indices[0], indices[1], enabled as u8, invert as u8];
+    bytes.extend_from_slice(&gain.to_le_bytes());
+    Ok(Value::Bytes(bytes))
+}
+
+/// A crosspoint packet back as the line that would produce it.
+fn format_crosspoint(bytes: &[u8]) -> String {
+    if bytes.len() < 8 {
+        return String::new();
+    }
+    let gain = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let mut s = format!(
+        "{} {}",
+        if bytes[2] != 0 { "on" } else { "off" },
+        format_value("out.gain", &Value::Float(gain))
+    );
+    if bytes[3] != 0 {
+        s.push_str(" inv");
+    }
+    s
+}
+
+/// Build a structured payload from `key=value` tokens.
+///
+/// Three token shapes are accepted, because all three are how a person writes
+/// this: `gain=-3` names its field, `invert` alone is a flag or a boolean set
+/// to on, and a bare word may fill the next positional field, so
+/// `mix 0 4 on gain=-3 invert` reads the way the Console's own grid does.
+/// The command's indices fill the fields that name them, so the crosspoint in
+/// `mix 0 4` does not have to be typed twice.
+fn parse_packet(d: &ParamDesc, indices: &[u8], tokens: &[&str]) -> Result<Value, ParseError> {
+    let Some(spec) = spec_for_path(d.path) else {
+        return Err(ParseError::BadValue {
+            path: d.path.into(),
+            value: tokens.join(" "),
+            expected: "a packet this build knows how to type".into(),
+        });
+    };
+
+    let mut pairs: Vec<(String, String)> = spec
+        .index_fields
+        .iter()
+        .zip(indices)
+        .map(|(name, index)| ((*name).to_string(), index.to_string()))
+        .collect();
+
+    let mut next_positional = 0usize;
+    for token in tokens {
+        if let Some((key, value)) = token.split_once('=') {
+            pairs.push((
+                key.to_ascii_lowercase(),
+                value.trim_matches('"').to_string(),
+            ));
+            continue;
+        }
+
+        let word = token.to_ascii_lowercase();
+
+        // A bare field name that holds a yes or no means yes.
+        if let Some(f) = spec.field(&word)
+            && f.kind == FieldKind::Bool
+        {
+            pairs.push((word, "on".into()));
+            continue;
+        }
+
+        // A bare flag name goes into whichever field owns that bit.
+        if let Some(field) = flag_field_for(spec, &word) {
+            pairs.push((field.to_string(), word));
+            continue;
+        }
+
+        // Otherwise it fills the next field that may be given without a key.
+        match spec.positional.get(next_positional) {
+            Some(name) => {
+                next_positional += 1;
+                pairs.push(((*name).to_string(), word));
+            }
+            None => {
+                return Err(ParseError::BadValue {
+                    path: d.path.into(),
+                    value: (*token).into(),
+                    expected: format!("one of {}, as key=value", spec.field_names().join(", ")),
+                });
+            }
+        }
+    }
+
+    // Several flag words are separate tokens on the line but one field on the
+    // wire, so they are merged rather than overwriting each other.
+    let merged = merge_flag_fields(spec, pairs);
+    let refs: Vec<(&str, &str)> = merged
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    (spec.encode)(&refs)
+        .map(Value::Bytes)
+        .map_err(|e| ParseError::BadValue {
+            path: d.path.into(),
+            value: tokens.join(" "),
+            expected: e.to_string(),
+        })
+}
+
+/// Which field, if any, owns a bare flag word.
+fn flag_field_for(spec: &'static PacketSpec, word: &str) -> Option<&'static str> {
+    spec.fields.iter().find_map(|f| match f.kind {
+        FieldKind::Flags(table) if table.iter().any(|(n, _)| *n == word) => Some(f.name),
+        _ => None,
+    })
+}
+
+/// Join repeated flag fields with commas, which is how the codec reads a set.
+fn merge_flag_fields(
+    spec: &'static PacketSpec,
+    pairs: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        let is_flags = matches!(spec.field(&key).map(|f| f.kind), Some(FieldKind::Flags(_)));
+        match out.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, existing)) if is_flags => {
+                existing.push(',');
+                existing.push_str(&value);
+            }
+            // A later value of an ordinary field wins, so a mistyped field can
+            // be corrected by typing it again rather than starting over.
+            Some((_, existing)) => *existing = value,
+            None => out.push((key, value)),
+        }
+    }
+    out
 }
 
 /// `eq <channel> <band> <type> [freq] [q] [gain]`
@@ -219,14 +434,18 @@ fn parse_eq(tokens: &[&str], ctx: &Context) -> Result<Command, ParseError> {
     let band = parse_band(tokens[1], ctx)?;
 
     let type_desc = by_path("eq.type").expect("eq.type is in the registry");
-    let filter_type =
-        parse_value(type_desc, tokens[2])?
+    // The registry's choice list covers the PEQ types; the crossover types
+    // occupy 32 to 63 and are named by family, order and direction instead.
+    let filter_type = match crossover_from_token(tokens[2]) {
+        Some(raw) => raw,
+        None => parse_value(type_desc, tokens[2])?
             .as_u8()
             .ok_or_else(|| ParseError::BadValue {
                 path: "eq.type".into(),
                 value: tokens[2].into(),
                 expected: "a filter type".into(),
-            })?;
+            })?,
+    };
 
     let num = |i: usize, default: f32| -> Result<f32, ParseError> {
         match tokens.get(i) {
@@ -246,6 +465,12 @@ fn parse_eq(tokens: &[&str], ctx: &Context) -> Result<Command, ParseError> {
         freq: num(3, 1000.0)?,
         q: num(4, 0.707)?,
         gain: num(5, 0.0)?,
+        // The Linkwitz Transform's target Q rides in the 18-byte band form;
+        // a seventh token carries it and nothing else does.
+        qp: match tokens.get(6) {
+            Some(_) => Some(num(6, 0.707)?),
+            None => None,
+        },
     })
 }
 
@@ -271,6 +496,8 @@ fn parse_indices(d: &ParamDesc, tokens: &[&str], ctx: &Context) -> Result<Vec<u8
                 .channel(tok)
                 .ok_or_else(|| ParseError::UnknownChannel((*tok).into()))?,
             (Target::ChannelBand, 1) => parse_band(tok, ctx)?,
+            // The limiter's every-output address (limiter.h:21).
+            (Target::OutputOrAll, 0) if tok.eq_ignore_ascii_case("all") => ALL_OUTPUTS,
             _ => tok.parse::<u8>().map_err(|_| ParseError::BadValue {
                 path: d.path.into(),
                 value: (*tok).into(),
@@ -340,6 +567,13 @@ pub fn parse_value(d: &ParamDesc, raw: &str) -> Result<Value, ParseError> {
             Some(hex) => u32::from_str_radix(hex, 16).map_err(|_| bad("a hex mask"))?,
             None => raw.parse().map_err(|_| bad("a mask"))?,
         }),
+        // A structured payload, built from its named fields. Without this arm
+        // a packet fell through to Float and then failed to encode, so none of
+        // these parameters could be set from the command line at all.
+        Kind::Packet => {
+            let tokens: Vec<&str> = raw.split_whitespace().collect();
+            parse_packet(d, &[], &tokens)?
+        }
         _ => Value::Float(raw.parse().map_err(|_| bad("a number"))?),
     })
 }
@@ -358,6 +592,18 @@ pub fn format(cmd: &Command, ctx: &Context) -> String {
                 s.push_str(&format_index(path, i, *idx, ctx));
             }
             s
+        }
+        Command::Set {
+            path,
+            indices,
+            value: Value::Bytes(bytes),
+        } if *path == "mix" => {
+            format!(
+                "mix {} {} {}",
+                indices.first().copied().unwrap_or(0),
+                indices.get(1).copied().unwrap_or(0),
+                format_crosspoint(bytes)
+            )
         }
         Command::Set {
             path,
@@ -382,24 +628,32 @@ pub fn format(cmd: &Command, ctx: &Context) -> String {
             freq,
             q,
             gain,
+            qp,
         } => {
-            let ty = by_path("eq.type")
-                .and_then(|d| match d.kind {
-                    Kind::Choice(v) => v
-                        .iter()
-                        .find(|(raw, _)| raw == filter_type)
-                        .map(|(_, n)| *n),
-                    _ => None,
-                })
-                .unwrap_or("?");
-            format!(
+            let ty = crossover_token(*filter_type).unwrap_or_else(|| {
+                by_path("eq.type")
+                    .and_then(|d| match d.kind {
+                        Kind::Choice(v) => v
+                            .iter()
+                            .find(|(raw, _)| raw == filter_type)
+                            .map(|(_, n)| *n),
+                        _ => None,
+                    })
+                    .unwrap_or("?")
+                    .to_string()
+            });
+            let mut line = format!(
                 "eq {} {} {ty} {freq} {q} {gain}",
                 ctx.channel_slugs
                     .get(*channel as usize)
                     .cloned()
                     .unwrap_or_else(|| channel.to_string()),
                 display_band(*band),
-            )
+            );
+            if let Some(qp) = qp {
+                line.push_str(&format!(" {qp}"));
+            }
+            line
         }
         Command::Verb { name, args } => {
             if args.is_empty() {
@@ -422,6 +676,7 @@ fn format_index(path: &str, position: usize, index: u8, ctx: &Context) -> String
             .cloned()
             .unwrap_or_else(|| index.to_string()),
         (Target::ChannelBand, 1) => display_band(index),
+        (Target::OutputOrAll, 0) if index == ALL_OUTPUTS => "all".to_string(),
         _ => index.to_string(),
     }
 }
@@ -439,6 +694,11 @@ fn format_value(path: &str, v: &Value) -> String {
         return v.display(dspi_proto::value::Unit::None);
     };
     match (d.kind, v) {
+        // A packet reads back as the same `key=value` line it was typed as,
+        // minus the fields the command carries as its own indices.
+        (Kind::Packet, Value::Bytes(bytes)) => spec_for_path(path)
+            .and_then(|spec| spec.format(bytes))
+            .unwrap_or_else(|| format!("{} bytes", bytes.len())),
         (Kind::Choice(variants), _) => match v.as_u8().and_then(|n| {
             variants
                 .iter()
@@ -540,6 +800,83 @@ mod tests {
                 value: Value::Float(-18.0)
             }
         );
+    }
+
+    /// A crosspoint is the one packet the interface writes constantly, so it
+    /// has to be typable and it has to round-trip through the echo line.
+    #[test]
+    fn a_crosspoint_takes_its_state_gain_and_polarity() {
+        let cmd = p("mix 0 8 on -6 inv").unwrap();
+        match &cmd {
+            Command::Set {
+                path: "mix",
+                indices,
+                value: Value::Bytes(b),
+            } => {
+                assert_eq!(indices, &vec![0, 8]);
+                assert_eq!(b[..4], [0, 8, 1, 1]);
+                assert_eq!(f32::from_le_bytes([b[4], b[5], b[6], b[7]]), -6.0);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(format(&cmd, &ctx()), "mix 0 8 on -6 inv");
+        // The gain and the polarity are optional.
+        match p("mix 1 2 off").unwrap() {
+            Command::Set {
+                value: Value::Bytes(b),
+                ..
+            } => assert_eq!(b, vec![1, 2, 0, 0, 0, 0, 0, 0]),
+            other => panic!("{other:?}"),
+        }
+        assert!(p("mix 0 1 maybe").is_err());
+        assert!(p("mix 0 1 on 0 sideways").is_err());
+    }
+
+    /// The crossover types live outside the registry's choice list, since the
+    /// UI picks them by family, order and direction rather than by number.
+    #[test]
+    fn a_crossover_band_is_named_by_its_family_and_order() {
+        let cmd = p("eq pdm 20 lr4hp 80").unwrap();
+        match &cmd {
+            Command::SetBand {
+                channel,
+                band,
+                filter_type,
+                freq,
+                ..
+            } => {
+                assert_eq!((*channel, *band, *filter_type, *freq), (16, 20, 35, 80.0));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(format(&cmd, &ctx()), "eq pdm 20 lr4hp 80 0.707 0");
+        assert_eq!(
+            p("eq pdm 21 BES8LP 120").unwrap(),
+            p("eq pdm 21 bes8lp 120").unwrap(),
+            "the codes are case-insensitive"
+        );
+        assert!(p("eq pdm 20 lr3lp 80").is_err(), "LR has no third order");
+    }
+
+    /// The limiter can address every output at once (limiter.h:21), and the
+    /// word for that round-trips through the echo line.
+    #[test]
+    fn a_limiter_write_can_name_every_output() {
+        let cmd = p("limit.threshold all -3").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Set {
+                path: "limit.threshold",
+                indices: vec![0xFF],
+                value: Value::Float(-3.0)
+            }
+        );
+        assert_eq!(format(&cmd, &ctx()), "limit.threshold all -3");
+        assert!(matches!(
+            p("limit.on 4 on"),
+            Ok(Command::Set { indices, .. }) if indices == vec![4]
+        ));
+        assert!(p("out.gain all -3").is_err(), "only the limiter has an all");
     }
 
     #[test]
@@ -694,6 +1031,7 @@ mod tests {
                 freq: 2856.0,
                 q: 3.58,
                 gain: -8.6,
+                qp: None,
             }
         );
     }
@@ -713,7 +1051,11 @@ mod tests {
     #[test]
     fn missing_values_are_reported_not_guessed() {
         let e = p("vol.user").unwrap_err();
-        assert!(matches!(e, ParseError::WrongArity { .. }), "{e}");
+        assert!(matches!(e, ParseError::MissingValue(_)), "{e}");
+        assert_eq!(e.to_string(), "`vol.user` needs a value");
+        // Too few indices still reads as an index problem.
+        let e = p("eq.freq 0").unwrap_err();
+        assert!(matches!(e, ParseError::WrongArity { got: 1, .. }), "{e}");
     }
 
     #[test]
@@ -788,6 +1130,180 @@ mod tests {
     fn an_unknown_word_suggests_where_to_look() {
         let e = p("wobble 3").unwrap_err();
         assert!(e.to_string().contains("dspi params"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod packet_tests {
+    use super::tests::ctx;
+    use super::*;
+    use dspi_proto::packets::{CsBinding, GPIO_UNUSED, MatrixRoutePacket};
+
+    fn p(line: &str) -> Result<Command, ParseError> {
+        let toks = tokenize(line);
+        let refs: Vec<&str> = toks.iter().map(String::as_str).collect();
+        parse(&refs, &ctx())
+    }
+
+    fn bytes(line: &str) -> Vec<u8> {
+        match p(line).unwrap() {
+            Command::Set {
+                value: Value::Bytes(b),
+                ..
+            } => b,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Before this, a packet parameter fell through to Float and then failed
+    /// to encode, so none of them could be set from the command line at all.
+    #[test]
+    fn a_binding_is_typed_as_named_fields() {
+        let line =
+            "cs.binding 3 type=encoder noun=user_volume action=step gpio=10,11 step=1 flags=accel";
+        match p(line).unwrap() {
+            Command::Set {
+                path,
+                indices,
+                value: Value::Bytes(b),
+            } => {
+                assert_eq!(path, "cs.binding");
+                assert_eq!(indices, vec![3], "the slot rides in wValue");
+                assert_eq!(
+                    b,
+                    CsBinding {
+                        component: 4,
+                        noun: 0,
+                        action: 1,
+                        flags: 0x08,
+                        gpio: [10, 11],
+                        step: 1,
+                        ..Default::default()
+                    }
+                    .encode()
+                    .to_vec()
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// One GPIO means the second is explicitly unused, which is what the
+    /// firmware expects of a configured one-pin component.
+    #[test]
+    fn a_single_gpio_still_marks_the_second_unused() {
+        let b = bytes("cs.binding 0 type=button noun=user_mute action=toggle gpio=16");
+        assert_eq!(b[4], 16);
+        assert_eq!(b[5], GPIO_UNUSED);
+    }
+
+    /// The crosspoint's own indices fill the packet's input and output, so the
+    /// route is not typed twice, and `on` reads the way the Console's grid does.
+    #[test]
+    fn a_crosspoint_takes_its_indices_and_a_bare_word() {
+        let line = "mix 0 4 on gain=-3 invert";
+        match p(line).unwrap() {
+            Command::Set {
+                indices,
+                value: Value::Bytes(b),
+                ..
+            } => {
+                assert_eq!(indices, vec![0, 4]);
+                assert_eq!(
+                    MatrixRoutePacket::decode(&b).unwrap(),
+                    MatrixRoutePacket {
+                        input: 0,
+                        output: 4,
+                        enabled: true,
+                        phase_invert: true,
+                        gain_db: -3.0,
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Flag words are separate tokens on the line but one byte on the wire, so
+    /// a second flag must not replace the first.
+    #[test]
+    fn several_flag_words_merge_into_one_field() {
+        let b = bytes("cs.binding 1 type=encoder noun=preset action=step wrap accel");
+        assert_eq!(b[3], 0x0C, "wrap | accel");
+        let same = bytes("cs.binding 1 type=encoder noun=preset action=step flags=wrap,accel");
+        assert_eq!(b, same);
+    }
+
+    #[test]
+    fn a_typo_is_refused_with_the_fields_that_would_have_worked() {
+        let e = p("cs.binding 3 type=encoder pin=10").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("pin"), "{msg}");
+        assert!(msg.contains("gpio"), "the valid fields are listed: {msg}");
+    }
+
+    #[test]
+    fn a_bad_field_value_lists_the_alternatives() {
+        let e = p("cs.binding 3 type=banana").unwrap_err();
+        assert!(e.to_string().contains("encoder"), "{e}");
+    }
+
+    #[test]
+    fn a_bare_word_with_nowhere_to_go_is_refused() {
+        let e = p("cs.binding 3 type=encoder nonsense").unwrap_err();
+        assert!(e.to_string().contains("key=value"), "{e}");
+    }
+
+    /// The echo line has to be a line the parser accepts, or copying it out of
+    /// the interface writes something else.
+    #[test]
+    fn packet_lines_round_trip_through_the_formatter() {
+        let ctx = ctx();
+        for line in [
+            "cs.binding 3 type=encoder noun=master_volume action=step gpio=27,28 step=256 flags=accel",
+            "cs.ir 2 noun=user_volume action=inc protocol=nec step=256 code=0x20DF40BF",
+            "cs.group 1 kind=output_ch members=0xA",
+            "cs.macro.step 0 1 noun=output_mute action=set target=2 value=1 pre_delay=150",
+            "cs.display mode=cycle_selected dwell=50 overlay_hold=20 edit_timeout=100",
+            "cs.display.page 4 noun=output_gain target=2 flags=active,large",
+            "mix 0 4 on gain=-3 invert",
+            "dev.dacmute on pin=11 hold_ms=5",
+            "dev.uart on baud=115200",
+            "dev.i2c on address=0x42",
+            "preset.startup specified 3",
+        ] {
+            let cmd = p(line).unwrap_or_else(|e| panic!("`{line}` did not parse: {e}"));
+            let rendered = format(&cmd, &ctx);
+            let toks = tokenize(&rendered);
+            let refs: Vec<&str> = toks.iter().map(String::as_str).collect();
+            let reparsed = parse(&refs, &ctx).unwrap_or_else(|e| {
+                panic!("`{line}` rendered as `{rendered}`, which does not parse: {e}")
+            });
+            assert_eq!(cmd, reparsed, "`{line}` did not survive the round trip");
+        }
+    }
+
+    /// The two fields the command line carries as indices must not be printed
+    /// again in the value, or the echo would set the wrong crosspoint.
+    #[test]
+    fn the_index_fields_are_not_printed_twice() {
+        let cmd = p("mix 3 5 on").unwrap();
+        let rendered = format(&cmd, &ctx());
+        assert!(rendered.starts_with("mix 3 5 "), "{rendered}");
+        assert!(!rendered.contains("input="), "{rendered}");
+        assert!(!rendered.contains("output="), "{rendered}");
+    }
+
+    /// The public value parser has the arm too, for a caller that already has
+    /// the tail as one string.
+    #[test]
+    fn parse_value_builds_a_packet_from_a_joined_line() {
+        let d = by_path("dev.i2c").unwrap();
+        let v = parse_value(d, "on sda_pin=18 scl_pin=19 address=0x42").unwrap();
+        match v {
+            Value::Bytes(b) => assert_eq!(b, vec![1, 18, 19, 0x42, 0, 0, 0, 0]),
+            other => panic!("{other:?}"),
+        }
     }
 }
 
