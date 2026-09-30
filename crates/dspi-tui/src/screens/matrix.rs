@@ -82,7 +82,6 @@ enum Line {
 /// place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
-    Clear,
     Rename(usize),
     /// Enabling this output needs the other side of Core 1 switched off first.
     Enable(usize),
@@ -117,7 +116,6 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("Enter", "Edit a gain"),
     KeyHelp::new("i", "Invert"),
     KeyHelp::new("d", "Direct 1:1"),
-    KeyHelp::new("D", "Clear"),
     KeyHelp::new("r", "Rename"),
     KeyHelp::new("y Y", "Copy, paste parameters"),
     KeyHelp::new("I", "Identify"),
@@ -965,7 +963,7 @@ impl MatrixPanel {
     }
 
     /// The ROUTING band. The Console puts its Direct 1:1 and Clear buttons
-    /// here; they are the `d` and `D` keys, on the key line, so the band
+    /// here; they are the `d` key and the command bar's `clear`, so the band
     /// carries only its name.
     fn draw_routing(&self, p: &mut Paint, y: u16) {
         let (area, theme) = (p.area, p.theme);
@@ -1132,17 +1130,8 @@ impl Screen for MatrixPanel {
                     ScreenEvent::Command(cmds.join("\n"))
                 }
             }
-            KeyCode::Char('D') => {
-                if !is_8ch(state) {
-                    return ScreenEvent::Handled;
-                }
-                self.pending = Some(Pending::Clear);
-                ScreenEvent::Dialog(Dialog::confirm(
-                    "Clear",
-                    "Disconnect every crosspoint",
-                    vec![Button::destructive("Clear"), Button::new("Cancel")],
-                ))
-            }
+            // No `D` for Clear: it opens the Tube Modeller from every screen
+            // (PLAN-beta4 decision 2), and the command bar's `clear` remains.
             KeyCode::Char('r') => {
                 let channel = output_channel(state, self.col);
                 self.pending = Some(Pending::Rename(channel));
@@ -1187,14 +1176,6 @@ impl Screen for MatrixPanel {
             return ScreenEvent::Handled;
         };
         match (pending, outcome) {
-            (Pending::Clear, DialogOutcome::Button(0)) => {
-                let cmds = self.clear_routes(state);
-                if cmds.is_empty() {
-                    ScreenEvent::Handled
-                } else {
-                    ScreenEvent::Command(cmds.join("\n"))
-                }
-            }
             (Pending::Rename(channel), DialogOutcome::Text(name)) => {
                 let name = name.trim().to_string();
                 if name.is_empty() {
@@ -1719,32 +1700,22 @@ mod tests {
             ScreenEvent::Handled,
             "the Console only offers it in 8-channel mode"
         );
-        assert_eq!(
-            p.handle(key(KeyCode::Char('D')), &stereo()),
-            ScreenEvent::Handled
-        );
     }
 
+    /// Clear is the command bar's `clear`; `D` is the Tube Modeller's, from
+    /// every screen (PLAN-beta4 decision 2).
     #[test]
-    fn clear_confirms_then_disconnects_every_crosspoint() {
+    fn clear_disconnects_every_crosspoint_and_d_is_the_shells() {
         let state = fixture::state();
         let mut p = panel();
-        let ScreenEvent::Dialog(d) = p.handle(key(KeyCode::Char('D')), &state) else {
-            panic!("Clear asks first");
-        };
-        assert_eq!(d.body, "Disconnect every crosspoint");
-        assert!(d.buttons[0].destructive);
-        let ScreenEvent::Command(c) = p.dialog_result(DialogOutcome::Button(0), &state) else {
-            panic!("Clear wrote nothing");
-        };
+        let q = p.quick_reply("clear", &state);
         // The fixture's eight diagonal routes, gains and phase left alone.
-        assert_eq!(c.lines().count(), 8, "{c}");
-        assert_eq!(c.lines().next().unwrap(), "mix 0 0 off 0");
-        // Cancel writes nothing.
-        p.handle(key(KeyCode::Char('D')), &state);
+        assert_eq!(q.commands.len(), 8, "{q:?}");
+        assert_eq!(q.commands[0], "mix 0 0 off 0");
+        assert_eq!(q.hint, "disconnect every crosspoint (8)");
         assert_eq!(
-            p.dialog_result(DialogOutcome::Cancelled, &state),
-            ScreenEvent::Handled
+            p.handle(key(KeyCode::Char('D')), &state),
+            ScreenEvent::Unhandled
         );
     }
 

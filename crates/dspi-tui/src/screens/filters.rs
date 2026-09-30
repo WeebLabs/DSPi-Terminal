@@ -28,9 +28,7 @@ use crate::shell::ScreenEvent;
 use crate::theme::{Glyphs, Theme};
 use crate::widgets::table::Cell;
 use crate::widgets::text::q as q_text;
-use crate::widgets::{
-    Button, Column, Dialog, DialogOutcome, KeyHelp, NumberEdit, PopupList, Table,
-};
+use crate::widgets::{Column, DialogOutcome, KeyHelp, NumberEdit, PopupList, Table};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterMode {
@@ -72,8 +70,6 @@ enum Pending {
     Family(Vec<Option<Family>>),
     Direction,
     Slope(Vec<u8>),
-    ClearAll,
-    BypassAll,
 }
 
 const PEQ_COLUMNS: &[Column] = &[
@@ -99,8 +95,6 @@ pub const PEQ_KEYS: &[KeyHelp] = &[
     KeyHelp::new("Space", "Bypass"),
     KeyHelp::new("1-9,0", "Jump to a band"),
     KeyHelp::new("a", "Enable All"),
-    KeyHelp::new("A", "Bypass All"),
-    KeyHelp::new("D", "Clear All"),
 ];
 
 pub const TABBED_KEYS: &[KeyHelp] = &[
@@ -110,8 +104,6 @@ pub const TABBED_KEYS: &[KeyHelp] = &[
     KeyHelp::new("Space", "Bypass"),
     KeyHelp::new("1-9,0", "Jump to a band"),
     KeyHelp::new("a", "Enable All"),
-    KeyHelp::new("A", "Bypass All"),
-    KeyHelp::new("D", "Clear All"),
     KeyHelp::new("x", "PEQ / XO"),
 ];
 
@@ -495,35 +487,11 @@ impl FilterList {
                 ScreenEvent::Command(self.bypass_command(state, self.band, !band.bypass))
             }
             KeyCode::Enter => self.open(state, &band),
+            // Bypass All and Clear All have no keys: `A` and `D` open the
+            // Spectrum Analyser and the Tube Modeller from every screen
+            // (PLAN-beta4 decision 2), and the command bar's `bypass` and
+            // `clear` reach both.
             KeyCode::Char('a') => self.set_all_bypassed(state, false),
-            KeyCode::Char('A') => {
-                if self.mode == FilterMode::Xo {
-                    self.pending = Some(Pending::BypassAll);
-                    // Bypassing a crossover sends full-range audio to the
-                    // driver, so the Console asks first, in these words.
-                    ScreenEvent::Dialog(
-                        Dialog::confirm(
-                            "Bypass this output's crossovers?",
-                            "This sends full-range audio to this output with no crossover \
-                             protection, which can damage unprotected drivers such as \
-                             tweeters. Continue only if you are sure.",
-                            vec![Button::destructive("Bypass All"), Button::new("Cancel")],
-                        )
-                        .critical(),
-                    )
-                } else {
-                    self.set_all_bypassed(state, true)
-                }
-            }
-            KeyCode::Char('D') => {
-                self.pending = Some(Pending::ClearAll);
-                ScreenEvent::Dialog(Dialog::confirm(
-                    "Clear All Bands?",
-                    "Every band in this list will be reset to its default (flat) state. \
-                     This cannot be undone.",
-                    vec![Button::destructive("Clear All"), Button::new("Cancel")],
-                ))
-            }
             KeyCode::Char('x') if self.can_switch_mode => {
                 self.mode = match self.mode {
                     FilterMode::Peq => FilterMode::Xo,
@@ -661,8 +629,30 @@ impl FilterList {
         }
     }
 
-    /// `a` and `A`: every band that is not Off, as the Console's
-    /// `BypassAllControls` does.
+    /// Bypass All (`on`) or Enable All over the bank showing, for the command
+    /// bar's `bypass`; `None` when no band would change.
+    pub fn bypass_all_command(&self, state: &DeviceState, on: bool) -> Option<String> {
+        match self.set_all_bypassed(state, on) {
+            ScreenEvent::Command(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Clear All over the bank showing, for the command bar's `clear`;
+    /// `None` when every band is already Off.
+    pub fn clear_all_command(&self, state: &DeviceState) -> Option<String> {
+        let bands = self.bands(state);
+        if bands.iter().all(|b| b.filter_type == FilterType::Flat) {
+            return None;
+        }
+        match self.clear_all(state) {
+            ScreenEvent::Command(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// `a` (Enable All) and the command bar's `bypass`: every band that is
+    /// not Off, as the Console's `BypassAllControls` does.
     fn set_all_bypassed(&self, state: &DeviceState, on: bool) -> ScreenEvent {
         if !supports_bypass(state) {
             return ScreenEvent::Handled;
@@ -735,22 +725,16 @@ impl FilterList {
                 };
                 p.filter_type = FilterType::from_raw(xover::Meta { order, ..m }.to_type());
             }
-            Pending::ClearAll | Pending::BypassAll => return ScreenEvent::Handled,
         }
         self.field = self.field.min(self.fields(&p).len().saturating_sub(1));
         ScreenEvent::Command(self.write(state, self.band, &p))
     }
 
-    pub fn dialog_result(&mut self, outcome: DialogOutcome, state: &DeviceState) -> ScreenEvent {
-        let pending = self.pending.take();
-        if outcome != DialogOutcome::Button(0) {
-            return ScreenEvent::Handled;
-        }
-        match pending {
-            Some(Pending::ClearAll) => self.clear_all(state),
-            Some(Pending::BypassAll) => self.set_all_bypassed(state, true),
-            _ => ScreenEvent::Handled,
-        }
+    /// The list opens no dialogs of its own now that Bypass All and Clear
+    /// All live on the command bar; a page forwards its outcome regardless.
+    pub fn dialog_result(&mut self, _outcome: DialogOutcome, _state: &DeviceState) -> ScreenEvent {
+        self.pending = None;
+        ScreenEvent::Handled
     }
 }
 
@@ -1320,60 +1304,50 @@ mod tests {
     #[test]
     fn enable_all_and_bypass_all_touch_every_band_that_is_not_off() {
         let state = fixture::state();
-        let mut l = list(0);
-        match l.handle(key(KeyCode::Char('A')), &state) {
-            ScreenEvent::Command(c) => {
-                let lines: Vec<&str> = c.lines().collect();
-                assert_eq!(lines.len(), 5, "the fixture sets five bands: {c}");
-                assert_eq!(lines[0], "eq.bypass in.1 1 on");
-            }
-            other => panic!("{other:?}"),
-        }
-        // Nothing is bypassed yet, so Enable All is a no-op.
+        let l = list(0);
+        let c = l
+            .bypass_all_command(&state, true)
+            .expect("five bands to bypass");
+        let lines: Vec<&str> = c.lines().collect();
+        assert_eq!(lines.len(), 5, "the fixture sets five bands: {c}");
+        assert_eq!(lines[0], "eq.bypass in.1 1 on");
+        // Nothing is bypassed yet, so Enable All is a no-op, from `a` too.
+        assert_eq!(l.bypass_all_command(&state, false), None);
+        let mut l = l;
         assert_eq!(
             l.handle(key(KeyCode::Char('a')), &state),
             ScreenEvent::Handled
         );
     }
 
+    /// `A` and `D` belong to the Spectrum Analyser and the Tube Modeller
+    /// (PLAN-beta4 decision 2), so the list lets them through to the shell.
     #[test]
-    fn bypassing_all_crossovers_asks_the_consoles_question_first() {
+    fn shift_a_and_shift_d_are_the_shells() {
         let state = fixture::state();
-        let mut l = list(16);
-        l.mode = FilterMode::Xo;
-        match l.handle(key(KeyCode::Char('A')), &state) {
-            ScreenEvent::Dialog(d) => {
-                assert_eq!(d.title, "Bypass this output's crossovers?");
-                assert!(
-                    d.body
-                        .contains("can damage unprotected drivers such as tweeters")
+        for mode in [FilterMode::Peq, FilterMode::Xo] {
+            let mut l = list(16).tabbed(true);
+            l.mode = mode;
+            for c in ['A', 'D'] {
+                assert_eq!(
+                    l.handle(key(KeyCode::Char(c)), &state),
+                    ScreenEvent::Unhandled,
+                    "{c} in {mode:?}"
                 );
-                assert!(d.critical);
             }
-            other => panic!("{other:?}"),
         }
-        assert_eq!(
-            l.dialog_result(DialogOutcome::Cancelled, &state),
-            ScreenEvent::Handled
-        );
     }
 
     #[test]
-    fn clear_all_confirms_and_then_resets_every_band() {
+    fn clear_all_resets_every_band_of_the_bank_showing() {
         let state = fixture::state();
-        let mut l = list(0);
-        match l.handle(key(KeyCode::Char('D')), &state) {
-            ScreenEvent::Dialog(d) => assert_eq!(d.title, "Clear All Bands?"),
-            other => panic!("{other:?}"),
-        }
-        match l.dialog_result(DialogOutcome::Button(0), &state) {
-            ScreenEvent::Command(c) => {
-                let lines: Vec<&str> = c.lines().collect();
-                assert_eq!(lines.len(), 10);
-                assert_eq!(lines[0], "eq in.1 1 flat 1000 0.707 0");
-            }
-            other => panic!("{other:?}"),
-        }
+        let l = list(0);
+        let c = l.clear_all_command(&state).expect("bands to clear");
+        let lines: Vec<&str> = c.lines().collect();
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0], "eq in.1 1 flat 1000 0.707 0");
+        // A bank with every band Off has nothing to clear.
+        assert_eq!(list(2).clear_all_command(&state), None);
     }
 
     #[test]

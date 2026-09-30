@@ -46,6 +46,11 @@ pub enum Tool {
     Stats,
     Monitor,
     AutoEq,
+    /// Beta4's three tools (`DSPi_ConsoleApp.swift:11028-11056`). Their keys
+    /// are global like the rest; the factory gates each on its feature.
+    Subharm,
+    Tube,
+    Spectrum,
 }
 
 impl Tool {
@@ -62,6 +67,9 @@ impl Tool {
             'T' => Self::Stats,
             'I' => Self::Monitor,
             'B' => Self::AutoEq,
+            'S' => Self::Subharm,
+            'D' => Self::Tube,
+            'A' => Self::Spectrum,
             _ => return None,
         })
     }
@@ -78,6 +86,9 @@ impl Tool {
             Self::Stats => 'T',
             Self::Monitor => 'I',
             Self::AutoEq => 'B',
+            Self::Subharm => 'S',
+            Self::Tube => 'D',
+            Self::Spectrum => 'A',
         }
     }
 
@@ -94,6 +105,11 @@ impl Tool {
             Self::Stats => "System Statistics",
             Self::Monitor => "Interrupt Monitor",
             Self::AutoEq => "AutoEQ",
+            // SubharmonicSynthView.swift:25, TubeModellerView.swift:19,
+            // SpectrumAnalyserView.swift:1503.
+            Self::Subharm => "Subharmonic Synthesizer",
+            Self::Tube => "Tube Modeller",
+            Self::Spectrum => "Spectrum Analyser",
         }
     }
 }
@@ -193,7 +209,7 @@ const GLOBAL_KEYS: &[KeyHelp] = &[
     KeyHelp::new("Tab", "Next region"),
     KeyHelp::new("Ctrl-P", "Search everything"),
     KeyHelp::new(":", "Command line"),
-    KeyHelp::new("M L X P U V G T I B", "Open a tool"),
+    KeyHelp::new("M L X P S D U V G A T I B", "Open a tool"),
     KeyHelp::new(",", "Settings"),
     KeyHelp::new("Ctrl-S", "Commit parameters to the preset"),
     KeyHelp::new("Ctrl-D", "Device picker"),

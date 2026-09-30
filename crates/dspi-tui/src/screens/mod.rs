@@ -626,23 +626,42 @@ pub(crate) mod tests {
     }
 
     /// The shell hands the key to the focused screen before it looks at it
-    /// itself, so a screen's own letters have to survive the trip.
+    /// itself, so a screen's own letters have to survive the trip, and the
+    /// tool keys a band list gave up (PLAN-beta4 decision 2) have to pass
+    /// through it to the shell.
     #[test]
-    fn a_screens_keys_reach_it_through_the_shell() {
+    fn a_screens_keys_reach_it_and_the_band_list_lets_s_d_and_a_through() {
+        use crate::shell::{Selection, ShellEvent, Tool};
         let state = fixture::state();
-        let mut s = shell(
-            Box::new(InputPage::new(0, shared(), &state)),
-            crate::shell::Selection::Input(0),
-        );
-        let events = s.handle(
-            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
-            &state,
-        );
-        assert!(
-            events.is_empty(),
-            "D opened the Clear All dialog, not a tool"
-        );
-        assert!(s.dialog.is_some());
+        let pages: [(Box<dyn crate::shell::Screen>, Selection); 2] = [
+            (
+                Box::new(InputPage::new(0, shared(), &state)),
+                Selection::Input(0),
+            ),
+            (
+                Box::new(OutputPage::new(0, shared(), &state)),
+                Selection::Output(0),
+            ),
+        ];
+        for (page, selection) in pages {
+            let mut s = shell(page, selection);
+            // Down into the band list, where `A` and `D` used to be bound.
+            s.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state);
+            let events = s.handle(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &state,
+            );
+            assert!(events.is_empty(), "`a` is the list's Enable All");
+            for (c, tool) in [
+                ('S', Tool::Subharm),
+                ('D', Tool::Tube),
+                ('A', Tool::Spectrum),
+            ] {
+                let events = s.handle(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT), &state);
+                assert_eq!(events, vec![ShellEvent::OpenTool(tool)], "{c}");
+                assert!(s.dialog.is_none(), "{c} opened a dialog");
+            }
+        }
     }
 
     #[test]

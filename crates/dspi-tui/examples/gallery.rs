@@ -3,7 +3,7 @@
 //!   gallery [width] [height] [calm|console|amber|dark|mono] [rp2350|rp2040]
 //!           [--screen overview|input|output|matrix|crossfeed|loudness
 //!                     |leveller|psybass|upmixer|signals|stats|monitor
-//!                     |autoeq|nodevice] [--settings <page>] [--expand n] [--busy|--full]
+//!                     |autoeq|subharm|tube|spectrum|nodevice] [--settings <page>] [--expand n] [--busy|--full]
 //!           [--depth truecolor|256|16|mono] [--ansi]
 //!
 //! Prints the frame as text, or as ANSI escapes with `--ansi` so the colours
@@ -17,6 +17,7 @@
 //! the fixture with every channel tuned, which is what the overview grid
 //! is for; `--full` the one where no two channels are alike.
 
+use dspi_tui::live::pending_tool;
 use dspi_tui::screens::{
     AutoEqPanel, CrossfeedPanel, InputPage, LevellerPanel, LoudnessPanel, MatrixPanel,
     MonitorPanel, OutputPage, Overview, PsybassPanel, SignalsPanel, StatsPanel, UpmixerPanel,
@@ -361,6 +362,11 @@ fn main() {
             Tool::AutoEq,
             Box::new(AutoEqPanel::searching(shared.clone(), "sennheiser")) as Box<dyn Screen>,
         )),
+        // Beta4's tools, until their panels land: the fixture reports none
+        // of their features, so each shows what the device lacks.
+        "subharm" => Some((Tool::Subharm, pending_tool(&state, Tool::Subharm))),
+        "tube" => Some((Tool::Tube, pending_tool(&state, Tool::Tube))),
+        "spectrum" => Some((Tool::Spectrum, pending_tool(&state, Tool::Spectrum))),
         _ => None,
     };
     let (detail, selection): (Box<dyn Screen>, Selection) = match screen.as_str() {

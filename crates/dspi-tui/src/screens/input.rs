@@ -62,8 +62,6 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("Space", "Bypass"),
     KeyHelp::new("1-9,0", "Jump to a band"),
     KeyHelp::new("a", "Enable All"),
-    KeyHelp::new("A", "Bypass All"),
-    KeyHelp::new("D", "Clear All"),
     KeyHelp::new("Backspace", "Reset the preamp"),
 ];
 
@@ -147,14 +145,14 @@ impl InputPage {
     }
 
     /// The page grammar behind `;` (DESIGN 13): the preamp, a band in one
-    /// line (`3 peak 1k -2 1.4`), the delay, `clear` and `name`. Edits
+    /// line (`3 peak 1k -2 1.4`), the delay, `bypass`, `clear` and `name`. Edits
     /// mirror onto a linked partner like every other edit on this page.
     fn quick_reply(&self, line: &str, state: &DeviceState) -> crate::shell::Quick {
         use super::quick::{ghost, number as num, verb};
         use crate::shell::Quick;
-        const VERBS: &[&str] = &["pre", "delay", "clear", "name"];
+        const VERBS: &[&str] = &["pre", "delay", "bypass", "clear", "name"];
         const SUMMARY: &str =
-            "pre -5.3 · 3 peak 1k -2 [q] · 3 off · delay 2.5 · clear · name Front L";
+            "pre -5.3 · 3 peak 1k -2 [q] · 3 off · delay 2.5 · bypass · clear · name Front L";
         let lower = line.to_ascii_lowercase();
         let tokens: Vec<&str> = lower.split_whitespace().collect();
         let hint = |h: &str| Quick {
@@ -210,6 +208,17 @@ impl InputPage {
                     }
                 }
                 None => hint("delay <ms>"),
+            },
+            // Bypass All, which has no key since `A` opens the Spectrum
+            // Analyser; Enable All stays on `a`.
+            Some("bypass") => match self.list.bypass_all_command(state, true) {
+                Some(c) => Quick {
+                    fallthrough: false,
+                    hint: format!("Bypass All{}", self.mirror_note()),
+                    ghost: None,
+                    commands: vec![c],
+                },
+                None => hint("nothing to bypass"),
             },
             Some("clear") => match self.clear_peq(state) {
                 ScreenEvent::Command(c) => Quick {

@@ -59,8 +59,6 @@ const KEYS: &[KeyHelp] = &[
     KeyHelp::new("i", "Invert"),
     KeyHelp::new("1-9,0", "Jump to a band"),
     KeyHelp::new("a", "Enable All"),
-    KeyHelp::new("A", "Bypass All"),
-    KeyHelp::new("D", "Clear All"),
     KeyHelp::new("x", "PEQ / XO"),
     KeyHelp::new("Backspace", "Reset to 0"),
 ];
@@ -319,13 +317,15 @@ fn cell_style(theme: &Theme, focused: bool, armed: bool) -> Style {
 
 impl OutputPage {
     /// The page grammar behind `;` (DESIGN 13): the output's own gain,
-    /// delay, mute and enable, a PEQ band in one line, and the crossover
-    /// (`xo hp 80 lr4`).
+    /// delay, mute and enable, a PEQ band in one line, the crossover (`xo hp
+    /// 80 lr4`), and Bypass All and Clear All over the bank showing.
     fn quick_reply(&self, line: &str, state: &DeviceState) -> crate::shell::Quick {
         use super::quick::{ghost, number as num, verb};
         use crate::shell::Quick;
-        const VERBS: &[&str] = &["gain", "delay", "mute", "unmute", "on", "off", "xo", "name"];
-        const SUMMARY: &str = "gain -3 · delay 2.5 · mute · unmute · on · off · 3 peak 1k -2 · xo hp 80 lr4 · name Sub";
+        const VERBS: &[&str] = &[
+            "gain", "delay", "mute", "unmute", "on", "off", "xo", "bypass", "clear", "name",
+        ];
+        const SUMMARY: &str = "gain -3 · delay 2.5 · mute · unmute · on · off · 3 peak 1k -2 · xo hp 80 lr4 · bypass · clear · name Sub";
         let o = self.output;
         let channel = output_channel(state, o);
         let lower = line.to_ascii_lowercase();
@@ -378,6 +378,31 @@ impl OutputPage {
             Some("on") => one("enabled".into(), format!("out.enable {o} on")),
             Some("off") => one("disabled".into(), format!("out.enable {o} off")),
             Some("xo") => self.quick_xover(state, channel, &tokens[1..]),
+            // Bypass All and Clear All over the bank the tabs show; they
+            // have no keys since `A` and `D` open tools. Bypassing the
+            // crossovers carries the Console's warning in the hint, which
+            // reads before Enter runs it (`Components.swift:1619-1628`).
+            Some("bypass") => match self.list.bypass_all_command(state, true) {
+                Some(c) if self.list.mode == FilterMode::Xo => one(
+                    "Bypass this output's crossovers? This sends full-range audio to this \
+                     output with no crossover protection, which can damage unprotected drivers \
+                     such as tweeters."
+                        .into(),
+                    c,
+                ),
+                Some(c) => one("Bypass All".into(), c),
+                None => hint("nothing to bypass"),
+            },
+            Some("clear") => match self.list.clear_all_command(state) {
+                Some(c) => one(
+                    match self.list.mode {
+                        FilterMode::Xo => "every crossover band off".into(),
+                        FilterMode::Peq => "every band off".into(),
+                    },
+                    c,
+                ),
+                None => hint("nothing to clear"),
+            },
             Some("name") => {
                 let name = line
                     .trim_start()
@@ -872,6 +897,30 @@ mod tests {
         assert!(f.contains("TYPE"), "the filter list is beneath: {f}");
         // Only the base stereo pair; the rest is the Matrix Mixer's job.
         assert!(!f.contains("FC"), "{f}");
+    }
+
+    /// Bypass All and Clear All moved from `A` and `D` to the command bar,
+    /// over whichever bank the tabs show; bypassing crossovers says the
+    /// Console's warning before Enter.
+    #[test]
+    fn the_command_bar_bypasses_and_clears_the_bank_showing() {
+        let (mut p, state) = page(0);
+        // The fixture's OUT L has a crossover and no PEQ bands.
+        assert!(p.quick_reply("bypass", &state).commands.is_empty());
+        assert!(p.quick_reply("clear", &state).commands.is_empty());
+        p.list.mode = FilterMode::Xo;
+        let q = p.quick_reply("bypass", &state);
+        assert_eq!(q.commands.len(), 1, "{q:?}");
+        assert!(q.commands[0].starts_with("eq.bypass out.1 "), "{q:?}");
+        assert!(
+            q.hint.starts_with("Bypass this output's crossovers?"),
+            "{q:?}"
+        );
+        assert!(q.hint.contains("can damage unprotected drivers"), "{q:?}");
+        let q = p.quick_reply("clear", &state);
+        assert_eq!(q.commands.len(), 1, "{q:?}");
+        assert_eq!(q.hint, "every crossover band off");
+        assert!(q.commands[0].lines().all(|l| l.contains(" flat ")), "{q:?}");
     }
 
     /// Routing names are the sidebar's channel names, not 7.1 labels

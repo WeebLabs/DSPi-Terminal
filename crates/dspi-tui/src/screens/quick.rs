@@ -120,6 +120,11 @@ mod tests {
         assert_eq!(q("delay 2.5").commands, vec!["ch.delay in.1 2.5"]);
         assert_eq!(q("name Front L").commands, vec!["ch.name 0 Front L"]);
         assert!(!q("clear").commands.is_empty());
+        // Bypass All, which lost its `A` to the Spectrum Analyser.
+        let bypass = q("bypass");
+        assert_eq!(bypass.commands.len(), 1);
+        assert_eq!(bypass.commands[0].lines().count(), 5, "five bands are set");
+        assert_eq!(q("by").commands, bypass.commands, "any unambiguous prefix");
         for partial in ["", "pre", "3", "3 peak", "3 peak 1k", "99 off", "de"] {
             let r = q(partial);
             assert!(r.commands.is_empty(), "{partial:?} ran {:?}", r.commands);

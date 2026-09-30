@@ -136,6 +136,39 @@ impl ConsoleScreens {
     }
 }
 
+/// A beta4 tool whose panel is still to come (phases B5, B6 and B8).
+///
+/// The tool is shown only when the device reports its feature (the probe's
+/// `subharmonic_synth`, `tube_preamp` and `spectrum_analyser`); without it
+/// the Console's own unsupported notice stands in for the window
+/// (`SubharmonicSynthView.swift:252-257`, `TubeModellerView.swift:404-409`,
+/// `SpectrumAnalyserView.swift:859`). No panel is stubbed: both cases are the
+/// shell's plain [`Placeholder`], which the real panels replace.
+pub fn pending_tool(state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
+    let (feature, unsupported) = match tool {
+        Tool::Subharm => (
+            "subharmonic_synth",
+            "Requires firmware with wire format V29 or newer. Update the DSPi firmware to \
+             use the Subharmonic Synthesizer.",
+        ),
+        Tool::Tube => (
+            "tube_preamp",
+            "Requires firmware with wire format V31 or newer. Update the DSPi firmware to \
+             use the Tube Modeller.",
+        ),
+        _ => (
+            "spectrum_analyser",
+            "This firmware has no spectrum analyser.",
+        ),
+    };
+    let body = if panel::has_feature(state, feature) {
+        "This panel arrives in a later phase."
+    } else {
+        unsupported
+    };
+    Box::new(Placeholder::new(tool.title(), body))
+}
+
 impl Screens for ConsoleScreens {
     fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen> {
         match selection {
@@ -145,8 +178,9 @@ impl Screens for ConsoleScreens {
         }
     }
 
-    fn tool(&self, _state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
+    fn tool(&self, state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
         match tool {
+            Tool::Subharm | Tool::Tube | Tool::Spectrum => pending_tool(state, tool),
             Tool::Matrix => Box::new(MatrixPanel::new(self.shared.clone())),
             Tool::Crossfeed => Box::new(CrossfeedPanel::new()),
             Tool::Loudness => Box::new(LoudnessPanel::new()),
@@ -1507,7 +1541,8 @@ impl Live {
     /// `overview`, `input` (the first input), `output` (the first output),
     /// a tool's lowercase title word (`matrix`, `crossfeed`, `loudness`,
     /// `leveller`, `psybass`, `upmixer`, `signals`, `stats`, `monitor`,
-    /// `autoeq`), or `settings`. Returns false for a name it does not know.
+    /// `autoeq`, `subharm`, `tube`, `spectrum`), or `settings`. Returns false
+    /// for a name it does not know.
     pub fn show(&mut self, session: &mut Session, name: &str) -> bool {
         match name.to_ascii_lowercase().as_str() {
             "overview" => self.select(Selection::Overview),
@@ -1523,6 +1558,9 @@ impl Live {
             "stats" => self.open_tool(Tool::Stats),
             "monitor" => self.open_tool(Tool::Monitor),
             "autoeq" => self.open_tool(Tool::AutoEq),
+            "subharm" => self.open_tool(Tool::Subharm),
+            "tube" => self.open_tool(Tool::Tube),
+            "spectrum" => self.open_tool(Tool::Spectrum),
             "settings" => self.open_settings(session),
             _ => return false,
         }
@@ -2485,6 +2523,58 @@ mod tests {
         );
         l.handle_event(&mut s, ShellEvent::Select(Selection::Output(0)));
         assert!(l.shell.detail.keys().iter().any(|k| k.key == "x"));
+    }
+
+    /// `S`, `D` and `A` open the beta4 tools by their Console titles; until
+    /// their panels land, the placeholder says what the device lacks, or
+    /// that the panel is still to come when it has the feature.
+    #[test]
+    fn the_beta4_tool_keys_open_their_tools_or_say_what_is_missing() {
+        let (mut l, mut s, _) = console();
+        let frame = |l: &mut Live, w, h| crate::render_frame(w, h, |a, b| l.draw(a, b));
+        for (tool, title, missing) in [
+            (
+                Tool::Subharm,
+                "Subharmonic Synthesizer",
+                "Requires firmware with wire format V29",
+            ),
+            (
+                Tool::Tube,
+                "Tube Modeller",
+                "Requires firmware with wire format V31",
+            ),
+            (
+                Tool::Spectrum,
+                "Spectrum Analyser",
+                "This firmware has no spectrum analyser.",
+            ),
+        ] {
+            l.handle_event(&mut s, ShellEvent::OpenTool(tool));
+            assert!(matches!(l.shell.tool, Some((t, _)) if t == tool));
+            for (w, h) in [(120u16, 40u16), (80, 24)] {
+                let f = frame(&mut l, w, h);
+                assert!(f.contains(title), "{w}x{h}:\n{f}");
+                assert!(f.contains(&format!("{} closes", tool.key())), "{f}");
+                assert!(f.contains(missing), "{w}x{h}:\n{f}");
+            }
+            l.handle_event(&mut s, ShellEvent::CloseTool);
+        }
+        let name = |t: Tool| match t {
+            Tool::Subharm => "subharmonic_synth",
+            Tool::Tube => "tube_preamp",
+            _ => "spectrum_analyser",
+        };
+        for tool in [Tool::Subharm, Tool::Tube, Tool::Spectrum] {
+            l.state.caps.features.push(dspi_session::probe::Feature {
+                name: name(tool).into(),
+                present: true,
+                evidence: "test".into(),
+            });
+            l.handle_event(&mut s, ShellEvent::OpenTool(tool));
+            let f = frame(&mut l, 120, 40);
+            assert!(f.contains("This panel arrives in a later phase."), "{f}");
+            assert!(!f.contains("Requires firmware"), "{f}");
+        }
     }
 
     /// The Console's no-device state: no channel rows, a graph grid with no
