@@ -2310,6 +2310,14 @@ impl Live {
                     Applied::InputFormat { channels } => {
                         self.note(format!("{channels} input channels active"));
                     }
+                    // The ADAT link changing state (NOTIFY_EVT_ADAT_STATE and
+                    // NOTIFY_EVT_ADAT_INPUT_STATE, notify.h) moves the Stats
+                    // panel's ADAT sections on the next tick rather than at
+                    // the next two-second poll.
+                    Applied::Status(
+                        dspi_session::notify::Event::AdatState { .. }
+                        | dspi_session::notify::Event::AdatInputState { .. },
+                    ) => self.last_stats_poll = now - Duration::from_secs(3),
                     Applied::Status(_) | Applied::Nothing => {}
                 }
             }
@@ -3663,6 +3671,26 @@ mod tests {
         assert_eq!(
             l.shell.model.echo,
             "user volume changed by the system volume"
+        );
+    }
+
+    /// An ADAT state change brings the Stats poll forward, so the panel's
+    /// ADAT section follows the link without waiting out the two seconds.
+    #[test]
+    fn an_adat_state_change_brings_the_stats_poll_forward() {
+        let (mut l, mut s, _) = live();
+        l.open_tool(Tool::Stats);
+        let polled = Instant::now();
+        l.last_stats_poll = polled;
+        let mock = MockTransport::new();
+        mock.push_notification(vec![2, 8, 0, 13, 1, 1, 12, 0]);
+        let n = Notifications::start(mock.notifications().unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        l.tick(&mut s, Some(&n));
+        assert_eq!(l.state.adat_state, Some((true, true, 12)));
+        assert!(
+            l.last_stats_poll < polled,
+            "the next tick reads Stats again"
         );
     }
 
