@@ -220,15 +220,12 @@ impl InputPage {
                 },
                 None => hint("nothing to bypass"),
             },
-            Some("clear") => match self.clear_peq(state) {
-                ScreenEvent::Command(c) => Quick {
-                    fallthrough: false,
-                    hint: format!("every band off{}", self.mirror_note()),
-                    ghost: None,
-                    commands: vec![c],
-                },
-                _ => hint("nothing to clear"),
-            },
+            // Enter asks the Console's "Clear All Bands?" first (`quick_run`,
+            // `Components.swift:1643-1651`), as the header's Clear does.
+            Some("clear") => hint(&format!(
+                "Clear All Bands? · every band off{}",
+                self.mirror_note()
+            )),
             Some("name") => {
                 let name = line
                     .trim_start()
@@ -353,6 +350,17 @@ impl InputPage {
     }
 
     /// Every band on this input, and on its partner when linked, set to Off.
+    /// The Console's Clear All question (`Components.swift:1643-1651`).
+    fn ask_clear(&mut self) -> ScreenEvent {
+        self.pending = Some(Pending::ClearPeq);
+        ScreenEvent::Dialog(Dialog::confirm(
+            "Clear All Bands?",
+            "Every band in this list will be reset to its default (flat) state. \
+             This cannot be undone.",
+            vec![Button::destructive("Clear All"), Button::new("Cancel")],
+        ))
+    }
+
     fn clear_peq(&self, state: &DeviceState) -> ScreenEvent {
         let mut lines = Vec::new();
         for target in std::iter::once(self.input).chain(self.list.mirror) {
@@ -507,6 +515,16 @@ impl Screen for InputPage {
         Some(self.quick_reply(line, state))
     }
 
+    /// `clear` asks the Console's question before it writes, as the header's
+    /// Clear does.
+    fn quick_run(&mut self, line: &str, _state: &DeviceState) -> Option<ScreenEvent> {
+        let lower = line.trim().to_ascii_lowercase();
+        (!lower.contains(char::is_whitespace)
+            && super::quick::verb(&lower, &["pre", "delay", "bypass", "clear", "name"])
+                == Some("clear"))
+        .then(|| self.ask_clear())
+    }
+
     fn title(&self) -> String {
         self.name.clone()
     }
@@ -624,15 +642,7 @@ impl Screen for InputPage {
                     });
                     ScreenEvent::Handled
                 }
-                Item::Clear => {
-                    self.pending = Some(Pending::ClearPeq);
-                    ScreenEvent::Dialog(Dialog::confirm(
-                        "Clear All Bands?",
-                        "Every band in this list will be reset to its default (flat) state. \
-                         This cannot be undone.",
-                        vec![Button::destructive("Clear All"), Button::new("Cancel")],
-                    ))
-                }
+                Item::Clear => self.ask_clear(),
             },
             KeyCode::Backspace if item == Item::Preamp => {
                 ScreenEvent::Command(self.preamp_command(0.0))

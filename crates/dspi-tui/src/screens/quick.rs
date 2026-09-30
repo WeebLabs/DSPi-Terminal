@@ -119,7 +119,8 @@ mod tests {
         assert_eq!(q("3 off").commands, vec!["eq in.1 3 flat 1000 0.707 0"]);
         assert_eq!(q("delay 2.5").commands, vec!["ch.delay in.1 2.5"]);
         assert_eq!(q("name Front L").commands, vec!["ch.name 0 Front L"]);
-        assert!(!q("clear").commands.is_empty());
+        assert!(q("clear").commands.is_empty(), "Enter asks first");
+        assert!(q("clear").hint.starts_with("Clear All Bands?"));
         // Bypass All, which lost its `A` to the Spectrum Analyser.
         let bypass = q("bypass");
         assert_eq!(bypass.commands.len(), 1);

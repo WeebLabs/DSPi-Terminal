@@ -28,7 +28,9 @@ use crate::shell::ScreenEvent;
 use crate::theme::{Glyphs, Theme};
 use crate::widgets::table::Cell;
 use crate::widgets::text::q as q_text;
-use crate::widgets::{Column, DialogOutcome, KeyHelp, NumberEdit, PopupList, Table};
+use crate::widgets::{
+    Button, Column, Dialog, DialogOutcome, KeyHelp, NumberEdit, PopupList, Table,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterMode {
@@ -70,6 +72,8 @@ enum Pending {
     Family(Vec<Option<Family>>),
     Direction,
     Slope(Vec<u8>),
+    ClearAll,
+    BypassAll,
 }
 
 const PEQ_COLUMNS: &[Column] = &[
@@ -725,16 +729,61 @@ impl FilterList {
                 };
                 p.filter_type = FilterType::from_raw(xover::Meta { order, ..m }.to_type());
             }
+            Pending::ClearAll | Pending::BypassAll => return ScreenEvent::Handled,
         }
         self.field = self.field.min(self.fields(&p).len().saturating_sub(1));
         ScreenEvent::Command(self.write(state, self.band, &p))
     }
 
-    /// The list opens no dialogs of its own now that Bypass All and Clear
-    /// All live on the command bar; a page forwards its outcome regardless.
-    pub fn dialog_result(&mut self, _outcome: DialogOutcome, _state: &DeviceState) -> ScreenEvent {
-        self.pending = None;
-        ScreenEvent::Handled
+    /// The command bar's `bypass`: Bypass All over the bank showing. On the
+    /// XO tab the Console asks first, because bypassing a crossover sends
+    /// full-range audio to the driver (`Components.swift:1619-1628`; audit
+    /// D20), so this opens its critical dialog and writes on its answer.
+    pub fn bypass_all(&mut self, state: &DeviceState) -> ScreenEvent {
+        if self.mode != FilterMode::Xo {
+            return self.set_all_bypassed(state, true);
+        }
+        if self.bypass_all_command(state, true).is_none() {
+            return ScreenEvent::Handled;
+        }
+        self.pending = Some(Pending::BypassAll);
+        ScreenEvent::Dialog(
+            Dialog::confirm(
+                "Bypass this output's crossovers?",
+                "This sends full-range audio to this output with no crossover \
+                 protection, which can damage unprotected drivers such as \
+                 tweeters. Continue only if you are sure.",
+                vec![Button::destructive("Bypass All"), Button::new("Cancel")],
+            )
+            .critical(),
+        )
+    }
+
+    /// The command bar's `clear`: Clear All over the bank showing, after the
+    /// Console's question (`Components.swift:1643-1651`).
+    pub fn clear_all_confirm(&mut self, state: &DeviceState) -> ScreenEvent {
+        if self.clear_all_command(state).is_none() {
+            return ScreenEvent::Status("nothing to clear".into());
+        }
+        self.pending = Some(Pending::ClearAll);
+        ScreenEvent::Dialog(Dialog::confirm(
+            "Clear All Bands?",
+            "Every band in this list will be reset to its default (flat) state. \
+             This cannot be undone.",
+            vec![Button::destructive("Clear All"), Button::new("Cancel")],
+        ))
+    }
+
+    pub fn dialog_result(&mut self, outcome: DialogOutcome, state: &DeviceState) -> ScreenEvent {
+        let pending = self.pending.take();
+        if outcome != DialogOutcome::Button(0) {
+            return ScreenEvent::Handled;
+        }
+        match pending {
+            Some(Pending::ClearAll) => self.clear_all(state),
+            Some(Pending::BypassAll) => self.set_all_bypassed(state, true),
+            _ => ScreenEvent::Handled,
+        }
     }
 }
 
