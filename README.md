@@ -57,7 +57,8 @@ mnemonics (its Shift-Cmd-M is `M` here):
 |---|---|
 | `M` | Matrix Mixer |
 | `L` `X` `V` `P` `U` | Loudness, Crossfeed, Volume Leveller, Psychoacoustic Bass, Stereo Upmixer |
-| `G` | Test Signals |
+| `S` `D` | Subharmonic Synthesizer, Tube Modeller |
+| `G` `A` | Signal Generator, Spectrum Analyser |
 | `T` `I` | Stats for Nerbs, Interrupt Monitor |
 | `B` | AutoEQ |
 | `,` | Settings |

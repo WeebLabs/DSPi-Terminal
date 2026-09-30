@@ -29,9 +29,9 @@ use crate::probe::ControlSurfaceCaps;
 /// to reach into `dspi-proto` for the records it hands back. The codecs
 /// themselves live there, so there is exactly one decoder per record.
 pub use dspi_proto::packets::{
-    CsBinding, CsDisplayCfg, CsDisplayCfgReply, CsDisplayPage, CsDisplayStatus, CsExtStatusPacket,
-    CsGroup, CsMacro, CsMacroHeaderWire, CsMacroStep, CsNounDesc, CsStatusPacket, GPIO_UNUSED,
-    IrCommand, IrLearnResult, PacketError,
+    CsAuxStates, CsBinding, CsDisplayCfg, CsDisplayCfgReply, CsDisplayPage, CsDisplayStatus,
+    CsExtStatusPacket, CsGroup, CsMacro, CsMacroHeaderWire, CsMacroStep, CsNounDesc,
+    CsStatusPacket, GPIO_UNUSED, IrCommand, IrLearnResult, PacketError,
 };
 
 /// The names this app has always used for three of them.
@@ -47,7 +47,21 @@ pub mod status {
     pub const PENDING: u8 = 0x16;
     /// A previous SET is still queued. Back off and retry.
     pub const BUSY: u8 = 0x1B;
+    /// A value or its length is out of range (control_surfaces.h:689).
+    pub const INVALID_VALUE: u8 = 0x14;
+    /// Not an auxiliary output, or a level for an on/off one
+    /// (control_surfaces.h:714-715).
+    pub const INVALID_AUX: u8 = 0x26;
 }
+
+/// The highest auxiliary output level, 100 % in 8.8: the SET clamps there
+/// (config.h:141-142), and `CS_NOUN_AUX_LEVEL` is 0..100 %
+/// (control_surfaces.h:238-239).
+pub const AUX_LEVEL_MAX_Q8: u16 = 100 * 256;
+
+/// `wValue` that reads every slot's aux state and level in one transfer
+/// (config.h:138-140).
+pub const AUX_STATE_ALL: u16 = 0xFFFF;
 
 /// What `last_slot` in the status packet is tagged with
 /// (control_surfaces.h:592-596, :767-782).
@@ -112,7 +126,9 @@ pub fn explain_status(code: u8) -> String {
         0x16 => "accepted, not applied yet".into(),
         0x17 => "that channel or band does not exist".into(),
         0x18 => "not a gesture a button can carry".into(),
-        0x19 => "that LED clashes with another on the same PWM slice".into(),
+        // Caps v18 widened the clash to the dimmable outputs; the Console's
+        // words (`statusMessage`, DSPi_ConsoleApp.swift:7581).
+        0x19 => "this PWM pin conflicts with another dimmable LED or output".into(),
         0x1A => "another binding already uses that pin and gesture".into(),
         0x1B => "still applying a previous change; try again shortly".into(),
         0x1C => "could not write to flash".into(),
@@ -407,6 +423,78 @@ impl<'t> Surfaces<'t> {
             .control_out(op::REQ_SET_CS_DISPLAY_PAGE, page as u16, &p.encode())?;
         self.expect(tag::DISPLAY | page);
         self.wait_applied()
+    }
+
+    // ---------------------------------------------------- auxiliary outputs
+
+    /// Switch the auxiliary output in `slot` on or off, answering the device's
+    /// verdict.
+    ///
+    /// Not deferred and not a preview: the handler applies it at once, never
+    /// writes flash and never raises the unsaved flag (config.h:136-137). It is
+    /// also not refused on the wire. `config.h` says the SET stalls on a slot
+    /// that is not an aux output, but the handler only records
+    /// `CS_STATUS_INVALID_AUX` in the status packet and the data stage is
+    /// acknowledged all the same (vendor_commands.c:1496-1531, 4506-4512), so
+    /// the status packet is the only place a refusal shows.
+    pub fn set_aux_state(&mut self, slot: u8, on: bool) -> Result<u8> {
+        let before = self.read_status()?;
+        self.t
+            .control_out(op::REQ_SET_CS_AUX_STATE, slot as u16, &[u8::from(on)])?;
+        self.aux_outcome(slot, before, |s| s.is_on(slot as usize) == on)
+    }
+
+    /// Set a dimmable output's level, 8.8 percent, clamped to 100 %
+    /// (config.h:141-142). On an on/off output the device refuses it with
+    /// `CS_STATUS_INVALID_AUX`.
+    pub fn set_aux_level(&mut self, slot: u8, level_q8: u16) -> Result<u8> {
+        let level = level_q8.min(AUX_LEVEL_MAX_Q8);
+        let before = self.read_status()?;
+        self.t
+            .control_out(op::REQ_SET_CS_AUX_LEVEL, slot as u16, &level.to_le_bytes())?;
+        self.aux_outcome(slot, before, |s| {
+            s.level_q8.get(slot as usize).copied() == Some(level)
+        })
+    }
+
+    /// What an aux SET came to.
+    ///
+    /// A rejection writes `last_status` and `last_slot`; a success writes
+    /// neither (vendor_commands.c:1502-1536), so the previous write's failure
+    /// can still be standing when this one worked. A failure is reported only
+    /// when the packet names this slot with one of the two aux refusals and
+    /// either it is new since the write or the output did not take the value.
+    fn aux_outcome(
+        &mut self,
+        slot: u8,
+        before: CsStatusPacket,
+        took: impl Fn(&CsAuxStates) -> bool,
+    ) -> Result<u8> {
+        let after = self.read_status()?;
+        let refused = after.last_slot == slot
+            && matches!(
+                after.last_status,
+                status::INVALID_AUX | status::INVALID_VALUE
+            );
+        if !refused {
+            return Ok(status::SUCCESS);
+        }
+        let fresh = (after.last_status, after.last_slot) != (before.last_status, before.last_slot);
+        if fresh || !took(&self.read_aux_states()?) {
+            return Ok(after.last_status);
+        }
+        Ok(status::SUCCESS)
+    }
+
+    /// Every slot's live aux state and level, one 48-byte read (config.h:
+    /// 138-140). Slots without a running aux output read zero.
+    pub fn read_aux_states(&mut self) -> Result<CsAuxStates> {
+        let d = self.t.control_in(
+            op::REQ_GET_CS_AUX_STATE,
+            AUX_STATE_ALL,
+            CsAuxStates::SIZE as u16,
+        )?;
+        Ok(CsAuxStates::decode(&d)?)
     }
 
     // ---------------------------------------------------------------- reads
@@ -1305,5 +1393,124 @@ mod tests {
         assert_eq!(save(&mut t).unwrap(), 0);
         assert_eq!(revert(&mut t).unwrap(), 0);
         assert!(t.log().iter().all(|e| e.direction == Direction::In));
+    }
+
+    /// The 48-byte aux block with one slot set.
+    fn aux_block(slot: usize, on: bool, level: u16) -> Vec<u8> {
+        let mut a = CsAuxStates::default();
+        a.state[slot] = u8::from(on);
+        a.level_q8[slot] = level;
+        a.encode().to_vec()
+    }
+
+    /// An aux SET is immediate: one OUT with the byte, then the status packet
+    /// read either side of it, and no pending wait.
+    #[test]
+    fn an_aux_switch_is_one_write_and_its_status() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_STATE, vec![])
+            .data(op::REQ_GET_CS_STATUS, status_bytes(0, status::SUCCESS));
+        let code = surfaces(&mut t).set_aux_state(10, true).unwrap();
+        assert_eq!(code, status::SUCCESS);
+        let log = t.log();
+        let set = log
+            .iter()
+            .find(|e| e.opcode == op::REQ_SET_CS_AUX_STATE)
+            .expect("the SET");
+        assert_eq!(set.direction, Direction::Out);
+        assert_eq!(set.value, 10, "the slot rides in wValue");
+        assert_eq!(set.payload, vec![1]);
+        assert_eq!(log.len(), 3, "status, SET, status: {log:?}");
+    }
+
+    /// The level is 8.8 percent, little-endian, and never past 100 %.
+    #[test]
+    fn an_aux_level_is_clamped_to_one_hundred_percent() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_LEVEL, vec![])
+            .data(op::REQ_GET_CS_STATUS, status_bytes(0, status::SUCCESS));
+        surfaces(&mut t).set_aux_level(11, 30_000).unwrap();
+        let set = t
+            .log()
+            .into_iter()
+            .find(|e| e.opcode == op::REQ_SET_CS_AUX_LEVEL)
+            .expect("the SET");
+        assert_eq!(set.payload, AUX_LEVEL_MAX_Q8.to_le_bytes().to_vec());
+        assert_eq!(set.payload, vec![0x00, 0x64], "25600 LE");
+    }
+
+    /// A refused aux SET is acknowledged on the wire all the same; only the
+    /// status packet says so, under the slot it was for.
+    #[test]
+    fn a_refused_aux_write_reports_invalid_aux() {
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_LEVEL, vec![])
+            .reply(
+                op::REQ_GET_CS_STATUS,
+                Reply::Sequence(vec![
+                    Reply::Data(status_bytes(0, status::SUCCESS)),
+                    Reply::Data(status_bytes(10, status::INVALID_AUX)),
+                ]),
+            );
+        let code = surfaces(&mut t).set_aux_level(10, 128 * 256).unwrap();
+        assert_eq!(code, status::INVALID_AUX);
+        assert_eq!(
+            explain_status(code),
+            "the target isn't an auxiliary output, or a level control needs a dimmable one"
+        );
+    }
+
+    /// A success writes nothing to the status packet, so a refusal left by
+    /// the previous write to the same slot is still there. The readback
+    /// settles it: the output took the value, so this write worked.
+    #[test]
+    fn a_standing_refusal_is_not_taken_for_this_writes() {
+        let refused = status_bytes(10, status::INVALID_AUX);
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_STATE, vec![])
+            .data(op::REQ_GET_CS_STATUS, refused.clone())
+            .data(op::REQ_GET_CS_AUX_STATE, aux_block(10, true, 0));
+        assert_eq!(
+            surfaces(&mut t).set_aux_state(10, true).unwrap(),
+            status::SUCCESS
+        );
+        // The same standing status, but the output did not move: refused.
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_STATE, vec![])
+            .data(op::REQ_GET_CS_STATUS, refused)
+            .data(op::REQ_GET_CS_AUX_STATE, aux_block(10, false, 0));
+        assert_eq!(
+            surfaces(&mut t).set_aux_state(10, true).unwrap(),
+            status::INVALID_AUX
+        );
+        // Another slot's refusal is not this write's.
+        let mut t = MockTransport::new()
+            .data(op::REQ_SET_CS_AUX_STATE, vec![])
+            .data(op::REQ_GET_CS_STATUS, status_bytes(3, status::INVALID_AUX));
+        assert_eq!(
+            surfaces(&mut t).set_aux_state(10, false).unwrap(),
+            status::SUCCESS
+        );
+    }
+
+    /// Every slot's state and level in one transfer, wValue 0xFFFF.
+    #[test]
+    fn the_aux_block_is_one_read_of_every_slot() {
+        let mut t =
+            MockTransport::new().data(op::REQ_GET_CS_AUX_STATE, aux_block(11, true, 0x3200));
+        let a = surfaces(&mut t).read_aux_states().unwrap();
+        assert!(a.is_on(11) && !a.is_on(10));
+        assert_eq!(a.level_percent(11), 50.0);
+        assert_eq!(t.log()[0].value, AUX_STATE_ALL);
+    }
+
+    /// Caps v18 widened the PWM clash to the dimmable outputs, and the
+    /// Console's message says so.
+    #[test]
+    fn the_pwm_clash_names_the_dimmable_outputs() {
+        assert_eq!(
+            explain_status(0x19),
+            "this PWM pin conflicts with another dimmable LED or output"
+        );
     }
 }
