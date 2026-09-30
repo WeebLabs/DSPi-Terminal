@@ -142,6 +142,70 @@ pub struct Upmix {
     pub decorr: f32,
 }
 
+/// `WireSubharmParams` (bulk_params.h:378-400). Solo is not here: it is
+/// runtime only and lives in [`DeviceState::subharm_solo`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Subharm {
+    pub enabled: bool,
+    pub output_mask: u16,
+    /// The 24-36 Hz sub; `SUBHARM_LEVEL_MIN` (-30) is the band off.
+    pub low_db: f32,
+    /// The 36-56 Hz sub.
+    pub high_db: f32,
+    /// The 70 Hz bell.
+    pub boost_db: f32,
+    /// The 56-80 Hz sub.
+    pub top_db: f32,
+    pub select_depth_pct: f32,
+    pub select_hold_ms: f32,
+    /// `SUBHARM_CEILING_MAX` (0 dBFS) is the ceiling off.
+    pub ceiling_db: f32,
+    /// `SUBHARM_SELECT_*` (subharm.h:71-73).
+    pub select_mode: u8,
+    pub link_pairs: bool,
+}
+
+/// `WireTubeParams` (bulk_params.h:403-427).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tube {
+    pub enabled: bool,
+    /// 0 is Custom, 1..=`TUBE_TYPE_MAX` a row of [`crate::tube::TYPES`].
+    pub tube_type: u8,
+    /// `0..=TUBE_RECT_MAX`, a row of [`crate::tube::RECTIFIERS`].
+    pub rectifier: u8,
+    /// The output stage.
+    pub xfmr_enabled: bool,
+    pub output_mask: u16,
+    pub drive_db: f32,
+    pub bias_pct: f32,
+    pub asym_db: f32,
+    pub hardness_pct: f32,
+    pub sag_pct: f32,
+    pub xfmr_damping: f32,
+    pub xfmr_res_hz: f32,
+    pub mix_pct: f32,
+    pub trim_db: f32,
+}
+
+/// One `WireLimiterOutput` (bulk_params.h:436-442).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LimiterOutput {
+    pub enabled: bool,
+    /// 0 unlinked, 1..=`LIMITER_LINK_GROUP_MAX`.
+    pub link_group: u8,
+    pub threshold_db: f32,
+    pub release_ms: f32,
+}
+
+/// `OUTPUT_CONFIG_MODE_*` (config.h:497-498): whether the output
+/// configuration, and from wire V32 the limiters, is stored on its own or with
+/// each preset. The header's names are not generated, so they are here.
+pub mod output_config_mode {
+    pub const INDEPENDENT: u8 = 0;
+    /// The firmware's default.
+    pub const WITH_PRESET: u8 = 1;
+}
+
 /// What changed since the last snapshot, one line each, categorised as the
 /// Console's `PresetDiff` is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,16 +217,25 @@ pub struct DiffLine {
 /// The preset-relevant state at a point in time: the bulk packet with the
 /// runtime-only fields blanked, so two snapshots compare equal exactly when
 /// the device would save the same preset.
+///
+/// The output-config mode is kept with the bytes, as the Console's snapshot
+/// keeps `outputConfigMode`: the limiters belong to the preset only in
+/// WITH_PRESET mode (bulk_params.c:1008 applies them from a preset only
+/// then), so the comparison and the diff are gated on the live mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetSnapshot {
     bytes: Vec<u8>,
+    output_config_mode: u8,
 }
 
 impl PresetSnapshot {
     pub fn capture(state: &DeviceState) -> Self {
         let mut bytes = state.bulk.as_bytes().to_vec();
         Self::blank_runtime(&mut bytes);
-        Self { bytes }
+        Self {
+            bytes,
+            output_config_mode: state.output_config_mode,
+        }
     }
 
     /// Zero the fields that change without anyone editing a preset: the
@@ -177,14 +250,22 @@ impl PresetSnapshot {
 
     /// Whether a live packet would capture to this snapshot, compared in
     /// place: this runs every frame, so it must not allocate.
-    pub fn matches(&self, live: &[u8]) -> bool {
+    ///
+    /// `output_config_mode` is the live mode. In INDEPENDENT mode the limiter
+    /// section is the output configuration's, not the preset's, so it is left
+    /// out of the comparison, as the Console's diff leaves it out.
+    pub fn matches(&self, live: &[u8], output_config_mode: u8) -> bool {
         if live.len() != self.bytes.len() {
             return false;
         }
         let (_, hoff, hlen) = section("header");
         let (_, loff, _) = section("lg_sound_sync");
+        let (_, moff, mlen) = section("limiter");
+        let limiters = output_config_mode == output_config_mode::WITH_PRESET;
         live.iter().zip(&self.bytes).enumerate().all(|(i, (a, b))| {
-            let blanked = (i >= hoff && i < hoff + hlen) || (i > loff && i < loff + 4);
+            let blanked = (i >= hoff && i < hoff + hlen)
+                || (i > loff && i < loff + 4)
+                || (!limiters && i >= moff && i < moff + mlen);
             blanked || a == b
         })
     }
@@ -429,6 +510,49 @@ impl PresetSnapshot {
                 line(&mut out, "Psybass", "Psychoacoustic Bass parameters".into());
             }
         }
+        if differs("subharm", a, b) {
+            diff_subharm(
+                &decode_subharm(sec(a, "subharm")),
+                &decode_subharm(sec(b, "subharm")),
+                &mut out,
+            );
+        }
+        if differs("tube", a, b) {
+            diff_tube(
+                &decode_tube(sec(a, "tube")),
+                &decode_tube(sec(b, "tube")),
+                &mut out,
+            );
+        }
+        // The limiters follow the output-config mode like the pins: only in
+        // WITH_PRESET mode does a preset restore them, so only there are they
+        // a preset change. The gate is the live mode, as the Console's is
+        // (PresetSnapshot.swift:355-362).
+        if other.output_config_mode == output_config_mode::WITH_PRESET && differs("limiter", a, b) {
+            let (la, lb) = (sec(a, "limiter"), sec(b, "limiter"));
+            for o in 0..num_outputs.min(9) {
+                let (x, y) = (
+                    decode_limiter(&la[o * 12..o * 12 + 12]),
+                    decode_limiter(&lb[o * 12..o * 12 + 12]),
+                );
+                if x != y {
+                    // The output's channel name, from the older snapshot as
+                    // the other lines take it; the Console's fallback is the
+                    // zero-based output index.
+                    let at = (num_inputs + o) * 32;
+                    let n = sec(a, "channel_names")
+                        .get(at..at + 32)
+                        .map(cstr)
+                        .unwrap_or_default();
+                    let n = if n.is_empty() {
+                        format!("Output {o}")
+                    } else {
+                        n
+                    };
+                    diff_limiter(&n, &x, &y, &mut out);
+                }
+            }
+        }
         if differs("upmix", a, b) {
             let (x, y) = (decode_upmix(sec(a, "upmix")), decode_upmix(sec(b, "upmix")));
             if x.enabled != y.enabled {
@@ -459,6 +583,246 @@ impl PresetSnapshot {
 
 fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
+}
+
+// The beta4 sections' lines are the Console's own, word for word
+// (PresetSnapshot.swift:261-378), with its arrow, one line per field.
+
+/// The Console's `formatVal` (PresetSnapshot.swift:665-670): whole numbers
+/// without a decimal, the rest to one place.
+fn format_val(v: f32) -> String {
+    if v == v.round() && v.abs() < 100_000.0 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+fn enabled(b: bool) -> &'static str {
+    if b { "enabled" } else { "disabled" }
+}
+
+fn diff_subharm(o: &Subharm, n: &Subharm, out: &mut Vec<DiffLine>) {
+    use dspi_proto::generated::ranges::{SUBHARM_CEILING_MAX, SUBHARM_LEVEL_MIN};
+    let mut line = |text: String| {
+        out.push(DiffLine {
+            category: "Subharm",
+            text,
+        })
+    };
+    // The floor is the band off, and a ceiling at full scale is the stage
+    // off, so both are named rather than given as levels.
+    let level = |db: f32| {
+        if db <= SUBHARM_LEVEL_MIN {
+            "off".to_string()
+        } else {
+            format!("{} dB", format_val(db))
+        }
+    };
+    let ceiling = |db: f32| {
+        if db >= SUBHARM_CEILING_MAX {
+            "off".to_string()
+        } else {
+            format!("{} dBFS", format_val(db))
+        }
+    };
+    // SUBHARM_SELECT_* (subharm.h:71-73).
+    let select = |m: u8| match m as u16 {
+        dspi_proto::generated::subharm::SUBHARM_SELECT_PERCUSSIVE => "percussive",
+        dspi_proto::generated::subharm::SUBHARM_SELECT_SUSTAINED => "sustained",
+        _ => "all material",
+    };
+    if o.enabled != n.enabled {
+        line(format!("Subharmonic Synthesizer: {}", enabled(n.enabled)));
+    }
+    if o.output_mask != n.output_mask {
+        line(format!(
+            "Subharm outputs: 0x{:04X} → 0x{:04X}",
+            o.output_mask, n.output_mask
+        ));
+    }
+    for (label, a, b) in [
+        ("24-36 Hz", o.low_db, n.low_db),
+        ("36-56 Hz", o.high_db, n.high_db),
+        ("56-80 Hz", o.top_db, n.top_db),
+    ] {
+        if a != b {
+            line(format!("Subharm {label}: {} → {}", level(a), level(b)));
+        }
+    }
+    if o.select_mode != n.select_mode {
+        line(format!(
+            "Subharm selectivity: {} → {}",
+            select(o.select_mode),
+            select(n.select_mode)
+        ));
+    }
+    if o.select_depth_pct != n.select_depth_pct {
+        line(format!(
+            "Subharm selectivity depth: {}% → {}%",
+            format_val(o.select_depth_pct),
+            format_val(n.select_depth_pct)
+        ));
+    }
+    if o.select_hold_ms != n.select_hold_ms {
+        line(format!(
+            "Subharm selectivity hold: {} ms → {} ms",
+            format_val(o.select_hold_ms),
+            format_val(n.select_hold_ms)
+        ));
+    }
+    if o.ceiling_db != n.ceiling_db {
+        line(format!(
+            "Subharm sub ceiling: {} → {}",
+            ceiling(o.ceiling_db),
+            ceiling(n.ceiling_db)
+        ));
+    }
+    if o.link_pairs != n.link_pairs {
+        line(format!(
+            "Subharm pair link: {}",
+            if n.link_pairs {
+                "linked"
+            } else {
+                "independent"
+            }
+        ));
+    }
+    if o.boost_db != n.boost_db {
+        line(format!(
+            "Subharm LF boost: {} dB → {} dB",
+            format_val(o.boost_db),
+            format_val(n.boost_db)
+        ));
+    }
+}
+
+/// A type change moves the four character values too, so their lines come
+/// with it; the Console expects that rather than treating it as noise.
+fn diff_tube(o: &Tube, n: &Tube, out: &mut Vec<DiffLine>) {
+    use crate::tube::{rectifier_name, type_name};
+    let mut line = |text: String| {
+        out.push(DiffLine {
+            category: "Tube",
+            text,
+        })
+    };
+    let pair =
+        |a: f32, b: f32, unit: &str| format!("{}{unit} → {}{unit}", format_val(a), format_val(b));
+    if o.enabled != n.enabled {
+        line(format!("Tube Modeller: {}", enabled(n.enabled)));
+    }
+    if o.output_mask != n.output_mask {
+        line(format!(
+            "Tube outputs: 0x{:04X} → 0x{:04X}",
+            o.output_mask, n.output_mask
+        ));
+    }
+    if o.tube_type != n.tube_type {
+        line(format!(
+            "Tube type: {} → {}",
+            type_name(o.tube_type),
+            type_name(n.tube_type)
+        ));
+    }
+    if o.drive_db != n.drive_db {
+        line(format!(
+            "Tube drive: {}",
+            pair(o.drive_db, n.drive_db, " dB")
+        ));
+    }
+    if o.bias_pct != n.bias_pct {
+        line(format!("Tube bias: {}", pair(o.bias_pct, n.bias_pct, "%")));
+    }
+    if o.asym_db != n.asym_db {
+        line(format!(
+            "Tube asymmetry: {}",
+            pair(o.asym_db, n.asym_db, " dB")
+        ));
+    }
+    if o.hardness_pct != n.hardness_pct {
+        line(format!(
+            "Tube knee hardness: {}",
+            pair(o.hardness_pct, n.hardness_pct, "%")
+        ));
+    }
+    if o.sag_pct != n.sag_pct {
+        line(format!("Tube sag: {}", pair(o.sag_pct, n.sag_pct, "%")));
+    }
+    if o.rectifier != n.rectifier {
+        line(format!(
+            "Tube rectifier: {} → {}",
+            rectifier_name(o.rectifier),
+            rectifier_name(n.rectifier)
+        ));
+    }
+    if o.xfmr_enabled != n.xfmr_enabled {
+        line(format!("Tube output stage: {}", enabled(n.xfmr_enabled)));
+    }
+    if o.xfmr_damping != n.xfmr_damping {
+        line(format!(
+            "Tube damping factor: {}",
+            pair(o.xfmr_damping, n.xfmr_damping, "")
+        ));
+    }
+    if o.xfmr_res_hz != n.xfmr_res_hz {
+        // The Console gives the unit once, at the end.
+        line(format!(
+            "Tube speaker resonance: {} → {} Hz",
+            format_val(o.xfmr_res_hz),
+            format_val(n.xfmr_res_hz)
+        ));
+    }
+    if o.mix_pct != n.mix_pct {
+        line(format!("Tube mix: {}", pair(o.mix_pct, n.mix_pct, "%")));
+    }
+    if o.trim_db != n.trim_db {
+        line(format!(
+            "Tube output trim: {}",
+            pair(o.trim_db, n.trim_db, " dB")
+        ));
+    }
+}
+
+/// The Console's `limiterLinkGroupName` (Constants.swift:448-450).
+pub fn limiter_link_group_name(group: u8) -> String {
+    if group == 0 {
+        "Unlinked".into()
+    } else {
+        format!("Group {group}")
+    }
+}
+
+fn diff_limiter(name: &str, o: &LimiterOutput, n: &LimiterOutput, out: &mut Vec<DiffLine>) {
+    let mut line = |text: String| {
+        out.push(DiffLine {
+            category: "Limiter",
+            text,
+        })
+    };
+    if o.enabled != n.enabled {
+        line(format!("{name} limiter: {}", enabled(n.enabled)));
+    }
+    if o.threshold_db != n.threshold_db {
+        line(format!(
+            "{name} limiter threshold: {:.1} → {:.1} dBFS",
+            o.threshold_db, n.threshold_db
+        ));
+    }
+    if o.release_ms != n.release_ms {
+        line(format!(
+            "{name} limiter release: {} ms → {} ms",
+            format_val(o.release_ms),
+            format_val(n.release_ms)
+        ));
+    }
+    if o.link_group != n.link_group {
+        line(format!(
+            "{name} limiter link: {} → {}",
+            limiter_link_group_name(o.link_group),
+            limiter_link_group_name(n.link_group)
+        ));
+    }
 }
 
 fn cstr(b: &[u8]) -> String {
@@ -555,6 +919,55 @@ fn decode_upmix(b: &[u8]) -> Upmix {
     }
 }
 
+/// bulk_params.h:385-400: two bytes, the mask, seven floats, two bytes and
+/// two reserved.
+fn decode_subharm(b: &[u8]) -> Subharm {
+    Subharm {
+        enabled: b[0] != 0,
+        output_mask: u16_at(b, 2),
+        low_db: f32_at(b, 4),
+        high_db: f32_at(b, 8),
+        boost_db: f32_at(b, 12),
+        top_db: f32_at(b, 16),
+        select_depth_pct: f32_at(b, 20),
+        select_hold_ms: f32_at(b, 24),
+        ceiling_db: f32_at(b, 28),
+        select_mode: b[32],
+        link_pairs: b[33] != 0,
+    }
+}
+
+/// bulk_params.h:410-427: four bytes, the mask, two reserved, then nine
+/// floats and a reserved one.
+fn decode_tube(b: &[u8]) -> Tube {
+    Tube {
+        enabled: b[0] != 0,
+        tube_type: b[1],
+        rectifier: b[2],
+        xfmr_enabled: b[3] != 0,
+        output_mask: u16_at(b, 4),
+        drive_db: f32_at(b, 8),
+        bias_pct: f32_at(b, 12),
+        asym_db: f32_at(b, 16),
+        hardness_pct: f32_at(b, 20),
+        sag_pct: f32_at(b, 24),
+        xfmr_damping: f32_at(b, 28),
+        xfmr_res_hz: f32_at(b, 32),
+        mix_pct: f32_at(b, 36),
+        trim_db: f32_at(b, 40),
+    }
+}
+
+/// bulk_params.h:436-442: one 12-byte record.
+fn decode_limiter(b: &[u8]) -> LimiterOutput {
+    LimiterOutput {
+        enabled: b[0] != 0,
+        link_group: b[1],
+        threshold_db: f32_at(b, 4),
+        release_ms: f32_at(b, 8),
+    }
+}
+
 /// What a notification did to the state, for the screens to react to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Applied {
@@ -598,9 +1011,41 @@ pub struct DeviceState {
     pub adat_input_state: Option<(u8, u32, u8)>,
     pub ir_learn: Option<(u8, u8, u32)>,
     /// The last auxiliary output change, `(slot, state, level_q8)`
-    /// (`NOTIFY_EVT_CS_AUX`, notify.h:78-83). A per-slot view of the aux
-    /// outputs is phase B2; this keeps the event rather than dropping it.
+    /// (`NOTIFY_EVT_CS_AUX`, notify.h:78-83). The per-slot view is
+    /// [`Self::cs_aux_states`]; this keeps the event itself for the status
+    /// views.
     pub cs_aux: Option<(u8, u8, u16)>,
+    /// Every auxiliary output's state and level (`REQ_GET_CS_AUX_STATE` with
+    /// `wValue = 0xFFFF`, config.h:138-140). `None` until something reads it
+    /// with [`Self::refresh_cs_aux`]; after that every `NOTIFY_EVT_CS_AUX`
+    /// patches its slot, so it stays current without polling.
+    pub cs_aux_states: Option<dspi_proto::packets::CsAuxStates>,
+    /// The subharmonic synthesizer's solo (`REQ_GET_SUBHARM_SOLO`,
+    /// config.h:202). Runtime only, not on the wire and never notified, so a
+    /// panel that shows it polls [`Self::refresh_subharm_solo`]. `None` until
+    /// read, and on a device without the feature.
+    pub subharm_solo: Option<bool>,
+    /// The worst-case gain the synthesizer adds, dB (`REQ_GET_SUBHARM_HEADROOM`,
+    /// config.h:194); 0 while it is off. Not on the wire either.
+    pub subharm_headroom_db: Option<f32>,
+    /// The synthesized sub's peak per output (`REQ_GET_SUBHARM_METER`,
+    /// config.h:200), polled while a panel shows it.
+    pub subharm_meter: Option<dspi_proto::packets::SubharmMeter>,
+    /// Gain reduction per output (`REQ_LIMITER` index `LIMITER_GET_METER`,
+    /// limiter.h:19), polled while a page shows it.
+    pub limiter_meter: Option<dspi_proto::packets::LimiterMeter>,
+    /// Whether the lookahead delay is in the path (`LIMITER_GET_STATUS`,
+    /// limiter.h:20).
+    pub limiter_status: Option<dspi_proto::packets::LimiterStatus>,
+    /// `OUTPUT_CONFIG_MODE_*` (config.h:497-498), from the preset directory.
+    /// It decides whether a limiter edit is a preset change or an output
+    /// configuration change. WITH_PRESET, the firmware's default, until read.
+    pub output_config_mode: u8,
+    /// The limiter records as they stood before the first edit since the
+    /// output configuration was last saved, in INDEPENDENT mode: the
+    /// limiter part of the Console's `OutputConfigSnapshot`. See
+    /// [`Self::begin_limiter_edit`].
+    pub limiter_baseline: Option<Vec<u8>>,
     /// The upmixer's telemetry (`REQ_UPMIX_GET_STATUS`, config.h:187-191).
     ///
     /// The notification endpoint does not carry it, so unlike the sub-states
@@ -636,6 +1081,14 @@ impl DeviceState {
             adat_input_state: None,
             ir_learn: None,
             cs_aux: None,
+            cs_aux_states: None,
+            subharm_solo: None,
+            subharm_headroom_db: None,
+            subharm_meter: None,
+            limiter_meter: None,
+            limiter_status: None,
+            output_config_mode: output_config_mode::WITH_PRESET,
+            limiter_baseline: None,
             upmix_status: None,
             stale: false,
             connected: true,
@@ -658,7 +1111,7 @@ impl DeviceState {
 
     pub fn has_unsaved_changes(&self) -> bool {
         match &self.saved {
-            Some(s) => !s.matches(self.bulk.as_bytes()),
+            Some(s) => !s.matches(self.bulk.as_bytes(), self.output_config_mode),
             None => false,
         }
     }
@@ -778,6 +1231,17 @@ impl DeviceState {
                 ..
             } => {
                 self.cs_aux = Some((*slot, *state, *level_q8));
+                // Patch the slot into the block once it has been read. A slot
+                // past the block is ignored rather than trusted.
+                if let Some(all) = self.cs_aux_states.as_mut()
+                    && let (Some(s), Some(l)) = (
+                        all.state.get_mut(*slot as usize),
+                        all.level_q8.get_mut(*slot as usize),
+                    )
+                {
+                    *s = *state;
+                    *l = *level_q8;
+                }
                 Applied::Status(n.event.clone())
             }
             Event::MasterVolume(_) | Event::Idle => Applied::Nothing,
@@ -951,6 +1415,113 @@ impl DeviceState {
 
     pub fn upmix(&self) -> Upmix {
         decode_upmix(sec(self.bulk.as_bytes(), "upmix"))
+    }
+
+    pub fn subharm(&self) -> Subharm {
+        decode_subharm(sec(self.bulk.as_bytes(), "subharm"))
+    }
+
+    pub fn tube(&self) -> Tube {
+        decode_tube(sec(self.bulk.as_bytes(), "tube"))
+    }
+
+    /// One output's limiter. The wire always carries nine records; the ones
+    /// past this device's outputs are zero on a read and ignored on a write
+    /// (bulk_params.h:432-434), so they are `None` here.
+    pub fn limiter(&self, output: usize) -> Option<LimiterOutput> {
+        if output >= self.caps.num_outputs as usize {
+            return None;
+        }
+        let l = sec(self.bulk.as_bytes(), "limiter");
+        l.get(output * 12..output * 12 + 12).map(decode_limiter)
+    }
+
+    /// Every output's limiter, in output order.
+    pub fn limiters(&self) -> Vec<LimiterOutput> {
+        (0..self.caps.num_outputs as usize)
+            .filter_map(|o| self.limiter(o))
+            .collect()
+    }
+
+    // The limiters as output configuration.
+    //
+    // In INDEPENDENT mode a limiter edit is not a preset change: it lives
+    // with the pins and the clocks, is stored by Save Output Configuration
+    // (0x52, config.h:259-269) and is put back by Revert, as part of the
+    // output-config category of the Console's save bar
+    // (DSPi_ConsoleApp.swift:950-1115).
+    // Limiter edits are made from the output page, not from Settings, so the
+    // baseline lives here, on the state every screen shares, rather than in
+    // the Settings screen, which is rebuilt each time it opens.
+
+    fn limiter_bytes(&self) -> Vec<u8> {
+        sec(self.bulk.as_bytes(), "limiter").to_vec()
+    }
+
+    /// Call before a write that may change a limiter: keeps the records it
+    /// is about to replace, the Console's `beginOutputEdit`
+    /// (DSPi_ConsoleApp.swift:1109-1115). Only in INDEPENDENT mode, and only
+    /// when nothing is unsaved yet, so the baseline stays the saved state
+    /// across a run of edits.
+    pub fn begin_limiter_edit(&mut self) {
+        if self.output_config_mode != output_config_mode::INDEPENDENT || self.limiter_unsaved() {
+            return;
+        }
+        self.limiter_baseline = Some(self.limiter_bytes());
+    }
+
+    /// Whether the limiters differ from the saved output configuration.
+    ///
+    /// Compared rather than flagged, which is the one departure from the
+    /// Console: an edit put back by hand, or by Revert, reads as saved again,
+    /// the way the preset marker does.
+    pub fn limiter_unsaved(&self) -> bool {
+        self.output_config_mode == output_config_mode::INDEPENDENT
+            && self
+                .limiter_baseline
+                .as_deref()
+                .is_some_and(|b| b != sec(self.bulk.as_bytes(), "limiter"))
+    }
+
+    /// The output configuration was saved (0x52): the live limiters are the
+    /// saved ones now.
+    pub fn limiter_saved(&mut self) {
+        self.limiter_baseline = None;
+    }
+
+    /// The commands that put the baseline back, in the Console's order
+    /// (`applyLimiterSettings`, Commands.swift:1658-1672): unlink the outputs
+    /// that will change, so that one write does not move a whole group
+    /// (limiter.c:143-194), then threshold, release and enable, then the
+    /// groups again in ascending order, each joining output adopting the
+    /// settings its lowest member already has.
+    pub fn limiter_restore_commands(&self) -> Vec<String> {
+        let Some(base) = self.limiter_baseline.as_deref() else {
+            return Vec::new();
+        };
+        let targets: Vec<(usize, LimiterOutput)> = (0..self.caps.num_outputs as usize)
+            .filter_map(|o| {
+                let want = decode_limiter(base.get(o * 12..o * 12 + 12)?);
+                (self.limiter(o)? != want).then_some((o, want))
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (o, _) in &targets {
+            if self.limiter(*o).is_some_and(|l| l.link_group != 0) {
+                out.push(format!("limit.link {o} 0"));
+            }
+        }
+        for (o, want) in &targets {
+            out.push(format!("limit.threshold {o} {}", want.threshold_db));
+            out.push(format!("limit.release {o} {}", want.release_ms));
+            out.push(format!("limit.on {o} {}", on_off(want.enabled)));
+        }
+        for (o, want) in &targets {
+            if want.link_group != 0 {
+                out.push(format!("limit.link {o} {}", want.link_group));
+            }
+        }
+        out
     }
 }
 
@@ -1207,5 +1778,395 @@ mod tests {
         assert!(summary.ends_with("- and 2 more"), "{summary}");
         s.mark_saved();
         assert!(!s.has_unsaved_changes());
+    }
+
+    // -- the beta4 sections -------------------------------------------------
+
+    fn put_f32(s: &mut DeviceState, off: usize, v: f32) {
+        s.bulk.patch(off, &v.to_le_bytes()).unwrap();
+    }
+
+    /// The firmware's factory subharm section (subharm.h:85-94), at 5944.
+    fn default_subharm(s: &mut DeviceState) {
+        let (_, o, _) = section("subharm");
+        assert_eq!(o, 5944);
+        s.bulk.patch(o, &[0, 0, 0xFF, 0xFF]);
+        for (at, v) in [(4, 0.0), (8, 0.0), (12, 0.0), (16, -30.0)] {
+            put_f32(s, o + at, v);
+        }
+        for (at, v) in [(20, 100.0), (24, 150.0), (28, 0.0)] {
+            put_f32(s, o + at, v);
+        }
+        s.bulk.patch(o + 32, &[0, 1]);
+    }
+
+    /// The firmware's factory tube section (tube.h:60-73), at 5980.
+    fn default_tube(s: &mut DeviceState) {
+        let (_, o, _) = section("tube");
+        assert_eq!(o, 5980);
+        s.bulk.patch(o, &[0, 1, 1, 1, 0xFF, 0xFF]);
+        for (i, v) in [-12.0, 10.0, 3.0, 40.0, 15.0, 2.0, 95.0, 100.0, 0.0]
+            .iter()
+            .enumerate()
+        {
+            put_f32(s, o + 8 + 4 * i, *v);
+        }
+    }
+
+    /// Every output's limiter at the firmware's defaults (limiter.h:32-33),
+    /// at 6028.
+    fn default_limiters(s: &mut DeviceState) {
+        let (_, o, _) = section("limiter");
+        assert_eq!(o, 6028);
+        for k in 0..9 {
+            put_f32(s, o + 12 * k + 4, -1.0);
+            put_f32(s, o + 12 * k + 8, 100.0);
+        }
+    }
+
+    fn beta4_state() -> DeviceState {
+        let mut s = state();
+        default_subharm(&mut s);
+        default_tube(&mut s);
+        default_limiters(&mut s);
+        s.mark_saved();
+        s
+    }
+
+    fn texts(s: &DeviceState) -> Vec<String> {
+        s.unsaved_diff()
+            .iter()
+            .map(|d| format!("{}: {}", d.category, d.text))
+            .collect()
+    }
+
+    #[test]
+    fn the_subharm_section_decodes_field_by_field() {
+        let s = beta4_state();
+        assert_eq!(
+            s.subharm(),
+            Subharm {
+                enabled: false,
+                output_mask: 0xFFFF,
+                low_db: 0.0,
+                high_db: 0.0,
+                boost_db: 0.0,
+                top_db: -30.0,
+                select_depth_pct: 100.0,
+                select_hold_ms: 150.0,
+                ceiling_db: 0.0,
+                select_mode: 0,
+                link_pairs: true,
+            }
+        );
+    }
+
+    #[test]
+    fn the_tube_section_decodes_field_by_field() {
+        let s = beta4_state();
+        assert_eq!(
+            s.tube(),
+            Tube {
+                enabled: false,
+                tube_type: 1,
+                rectifier: 1,
+                xfmr_enabled: true,
+                output_mask: 0xFFFF,
+                drive_db: -12.0,
+                bias_pct: 10.0,
+                asym_db: 3.0,
+                hardness_pct: 40.0,
+                sag_pct: 15.0,
+                xfmr_damping: 2.0,
+                xfmr_res_hz: 95.0,
+                mix_pct: 100.0,
+                trim_db: 0.0,
+            }
+        );
+    }
+
+    /// Nine records on the wire whatever the device; the ones past its outputs
+    /// are ignored (bulk_params.h:432-434).
+    #[test]
+    fn limiter_records_follow_the_output_count() {
+        let mut s = beta4_state();
+        let (_, o, _) = section("limiter");
+        s.bulk.patch(o + 12 * 2, &[1, 3]).unwrap();
+        put_f32(&mut s, o + 12 * 2 + 4, -6.5);
+        assert_eq!(
+            s.limiter(2),
+            Some(LimiterOutput {
+                enabled: true,
+                link_group: 3,
+                threshold_db: -6.5,
+                release_ms: 100.0
+            })
+        );
+        assert_eq!(s.limiters().len(), 9);
+        s.caps.num_outputs = 5;
+        assert_eq!(s.limiters().len(), 5, "an RP2040 has five outputs");
+        assert_eq!(s.limiter(5), None);
+    }
+
+    /// A notification at any of the three new offsets patches the shadow in
+    /// place and names its section, like every other one.
+    #[test]
+    fn param_changes_patch_the_new_sections() {
+        let mut s = beta4_state();
+        for (offset, bytes, name) in [
+            (5944 + 16, (-6.0f32).to_le_bytes().to_vec(), "subharm"),
+            (5980 + 1, vec![12], "tube"),
+            (
+                6028 + 12 * 4 + 4,
+                (-3.0f32).to_le_bytes().to_vec(),
+                "limiter",
+            ),
+        ] {
+            let applied = s.apply(&Notification {
+                seq: 1,
+                event: Event::ParamChanged {
+                    offset,
+                    source: Source::Gpio,
+                    bytes,
+                },
+                lost: false,
+            });
+            assert_eq!(
+                applied,
+                Applied::Section {
+                    name,
+                    source: Source::Gpio
+                }
+            );
+        }
+        assert_eq!(s.subharm().top_db, -6.0);
+        assert_eq!(s.tube().tube_type, 12);
+        assert_eq!(s.limiter(4).unwrap().threshold_db, -3.0);
+        assert!(!s.stale);
+    }
+
+    /// A change this build cannot place must not be dropped: the shadow is
+    /// marked stale and the caller re-reads, as the Console now resyncs on an
+    /// offset it does not decode in place (survey-console-beta4 section 3).
+    #[test]
+    fn a_change_that_cannot_be_patched_asks_for_a_reread() {
+        for (offset, len) in [
+            // Past the end of the V32 packet.
+            (BULK_SIZE as u16, 4usize),
+            // The last limiter record, running off the end.
+            (BULK_SIZE as u16 - 2, 4),
+            // Into the header.
+            (6, 2),
+        ] {
+            let mut s = beta4_state();
+            let before = s.bulk.as_bytes().to_vec();
+            let applied = s.apply(&Notification {
+                seq: 1,
+                event: Event::ParamChanged {
+                    offset,
+                    source: Source::HostSet,
+                    bytes: vec![0xAA; len],
+                },
+                lost: false,
+            });
+            assert_eq!(
+                applied,
+                Applied::NeedsReread {
+                    source: Source::HostSet
+                },
+                "offset {offset}"
+            );
+            assert!(s.stale, "offset {offset}");
+            assert_eq!(s.bulk.as_bytes(), &before[..], "nothing half-patched");
+        }
+    }
+
+    /// PresetSnapshot.swift:261-308, word for word, one line per field.
+    #[test]
+    fn subharm_changes_read_as_the_console_words_them() {
+        let mut s = beta4_state();
+        let (_, o, _) = section("subharm");
+        s.bulk.patch(o, &[1, 0, 0x00, 0x01]).unwrap();
+        put_f32(&mut s, o + 4, -30.0);
+        put_f32(&mut s, o + 8, 2.5);
+        put_f32(&mut s, o + 12, 3.0);
+        put_f32(&mut s, o + 16, 0.0);
+        put_f32(&mut s, o + 20, 75.0);
+        put_f32(&mut s, o + 24, 200.0);
+        put_f32(&mut s, o + 28, -12.0);
+        s.bulk.patch(o + 32, &[1, 0]).unwrap();
+        assert_eq!(
+            texts(&s),
+            vec![
+                "Subharm: Subharmonic Synthesizer: enabled",
+                "Subharm: Subharm outputs: 0xFFFF → 0x0100",
+                "Subharm: Subharm 24-36 Hz: 0 dB → off",
+                "Subharm: Subharm 36-56 Hz: 0 dB → 2.5 dB",
+                "Subharm: Subharm 56-80 Hz: off → 0 dB",
+                "Subharm: Subharm selectivity: all material → percussive",
+                "Subharm: Subharm selectivity depth: 100% → 75%",
+                "Subharm: Subharm selectivity hold: 150 ms → 200 ms",
+                "Subharm: Subharm sub ceiling: off → -12 dBFS",
+                "Subharm: Subharm pair link: independent",
+                "Subharm: Subharm LF boost: 0 dB → 3 dB",
+            ]
+        );
+    }
+
+    /// PresetSnapshot.swift:310-353. A type change carries its four
+    /// character values with it, which is what the device does.
+    #[test]
+    fn tube_changes_read_as_the_console_words_them() {
+        let mut s = beta4_state();
+        let (_, o, _) = section("tube");
+        // Type 3 (12AT7) and its row (tube.c:52), then the rest by hand.
+        s.bulk.patch(o, &[1, 3, 0, 0, 0x0F, 0x00]).unwrap();
+        for (i, v) in [-6.0, 5.0, 2.0, 55.0, 10.0, 4.5, 80.0, 50.0, -1.5]
+            .iter()
+            .enumerate()
+        {
+            put_f32(&mut s, o + 8 + 4 * i, *v);
+        }
+        assert_eq!(
+            texts(&s),
+            vec![
+                "Tube: Tube Modeller: enabled",
+                "Tube: Tube outputs: 0xFFFF → 0x000F",
+                "Tube: Tube type: 12AX7 / ECC83 → 12AT7 / ECC81",
+                "Tube: Tube drive: -12 dB → -6 dB",
+                "Tube: Tube bias: 10% → 5%",
+                "Tube: Tube asymmetry: 3 dB → 2 dB",
+                "Tube: Tube knee hardness: 40% → 55%",
+                "Tube: Tube sag: 15% → 10%",
+                "Tube: Tube rectifier: GZ34 / 5AR4 → Solid state",
+                "Tube: Tube output stage: disabled",
+                "Tube: Tube damping factor: 2 → 4.5",
+                "Tube: Tube speaker resonance: 95 → 80 Hz",
+                "Tube: Tube mix: 100% → 50%",
+                "Tube: Tube output trim: 0 dB → -1.5 dB",
+            ]
+        );
+        // Custom has a name of its own.
+        s.mark_saved();
+        s.bulk.patch(o + 1, &[0]).unwrap();
+        assert_eq!(texts(&s), vec!["Tube: Tube type: 12AT7 / ECC81 → Custom"]);
+    }
+
+    fn edit_limiter(s: &mut DeviceState) {
+        let (_, o, _) = section("limiter");
+        // Output 1 ("OUT R" on the fixture is unnamed here: channel 9).
+        s.bulk.patch(o + 12, &[1, 2]).unwrap();
+        put_f32(s, o + 12 + 4, -3.5);
+        put_f32(s, o + 12 + 8, 250.0);
+    }
+
+    /// PresetSnapshot.swift:355-378: in WITH_PRESET mode a limiter is part
+    /// of the preset, named after its output channel.
+    #[test]
+    fn limiter_lines_appear_with_the_preset_mode() {
+        let mut s = beta4_state();
+        let (_, n, _) = section("channel_names");
+        s.bulk.patch(n + 9 * 32, b"Tweeter R\0").unwrap();
+        s.mark_saved();
+        edit_limiter(&mut s);
+        assert!(s.has_unsaved_changes());
+        assert_eq!(
+            texts(&s),
+            vec![
+                "Limiter: Tweeter R limiter: enabled",
+                "Limiter: Tweeter R limiter threshold: -1.0 → -3.5 dBFS",
+                "Limiter: Tweeter R limiter release: 100 ms → 250 ms",
+                "Limiter: Tweeter R limiter link: Unlinked → Group 2",
+            ]
+        );
+        assert!(
+            !s.limiter_unsaved(),
+            "not output configuration in this mode"
+        );
+        // An unnamed output falls back to the Console's zero-based label.
+        s.bulk.patch(n + 9 * 32, &[0; 32]).unwrap();
+        s.mark_saved();
+        let (_, o, _) = section("limiter");
+        s.bulk.patch(o + 12, &[0]).unwrap();
+        assert_eq!(texts(&s), vec!["Limiter: Output 1 limiter: disabled"]);
+    }
+
+    /// In INDEPENDENT mode the limiters are output configuration: no preset
+    /// change, no diff line, and the output-config category says unsaved
+    /// instead.
+    #[test]
+    fn limiter_edits_mark_the_output_configuration_in_independent_mode() {
+        let mut s = beta4_state();
+        s.output_config_mode = output_config_mode::INDEPENDENT;
+        s.mark_saved();
+        s.begin_limiter_edit();
+        edit_limiter(&mut s);
+        assert!(!s.has_unsaved_changes(), "the preset is untouched");
+        assert!(texts(&s).is_empty());
+        assert!(s.limiter_unsaved());
+
+        // A second edit keeps the first baseline.
+        s.begin_limiter_edit();
+        put_f32(&mut s, section("limiter").1 + 12 + 4, -9.0);
+        assert_eq!(
+            s.limiter_restore_commands(),
+            vec![
+                "limit.link 1 0",
+                "limit.threshold 1 -1",
+                "limit.release 1 100",
+                "limit.on 1 off",
+            ],
+            "unlink first, so one write does not move the group"
+        );
+
+        // Put back by hand, it reads as saved again.
+        let base = s.limiter_baseline.clone().unwrap();
+        let (_, o, _) = section("limiter");
+        s.bulk.patch(o, &base).unwrap();
+        assert!(!s.limiter_unsaved());
+
+        // Saved with 0x52, the baseline goes.
+        s.begin_limiter_edit();
+        edit_limiter(&mut s);
+        s.limiter_saved();
+        assert!(!s.limiter_unsaved());
+        assert!(s.limiter_restore_commands().is_empty());
+
+        // The same edit in WITH_PRESET mode never takes a baseline.
+        let mut s = beta4_state();
+        s.begin_limiter_edit();
+        assert!(s.limiter_baseline.is_none());
+    }
+
+    /// Restoring a linked output relinks it after its values are back, so it
+    /// adopts the group rather than dragging the group along.
+    #[test]
+    fn restoring_a_group_member_relinks_it_last() {
+        let mut s = beta4_state();
+        let (_, o, _) = section("limiter");
+        s.bulk.patch(o + 24, &[1, 1]).unwrap();
+        s.output_config_mode = output_config_mode::INDEPENDENT;
+        s.begin_limiter_edit();
+        s.bulk.patch(o + 24, &[0, 0]).unwrap();
+        put_f32(&mut s, o + 24 + 8, 400.0);
+        assert_eq!(
+            s.limiter_restore_commands(),
+            vec![
+                "limit.threshold 2 -1",
+                "limit.release 2 100",
+                "limit.on 2 on",
+                "limit.link 2 1",
+            ]
+        );
+    }
+
+    /// Solo and headroom are runtime only, so no snapshot can see them.
+    #[test]
+    fn solo_and_headroom_never_dirty_the_preset() {
+        let mut s = beta4_state();
+        s.subharm_solo = Some(true);
+        s.subharm_headroom_db = Some(6.0);
+        assert!(!s.has_unsaved_changes());
+        assert!(texts(&s).is_empty());
     }
 }
