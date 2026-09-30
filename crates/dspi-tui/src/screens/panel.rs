@@ -1250,6 +1250,7 @@ fn draw_graph(area: Rect, buf: &mut Buffer, theme: &Theme, g: &PanelGraph) {
                 freq_labels: true,
                 db_grid: true,
                 db_labels: true,
+                ..GraphSettings::default()
             };
             let curves: Vec<GraphCurve> = series
                 .iter()

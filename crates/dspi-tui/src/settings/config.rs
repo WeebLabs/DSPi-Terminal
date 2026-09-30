@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::GraphSettings;
+use crate::graph::{GraphSettings, GridStrength};
 
 /// Settings > Graphing, with the Console's defaults.
 ///
@@ -33,6 +33,15 @@ pub struct Graphing {
     pub freq_labels: bool,
     pub db_grid: bool,
     pub db_labels: bool,
+    /// Show Frequency Readout and Show Gain Readout
+    /// (`DSPi_ConsoleApp.swift:54-55`, both on by default).
+    pub freq_readout: bool,
+    pub gain_readout: bool,
+    /// Grid Opacity, in the three steps [`GridStrength`] describes.
+    pub grid: GridStrength,
+    /// The dashboard's cards per row: 0 is Auto, else 1 to 3
+    /// (`DashboardView.swift:507-560`).
+    pub dashboard_cards: u8,
     pub db_range: f64,
     pub db_center: f64,
     pub min_hz: f64,
@@ -52,6 +61,10 @@ impl Default for Graphing {
             freq_labels: true,
             db_grid: true,
             db_labels: true,
+            freq_readout: true,
+            gain_readout: true,
+            grid: GridStrength::Dim,
+            dashboard_cards: 0,
             db_range: 50.0,
             db_center: 0.0,
             min_hz: 15.0,
@@ -232,6 +245,10 @@ impl GraphSettings {
             freq_labels: g.freq_labels,
             db_grid: g.db_grid,
             db_labels: g.db_labels,
+            freq_readout: g.freq_readout,
+            gain_readout: g.gain_readout,
+            grid: g.grid,
+            dashboard_cards: g.dashboard_cards.min(3),
         }
     }
 }

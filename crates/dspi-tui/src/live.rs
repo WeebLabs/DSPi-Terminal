@@ -116,8 +116,9 @@ pub struct ConsoleScreens {
     /// What Settings reads that the bulk packet does not carry, refreshed the
     /// moment before the page opens.
     pub settings: std::rc::Rc<std::cell::RefCell<SettingsData>>,
-    /// The app-side settings file, read once at start.
-    pub config: AppConfig,
+    /// The app-side settings file, read at start and replaced by every
+    /// change Settings saves, so the page reopens on what was last chosen.
+    pub config: std::rc::Rc<std::cell::RefCell<AppConfig>>,
 }
 
 impl Default for ConsoleScreens {
@@ -139,7 +140,7 @@ impl ConsoleScreens {
         Self {
             shared,
             settings: std::rc::Rc::new(std::cell::RefCell::new(SettingsData::default())),
-            config,
+            config: std::rc::Rc::new(std::cell::RefCell::new(config)),
         }
     }
 }
@@ -172,12 +173,16 @@ impl Screens for ConsoleScreens {
     }
 
     fn settings(&self, state: &DeviceState) -> Box<dyn Screen> {
-        let mut config = self.config.clone();
+        let mut config = self.config.borrow().clone();
         config.spectrum = self.shared.borrow().spectrum.settings.clone();
         let shared = self.shared.clone();
+        let kept = self.config.clone();
         Box::new(
             SettingsScreen::new(state, self.settings.borrow().clone(), config).on_config(
-                move |c: &AppConfig| shared.borrow_mut().spectrum.adopt_settings(&c.spectrum),
+                move |c: &AppConfig| {
+                    shared.borrow_mut().spectrum.adopt_settings(&c.spectrum);
+                    *kept.borrow_mut() = c.clone();
+                },
             ),
         )
     }
@@ -187,7 +192,7 @@ impl Screens for ConsoleScreens {
     }
 
     fn config(&self) -> AppConfig {
-        self.config.clone()
+        self.config.borrow().clone()
     }
 
     fn refresh_settings(&self, session: &mut Session) {
@@ -561,6 +566,9 @@ pub struct Live {
     /// A key is waiting: the loop sets this before a tick so the analyser
     /// sits that tick out and the key's write goes first.
     pub input_pending: bool,
+    /// The Graphing settings the graph was last built from, so a change
+    /// saved in Settings reaches the graph without a restart.
+    graphing: crate::settings::config::Graphing,
 }
 
 impl Live {
@@ -620,6 +628,7 @@ impl Live {
             rebuild: None,
             switch_to: None,
             input_pending: false,
+            graphing: config.graphing.clone(),
         };
         live.sync_model();
         live
@@ -1483,14 +1492,12 @@ impl Live {
                 if let Some(hz) = hz {
                     let m = &self.shell.model;
                     let g = crate::graph::Graph::new(&m.curves, &m.graph, &self.shell.theme);
-                    let parts: Vec<String> = g
-                        .readout(hz)
-                        .iter()
-                        .map(|(d, db)| format!("{d} {db:+.1}"))
-                        .collect();
-                    let text = format!("{:.0} Hz  {}", hz, parts.join("  "));
-                    self.shell.model.status = Some(text);
-                    self.status_until = Some(Instant::now() + Duration::from_secs(5));
+                    // Graphing's two readout switches; with both off the
+                    // cursor line alone is drawn.
+                    if let Some(text) = g.readout_text(hz) {
+                        self.shell.model.status = Some(text);
+                        self.status_until = Some(Instant::now() + Duration::from_secs(5));
+                    }
                 }
             }
             ShellEvent::GraphZoom(delta) => self.shell.model.graph.zoom(delta),
@@ -2102,6 +2109,19 @@ impl Live {
         let events = self.shell.handle(key, &self.state);
         for ev in events {
             self.handle_event(session, ev);
+        }
+        self.adopt_graphing();
+    }
+
+    /// Rebuild the graph's settings when Settings > Graphing has saved a
+    /// change. The zoom and the phase toggle are the graph's own between
+    /// saves; a save sets them to what the page shows.
+    fn adopt_graphing(&mut self) {
+        let g = self.screens.config().graphing;
+        if g != self.graphing {
+            self.shell.model.graph = crate::graph::GraphSettings::from_config(&g);
+            self.graphing = g;
+            self.sync_model();
         }
     }
 
@@ -3718,5 +3738,44 @@ mod tests {
             .map(|x| (x.direction, x.value))
             .collect();
         assert_eq!(stops, vec![(Direction::In, 0)], "STOP, wValue 0");
+    }
+
+    /// A change Settings > Graphing saves reaches the graph, the overview's
+    /// layout and the cursor readout without a restart.
+    #[test]
+    fn a_saved_graphing_change_reaches_the_graph() {
+        let (_, mut s, _) = console();
+        let screens = ConsoleScreens::new();
+        let config = screens.config.clone();
+        let state = DeviceState::new(
+            caps(),
+            dspi_proto::wire::BulkPacket::decode(packet()).unwrap(),
+        );
+        let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
+        let mut l = Live::new(state, theme, Performance::lite(), Box::new(screens));
+        {
+            let mut c = config.borrow_mut();
+            c.graphing.grid = crate::graph::GridStrength::Off;
+            c.graphing.dashboard_cards = 2;
+            c.graphing.freq_readout = false;
+            c.graphing.gain_readout = true;
+        }
+        l.adopt_graphing();
+        assert_eq!(l.shell.model.graph.grid, crate::graph::GridStrength::Off);
+        assert_eq!(l.shared.borrow().graph.dashboard_cards, 2);
+        l.handle_event(&mut s, ShellEvent::Select(Selection::Input(0)));
+        l.handle_event(&mut s, ShellEvent::GraphCursor(Some(1000.0)));
+        let status = l.shell.model.status.clone().unwrap_or_default();
+        assert!(!status.contains("Hz"), "no frequency: {status}");
+        config.borrow_mut().graphing.gain_readout = false;
+        l.adopt_graphing();
+        l.shell.model.status = None;
+        l.handle_event(&mut s, ShellEvent::GraphCursor(Some(500.0)));
+        assert_eq!(l.shell.model.status, None, "nothing to read out");
+        assert_eq!(
+            l.shell.model.cursor_hz,
+            Some(500.0),
+            "the cursor still moves"
+        );
     }
 }

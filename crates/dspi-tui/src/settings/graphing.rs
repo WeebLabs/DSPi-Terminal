@@ -10,7 +10,7 @@
 //! the file round-trips and a phase that gives the curve a draw-in has
 //! somewhere to read its timing from.
 
-use crate::graph::GraphSettings;
+use crate::graph::{GraphSettings, GridStrength};
 use crate::widgets::{Action, KeyHelp};
 
 use super::{AppConfig, Cx, PageEvent, Row, SettingsPage};
@@ -26,11 +26,15 @@ enum Item {
     FreqLabels,
     DbGrid,
     DbLabels,
+    FreqReadout,
+    GainReadout,
+    Grid,
     Range,
     Center,
     MinFreq,
     MaxFreq,
     Popout,
+    Dashboard,
     VolumeMode,
 }
 
@@ -67,6 +71,18 @@ fn nearest(values: &[f64], v: f64) -> usize {
         })
         .map(|(i, _)| i)
         .unwrap_or(0)
+}
+
+/// The Console's four layout tiles (`DashboardView.swift:527-553`).
+const DASHBOARD_CHOICES: [&str; 4] = ["Auto", "1", "2", "3"];
+
+/// The Console's line under the tiles (`DashboardView.swift:522-523`).
+fn dashboard_caption(n: u8) -> String {
+    match n.min(3) {
+        0 => "Fits as many cards per row as the window allows.".into(),
+        1 => "Up to 1 card per row.".into(),
+        n => format!("Up to {n} cards per row."),
+    }
 }
 
 fn hz_label(v: f64) -> String {
@@ -171,6 +187,34 @@ impl GraphingPage {
             ),
             toggle(Item::DbGrid, "Show dB Grid", g.db_grid, None, true),
             toggle(Item::DbLabels, "Show dB Labels", g.db_labels, None, true),
+            toggle(
+                Item::FreqReadout,
+                "Show Frequency Readout",
+                g.freq_readout,
+                None,
+                true,
+            ),
+            toggle(
+                Item::GainReadout,
+                "Show Gain Readout",
+                g.gain_readout,
+                None,
+                true,
+            ),
+            (
+                Some(Item::Grid),
+                Row::Pick {
+                    label: "Grid Opacity".into(),
+                    choices: GridStrength::CHOICES
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
+                    selected: g.grid.index(),
+                    caption: None,
+                    // The Console disables the slider with both grids off.
+                    enabled: g.freq_grid || g.db_grid,
+                },
+            ),
             (
                 Some(Item::Range),
                 Row::Number {
@@ -233,6 +277,18 @@ impl GraphingPage {
                 true,
             ),
             (None, Row::Blank),
+            (None, Row::section("Dashboard Layout")),
+            (
+                Some(Item::Dashboard),
+                Row::Pick {
+                    label: "Cards per Row".into(),
+                    choices: DASHBOARD_CHOICES.iter().map(|s| (*s).to_string()).collect(),
+                    selected: g.dashboard_cards.min(3) as usize,
+                    caption: Some(dashboard_caption(g.dashboard_cards)),
+                    enabled: true,
+                },
+            ),
+            (None, Row::Blank),
             (None, Row::section("Volume")),
             (
                 Some(Item::VolumeMode),
@@ -284,6 +340,10 @@ impl SettingsPage for GraphingPage {
             (Item::FreqLabels, Action::Toggled(v)) => g.freq_labels = v,
             (Item::DbGrid, Action::Toggled(v)) => g.db_grid = v,
             (Item::DbLabels, Action::Toggled(v)) => g.db_labels = v,
+            (Item::FreqReadout, Action::Toggled(v)) => g.freq_readout = v,
+            (Item::GainReadout, Action::Toggled(v)) => g.gain_readout = v,
+            (Item::Grid, Action::Selected(i)) => g.grid = GridStrength::from_index(i),
+            (Item::Dashboard, Action::Selected(i)) => g.dashboard_cards = i.min(3) as u8,
             (Item::Popout, Action::Toggled(v)) => g.popout_follows_selection = v,
             (Item::LineWidth, Action::Changed(v) | Action::Committed(v)) => g.line_width = v,
             (Item::Animation, Action::Changed(v) | Action::Committed(v)) => g.animation_speed = v,
@@ -360,6 +420,116 @@ mod tests {
         assert!(f.contains("SCALE & GRID"), "{f}");
         assert!(f.contains("Min Frequency"), "{f}");
         assert!(f.contains("Max Frequency"), "{f}");
+    }
+
+    /// The readouts, the grid strength and the dashboard layout, at both
+    /// sizes, reached by walking down the page.
+    #[test]
+    fn golden_frames_show_the_readouts_the_grid_and_the_dashboard_layout() {
+        for (w, h) in [(120u16, 40u16), (80, 24)] {
+            let (mut s, st) = screen(Page::Graphing);
+            s.handle(key(KeyCode::Tab), &st);
+            // Down to Grid Opacity: phase, unwrap, width, speed, four grid
+            // toggles and the two readouts lie between.
+            for _ in 0..11 {
+                s.handle(key(KeyCode::Down), &st);
+            }
+            let f = frame(&mut s, &st, w, h);
+            assert_eq!(f.lines().count(), h as usize);
+            for text in [
+                "Show Frequency Readout",
+                "Show Gain Readout",
+                "Grid Opacity",
+                "Dim",
+            ] {
+                assert!(f.contains(text), "{w}x{h}: {text}\n{f}");
+            }
+            for _ in 0..6 {
+                s.handle(key(KeyCode::Down), &st);
+            }
+            let f = frame(&mut s, &st, w, h);
+            for text in [
+                "DASHBOARD LAYOUT",
+                "Cards per Row",
+                "Auto",
+                "Fits as many cards per row as the window allows.",
+            ] {
+                assert!(f.contains(text), "{w}x{h}: {text}\n{f}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_new_rows_default_to_the_consoles_values_and_save() {
+        let d = AppConfig::default();
+        assert!(d.graphing.freq_readout && d.graphing.gain_readout);
+        assert_eq!(d.graphing.grid, GridStrength::Dim, "the Console's 50 %");
+        assert_eq!(d.graphing.dashboard_cards, 0, "Auto");
+
+        let mut p = GraphingPage::new(AppConfig::default());
+        let st = super::super::tests::state();
+        let cx_data = super::super::tests::data();
+        let cfg = AppConfig::default();
+        let cx = Cx {
+            state: &st,
+            data: &cx_data,
+            config: &cfg,
+            connected: true,
+            global_dirty: false,
+        };
+        let index = |p: &GraphingPage, item: Item| {
+            p.build()
+                .into_iter()
+                .filter(|(_, r)| r.focusable())
+                .position(|(i, _)| i == Some(item))
+                .unwrap()
+        };
+        let i = index(&p, Item::Grid);
+        let PageEvent::Config(c) = p.act(i, Action::Selected(2), &cx) else {
+            panic!("a change hands the config back");
+        };
+        assert_eq!(c.graphing.grid, GridStrength::Normal);
+        let i = index(&p, Item::Dashboard);
+        let PageEvent::Config(c) = p.act(i, Action::Selected(2), &cx) else {
+            panic!();
+        };
+        assert_eq!(c.graphing.dashboard_cards, 2);
+        let i = index(&p, Item::GainReadout);
+        let PageEvent::Config(c) = p.act(i, Action::Toggled(false), &cx) else {
+            panic!();
+        };
+        assert!(!c.graphing.gain_readout);
+        let back = AppConfig::from_toml(&c.to_toml());
+        assert_eq!(back.graphing.grid, GridStrength::Normal);
+        assert_eq!(back.graphing.dashboard_cards, 2);
+        assert!(!back.graphing.gain_readout);
+        assert!(c.to_toml().contains("grid = \"normal\""), "{}", c.to_toml());
+        let caption = p
+            .build()
+            .into_iter()
+            .find_map(|(i, r)| match (i, r) {
+                (Some(Item::Dashboard), Row::Pick { caption, .. }) => caption,
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(caption, "Up to 2 cards per row.");
+    }
+
+    #[test]
+    fn grid_opacity_is_disabled_with_both_grids_off() {
+        let mut p = GraphingPage::new(AppConfig::default());
+        let grid = |p: &GraphingPage| {
+            p.build()
+                .into_iter()
+                .find(|(i, _)| *i == Some(Item::Grid))
+                .map(|(_, r)| r)
+                .unwrap()
+        };
+        assert!(matches!(grid(&p), Row::Pick { enabled: true, .. }));
+        p.config.graphing.freq_grid = false;
+        assert!(matches!(grid(&p), Row::Pick { enabled: true, .. }));
+        p.config.graphing.db_grid = false;
+        assert!(matches!(grid(&p), Row::Pick { enabled: false, .. }));
     }
 
     #[test]

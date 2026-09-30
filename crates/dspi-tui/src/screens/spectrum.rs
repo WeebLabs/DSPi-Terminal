@@ -604,6 +604,8 @@ impl SpectrumPanel {
             freq_labels: true,
             db_grid: true,
             db_labels: true,
+            grid: app.graph.grid,
+            ..GraphSettings::default()
         };
         // Peak contours first, in grey, so every channel's own curve sits on
         // top of them.
