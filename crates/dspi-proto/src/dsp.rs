@@ -582,6 +582,58 @@ mod tests {
         }
     }
 
+    /// The Console moved `magnitudeSquared` to the sin^2(w/2) form because
+    /// its cos form, with a 1e-15 cut-off on the denominator, drew the peak of
+    /// a 10 Hz, Q 20 bell at 0 dB (Console 9c33a44). This evaluation keeps the
+    /// cos form with a 1e-20 cut-off, which clears those sections: pin that
+    /// narrow low peaks reach their gain, and that the two forms agree across
+    /// the plotted range. The graph is drawn at 48 kHz only, so the 96 kHz
+    /// cases are the same `w`: 20 Hz at 96 kHz is 10 Hz here.
+    #[test]
+    fn narrow_low_peaks_reach_their_gain() {
+        fn sin_squared_form(c: &Coeffs, freq: f64) -> f64 {
+            let s = (std::f64::consts::PI * freq / SAMPLE_RATE).sin();
+            let phi = s * s;
+            let sb = c.b0 + c.b1 + c.b2;
+            let sa = 1.0 + c.a1 + c.a2;
+            let num = sb * sb - 4.0 * (c.b0 * c.b1 + c.b1 * c.b2 + 4.0 * c.b0 * c.b2) * phi
+                + 16.0 * c.b0 * c.b2 * phi * phi;
+            let den =
+                sa * sa - 4.0 * (c.a1 + c.a1 * c.a2 + 4.0 * c.a2) * phi + 16.0 * c.a2 * phi * phi;
+            num.max(0.0) / den
+        }
+        // 20 Hz Q 10 at 48 kHz; 20 Hz Q 10 and 10 Hz Q 20 at 96 kHz; and
+        // narrower still.
+        for (freq, q) in [
+            (20.0f32, 10.0f32),
+            (10.0, 10.0),
+            (10.0, 20.0),
+            (10.0, 100.0),
+            (10.0, 1000.0),
+        ] {
+            for gain in [12.0f32, -12.0] {
+                let b = peaking(freq, q, gain);
+                let db = response_at(freq as f64, &[b]);
+                assert!(
+                    close(db, gain as f64, 1e-6),
+                    "{freq} Hz Q{q} {gain} dB drew {db} at its centre"
+                );
+                let c = coefficients(&b);
+                for hz in frequencies() {
+                    let ours = 10.0 * magnitude_squared(&c, hz).log10();
+                    let rbj = 10.0 * sin_squared_form(&c, hz).log10();
+                    // The sin^2 form is itself the less exact of the two at
+                    // the narrowest peaks (0.002 dB short at Q 1000, where
+                    // this one is within 1e-8), so compare to 0.01 dB.
+                    assert!(
+                        close(ours, rbj, 0.01),
+                        "{freq} Hz Q{q} at {hz} Hz: {ours} against {rbj}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn frequencies_at_or_above_nyquist_are_ignored_safely() {
         let b = [peaking(24_000.0, 2.0, 12.0)];
