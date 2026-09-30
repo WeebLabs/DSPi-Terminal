@@ -1518,6 +1518,6 @@ was right, but the implementation took the count from the bulk header's
 bands. The two extra rows were editable and did nothing. `max_bands` is now
 measured with a four-transfer binary search, so a firmware that grows its PEQ is
 picked up without a change here. Separately, reading the EQ through
-`GET_EQ_PARAM` costs five transfers per band — 24 seconds for a whole RP2350 —
+`GET_EQ_PARAM` costs five transfers per band (24 seconds for a whole RP2350)
 against 20 ms for the same table decoded out of one bulk snapshot. See
 `docs/firmware-notes.md` §9 and §10.

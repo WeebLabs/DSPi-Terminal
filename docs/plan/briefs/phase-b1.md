@@ -186,7 +186,7 @@ labels beyond placeholders needed to keep tests passing (B7).
   4-, 6- and 7-byte replies and the version ordering; CS caps with
   type_count 11; the CS_AUX event; the MS_LOG unit; the refusal message
   for a V28 device.
-- No em-dashes introduced (`grep -rn $'—'` over changed files).
+- No em-dashes introduced (`grep -rn $'\u2014'` over changed files).
 
 ## How to work and report
 

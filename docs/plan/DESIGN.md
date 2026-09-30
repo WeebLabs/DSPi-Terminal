@@ -173,14 +173,21 @@ own mnemonics (Shift-Cmd-M in the Console is `M` here):
 | `P` | Psychoacoustic Bass | Shift-Cmd-P |
 | `U` | Stereo Upmixer | Shift-Cmd-U |
 | `V` | Volume Leveller | Shift-Cmd-V |
-| `G` | Test Signals | Shift-Cmd-G |
+| `S` | Subharmonic Synthesizer | Shift-Cmd-S |
+| `D` | Tube Modeller | Shift-Cmd-D |
+| `G` | Signal Generator | Shift-Cmd-G |
+| `A` | Spectrum Analyser | Shift-Cmd-A |
 | `T` | Stats for Nerbs | Shift-Cmd-T |
 | `I` | Interrupt Monitor | Shift-Cmd-I |
 | `B` | AutoEQ Browse Profiles | Shift-Cmd-B |
 | `,` | Settings | Cmd-, |
 
 Pressing the same key again closes the panel (Console: the toggle
-behaviour of the strip). Only one tool panel is open at a time.
+behaviour of the strip). Only one tool panel is open at a time. The tool
+letters are global: no screen binds an uppercase letter that opens a tool,
+so the band list's Bypass All and Clear All are `;bypass` and `;clear`
+(section 13), the matrix's Clear is `;clear`, and the Interrupt Monitor
+clears on Backspace (section 11).
 
 Global keys that work everywhere:
 
@@ -188,6 +195,7 @@ Global keys that work everywhere:
 |---|---|
 | `Ctrl-P` | Palette: every parameter, every tool, every file action |
 | `:` | Command line |
+| `;` | Page command bar (section 13) |
 | `?` | Help for the focused region |
 | `Ctrl-S` | Commit Parameters (save to the active slot), with confirm |
 | `Ctrl-D` | Device picker |
@@ -205,7 +213,9 @@ Global keys that work everywhere:
 
 File actions are palette and command-line verbs, not keys: `:import`,
 `:export`, `:import-config`, `:export-config`, `:autoeq`, `:save-master`,
-`:save-output-config`, `:revert`, `:factory-reset`, `:bootloader`.
+`:save-output-config`, `:revert`, `:factory-reset`, `:bootloader`
+(Reboot into Bootloader), `:reconnect`, `:clear-favourites`, and `:tube`
+and `:subharm` for the two panels.
 
 Digits are contextual: in a filter list they jump to a band; in the
 sidebar they select an input.
@@ -820,6 +830,102 @@ Recorded as they were taken, so the document stays the spec.
 - **`theme` in the config file** selects the palette; `--theme` overrides
   it for one run.
 
+*Added 2026-09-30, for the beta4 work (`PLAN-beta4.md`).*
+
+- **Limiter dirtiness in INDEPENDENT mode is compared, not flagged** (B2).
+  The Console sets a flag on the first limiter edit and clears it on Save
+  Output Configuration. The Terminal keeps the values an edit replaced and
+  compares, so an edit put back by hand reads as saved and the save bar
+  goes away; Revert writes the kept values back.
+- **Limiter settings are an expanded section on the output page, not a
+  popover** (B4). The Console opens a popover from the limiter icon beside
+  Mute. A terminal has no popover that does not cover the row it came from,
+  so Enter on the limiter cell shows the settings in place of the filter
+  list and Esc returns. The latency caption ("Turning on the first limiter
+  adds 32 samples of latency to every output...") is the Terminal's own
+  sentence: the Console carries no such caption, and the plan asked for
+  the warning.
+- **Subharm solo is polled once a second while the panel is open** (B5).
+  The Console reads it once when the window opens. The firmware sends no
+  notification for solo (0x2D), so a solo set from a control surface would
+  otherwise read stale for as long as the panel stays open.
+- **The subharm band graph draws the firmware's filter shapes** (B5). The
+  Console draws each derived band as a flat block. The Terminal draws the
+  fundamental of the firmware's own headroom model (`subharm.c:511-530`),
+  which is what the device does, and the graph already had the curve
+  machinery.
+- **The Tube Modeller shows one layout** (B6): the Console's Advanced rows,
+  with the transfer curve first. The Console switches between Basic and
+  Advanced to save window space; a terminal panel scrolls and has room for
+  every row. Mix keeps its Basic-mode end labels (Dry / All tube), because
+  the percentage alone does not say which end is which.
+- **The spectrum analyser draws strength and peak hold in cells** (B8,
+  decision 3). The Console's Strength is an opacity; a cell has none, so a
+  strength in the lower half of the slider draws the curves dim and the
+  upper half normal. Peak hold is a contour above the curve, or a cap on
+  each bar. The overlay on the response graph and the RTA strip above the
+  pages are not built: `PLAN-beta4.md` puts them after the panel is stable,
+  off by default, and row T5 stays open.
+- **Aux live switches and levels move on the device's echo** (B7). The
+  Console moves the switch when clicked and fires the SET without reading
+  a reply. The Terminal reads status 0x87 after each aux SET, because the
+  device acknowledges a refused SET on the wire and the status packet is
+  the only place the refusal shows; the switch and level then move when
+  `NOTIFY_EVT_CS_AUX` or the re-read says so. Aux nouns are hidden from the
+  noun pickers until an aux output exists, since every one of them would
+  otherwise offer an empty target list.
+- **Cards on every Control Surfaces card page follow the device** (B7)
+  whenever they have no staged edit. The Console seeds its drafts from the
+  device when the page appears (`seedDrafts`) and after its own Apply or
+  Revert; the Terminal also takes each re-read into every card
+  without a staged edit, so a change from another host or a notification
+  shows without reopening Settings, and a card being edited is left alone.
+- **The Console's strips apply to every noun category** (B7). The
+  Console's Controls menu drops a family's prefix inside its submenu
+  ("Subharmonic Synth" lists "Low", not "Subharm Low"), but lists full
+  names when a control reaches only one category, and its closed menu
+  shows the full name. The Terminal's picker is one flat list that always
+  reads `Category / Item` (section 6.4), so the strip applies to every
+  entry, including the Output Limiter family the Console lacks.
+- **The tool keys are global** (B3). `S`, `D` and `A` open the
+  Subharmonic Synthesizer, the Tube Modeller and the Spectrum Analyser from
+  every screen, as the Console's Shift-Cmd letters do. The band list's
+  Bypass All and Clear All moved to the `;` bar as `bypass` and `clear`,
+  with the Console's dialogs ("Bypass this output's crossovers?", "Clear
+  All Bands?") on Enter. The matrix's `D` Clear is gone and `;clear` runs
+  without a dialog, as the Console's Clear button does. The Interrupt
+  Monitor's Clear moved to Backspace.
+- **Old RP2350 Terminal preset files are recognised and read, but the
+  Consoles misplace them** (B11). Before B11 the Terminal numbered channel
+  entries by its own unified index. The Terminal recognises such a file by
+  its numbering and reads it correctly; the Consoles, which place entries
+  by `eqChannel`, `inputIndex` and `outputIndex`, land its EQ on the wrong
+  channels. Re-export from the Terminal to fix a file.
+- **`:bootloader` is Reboot into Bootloader, not Firmware Update**
+  (audit D40, `PLAN-beta4.md` decision 4). The beta4 Console's Firmware
+  Update is an installer with bundled images; the Terminal only reboots the
+  device into the RP2 bootloader and waits for the `RPI-RP2` drive, and the
+  verb, the confirm and its progress say so. It is offered on every
+  platform because `dspi_proto::Platform` has no STM32 variant to hide it
+  from, and the confirm is always asked.
+- **AutoEQ result rows show the form factor as text** (audit D60). The
+  Console leads each row with an SF Symbol for the form factor; the
+  Terminal prints the form factor in its own column, which says the same
+  thing without a glyph that varies by terminal font.
+- **The control type row is labelled `Component`** (audit D69). The
+  Console picks a slot's type from a badge menu on the card, which has no
+  label; the Terminal needs a row, and names it for what is wired to the
+  GPIO. Every other Control Surfaces label is the Console's
+  (`Controls`, `On Press` / `Behavior` / `Indicates`, `Gesture`, `GPIO`,
+  `Channel Type`).
+- **Golden-frame tests assert on content, not stored frames.** Each screen
+  renders at 80x24 and 120x40 through `render_to_string` and the tests
+  assert the lines and strings that matter, not a byte-for-byte frame. A
+  stored frame breaks on every palette, glyph or spacing change and gets
+  regenerated without being read, which pins nothing; a `contains`
+  assertion names what the test is about and survives an unrelated change.
+  The key-hint tests and the both-sizes fill tests cover layout breakage.
+
 ## 12. The quiet redesign: one curve per graph, colour on demand
 
 *Revision 2, 2026-08-30. Supersedes 2.1's legend row, 4's use of channel
@@ -995,9 +1101,11 @@ any unambiguous prefix (`ga` is `gain`, `de` is `delay`).
 | Page | Grammar |
 |---|---|
 | Matrix | `1 3 > 5` connect (every listed input to every listed output) · `1 x all` disconnect · `1 > 3 -6 inv` connect with gain and polarity (a gain needs a sign, a point or an out-of-range value, so `1 > 3 4` stays two outputs) · `gain 1 3 -6` · `inv 1 3` (toggle) · `out 3-5 mute·unmute·on·off·gain -2·delay 2.5` · `direct` · `clear` |
-| Input page | `pre -5.3` · `3 peak 1k -2 [q]` (types: peak ls hs lp hp notch allpass) · `3 off` · `delay 2.5` · `clear` · `name Front L` — every edit mirrors to a linked partner |
-| Output page | `gain -3` · `delay 2.5` · `mute` `unmute` `on` `off` · `3 peak 1k -2 [q]` · `3 off` · `xo hp 80 [lr4]` `xo lp 120 bw2` `xo off` · `name Sub` · with the limiter: `limit on` `limit off` · `limit -1` (threshold, dBFS) · `release 100` · `link 1` `link off` |
+| Input page | `pre -5.3` · `3 peak 1k -2 [q]` (types: peak ls hs lp hp notch allpass) · `3 off` · `delay 2.5` · `bypass` (Bypass All) · `clear` (Clear All, after the Console's "Clear All Bands?") · `name Front L`; every edit mirrors to a linked partner |
+| Output page | `gain -3` · `delay 2.5` · `mute` `unmute` `on` `off` · `3 peak 1k -2 [q]` · `3 off` · `xo hp 80 [lr4]` `xo lp 120 bw2` `xo off` · `bypass` (Bypass All on the tab shown; on XO after the Console's "Bypass this output's crossovers?") · `clear` (after "Clear All Bands?") · `name Sub` · with the limiter: `limit on` `limit off` · `limit -1` (threshold, dBFS) · `release 100` · `link 1` `link off` |
 | Crossfeed, Loudness, Leveller, Bass, Upmixer | `on` · `off`; everything else falls through |
+| Subharmonic Synthesizer | `on` · `off` · `solo` · `low -6` · `high 0` · `top off` · `boost 3` · `ceiling -12` · `select percussive` · `depth 75` · `hold 150` · `link on` |
+| Tube Modeller | `on` · `off` · `type` · `drive` · `mix` · `trim` · `bias` · `asym` · `hardness` · `sag` · `rect` · `stage` · `damping` · `resonance` |
 | Everywhere else | the `:` grammar as typed |
 
 A line no page grammar reads is predicted by the shared grammar's
