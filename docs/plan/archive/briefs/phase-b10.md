@@ -1,6 +1,6 @@
 # Phase B10 brief: documentation and carried-over defects
 
-Read `docs/plan/briefs/common-b.md` first. Phases B1 to B8 and B11 are
+Read `docs/plan/archive/briefs/common-b.md` first. Phases B1 to B8 and B11 are
 merged. Phase B9 (refinements: graph magnitude, Graphing settings, Stats,
 dashboard, write rate) is running in parallel; avoid `curves.rs`,
 `screens/stats.rs`, `screens/overview.rs` and `settings/graphing` code.
@@ -37,7 +37,7 @@ dashboard, write rate) is running in parallel; avoid `curves.rs`,
      Consoles misplace them (B11).
    Update section 3's key table and section 13's command-bar rows (B3
    added `bypass` and `clear`; B4 already updated the output row).
-2. **`docs/plan/audit.md`.** Annotate every defect with its resolution:
+2. **`docs/plan/archive/audit.md`.** Annotate every defect with its resolution:
    fixed (commit), accepted (DESIGN section 11 entry) or open. Use
    `git log --grep` and the commit subjects. Then move `audit.md` and
    `briefs/` to `docs/plan/archive/`, fixing any links to them.

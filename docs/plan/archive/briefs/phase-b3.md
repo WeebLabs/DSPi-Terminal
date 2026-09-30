@@ -1,6 +1,6 @@
 # Phase B3 brief: small parity edits to existing screens
 
-Read `docs/plan/briefs/common-b.md` first. Phase B1 (protocol bump to V32)
+Read `docs/plan/archive/briefs/common-b.md` first. Phase B1 (protocol bump to V32)
 is merged; `git log` shows its commits.
 
 ## Scope

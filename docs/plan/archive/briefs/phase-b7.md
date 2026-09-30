@@ -1,6 +1,6 @@
 # Phase B7 brief: Control Surfaces caps v14 to v20 and Auxiliary Outputs
 
-Read `docs/plan/briefs/common-b.md` first. Phase B1 (protocol bump to V32)
+Read `docs/plan/archive/briefs/common-b.md` first. Phase B1 (protocol bump to V32)
 is merged: the noun table in `packets.rs` has nouns 57 to 78, and the
 codecs for `CsBinding.extras`, `CS_UNIT_MS_LOG`, `CS_TARGET_AUX`, the aux
 component types, status 0x26 and the 48-byte aux state block exist. Read

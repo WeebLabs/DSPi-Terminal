@@ -1,5 +1,8 @@
 # Console parity plan
 
+*Superseded for firmware targets by `PLAN-beta4.md` (firmware and Console
+v1.1.6-beta4, wire V32); this plan still holds for everything else.*
+
 *Written 2026-08-27. Owner of the plan and of every UX decision: Fable.
 Implementation phases are assigned below.*
 
@@ -11,9 +14,11 @@ mirrors the Console's, in a terminal.
 
 The work is done when all of the following hold:
 
-1. **Firmware parity.** The vendored headers are `release/v1.1.6` @ `112f35b`
-   (wire V28, 202 opcodes, CS caps v13), the coverage test reports 202/202,
-   and `dspi dump` on a v1.1.6 device reports the right topology.
+1. **Firmware parity.** The vendored headers are `release/v1.1.6` @ `557bce7`
+   (1.1.6 beta 4: wire V32, 244 opcodes, CS caps v20), the coverage test
+   reports 244/244, and `dspi dump` on a beta4 device reports the right
+   topology. (Phase 1 pinned `112f35b`, beta2 at wire V28; phase B1 of
+   `PLAN-beta4.md` moved the pin.)
 2. **Feature parity.** Every row of the coverage matrix in section 4 has a
    Terminal location and is checked off. The matrix is derived from
    `survey-console.md`, which lists every control in the Console.
@@ -188,7 +193,6 @@ read back one binding on the device; arm IR learn and press a remote.
 
 - `cmd_tui` loads matrix and surfaces (and everything else `DeviceState`
   needs) at connect, not only `cmd_screenshot`.
-- `Targets::expand` expands every target kind from discovered topology.
 - Trigger rows fire (Enter) with a confirm for `Hazard::Flash` and
   `Irreversible`.
 - Undo consumer: `:undo` / `:redo` over the journal, live params only.
@@ -279,16 +283,16 @@ verification, mono and 16-colour passes.
 ### Phase 10: Audit
 
 Opus audits every phase against its exit criteria and the coverage matrix,
-producing `docs/plan/audit.md`. Fable then audits: (1) `DeviceState` and
+producing `docs/plan/archive/audit.md`. Fable then audits: (1) `DeviceState` and
 the notification path, (2) the Control Surfaces pages, (3) the theme, graph
 and legend. Then HW-3.
 
 ### Progress (2026-08-30)
 
 Merged on `console-parity`: every implementation phase, 0 through 9, and
-the Opus audit (`audit.md`, 81 defects). Fixed by Fable: D1, D2, D2b, D5,
-D6, D6b, D8, D11, D12, D14, D15, D16, D17, D18, D20, D32, D33, D34, D39,
-D41, D43, D44, D56, D75, D77, D78. Both Opus fix rounds are merged
+the Opus audit (`archive/audit.md`, 81 defects). Fixed by Fable: D1, D2,
+D2b, D5, D6, D6b, D8, D11, D12, D14, D15, D16, D17, D18, D20, D32, D33,
+D34, D39, D43, D44, D56, D75, D77, D78. Both Opus fix rounds are merged
 (Settings; screens and panels). The quiet redesign of `DESIGN.md` section
 12 landed on 2026-08-30 (calm palette, one curve per graph, the overview
 grid), and the sidebar, matrix and page-command-bar rounds that followed
@@ -375,6 +379,31 @@ Tick when merged and golden-tested.
 | V1 | Console palette; a hue on the swatch and the selection (DESIGN 12), the Console's full colouring as `--theme console` | Theme | 3, 12| yes |
 | V2 | Disabled / unsupported presentation rules | Widgets | 3| yes |
 | Q1 | 80x24 and 200x60 layouts, help overlay, animation, `--lite` | Shell | 9| yes |
+
+### Beta4 rows
+
+Added from `PLAN-beta4.md` section 5, with that plan's ids (so T1 and O1
+here are not the rows of the same name above). Ticked when merged on
+`console-parity`.
+
+| # | Console | Terminal | Phase | Done |
+|---|---|---|---|---|
+| W1 | Wire V32, GET_PLATFORM beta ordinal, build info | Protocol, title bar, Stats | B1 | yes |
+| W2 | Resync on unknown PARAM_CHANGED; `CS_AUX` event | Session | B1, B2 | yes |
+| W3 | Subharm, tube and limiter in snapshot diff and `.dspipreset` | Session | B2 | yes |
+| T1 | Subharmonic Synthesizer window | Tool panel `S` | B5 | yes |
+| T2 | Tube Modeller window | Tool panel `D` | B6 | yes |
+| T3 | Spectrum Analyser window | Tool panel `A` | B8 | yes |
+| T4 | Spectrum Analyser settings page | Settings > Display | B8 | yes |
+| T5 | FFT Graph overlay and RTA Bars strip | Graph, pages | B8 (later) | |
+| O1 | Output limiter icon, popover and "All outputs" menu | Output page | B4 | yes |
+| C6 | Auxiliary Outputs page | Settings > Control | B7 | yes |
+| C7 | Nouns 57 to 78, target kind 5, MS_LOG | Control Surfaces | B7 | yes |
+| R1 | Signal Generator rename; HC / LC labels; High Cut / Low Cut | Everywhere | B3 | yes |
+| R2 | Matrix and routing names from channel names | Matrix, output page | B3 | yes |
+| R3 | Refusal of non-V32 firmware; no-device empty state | Shell | B3 | yes |
+| R4 | Bypassed bands as grey ghosts | Graph | B9 | |
+| R5 | Stats three columns and buffer history; dashboard cards per row | Stats, overview | B9 | |
 
 Not carried over, with reasons: the `STM32H723` platform (a separate
 firmware repository not in scope; the platform id is decoded generically so

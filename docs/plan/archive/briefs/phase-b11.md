@@ -1,6 +1,6 @@
 # Phase B11 brief: `.dspipreset` interoperability with the Console
 
-Read `docs/plan/briefs/common-b.md` first. Phases B1 and B2 are merged;
+Read `docs/plan/archive/briefs/common-b.md` first. Phases B1 and B2 are merged;
 B2 added subharm, tube and limiter blocks to `.dspipreset`
 (`crates/dspi-session/src/preset_file.rs`).
 

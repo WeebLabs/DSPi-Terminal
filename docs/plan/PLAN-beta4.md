@@ -310,7 +310,7 @@ land on the wrong channels, and the reverse. The import also drops the
 psybass, crossfeed and loudness masks and the upmix modes. Establish the
 format from the Console source, write it down, and make files move
 correctly in both directions on both platforms. Brief:
-`briefs/phase-b11.md`.
+`archive/briefs/phase-b11.md`.
 
 ### B10: Documentation, open defects, audit and merge (M)
 
