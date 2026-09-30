@@ -11,6 +11,9 @@ use super::model::{ChannelItem, Selection, ShellModel, VolumeMode};
 use crate::graph::GraphCurve;
 use crate::theme::{ChannelRole, Theme};
 
+/// The fixture's firmware: beta 4, the one release that speaks wire V32.
+pub const FIRMWARE: &str = "1.1.6 beta 4";
+
 fn item(
     theme: &Theme,
     name: &str,
@@ -66,7 +69,7 @@ fn curve(item: &ChannelItem, bands: &[dsp::Band], gain: f64, selected: bool) -> 
 pub fn rp2350(theme: &Theme) -> ShellModel {
     let mut m = ShellModel::empty();
     m.platform = "RP2350".into();
-    m.firmware = "1.1.6".into();
+    m.firmware = FIRMWARE.into();
     m.serial_short = "A1B2C3D4".into();
     m.connected = true;
     m.devices = vec!["DSPi A1B2C3D4".into()];
@@ -177,6 +180,18 @@ pub fn select(m: &mut ShellModel, state: &DeviceState, theme: &Theme, selection:
     }
     m.curves = curves;
     m.graph_channel = channel.map(|ch| state.channel_name(ch));
+}
+
+/// The device gone, projected as the runner projects it: no channel rows, no
+/// curves, and the overview selected. The gallery's `--screen nodevice`.
+pub fn disconnect(m: &mut ShellModel, state: &mut DeviceState) {
+    state.connected = false;
+    m.connected = false;
+    m.inputs.clear();
+    m.outputs.clear();
+    m.curves.clear();
+    m.graph_channel = None;
+    m.selection = Selection::Overview;
 }
 
 /// An RP2040: two inputs, four outputs and the sub.
@@ -399,8 +414,9 @@ pub fn caps() -> Capabilities {
     Capabilities {
         serial: "E6614C311B8B4E3A".into(),
         platform: Platform::Rp2350,
-        firmware: "1.1.6".into(),
-        firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 6, 0),
+        // The firmware the Terminal speaks to, spelt as the probe spells it.
+        firmware: FIRMWARE.into(),
+        firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 6, 4),
         build_info: None,
         wire_format: WIRE_FORMAT_VERSION as u8,
         num_channels: 17,
@@ -472,4 +488,11 @@ pub fn tube(state: &mut DeviceState, enabled: bool) {
     for (i, v) in floats.iter().enumerate() {
         state.bulk.patch(o + 8 + 4 * i, &v.to_le_bytes());
     }
+}
+
+/// Give the shared analyser an RP2350's caps and a picture of the first
+/// output, bins and all, so the Spectrum Analyser panel has something to draw
+/// without a device. `channels` picks what is chosen at the output tap.
+pub fn spectrum(shared: &crate::screens::Shared, channels: &[u8]) {
+    crate::screens::spectrum::demo::load(shared, dspi_session::rta::TAP_OUTPUT, channels);
 }

@@ -1,5 +1,5 @@
 //! The tool-panel template: the shape every DSP window in `DESIGN.md` 7.8 and
-//! the Test Signals panel in 7.9 are built from.
+//! the Signal Generator panel in 7.9 are built from.
 //!
 //! A panel is a pinned header (title, subtitle and the master toggle, which is
 //! always first in focus order) over a single scrolling column of rows. A panel
@@ -545,12 +545,14 @@ impl Body {
     /// Move the cursor, clamped. Returns false when it was already at the end,
     /// which is how a panel knows to hand the key back to the shell.
     pub fn step(&mut self, dir: i32, rows: &[Row]) -> bool {
-        let last = focus_rows(rows).len() + usize::from(!self.headless);
+        // Index 0 is the header and 1 up the rows, with or without a header
+        // drawn, so the last row is the row count either way.
+        let highest = focus_rows(rows).len();
         let lowest = usize::from(self.headless);
-        if last == 0 {
+        if highest < lowest {
             return false;
         }
-        let next = (self.focus as i32 + dir).clamp(lowest as i32, last as i32 - 1) as usize;
+        let next = (self.focus as i32 + dir).clamp(lowest as i32, highest as i32) as usize;
         let moved = next != self.focus;
         self.focus = next;
         if moved {
@@ -562,9 +564,9 @@ impl Body {
     /// Keep the cursor on a row that still exists after the panel's shape
     /// changed (an engine switched off, a signal type with fewer parameters).
     pub fn clamp(&mut self, rows: &[Row]) {
-        let last = focus_rows(rows).len() + usize::from(!self.headless);
+        let highest = focus_rows(rows).len();
         let lowest = usize::from(self.headless);
-        self.focus = self.focus.clamp(lowest, last.saturating_sub(1).max(lowest));
+        self.focus = self.focus.clamp(lowest, highest.max(lowest));
     }
 
     /// Draw the header and the column beneath it.
@@ -697,7 +699,7 @@ pub struct Header<'a> {
     /// `None` for a panel with no master switch.
     pub toggle: Option<bool>,
     pub enabled: bool,
-    /// A state pill instead of a switch, for Test Signals, whose header
+    /// A state pill instead of a switch, for the Signal Generator, whose header
     /// carries the generator's run state rather than a control.
     pub pill: Option<(String, StatusTone)>,
 }
@@ -1609,6 +1611,28 @@ mod tests {
             tiles(3).handle(key(KeyCode::Enter), &t),
             Some(Action::Button(3))
         );
+    }
+
+    /// A panel without a header numbers its rows from 1 as well, so its
+    /// last row is as reachable as a headed panel's.
+    #[test]
+    fn a_headless_body_reaches_its_last_row() {
+        let rows = vec![
+            Row::Param(Param::new("A", 1.0, 0.0, 2.0, "")),
+            Row::Param(Param::new("B", 1.0, 0.0, 2.0, "")),
+        ];
+        let mut b = Body::headless();
+        assert!(b.step(1, &rows));
+        assert_eq!(b.focused_row(&rows), Some(1));
+        assert!(!b.step(1, &rows), "and stops there");
+        b.focus = 9;
+        b.clamp(&rows);
+        assert_eq!(b.focus, 2);
+        let mut headed = Body::default();
+        headed.step(1, &rows);
+        headed.step(1, &rows);
+        assert_eq!(headed.focused_row(&rows), Some(1));
+        assert!(!Body::headless().step(1, &[]), "nothing to move to");
     }
 
     #[test]

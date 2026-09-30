@@ -33,8 +33,9 @@ use dspi_proto::packets::CsTypeDesc;
 use dspi_session::probe::ControlSurfaceCaps;
 use dspi_session::surfaces::explain_status;
 use dspi_session::surfaces::{
-    CsBinding, CsDisplayCfg, CsDisplayPage, CsDisplayStatus, CsExtStatusPacket, CsGroup, CsMacro,
-    CsMacroStep, CsNounDesc, CsStatusPacket, GPIO_UNUSED, IrCommand, Limits, Surfaces,
+    CsAuxStates, CsBinding, CsDisplayCfg, CsDisplayPage, CsDisplayStatus, CsExtStatusPacket,
+    CsGroup, CsMacro, CsMacroStep, CsNounDesc, CsStatusPacket, GPIO_UNUSED, IrCommand, Limits,
+    Surfaces,
 };
 use dspi_session::{DeviceState, Session};
 
@@ -45,7 +46,7 @@ use crate::shell::SessionReply;
 // The wire vocabulary, by name
 // ---------------------------------------------------------------------------
 
-/// `CsType` (control_surfaces.h:104-117).
+/// `CsType` (control_surfaces.h:129-146).
 pub mod ty {
     pub const NONE: u8 = 0;
     pub const BUTTON: u8 = 1;
@@ -56,6 +57,10 @@ pub mod ty {
     pub const LED_PWM: u8 = 6;
     pub const IR: u8 = 7;
     pub const DISPLAY: u8 = 8;
+    /// Caps v18: an on/off output and a dimmable one, containers that own a
+    /// pin a control switches (control_surfaces.h:141-144).
+    pub const AUX_OUT: u8 = 9;
+    pub const AUX_PWM: u8 = 10;
 }
 
 /// `CsAction` (control_surfaces.h:227-241).
@@ -133,8 +138,7 @@ pub mod noun {
     pub const DISPLAY_PAGE: u8 = 54;
     pub const DISPLAY_EDIT: u8 = 55;
     pub const PAGE_VALUE: u8 = 56;
-    // Caps v14 to v20 (control_surfaces.h:223-250). Named here so the picker
-    // shows the Console's words; their categories and rules are phase B7.
+    // Caps v14 to v20 (control_surfaces.h:223-250).
     pub const SUBHARM: u8 = 57;
     pub const SUBHARM_LOW: u8 = 58;
     pub const SUBHARM_HIGH: u8 = 59;
@@ -181,6 +185,9 @@ pub mod kind {
     pub const NONE: u8 = 255;
 }
 
+/// `CsBinding.extras` on an aux output (control_surfaces.h:425-437).
+pub use dspi_proto::packets::aux_extras;
+
 /// `CsNounDesc.unit`, from the protocol crate (control_surfaces.h:259-269).
 pub mod unit {
     pub use dspi_proto::packets::cs_unit::*;
@@ -193,6 +200,9 @@ pub mod target {
     pub const OUTPUT_CH: u8 = 2;
     pub const DSP_CH: u8 = 3;
     pub const DSP_BAND: u8 = 4;
+    /// Caps v18: a binding slot holding an auxiliary output, not a channel;
+    /// index must be 0 (control_surfaces.h:277-278).
+    pub const AUX: u8 = 5;
 }
 
 /// Highest per-LED brightness ceiling, as a percentage of full duty
@@ -226,6 +236,18 @@ pub fn is_indicator(t: u8) -> bool {
     t == ty::LED || t == ty::LED_PWM
 }
 
+/// True for the two auxiliary output types, the only ones whose `extras`
+/// byte means anything (control_surfaces.h:425-437, 468-469).
+pub fn is_aux(t: u8) -> bool {
+    t == ty::AUX_OUT || t == ty::AUX_PWM
+}
+
+/// True for the types driving a PWM slice, the only ones `base_bright` may be
+/// set on (control_surfaces.h:425-428, 454-457).
+pub fn is_pwm(t: u8) -> bool {
+    t == ty::LED_PWM || t == ty::AUX_PWM
+}
+
 /// `CS_ACT_BIT`: the caps masks are `1 << action`.
 pub fn act_bit(action: u8) -> u16 {
     1u16 << action
@@ -247,6 +269,8 @@ pub fn type_name(t: u8) -> String {
         ty::LED_PWM => "Dimmable LED".into(),
         ty::IR => "IR Remote".into(),
         ty::DISPLAY => "Display".into(),
+        ty::AUX_OUT => "On/Off Output".into(),
+        ty::AUX_PWM => "Dimmable Output".into(),
         other => format!("Type {other}"),
     }
 }
@@ -288,7 +312,7 @@ pub fn noun_name(n: u8, for_type: u8) -> String {
         noun::FILTER_Q => "Filter Q".into(),
         noun::FILTER_TYPE => "Filter Type".into(),
         noun::FILTER_BYPASS => "Filter Bypass".into(),
-        noun::SIGGEN => "Test Signal".into(),
+        noun::SIGGEN => "Signal Generator".into(),
         noun::DAC_MUTE_TEST => "DAC Mute Test".into(),
         noun::CLIP_CH => "Channel Clipping".into(),
         noun::LEVEL => "Channel Level".into(),
@@ -388,6 +412,8 @@ pub fn pin_detail(t: u8) -> &'static str {
         ty::POT => "ADC pin (GPIO 26, 27, or 28), wiper to the pin.",
         ty::LED | ty::LED_PWM => "Output pin driving the LED.",
         ty::IR => "GPIO wired to the receiver module's OUT (VCC to 3V3, GND to GND).",
+        ty::AUX_OUT => "Output pin driving the relay or MOSFET input.",
+        ty::AUX_PWM => "PWM output pin driving the dimmer or fan input.",
         _ => "Wired between this GPIO and GND.",
     }
 }
@@ -398,6 +424,7 @@ pub fn invert_title(t: u8) -> &'static str {
         ty::LED | ty::LED_PWM => "Active-Low LED",
         ty::POT | ty::ENCODER => "Pull-Down Wiring",
         ty::IR => "Idle-Low Receiver",
+        ty::AUX_OUT | ty::AUX_PWM => "Active-Low Output",
         _ => "Active-High Wiring",
     }
 }
@@ -414,6 +441,11 @@ pub fn invert_detail(t: u8) -> &'static str {
             "The receiver idles low and pulls high on a mark; default is the usual idle-high, \
              active-low module."
         }
+        ty::AUX_OUT => {
+            "Drive the pin low to switch the load on, which is what most relay and \
+             opto-isolator boards expect."
+        }
+        ty::AUX_PWM => "Invert the PWM duty for a driver that switches on when the pin goes low.",
         _ => "Component wired to 3V3 with the internal pull-down; default is to GND with pull-up.",
     }
 }
@@ -708,7 +740,14 @@ impl From<&ControlSurfaceCaps> for CsCaps {
     }
 }
 
-/// Every control-surface record the three Control pages show.
+/// Whether the device has auxiliary outputs: caps v18 and a type table that
+/// reaches `CS_TYPE_AUX_PWM` (control_surfaces.h:141-146). The Console's
+/// `csAuxSupported` (DSPViewModel.swift:1640-1642).
+pub fn aux_supported(caps: &CsCaps) -> bool {
+    caps.caps_version >= 18 && caps.type_count > ty::AUX_PWM
+}
+
+/// Every control-surface record the four Control pages show.
 ///
 /// Read once when Settings opens. Sixteen bindings, sixteen names, sixteen IR
 /// commands, eight groups, eight macros, the display config and its pages, plus
@@ -815,6 +854,26 @@ impl CsData {
         match self.groups.get(g) {
             Some(x) if !x.name.is_empty() => x.name.clone(),
             _ => format!("Group {}", g + 1),
+        }
+    }
+
+    /// The Console's `csAuxName`: the slot's own name, else the "Aux N" the
+    /// device's display pages use (DSPViewModel.swift:1644-1649).
+    pub fn aux_name(&self, slot: usize) -> String {
+        match self.names.get(slot) {
+            Some(n) if !n.is_empty() => n.clone(),
+            _ => format!("Aux {}", slot + 1),
+        }
+    }
+
+    /// Whether a slot holds an auxiliary output on the device, of either kind
+    /// or of the dimmable kind only.
+    pub fn is_aux_slot(&self, slot: usize, dimmable_only: bool) -> bool {
+        let t = self.binding(slot).component;
+        if dimmable_only {
+            t == ty::AUX_PWM
+        } else {
+            is_aux(t)
         }
     }
 
@@ -973,7 +1032,12 @@ pub const INPUT_SOURCES: [&str; 7] = [
 ];
 
 /// The Console's `targetName`: a channel address in the noun's own space.
+/// An aux address is a slot, not a channel; without the slot names to hand it
+/// reads as the device's own "Aux N" ([`target_label`] has the names).
 pub fn target_name(state: &DeviceState, nd: &CsNounDesc, t: u8) -> String {
+    if nd.target_kind == target::AUX {
+        return format!("Aux {}", t as u16 + 1);
+    }
     let ch = match nd.target_kind {
         target::OUTPUT_CH => t as usize + state.caps.num_inputs as usize,
         _ => t as usize,
@@ -1028,13 +1092,32 @@ pub(crate) fn enum_value_label(cx: &Cx<'_>, cs: &CsData, n: u8, value: i32) -> S
             .get(value.max(0) as usize)
             .map(|s| (*s).to_string())
             .unwrap_or_else(|| format!("Mode {value}")),
+        // The Console's enum label for the tube type (`tubeTypeName`),
+        // from the one tube table (dspi-session `tube.rs`); 0 is Custom.
+        noun::TUBE_TYPE => dspi_session::tube::type_name(value.clamp(0, 255) as u8),
+        // The Console labels neither of these on its Control Surfaces page;
+        // these are the words its Subharmonic Synthesizer window and limiter
+        // popover use for the same values (subharm.h:71-74; limiter.h:33,
+        // groups 1..4 with 0 unlinked).
+        noun::SUBHARM_SELECT => ["All material", "Percussive", "Sustained"]
+            .get(value.max(0) as usize)
+            .map(|s| (*s).to_string())
+            .unwrap_or_else(|| format!("Mode {value}")),
+        noun::LIMITER_LINK => {
+            if value <= 0 {
+                "Off".into()
+            } else {
+                value.to_string()
+            }
+        }
+        // PEQ passes read as cuts (`DSPi_ConsoleApp.swift:7426-7428`).
         noun::FILTER_TYPE => [
             "Flat",
             "Peaking",
             "Low Shelf",
             "High Shelf",
-            "Low Pass",
-            "High Pass",
+            "High Cut",
+            "Low Cut",
             "Notch",
             "All Pass",
             "All Pass (1st)",
@@ -1059,7 +1142,8 @@ pub(crate) fn enum_value_label(cx: &Cx<'_>, cs: &CsData, n: u8, value: i32) -> S
 /// (ADAT on an RP2040, say) and intersects with nothing, so it never appears. A
 /// noun that addresses a channel space with no channels in it is unavailable
 /// the other way round: there is nowhere for it to point, and the picker under
-/// it would be empty.
+/// it would be empty. The two aux nouns address auxiliary outputs rather than
+/// channels, so they need one of the right kind on the device.
 pub fn valid_nouns(cs: &CsData, t: u8) -> Vec<u8> {
     let Some(td) = cs.type_desc(t) else {
         return Vec::new();
@@ -1067,9 +1151,58 @@ pub fn valid_nouns(cs: &CsData, t: u8) -> Vec<u8> {
     (0..cs.nouns.len() as u8)
         .filter(|n| {
             let nd = &cs.nouns[*n as usize];
-            nd.actions & td.actions != 0 && (nd.target_kind == target::NONE || nd.target_count > 0)
+            nd.actions & td.actions != 0 && has_somewhere_to_point(cs, *n, nd)
         })
         .collect()
+}
+
+/// Whether a noun's target space has anything in it.
+fn has_somewhere_to_point(cs: &CsData, n: u8, nd: &CsNounDesc) -> bool {
+    match nd.target_kind {
+        target::NONE => true,
+        target::AUX => !target_addresses(cs, n, None).is_empty(),
+        _ => nd.target_count > 0,
+    }
+}
+
+/// The addresses a targeted noun's picker offers, before any group.
+///
+/// A channel noun addresses `0..target_count`. An aux noun addresses binding
+/// slots, and only those holding an auxiliary output on the device: either
+/// kind for the switch, the dimmable kind for the level (control_surfaces.h:
+/// 237-239, the Console's `targetChoices`, DSPi_ConsoleApp.swift:3364-3373).
+/// A binding may not point at its own slot, which `own` excludes.
+pub fn target_addresses(cs: &CsData, n: u8, own: Option<usize>) -> Vec<u8> {
+    let Some(nd) = cs.noun_desc(n) else {
+        return Vec::new();
+    };
+    if nd.target_kind != target::AUX {
+        return (0..nd.target_count).collect();
+    }
+    let slots = (nd.target_count as usize).min(cs.bindings.len());
+    (0..slots)
+        .filter(|s| Some(*s) != own && cs.is_aux_slot(*s, n == noun::AUX_LEVEL))
+        .map(|s| s as u8)
+        .collect()
+}
+
+/// What one address reads as: a channel's name, or an aux output's.
+pub fn target_label(state: &DeviceState, cs: &CsData, nd: &CsNounDesc, t: u8) -> String {
+    if nd.target_kind == target::AUX {
+        cs.aux_name(t as usize)
+    } else {
+        target_name(state, nd, t)
+    }
+}
+
+/// The Console's `targetNoun`: an aux noun's picker is not choosing a channel
+/// (DSPi_ConsoleApp.swift:7439-7447).
+pub fn target_noun(nd: &CsNounDesc) -> &'static str {
+    if nd.target_kind == target::AUX {
+        "Auxiliary Output"
+    } else {
+        "Channel"
+    }
 }
 
 /// Legal actions for a (type, noun) pair: the AND of their two masks.
@@ -1116,22 +1249,46 @@ pub fn default_action(cs: &CsData, t: u8, n: u8) -> u8 {
 pub struct NounCategory {
     pub name: &'static str,
     pub nouns: &'static [u8],
+    /// Name prefixes an item drops inside this category, because the
+    /// category already says it ("Crossfeed / Preset").
+    pub strip: &'static [&'static str],
+    /// The family's on/off noun, which reads "Enable/Disable" inside it.
+    pub enable_noun: Option<u8>,
 }
 
-/// The Console's `nounCategories`, in its order. A noun not named here (a
-/// future firmware's addition) still appears, under "Other".
-pub const NOUN_CATEGORIES: &[NounCategory] = &[
+/// A category with neither a prefix to strip nor an on/off noun.
+const fn plain(name: &'static str, nouns: &'static [u8]) -> NounCategory {
     NounCategory {
-        name: "Volume & Mute",
-        nouns: &[noun::USER_VOLUME, noun::MASTER_VOLUME, noun::USER_MUTE],
-    },
+        name,
+        nouns,
+        strip: &[],
+        enable_noun: None,
+    }
+}
+
+/// The Console's `nounCategories` (DSPi_ConsoleApp.swift:6150-6207), in its
+/// order, with its strips. A noun not named here (a future firmware's
+/// addition) still appears, under "Other".
+///
+/// "Output Limiter" is the Terminal's own: the Console has no limiter nouns
+/// (PLAN-beta4 decision 6). It follows the other families' pattern and sits
+/// beside "Channels", the other per-output nouns.
+pub const NOUN_CATEGORIES: &[NounCategory] = &[
+    plain(
+        "Volume & Mute",
+        &[noun::USER_VOLUME, noun::MASTER_VOLUME, noun::USER_MUTE],
+    ),
     NounCategory {
         name: "Loudness",
         nouns: &[noun::LOUDNESS, noun::LOUDNESS_SPL, noun::LOUDNESS_INTENSITY],
+        strip: &["Loudness"],
+        enable_noun: Some(noun::LOUDNESS),
     },
     NounCategory {
         name: "Crossfeed",
         nouns: &[noun::CROSSFEED, noun::CROSSFEED_PRESET, noun::CROSSFEED_ITD],
+        strip: &["Crossfeed"],
+        enable_noun: Some(noun::CROSSFEED),
     },
     NounCategory {
         name: "Volume Leveller",
@@ -1141,6 +1298,8 @@ pub const NOUN_CATEGORIES: &[NounCategory] = &[
             noun::LEVELLER_SPEED,
             noun::LEVELLER_LOOKAHEAD,
         ],
+        strip: &["Leveller"],
+        enable_noun: Some(noun::LEVELLER),
     },
     NounCategory {
         name: "Psychoacoustic Bass",
@@ -1152,6 +1311,37 @@ pub const NOUN_CATEGORIES: &[NounCategory] = &[
             noun::PSYBASS_CHARACTER,
             noun::PSYBASS_ORIGINAL,
         ],
+        strip: &["Psych Bass"],
+        enable_noun: Some(noun::PSYBASS),
+    },
+    NounCategory {
+        name: "Subharmonic Synth",
+        nouns: &[
+            noun::SUBHARM,
+            noun::SUBHARM_LOW,
+            noun::SUBHARM_HIGH,
+            noun::SUBHARM_TOP,
+            noun::SUBHARM_BOOST,
+            noun::SUBHARM_SELECT,
+            noun::SUBHARM_DEPTH,
+            noun::SUBHARM_HOLD,
+            noun::SUBHARM_CEILING,
+            noun::SUBHARM_LINK,
+            noun::SUBHARM_SOLO,
+        ],
+        strip: &["Subharm"],
+        enable_noun: Some(noun::SUBHARM),
+    },
+    NounCategory {
+        name: "Tube Modeller",
+        nouns: &[
+            noun::TUBE,
+            noun::TUBE_TYPE,
+            noun::TUBE_DRIVE,
+            noun::TUBE_MIX,
+        ],
+        strip: &["Tube"],
+        enable_noun: Some(noun::TUBE),
     },
     NounCategory {
         name: "Upmixer",
@@ -1163,25 +1353,39 @@ pub const NOUN_CATEGORIES: &[NounCategory] = &[
             noun::UPMIX_WIDTH,
             noun::UPMIX_PRESENCE,
         ],
+        strip: &["Upmixer"],
+        enable_noun: Some(noun::UPMIX),
     },
-    NounCategory {
-        name: "Input & Presets",
-        nouns: &[
+    plain(
+        "Input & Presets",
+        &[
             noun::PRESET,
             noun::PRESET_RELOAD,
             noun::INPUT_SOURCE,
             noun::LG_SYNC,
         ],
-    },
-    NounCategory {
-        name: "Channels",
-        nouns: &[
+    ),
+    plain(
+        "Channels",
+        &[
             noun::PREAMP,
             noun::OUTPUT_GAIN,
             noun::OUTPUT_MUTE,
             noun::OUTPUT_ENABLE,
             noun::OUTPUT_DELAY,
         ],
+    ),
+    NounCategory {
+        name: "Output Limiter",
+        nouns: &[
+            noun::LIMITER,
+            noun::LIMITER_THRESHOLD,
+            noun::LIMITER_RELEASE,
+            noun::LIMITER_LINK,
+            noun::LIMITER_GR,
+        ],
+        strip: &["Limiter"],
+        enable_noun: Some(noun::LIMITER),
     },
     NounCategory {
         name: "Filters",
@@ -1193,17 +1397,29 @@ pub const NOUN_CATEGORIES: &[NounCategory] = &[
             noun::FILTER_TYPE,
             noun::FILTER_BYPASS,
         ],
+        strip: &["Filter"],
+        enable_noun: None,
     },
-    NounCategory {
-        name: "Tools",
-        nouns: &[noun::MACRO, noun::SIGGEN, noun::DAC_MUTE_TEST, noun::CLIP],
-    },
+    plain(
+        "Tools",
+        &[noun::MACRO, noun::SIGGEN, noun::DAC_MUTE_TEST, noun::CLIP],
+    ),
     NounCategory {
         name: "Display",
         nouns: &[noun::DISPLAY_PAGE, noun::PAGE_VALUE, noun::DISPLAY_EDIT],
+        strip: &["Display"],
+        enable_noun: None,
+    },
+    NounCategory {
+        name: "Auxiliary Outputs",
+        nouns: &[noun::AUX, noun::AUX_LEVEL],
+        strip: &["Aux"],
+        enable_noun: Some(noun::AUX),
     },
     NounCategory {
         name: "Status",
+        strip: &[],
+        enable_noun: None,
         nouns: &[
             noun::CPU_LOAD,
             noun::CLIP_CH,
@@ -1261,13 +1477,44 @@ pub fn noun_choices(cs: &CsData, t: u8) -> Vec<(&'static str, u8)> {
         .collect()
 }
 
+/// The Console's `nounMenuLabel` (DSPi_ConsoleApp.swift:7083-7099): inside
+/// its category an item drops the family prefix, and the family's on/off noun
+/// reads "Enable/Disable", or "Enabled" on an indicator, which shows the state
+/// rather than changing it.
+pub fn noun_menu_label(category: &str, n: u8, t: u8) -> String {
+    let full = noun_name(n, t);
+    let Some(cat) = NOUN_CATEGORIES.iter().find(|c| c.name == category) else {
+        return full;
+    };
+    if cat.enable_noun == Some(n) {
+        return if is_indicator(t) {
+            "Enabled".into()
+        } else {
+            "Enable/Disable".into()
+        };
+    }
+    for p in cat.strip {
+        if let Some(rest) = full.strip_prefix(&format!("{p} ")) {
+            return rest.to_string();
+        }
+    }
+    full
+}
+
+/// One line of the picker: the category, then the item as it reads there.
+pub fn noun_choice_label(category: &str, n: u8, t: u8) -> String {
+    format!("{category} / {}", noun_menu_label(category, n, t))
+}
+
 /// Group slots whose channel space matches what a noun targets. A band noun
 /// addresses DSP channels, so it takes a DSP_CH group.
 pub fn compatible_groups(cs: &CsData, n: u8) -> Vec<u8> {
     let Some(nd) = cs.noun_desc(n) else {
         return Vec::new();
     };
-    if !nd.is_targeted() {
+    // An aux output is not a channel and never takes a group
+    // (survey-firmware-beta4 3.7; control_surfaces.h:277-278).
+    if !nd.is_targeted() || nd.target_kind == target::AUX {
         return Vec::new();
     }
     let wanted = if nd.target_kind == target::DSP_BAND {
@@ -1303,13 +1550,17 @@ pub fn group_menu_label(cs: &CsData, g: u8) -> String {
 pub(crate) fn target_choices(
     cx: &Cx<'_>,
     cs: &CsData,
-    nd: &CsNounDesc,
+    n: u8,
+    own: Option<usize>,
     usable: &[u8],
     target: u8,
     grouped: bool,
 ) -> (Vec<String>, usize) {
-    let mut choices: Vec<String> = (0..nd.target_count)
-        .map(|t| target_name(cx.state, nd, t))
+    let nd = cs.noun_desc(n).copied().unwrap_or_default();
+    let addresses = picker_addresses(cs, n, own, target, grouped);
+    let mut choices: Vec<String> = addresses
+        .iter()
+        .map(|t| target_label(cx.state, cs, &nd, *t))
         .collect();
     let channels = choices.len();
     let mut groups: Vec<u8> = usable.to_vec();
@@ -1326,22 +1577,40 @@ pub(crate) fn target_choices(
     let selected = if grouped {
         channels + groups.iter().position(|g| *g == target).unwrap_or(0)
     } else {
-        (target as usize).min(channels.saturating_sub(1))
+        addresses.iter().position(|t| *t == target).unwrap_or(0)
     };
     (choices, selected)
 }
 
+/// The addresses a picker lists. An aux binding whose output has since gone
+/// keeps its own address on the list, as a stale group does, so the picker
+/// never retargets it behind the user's back.
+fn picker_addresses(cs: &CsData, n: u8, own: Option<usize>, target: u8, grouped: bool) -> Vec<u8> {
+    let mut a = target_addresses(cs, n, own);
+    let is_aux = cs
+        .noun_desc(n)
+        .is_some_and(|d| d.target_kind == target::AUX);
+    if is_aux && !grouped && !a.contains(&target) {
+        a.push(target);
+        a.sort_unstable();
+    }
+    a
+}
+
 /// Where a choice from [`target_choices`] lands: a channel, or a group.
 pub(crate) fn target_choice(
-    nd: &CsNounDesc,
+    cs: &CsData,
+    n: u8,
+    own: Option<usize>,
     usable: &[u8],
     target: u8,
     grouped: bool,
     choice: usize,
 ) -> (bool, u8) {
-    let channels = nd.target_count as usize;
+    let addresses = picker_addresses(cs, n, own, target, grouped);
+    let channels = addresses.len();
     if choice < channels {
-        return (false, choice as u8);
+        return (false, addresses[choice]);
     }
     let mut groups: Vec<u8> = usable.to_vec();
     if grouped && !groups.contains(&target) {
@@ -1399,10 +1668,11 @@ pub fn band_options(cs: &CsData, state: &DeviceState, n: u8, t: u8, grouped: boo
 // ---------------------------------------------------------------------------
 
 /// Whether the firmware accepts on/off delays on this (type, action) pair: an
-/// LED following a boolean condition, and nothing else. A delay left anywhere
-/// else is rejected outright, so the editor clears the fields on the way out.
+/// LED following a boolean condition, or an auxiliary output's on/off flag
+/// (control_surfaces.h:425-428), and nothing else. A delay left anywhere else
+/// is rejected outright, so the editor clears the fields on the way out.
 pub fn delays_allowed(t: u8, action: u8) -> bool {
-    is_indicator(t) && (action == act::IND_EQUALS || action == act::IND_ABOVE)
+    is_aux(t) || (is_indicator(t) && (action == act::IND_EQUALS || action == act::IND_ABOVE))
 }
 
 /// The kind a noun's operands follow. `PAGE_VALUE` resolves its item at event
@@ -1428,6 +1698,11 @@ pub fn noun_range(cs: &CsData, n: u8) -> (f64, f64) {
 
 /// Reset value, step and range for a binding's action and noun kind.
 pub fn default_operands(cs: &CsData, b: &CsBinding) -> CsBinding {
+    // An aux output drives nothing, so it has no operands to reset: its
+    // `value` is the power-on level and its `extras` the power-on flags.
+    if is_aux(b.component) {
+        return b.clone();
+    }
     let mut b = b.clone();
     let nd = cs.noun_desc(b.noun).copied().unwrap_or_default();
     let k = operand_kind(cs, b.noun);
@@ -1440,8 +1715,14 @@ pub fn default_operands(cs: &CsData, b: &CsBinding) -> CsBinding {
         b.on_delay = 0;
         b.off_delay = 0;
     }
-    if b.component != ty::LED_PWM {
+    if !is_pwm(b.component) {
         b.base_bright = 0;
+    }
+    // `extras` carries an aux output's power-on flags and is 0 on every other
+    // type (control_surfaces.h:468-469), so it survives here only where it
+    // means something.
+    if !is_aux(b.component) {
+        b.extras = 0;
     }
     match b.action {
         act::STEP | act::INC | act::DEC => {
@@ -1660,6 +1941,17 @@ pub(crate) fn make_binding(
             ..Default::default()
         };
     }
+    // An aux output is a container too: its pin and nothing else until the
+    // user sets the sense, delays or power-on behaviour. All-zero extras is
+    // off at power-on, the safe default for an amplifier trigger (the
+    // Console's `makeBinding`, DSPi_ConsoleApp.swift:6282-6292).
+    if is_aux(t) {
+        return CsBinding {
+            component: t,
+            gpio: [free(false).first().copied().unwrap_or(0), GPIO_UNUSED],
+            ..Default::default()
+        };
+    }
     let td = cs.type_desc(t).copied().unwrap_or_default();
     let adc = td.pin_class == dspi_proto::packets::CsTypeDesc::PINCLASS_ADC;
     let two_pin = td.pin_count >= 2;
@@ -1692,6 +1984,12 @@ pub(crate) fn make_binding(
 /// Retarget a binding after its noun changed: the new noun may address a
 /// different space, or nothing at all.
 pub fn set_noun(cs: &CsData, b: &CsBinding, n: u8) -> CsBinding {
+    set_noun_in(cs, b, n, None)
+}
+
+/// [`set_noun`] for a binding in a known slot, so an aux noun is pointed at
+/// an aux output and never at the binding's own slot.
+pub fn set_noun_in(cs: &CsData, b: &CsBinding, n: u8, own: Option<usize>) -> CsBinding {
     let mut b = b.clone();
     b.noun = n;
     b.target = 0;
@@ -1700,7 +1998,32 @@ pub fn set_noun(cs: &CsData, b: &CsBinding, n: u8) -> CsBinding {
     if !acts.contains(&b.action) {
         b.action = default_action(cs, b.component, n);
     }
-    default_operands(cs, &b)
+    let mut b = default_operands(cs, &b);
+    // Slot 0 is rarely an aux output, so an aux noun starts on the first one.
+    // The group sweep above has already dropped any group: an aux noun takes
+    // none.
+    if cs
+        .noun_desc(n)
+        .is_some_and(|d| d.target_kind == target::AUX)
+    {
+        b.target = target_addresses(cs, n, own).first().copied().unwrap_or(0);
+    }
+    b
+}
+
+/// Change an aux output between its two kinds, keeping what both share: the
+/// pin, the sense, the delays and the power-on switch. The level, its ceiling
+/// and the linear curve exist only on the dimmable kind, and the on/off kind
+/// is refused if it carries any of them (control_surfaces.h:425-437).
+pub fn switch_aux_kind(b: &CsBinding, t: u8) -> CsBinding {
+    let mut nb = b.clone();
+    nb.component = t;
+    if t == ty::AUX_OUT {
+        nb.value = 0;
+        nb.base_bright = 0;
+        nb.extras &= !aux_extras::LINEAR;
+    }
+    nb
 }
 
 // ---------------------------------------------------------------------------
@@ -1812,7 +2135,7 @@ pub fn display_page_summary(state: &DeviceState, cs: &CsData, page: &CsDisplayPa
     let where_ = if page.flags & dspi_proto::packets::page_flags::GROUP != 0 {
         cs.group_name(page.target as usize)
     } else {
-        target_name(state, nd, page.target)
+        target_label(state, cs, nd, page.target)
     };
     format!("{where_} {name}")
 }
@@ -1846,7 +2169,7 @@ fn target_suffix(state: &DeviceState, cs: &CsData, b: &CsBinding) -> String {
     let mut s = if b.flags & flag::GROUP != 0 {
         format!(" ({}", cs.group_name(b.target as usize))
     } else {
-        format!(" ({}", target_name(state, nd, b.target))
+        format!(" ({}", target_label(state, cs, nd, b.target))
     };
     if nd.has_band() {
         s += &format!(", {}", band_name(b.index));
@@ -1878,6 +2201,22 @@ pub fn verb_phrase(state: &DeviceState, cs: &CsData, b: &CsBinding) -> String {
 fn action_phrase(state: &DeviceState, cs: &CsData, b: &CsBinding) -> String {
     if b.component == ty::IR {
         return "Receives commands from an IR remote.".into();
+    }
+    // The Console's `actionPhrase` (DSPi_ConsoleApp.swift:7246-7251).
+    if is_aux(b.component) {
+        let boots = if b.extras & aux_extras::BOOT_SAVED != 0 {
+            "comes back as last saved"
+        } else if b.extras & aux_extras::BOOT_ON != 0 {
+            "starts on"
+        } else {
+            "starts off"
+        };
+        let what = if b.component == ty::AUX_PWM {
+            "Dimmable output"
+        } else {
+            "On/off output"
+        };
+        return format!("{what} on GPIO {}, {boots}.", b.gpio[0]);
     }
     if b.component == ty::DISPLAY {
         let addr = if b.value == 0 {
@@ -2029,11 +2368,11 @@ pub fn ir_verb_phrase(state: &DeviceState, cs: &CsData, c: &IrCommand) -> String
         } else if nd.has_band() {
             format!(
                 " ({}, {})",
-                target_name(state, nd, c.target),
+                target_label(state, cs, nd, c.target),
                 band_name(c.index)
             )
         } else {
-            format!(" ({})", target_name(state, nd, c.target))
+            format!(" ({})", target_label(state, cs, nd, c.target))
         };
     }
     let is_enum = operand_kind(cs, c.noun) == kind::ENUM;
@@ -2067,7 +2406,7 @@ pub fn macro_step_summary(state: &DeviceState, cs: &CsData, st: &CsMacroStep) ->
             if st.flags & flag::GROUP != 0 {
                 format!(" ({})", cs.group_name(st.target as usize))
             } else {
-                format!(" ({})", target_name(state, nd, st.target))
+                format!(" ({})", target_label(state, cs, nd, st.target))
             }
         }
         _ => String::new(),
@@ -2169,10 +2508,10 @@ pub mod demo {
             | bit(act::TRIGGER)
             | bit(act::MOMENTARY);
         ControlSurfaceCaps {
-            caps_version: 13,
+            caps_version: 20,
             max_bindings: 16,
-            type_count: 9,
-            noun_count: 57,
+            type_count: 11,
+            noun_count: 79,
             max_ir_commands: 16,
             max_groups: 8,
             max_macros: 8,
@@ -2193,6 +2532,9 @@ pub mod demo {
                 ),
                 t(button, 1, 0),
                 t(0, 2, 0),
+                // The two aux containers drive nothing themselves.
+                t(0, 1, 0),
+                t(0, 1, 0),
             ],
         }
     }
@@ -2205,7 +2547,7 @@ pub mod demo {
         let ind = bit(act::IND_ABOVE) | bit(act::IND_LEVEL);
         let boolean = bit(act::TOGGLE) | bit(act::SET) | bit(act::FOLLOW) | bit(act::IND_EQUALS);
         let enums = bit(act::STEP) | bit(act::INC) | bit(act::DEC) | bit(act::SET);
-        let mut v = vec![CsNounDesc::default(); 57];
+        let mut v = vec![CsNounDesc::default(); 79];
         let mut set = |n: u8, d: CsNounDesc| v[n as usize] = d;
         set(
             noun::USER_VOLUME,
@@ -2374,6 +2716,121 @@ pub mod demo {
                 ..Default::default()
             },
         );
+        // Caps v14 to v20, as control_surfaces_nouns.c publishes them: the
+        // subharm, tube and limiter families, the two aux nouns addressing
+        // binding slots, and the limiter's read-only gain reduction.
+        let q8 = |x: i16| x * 256;
+        // The firmware's CS_CONT_RW, CS_BOOL_RW and CS_ENUM_RW masks.
+        let cont_rw = cont | bit(act::SET) | ind;
+        let bool_rw = boolean | bit(act::MOMENTARY);
+        let enum_rw = enums | bit(act::IND_EQUALS);
+        set(
+            noun::SUBHARM,
+            CsNounDesc {
+                kind: kind::BOOL,
+                actions: bool_rw,
+                ..Default::default()
+            },
+        );
+        set(
+            noun::SUBHARM_SELECT,
+            CsNounDesc {
+                kind: kind::ENUM,
+                enum_count: 3,
+                actions: enum_rw,
+                ..Default::default()
+            },
+        );
+        set(
+            noun::TUBE_TYPE,
+            CsNounDesc {
+                kind: kind::ENUM,
+                enum_count: 17,
+                actions: enum_rw,
+                ..Default::default()
+            },
+        );
+        set(
+            noun::AUX,
+            CsNounDesc {
+                kind: kind::BOOL,
+                actions: bool_rw,
+                target_kind: target::AUX,
+                target_count: 16,
+                ..Default::default()
+            },
+        );
+        set(
+            noun::AUX_LEVEL,
+            CsNounDesc {
+                kind: kind::CONTINUOUS,
+                actions: cont_rw,
+                max_q: q8(100),
+                unit: unit::PERCENT,
+                target_kind: target::AUX,
+                target_count: 16,
+                ..Default::default()
+            },
+        );
+        set(
+            noun::LIMITER,
+            CsNounDesc {
+                kind: kind::BOOL,
+                actions: bool_rw,
+                target_kind: target::OUTPUT_CH,
+                target_count: 8,
+                ..Default::default()
+            },
+        );
+        set(
+            noun::LIMITER_THRESHOLD,
+            CsNounDesc {
+                kind: kind::CONTINUOUS,
+                actions: cont_rw,
+                min_q: q8(-30),
+                max_q: 0,
+                unit: unit::DB,
+                target_kind: target::OUTPUT_CH,
+                target_count: 8,
+                ..Default::default()
+            },
+        );
+        set(
+            noun::LIMITER_RELEASE,
+            CsNounDesc {
+                kind: kind::CONTINUOUS,
+                actions: cont_rw,
+                min_q: 10,
+                max_q: 1000,
+                unit: unit::MS_LOG,
+                target_kind: target::OUTPUT_CH,
+                target_count: 8,
+                ..Default::default()
+            },
+        );
+        set(
+            noun::LIMITER_LINK,
+            CsNounDesc {
+                kind: kind::ENUM,
+                enum_count: 5,
+                actions: enum_rw,
+                target_kind: target::OUTPUT_CH,
+                target_count: 8,
+                ..Default::default()
+            },
+        );
+        set(
+            noun::LIMITER_GR,
+            CsNounDesc {
+                kind: kind::CONTINUOUS,
+                actions: ind,
+                max_q: q8(30),
+                unit: unit::DB,
+                target_kind: target::OUTPUT_CH,
+                target_count: 8,
+                ..Default::default()
+            },
+        );
         // ADAT_ACTIVE is left with a zero action mask: the firmware's way of
         // saying the platform does not have it.
         v
@@ -2420,8 +2877,34 @@ pub mod demo {
             index: 6,
             ..Default::default()
         };
+        // Two auxiliary outputs and a button that switches the first. They
+        // sit high so the first free slot stays where it was.
+        bindings[10] = CsBinding {
+            component: ty::AUX_OUT,
+            gpio: [27, GPIO_UNUSED],
+            off_delay: encode_delay(60),
+            ..Default::default()
+        };
+        bindings[11] = CsBinding {
+            component: ty::AUX_PWM,
+            gpio: [28, GPIO_UNUSED],
+            base_bright: 80,
+            value: encode_value(50.0, unit::PERCENT),
+            extras: aux_extras::BOOT_ON,
+            ..Default::default()
+        };
+        bindings[12] = CsBinding {
+            component: ty::BUTTON,
+            noun: noun::AUX,
+            action: act::TOGGLE,
+            gpio: [19, GPIO_UNUSED],
+            target: 10,
+            value: 1,
+            ..Default::default()
+        };
         let mut names = vec![String::new(); caps.max_bindings as usize];
         names[0] = "Volume Knob".into();
+        names[10] = "Amp Trigger".into();
         let mut ir = vec![IrCommand::default(); caps.max_ir_commands as usize];
         ir[0] = IrCommand {
             noun: noun::USER_VOLUME,
@@ -2476,7 +2959,7 @@ pub mod demo {
             last_slot: 0,
             max_bindings: caps.max_bindings,
             dirty: false,
-            active_mask: 0b0001_1111,
+            active_mask: 0b0001_1100_0001_1111,
             slot_status: vec![0; caps.max_bindings as usize],
             ir_active_mask: 0b0001,
             ir_learn_state: 0,
@@ -2524,6 +3007,15 @@ pub mod demo {
     pub fn state() -> DeviceState {
         let mut s = super::super::demo::state();
         s.caps.cs = Some(caps());
+        // The trigger is on; the lamp is on at its boot level. `DeviceState`
+        // holds the live aux values (`refresh_cs_aux`, runtime.rs).
+        s.cs_aux_states = Some({
+            let mut a = CsAuxStates::default();
+            a.state[10] = 1;
+            a.state[11] = 1;
+            a.level_q8[11] = 50 * 256;
+            a
+        });
         s
     }
 
@@ -2588,6 +3080,30 @@ mod tests {
         assert_eq!(noun_name(noun::CLIP, ty::LED), "Clipping");
         assert_eq!(noun_name(noun::MACRO, ty::LED), "Running Macro");
         assert_eq!(noun_name(noun::MACRO, ty::BUTTON), "Macro");
+        // Test Signal was renamed (`DSPi_ConsoleApp.swift:7134`).
+        assert_eq!(noun_name(noun::SIGGEN, ty::BUTTON), "Signal Generator");
+        // And the filter types read as cuts (`DSPi_ConsoleApp.swift:7426-7428`).
+        let state = demo::state();
+        let data = demo::settings_data();
+        let config = crate::settings::AppConfig::default();
+        let cx = Cx {
+            state: &state,
+            data: &data,
+            config: &config,
+            connected: true,
+            global_dirty: false,
+        };
+        let cs = data.cs.as_ref().expect("demo control surfaces");
+        let types: Vec<String> = (0..11)
+            .map(|v| enum_value_label(&cx, cs, noun::FILTER_TYPE, v))
+            .collect();
+        assert_eq!(types[4], "High Cut");
+        assert_eq!(types[5], "Low Cut");
+        assert!(
+            !types
+                .iter()
+                .any(|t| t.contains("Pass") && !t.starts_with("All"))
+        );
         assert_eq!(action_name(act::INC, noun::PRESET, true), "Next");
         assert_eq!(action_name(act::INC, noun::USER_VOLUME, false), "Increase");
         assert_eq!(action_name(act::INC, noun::PAGE_VALUE, true), "Up");
@@ -2868,6 +3384,210 @@ mod tests {
             "Running - step 2 of 2."
         );
         assert!(group_summary(&st, &cs.groups[0]).contains(','));
+    }
+
+    /// An aux noun addresses a binding slot holding an aux output: either kind
+    /// for the switch, the dimmable kind for the level, never a group and
+    /// never the binding's own slot (control_surfaces.h:237-239, 277-278).
+    #[test]
+    fn the_aux_target_picker_lists_only_aux_outputs() {
+        let cs = demo::data();
+        let st = demo::state();
+        assert_eq!(target_addresses(&cs, noun::AUX, None), vec![10, 11]);
+        assert_eq!(target_addresses(&cs, noun::AUX_LEVEL, None), vec![11]);
+        assert_eq!(target_addresses(&cs, noun::AUX, Some(10)), vec![11]);
+        // A channel noun still counts its channels.
+        assert_eq!(
+            target_addresses(&cs, noun::OUTPUT_GAIN, None),
+            (0..8).collect::<Vec<u8>>()
+        );
+        assert!(compatible_groups(&cs, noun::AUX).is_empty(), "no group");
+        assert!(compatible_groups(&cs, noun::AUX_LEVEL).is_empty());
+
+        // The picker says what it is choosing, and names the outputs by
+        // their slot names, else the device's "Aux N".
+        let nd = cs.noun_desc(noun::AUX).copied().unwrap();
+        assert_eq!(target_noun(&nd), "Auxiliary Output");
+        assert_eq!(
+            target_noun(cs.noun_desc(noun::OUTPUT_GAIN).unwrap()),
+            "Channel"
+        );
+        assert_eq!(target_label(&st, &cs, &nd, 10), "Amp Trigger");
+        assert_eq!(target_label(&st, &cs, &nd, 11), "Aux 12");
+        assert_eq!(target_name(&st, &nd, 11), "Aux 12");
+
+        // A noun change points an aux noun at the first output that fits,
+        // not at slot 0, and drops a group it cannot take.
+        let grouped = CsBinding {
+            flags: flag::GROUP,
+            ..cs.bindings[1].clone()
+        };
+        let b = set_noun_in(&cs, &grouped, noun::AUX_LEVEL, Some(1));
+        assert_eq!(b.target, 11);
+        assert_eq!(b.flags & flag::GROUP, 0);
+        assert_eq!(set_noun(&cs, &cs.bindings[1], noun::AUX).target, 10);
+
+        // With no aux output there is nowhere to point, so neither noun is
+        // offered, as a channel noun with no channels is not.
+        assert!(valid_nouns(&cs, ty::BUTTON).contains(&noun::AUX));
+        let mut none = cs.clone();
+        none.bindings[11] = CsBinding::default();
+        assert!(valid_nouns(&none, ty::BUTTON).contains(&noun::AUX));
+        assert!(!valid_nouns(&none, ty::ENCODER).contains(&noun::AUX_LEVEL));
+        none.bindings[10] = CsBinding::default();
+        assert!(!valid_nouns(&none, ty::BUTTON).contains(&noun::AUX));
+    }
+
+    /// Caps v14 to v20 in the Console's categories and order, with its
+    /// strips; the limiter family, which the Console lacks, the same way.
+    #[test]
+    fn the_new_nouns_sit_in_the_consoles_categories() {
+        let cs = demo::data();
+        let names: Vec<&str> = noun_groups(&cs, ty::BUTTON)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        // The demo's button reaches these; the order is the Console's, with
+        // the limiter beside the other per-output nouns.
+        assert_eq!(
+            names,
+            vec![
+                "Volume & Mute",
+                "Subharmonic Synth",
+                "Tube Modeller",
+                "Input & Presets",
+                "Channels",
+                "Output Limiter",
+                "Filters",
+                "Tools",
+                "Display",
+                "Auxiliary Outputs",
+            ]
+        );
+        assert!(
+            !names.contains(&"Other"),
+            "every new noun is placed: {names:?}"
+        );
+
+        assert_eq!(
+            noun_choice_label("Subharmonic Synth", noun::SUBHARM_LOW, ty::BUTTON),
+            "Subharmonic Synth / 24-36 Hz Level"
+        );
+        assert_eq!(
+            noun_choice_label("Subharmonic Synth", noun::SUBHARM, ty::BUTTON),
+            "Subharmonic Synth / Enable/Disable"
+        );
+        assert_eq!(
+            noun_choice_label("Tube Modeller", noun::TUBE_MIX, ty::POT),
+            "Tube Modeller / Mix"
+        );
+        assert_eq!(
+            noun_choice_label("Auxiliary Outputs", noun::AUX, ty::BUTTON),
+            "Auxiliary Outputs / Enable/Disable"
+        );
+        assert_eq!(
+            noun_choice_label("Auxiliary Outputs", noun::AUX, ty::LED),
+            "Auxiliary Outputs / Enabled"
+        );
+        assert_eq!(
+            noun_choice_label("Auxiliary Outputs", noun::AUX_LEVEL, ty::POT),
+            "Auxiliary Outputs / Level"
+        );
+        assert_eq!(
+            noun_choice_label("Output Limiter", noun::LIMITER_RELEASE, ty::ENCODER),
+            "Output Limiter / Release"
+        );
+        // Outside a category the full name stands.
+        assert_eq!(
+            noun_name(noun::LIMITER_GR, ty::LED),
+            "Limiter Gain Reduction"
+        );
+        assert_eq!(
+            noun_name(noun::SUBHARM, ty::BUTTON),
+            "Subharmonic Synthesizer"
+        );
+        assert_eq!(type_name(ty::AUX_OUT), "On/Off Output");
+        assert_eq!(type_name(ty::AUX_PWM), "Dimmable Output");
+        assert_eq!(invert_title(ty::AUX_PWM), "Active-Low Output");
+    }
+
+    /// The limiter's gain reduction is read-only: the firmware gives it the
+    /// indicator actions and nothing else, so only an LED or a display page
+    /// can show it and nothing can set it.
+    #[test]
+    fn the_read_only_gain_reduction_is_offered_only_to_indicators() {
+        let cs = demo::data();
+        assert!(!valid_nouns(&cs, ty::BUTTON).contains(&noun::LIMITER_GR));
+        assert!(!valid_nouns(&cs, ty::POT).contains(&noun::LIMITER_GR));
+        assert!(valid_nouns(&cs, ty::LED_PWM).contains(&noun::LIMITER_GR));
+        assert!(display_page_nouns(&cs).contains(&noun::LIMITER_GR));
+        assert!(!macro_step_nouns(&cs).contains(&noun::LIMITER_GR));
+        assert!(page_bar_allowed(&cs, noun::LIMITER_GR));
+    }
+
+    /// The enum nouns of v15 to v20 read as words, sized by the headers.
+    #[test]
+    fn the_new_enums_have_labels_the_size_of_their_headers() {
+        use dspi_proto::generated::{limiter, subharm, tube};
+        assert_eq!(
+            dspi_session::tube::TYPES.len(),
+            tube::TUBE_TYPE_MAX as usize
+        );
+        let cs = demo::data();
+        let (st, d, cfg) = (
+            demo::state(),
+            demo::settings_data(),
+            super::super::AppConfig::default(),
+        );
+        let cx = Cx {
+            state: &st,
+            data: &d,
+            config: &cfg,
+            connected: true,
+            global_dirty: false,
+        };
+        assert_eq!(enum_value_label(&cx, &cs, noun::TUBE_TYPE, 0), "Custom");
+        assert_eq!(
+            enum_value_label(&cx, &cs, noun::TUBE_TYPE, 1),
+            "12AX7 / ECC83"
+        );
+        assert_eq!(
+            enum_value_label(&cx, &cs, noun::TUBE_TYPE, 16),
+            "300B / 2A3"
+        );
+        assert_eq!(enum_value_label(&cx, &cs, noun::LIMITER_LINK, 0), "Off");
+        assert_eq!(
+            enum_value_label(&cx, &cs, noun::SUBHARM_SELECT, 1),
+            "Percussive"
+        );
+        assert_eq!(subharm::SUBHARM_SELECT_MODE_MAX, 2);
+        assert_eq!(limiter::LIMITER_LINK_GROUP_MAX, 4);
+    }
+
+    /// An aux output's summary line, as the collapsed card shows it.
+    #[test]
+    fn an_aux_output_summarises_its_pin_and_power_on() {
+        let cs = demo::data();
+        let st = demo::state();
+        assert_eq!(
+            verb_phrase(&st, &cs, &cs.bindings[10]),
+            "On/off output on GPIO 27, starts off. Delayed 1 min off."
+        );
+        assert_eq!(
+            verb_phrase(&st, &cs, &cs.bindings[11]),
+            "Dimmable output on GPIO 28, starts on. Up to 80% bright."
+        );
+        let saved = CsBinding {
+            extras: aux_extras::BOOT_SAVED | aux_extras::BOOT_ON,
+            ..cs.bindings[10].clone()
+        };
+        assert!(verb_phrase(&st, &cs, &saved).contains("comes back as last saved"));
+        assert_eq!(
+            verb_phrase(&st, &cs, &cs.bindings[12]),
+            "Press to toggle Aux Switch (Amp Trigger)."
+        );
+        // Delays are legal on an aux output's switch.
+        assert!(delays_allowed(ty::AUX_OUT, 0));
     }
 
     #[test]
