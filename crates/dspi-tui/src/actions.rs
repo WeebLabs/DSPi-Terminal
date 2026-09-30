@@ -89,6 +89,43 @@ impl ChannelStatus {
     }
 }
 
+/// The last few buffer fill readings, for the Stats panel's sparklines.
+///
+/// The Console keeps 256 samples of each buffer from a 60 ms poll, about
+/// 15 s (`StatsView.swift`, `BufferFillHistory`). The panel reads the buffers
+/// on its two-second poll instead, so [`FillHistory::LEN`] samples cover
+/// about the same span. The series are the Console's: S/PDIF slots 0 to 3,
+/// then the PDM DMA and PDM ring buffers. `None` is a sample where that
+/// buffer was not running, or no reading came back.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FillHistory {
+    pub series: [Vec<Option<u8>>; FillHistory::SERIES],
+}
+
+impl FillHistory {
+    /// Eight two-second samples: 16 s.
+    pub const LEN: usize = 8;
+    pub const SERIES: usize = 6;
+    pub const PDM_DMA: usize = 4;
+    pub const PDM_RING: usize = 5;
+
+    /// Add one poll's reading, dropping the oldest once full.
+    pub fn push(&mut self, b: Option<&packets::BufferStatsPacket>) {
+        for (i, ring) in self.series.iter_mut().enumerate() {
+            let v = b.and_then(|b| match i {
+                0..=3 if i < (b.num_spdif as usize).min(4) => Some(b.spdif[i].consumer_fill_pct),
+                Self::PDM_DMA if b.pdm_active() => Some(b.pdm.dma_fill_pct),
+                Self::PDM_RING if b.pdm_active() => Some(b.pdm.ring_fill_pct),
+                _ => None,
+            });
+            ring.push(v);
+            if ring.len() > Self::LEN {
+                ring.remove(0);
+            }
+        }
+    }
+}
+
 /// Everything the Stats panel shows that is not in the bulk packet.
 ///
 /// Every section is an `Option`: absent means the firmware stalled the read,
@@ -126,6 +163,8 @@ pub struct Stats {
     pub polls_since_starvation: Option<u32>,
     pub polls_between_starvations: Option<u32>,
     pub buffers: Option<packets::BufferStatsPacket>,
+    /// The buffer fills of the last few polls, oldest first.
+    pub fill_history: FillHistory,
     pub spdif_rx: Option<packets::SpdifRxStatusPacket>,
     pub spdif_channel: Option<ChannelStatus>,
     pub spdif_rx_pin: Option<u8>,
@@ -218,6 +257,8 @@ pub fn read_stats(session: &mut Session, state: &DeviceState, previous: &Stats) 
         packets::BufferStatsPacket::SIZE,
         packets::BufferStatsPacket::decode,
     );
+    s.fill_history = previous.fill_history.clone();
+    s.fill_history.push(s.buffers.as_ref());
 
     if feature("spdif_multi_input") || state.input_config().is_some() {
         s.spdif_rx = packet(
@@ -1520,6 +1561,35 @@ pub fn device_list() -> Vec<dspi_transport::DeviceDescriptor> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_fill_history_keeps_the_last_eight_readings_of_each_buffer() {
+        use dspi_proto::packets::BufferStatsPacket;
+        let mut h = super::FillHistory::default();
+        let mut b = BufferStatsPacket {
+            num_spdif: 2,
+            flags: BufferStatsPacket::FLAG_PDM_ACTIVE,
+            ..Default::default()
+        };
+        for k in 0..10u8 {
+            b.spdif[1].consumer_fill_pct = k;
+            b.pdm.ring_fill_pct = 50 + k;
+            h.push(Some(&b));
+        }
+        assert_eq!(h.series[1].len(), super::FillHistory::LEN);
+        assert_eq!(h.series[1][0], Some(2), "the oldest two aged out");
+        assert_eq!(h.series[1][7], Some(9));
+        assert_eq!(h.series[super::FillHistory::PDM_RING][7], Some(59));
+        // Slots past `num_spdif` never ran.
+        assert!(h.series[2].iter().all(Option::is_none));
+        // A poll with no reading, or with PDM stopped, leaves a gap.
+        h.push(None);
+        assert_eq!(h.series[1][7], None);
+        b.flags = 0;
+        h.push(Some(&b));
+        assert_eq!(h.series[super::FillHistory::PDM_DMA][7], None);
+        assert_eq!(h.series[0][7], Some(0));
+    }
+
     use super::*;
     use crate::shell::fixture;
 

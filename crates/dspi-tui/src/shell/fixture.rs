@@ -417,7 +417,12 @@ pub fn caps() -> Capabilities {
         // The firmware the Terminal speaks to, spelt as the probe spells it.
         firmware: FIRMWARE.into(),
         firmware_version: dspi_proto::packets::FirmwareVersion::new(1, 1, 6, 4),
-        build_info: None,
+        // As the firmware answers it: `git describe --always --dirty` and
+        // the build date (vendor_commands.c, REQ_GET_BUILD_INFO).
+        build_info: Some(dspi_proto::packets::BuildInfo {
+            describe: "v1.1.6-beta4-0-g557bce7".into(),
+            date: "2026-09-28".into(),
+        }),
         wire_format: WIRE_FORMAT_VERSION as u8,
         num_channels: 17,
         num_inputs: 8,

@@ -19,7 +19,7 @@ use ratatui::widgets::Widget;
 
 use super::Shared;
 use super::panel::{self, Header};
-use crate::actions::Stats;
+use crate::actions::{FillHistory, Stats};
 use crate::shell::{Screen, ScreenEvent};
 use crate::theme::{Glyphs, Theme};
 use crate::widgets::text::{fit_left, fit_right, truncate};
@@ -102,13 +102,15 @@ pub enum Row {
         over: Option<u32>,
         under: Option<u32>,
     },
-    /// A fill percentage with its min-max watermark band.
+    /// A fill percentage with its min-max watermarks and the last few
+    /// readings as a sparkline, oldest first.
     Fill {
         label: String,
         pct: u8,
         min: u8,
         max: u8,
         kind: FillKind,
+        history: Vec<Option<u8>>,
     },
     /// A row of little state dots: Audio Streaming, PDM Active.
     Flags(Vec<(String, bool)>),
@@ -188,15 +190,36 @@ impl StatsPanel {
         Self { shared, first: 0 }
     }
 
-    /// Every row, rebuilt from the last poll each frame.
-    pub fn rows(&self, state: &DeviceState, s: &Stats) -> Vec<Row> {
-        let mut rows = vec![
+    /// The panel's three columns, as the Console lays them out
+    /// (`StatsView.swift:673-734`): device facts and output counters, then
+    /// buffer health, then the optional inputs and interfaces, which is empty
+    /// on a device that reports none of them.
+    pub fn columns(&self, state: &DeviceState, s: &Stats) -> [Vec<Row>; 3] {
+        let mut a = vec![
             Row::section("Device Information"),
             Row::info(
                 "Platform",
                 format!("{:?}", state.caps.platform).to_uppercase(),
             ),
             Row::info("Firmware", format!("v{}", state.caps.firmware)),
+            // `REQ_GET_BUILD_INFO` (config.h:326): the build's `git describe`
+            // and date, which name a development build the version cannot.
+            Row::info(
+                "Build",
+                state
+                    .caps
+                    .build_info
+                    .as_ref()
+                    .map_or_else(|| "-".into(), |b| b.describe.clone()),
+            ),
+            Row::info(
+                "Build Date",
+                state
+                    .caps
+                    .build_info
+                    .as_ref()
+                    .map_or_else(|| "-".into(), |b| b.date.clone()),
+            ),
             Row::info(
                 "Serial",
                 if state.caps.serial.is_empty() {
@@ -230,21 +253,123 @@ impl StatsPanel {
         // Information rows. Firmware that stalls `REQ_GET_CORE1_MODE` leaves it
         // `None`, and an absent reading takes its row with it.
         if let Some(mode) = s.core1 {
-            rows.push(Row::info("Core 1 Mode", mode.label()));
+            a.push(Row::info("Core 1 Mode", mode.label()));
         }
 
+        a.push(Row::Blank);
+        a.push(Row::section("Audio Output"));
+        a.push(Row::Counters {
+            label: "USB Ring".into(),
+            detail: "ISR → Main Loop".into(),
+            over: Some(s.usb_ring_over),
+            under: None,
+        });
+        a.push(Row::Counters {
+            label: "Buffer Pool".into(),
+            detail: "USB → DMA".into(),
+            over: Some(s.spdif_over),
+            under: Some(s.spdif_under),
+        });
+
+        a.push(Row::Blank);
+        a.push(Row::section("PDM (Subwoofer)"));
+        a.push(Row::Counters {
+            label: "Ring Buffer".into(),
+            detail: "Core 0 → Core 1".into(),
+            over: Some(s.pdm_ring_over),
+            under: Some(s.pdm_ring_under),
+        });
+        a.push(Row::Counters {
+            label: "DMA Buffer".into(),
+            detail: "Core 1 → PIO".into(),
+            over: Some(s.pdm_dma_over),
+            under: Some(s.pdm_dma_under),
+        });
+
+        let mut mid = vec![
+            Row::section("SPDIF DMA Starvation"),
+            Row::Starvation {
+                total: s.starvation_total,
+                delta: s.starvation_delta,
+            },
+        ];
+        let instances = s
+            .buffers
+            .as_ref()
+            .map(|b| (b.num_spdif as usize).max(2))
+            .unwrap_or(2)
+            .min(4);
+        for i in 0..instances {
+            mid.push(Row::info(
+                &format!("Out {}/{}", i * 2 + 1, i * 2 + 2),
+                s.starvation_per_instance[i].to_string(),
+            ));
+        }
+        mid.push(Row::info(
+            "Time since last event",
+            polls_text(s.polls_since_starvation),
+        ));
+        mid.push(Row::info(
+            "Time between last two",
+            polls_text(s.polls_between_starvations),
+        ));
+
+        if let Some(b) = &s.buffers {
+            mid.push(Row::Blank);
+            mid.push(Row::section("Buffer Fill Levels"));
+            mid.push(Row::Flags(vec![
+                ("Audio Streaming".into(), b.streaming()),
+                ("PDM Active".into(), b.pdm_active()),
+            ]));
+            for i in 0..(b.num_spdif as usize).min(4) {
+                let f = &b.spdif[i];
+                mid.push(Row::Fill {
+                    label: format!("Out {}/{}", i * 2 + 1, i * 2 + 2),
+                    pct: f.consumer_fill_pct,
+                    min: f.consumer_min_fill_pct,
+                    max: f.consumer_max_fill_pct,
+                    kind: FillKind::Spdif,
+                    history: s.fill_history.series[i].clone(),
+                });
+            }
+            if b.pdm_active() {
+                mid.push(Row::Fill {
+                    label: "PDM DMA".into(),
+                    pct: b.pdm.dma_fill_pct,
+                    min: b.pdm.dma_min_fill_pct,
+                    max: b.pdm.dma_max_fill_pct,
+                    kind: FillKind::PdmDma,
+                    history: s.fill_history.series[FillHistory::PDM_DMA].clone(),
+                });
+                mid.push(Row::Fill {
+                    label: "PDM Ring".into(),
+                    pct: b.pdm.ring_fill_pct,
+                    min: b.pdm.ring_min_fill_pct,
+                    max: b.pdm.ring_max_fill_pct,
+                    kind: FillKind::PdmRing,
+                    history: s.fill_history.series[FillHistory::PDM_RING].clone(),
+                });
+            }
+        }
+
+        mid.push(Row::Blank);
+        // The Console's button, with the key that presses it in the value
+        // column where every other row's value is. It read backwards before.
+        mid.push(Row::info("Reset Watermarks", "r"));
+
+        let mut c = Vec::new();
         if let Some(rx) = &s.spdif_rx {
             let (word, tone) = spdif_state(rx.state);
             let locked = rx.state == dspi_proto::enums::SpdifRxState::Locked;
-            rows.push(Row::Blank);
-            rows.push(Row::section("S/PDIF Input"));
-            rows.push(Row::Pill {
+            c.push(Row::Blank);
+            c.push(Row::section("S/PDIF Input"));
+            c.push(Row::Pill {
                 label: "State".into(),
                 text: word.into(),
                 tone,
             });
-            rows.push(Row::info("Active Source", source_name(rx.input_source)));
-            rows.push(Row::info(
+            c.push(Row::info("Active Source", source_name(rx.input_source)));
+            c.push(Row::info(
                 "Sample Rate",
                 if locked && rx.sample_rate > 0 {
                     format!("{:.1} kHz", rx.sample_rate as f64 / 1000.0)
@@ -252,9 +377,9 @@ impl StatsPanel {
                     "-".into()
                 },
             ));
-            rows.push(Row::info("Lock Count", rx.lock_count.to_string()));
-            rows.push(Row::info("Loss Count", rx.loss_count.to_string()));
-            rows.push(Row::info(
+            c.push(Row::info("Lock Count", rx.lock_count.to_string()));
+            c.push(Row::info("Loss Count", rx.loss_count.to_string()));
+            c.push(Row::info(
                 "Parity Errors",
                 if locked {
                     rx.parity_errors.to_string()
@@ -262,7 +387,7 @@ impl StatsPanel {
                     "-".into()
                 },
             ));
-            rows.push(Row::info(
+            c.push(Row::info(
                 "FIFO Fill",
                 if locked {
                     format!("{}%", rx.fifo_fill_pct)
@@ -270,7 +395,7 @@ impl StatsPanel {
                     "-".into()
                 },
             ));
-            rows.push(Row::info(
+            c.push(Row::info(
                 "RX Pin",
                 match s.spdif_rx_pin {
                     Some(p) => format!("GPIO {p}"),
@@ -279,8 +404,8 @@ impl StatsPanel {
             ));
 
             if let Some(cs) = &s.spdif_channel {
-                rows.push(Row::section("Channel Status"));
-                rows.push(Row::info(
+                c.push(Row::section("Channel Status"));
+                c.push(Row::info(
                     "Format",
                     if cs.is_consumer() {
                         "Consumer"
@@ -288,13 +413,13 @@ impl StatsPanel {
                         "Professional"
                     },
                 ));
-                rows.push(Row::info(
+                c.push(Row::info(
                     "Audio",
                     if cs.is_pcm() { "PCM" } else { "Non-PCM" },
                 ));
-                rows.push(Row::info("Category", cs.category()));
-                rows.push(Row::info("Word Length", cs.word_length()));
-                rows.push(Row::info(
+                c.push(Row::info("Category", cs.category()));
+                c.push(Row::info("Word Length", cs.word_length()));
+                c.push(Row::info(
                     "Copy",
                     if cs.copy_permitted() {
                         "Permitted"
@@ -305,14 +430,14 @@ impl StatsPanel {
             }
 
             if rx.state != dspi_proto::enums::SpdifRxState::Inactive {
-                rows.push(Row::section("Debug"));
-                rows.push(Row::info("Library State", lib_state(rx.lib_state)));
+                c.push(Row::section("Debug"));
+                c.push(Row::info("Library State", lib_state(rx.lib_state)));
                 // The two counts share a byte, high nibble then low.
-                rows.push(Row::info(
+                c.push(Row::info(
                     "Stable Callbacks",
                     ((rx.callback_counts >> 4) & 0x0F).to_string(),
                 ));
-                rows.push(Row::info(
+                c.push(Row::info(
                     "Lost Callbacks",
                     (rx.callback_counts & 0x0F).to_string(),
                 ));
@@ -320,10 +445,10 @@ impl StatsPanel {
         }
 
         if let Some(lg) = &s.lg {
-            rows.push(Row::Blank);
-            rows.push(Row::section("LG Sound Sync"));
-            rows.push(Row::info("Enabled", yes_no(lg.enabled)));
-            rows.push(Row::Pill {
+            c.push(Row::Blank);
+            c.push(Row::section("LG Sound Sync"));
+            c.push(Row::info("Enabled", yes_no(lg.enabled)));
+            c.push(Row::Pill {
                 label: "Present".into(),
                 text: yes_no(lg.present).into(),
                 tone: if lg.present {
@@ -332,7 +457,7 @@ impl StatsPanel {
                     StatusTone::Neutral
                 },
             });
-            rows.push(Row::info(
+            c.push(Row::info(
                 "TV Volume",
                 if lg.volume == dspi_proto::packets::LgSoundSyncStatus::VOLUME_UNKNOWN {
                     "-".into()
@@ -340,13 +465,13 @@ impl StatsPanel {
                     format!("{} / 100", lg.volume)
                 },
             ));
-            rows.push(Row::info("TV Mute", on_off(lg.muted)));
+            c.push(Row::info("TV Mute", on_off(lg.muted)));
         }
 
         if let Some(a) = &s.adat {
-            rows.push(Row::Blank);
-            rows.push(Row::section("ADAT Bulk Output"));
-            rows.push(Row::Pill {
+            c.push(Row::Blank);
+            c.push(Row::section("ADAT Bulk Output"));
+            c.push(Row::Pill {
                 label: "State".into(),
                 text: if a.enabled { "Enabled" } else { "Disabled" }.into(),
                 tone: if a.active {
@@ -357,23 +482,23 @@ impl StatsPanel {
                     StatusTone::Neutral
                 },
             });
-            rows.push(Row::info("Streaming", yes_no(a.active)));
-            rows.push(Row::info("Rate Supported", yes_no(a.rate_ok)));
-            rows.push(Row::info("Data Pin", format!("GPIO {}", a.pin)));
-            rows.push(Row::info("Resync Count", a.resync_count.to_string()));
-            rows.push(Row::info("Slip Count", a.slip_count.to_string()));
+            c.push(Row::info("Streaming", yes_no(a.active)));
+            c.push(Row::info("Rate Supported", yes_no(a.rate_ok)));
+            c.push(Row::info("Data Pin", format!("GPIO {}", a.pin)));
+            c.push(Row::info("Resync Count", a.resync_count.to_string()));
+            c.push(Row::info("Slip Count", a.slip_count.to_string()));
         }
 
         if let Some(i) = &s.i2s_slave {
             let (word, tone) = i2s_state(i.state);
-            rows.push(Row::Blank);
-            rows.push(Row::section("I2S Input (Slave Clock)"));
-            rows.push(Row::Pill {
+            c.push(Row::Blank);
+            c.push(Row::section("I2S Input (Slave Clock)"));
+            c.push(Row::Pill {
                 label: "State".into(),
                 text: word,
                 tone,
             });
-            rows.push(Row::info(
+            c.push(Row::info(
                 "Detected Rate",
                 if i.detected_rate > 0 {
                     format!("{:.1} kHz", i.detected_rate as f64 / 1000.0)
@@ -381,7 +506,7 @@ impl StatsPanel {
                     "-".into()
                 },
             ));
-            rows.push(Row::info(
+            c.push(Row::info(
                 "Measured Rate",
                 if i.measured_hz > 0 {
                     format!("{} Hz", i.measured_hz)
@@ -389,107 +514,71 @@ impl StatsPanel {
                     "-".into()
                 },
             ));
-            rows.push(Row::info("Lock Count", i.lock_count.to_string()));
-            rows.push(Row::info("Loss Count", i.loss_count.to_string()));
+            c.push(Row::info("Lock Count", i.lock_count.to_string()));
+            c.push(Row::info("Loss Count", i.loss_count.to_string()));
         }
 
-        rows.push(Row::Blank);
-        rows.push(Row::section("PDM (Subwoofer)"));
-        rows.push(Row::Counters {
-            label: "Ring Buffer".into(),
-            detail: "Core 0 → Core 1".into(),
-            over: Some(s.pdm_ring_over),
-            under: Some(s.pdm_ring_under),
-        });
-        rows.push(Row::Counters {
-            label: "DMA Buffer".into(),
-            detail: "Core 1 → PIO".into(),
-            over: Some(s.pdm_dma_over),
-            under: Some(s.pdm_dma_under),
-        });
-
-        rows.push(Row::Blank);
-        rows.push(Row::section("Audio Output"));
-        rows.push(Row::Counters {
-            label: "USB Ring".into(),
-            detail: "ISR → Main Loop".into(),
-            over: Some(s.usb_ring_over),
-            under: None,
-        });
-        rows.push(Row::Counters {
-            label: "Buffer Pool".into(),
-            detail: "USB → DMA".into(),
-            over: Some(s.spdif_over),
-            under: Some(s.spdif_under),
-        });
-
-        rows.push(Row::Blank);
-        rows.push(Row::section("SPDIF DMA Starvation"));
-        rows.push(Row::Starvation {
-            total: s.starvation_total,
-            delta: s.starvation_delta,
-        });
-        let instances = s
-            .buffers
-            .as_ref()
-            .map(|b| (b.num_spdif as usize).max(2))
-            .unwrap_or(2)
-            .min(4);
-        for i in 0..instances {
-            rows.push(Row::info(
-                &format!("Out {}/{}", i * 2 + 1, i * 2 + 2),
-                s.starvation_per_instance[i].to_string(),
-            ));
+        // Each section opens with a gap; the column's first does not need one.
+        if c.first() == Some(&Row::Blank) {
+            c.remove(0);
         }
-        rows.push(Row::info(
-            "Time since last event",
-            polls_text(s.polls_since_starvation),
-        ));
-        rows.push(Row::info(
-            "Time between last two",
-            polls_text(s.polls_between_starvations),
-        ));
+        [a, mid, c]
+    }
 
-        if let Some(b) = &s.buffers {
-            rows.push(Row::Blank);
-            rows.push(Row::section("Buffer Fill Levels"));
-            rows.push(Row::Flags(vec![
-                ("Audio Streaming".into(), b.streaming()),
-                ("PDM Active".into(), b.pdm_active()),
-            ]));
-            for i in 0..(b.num_spdif as usize).min(4) {
-                let f = &b.spdif[i];
-                rows.push(Row::Fill {
-                    label: format!("Out {}/{}", i * 2 + 1, i * 2 + 2),
-                    pct: f.consumer_fill_pct,
-                    min: f.consumer_min_fill_pct,
-                    max: f.consumer_max_fill_pct,
-                    kind: FillKind::Spdif,
-                });
-            }
-            if b.pdm_active() {
-                rows.push(Row::Fill {
-                    label: "PDM DMA".into(),
-                    pct: b.pdm.dma_fill_pct,
-                    min: b.pdm.dma_min_fill_pct,
-                    max: b.pdm.dma_max_fill_pct,
-                    kind: FillKind::PdmDma,
-                });
-                rows.push(Row::Fill {
-                    label: "PDM Ring".into(),
-                    pct: b.pdm.ring_fill_pct,
-                    min: b.pdm.ring_min_fill_pct,
-                    max: b.pdm.ring_max_fill_pct,
-                    kind: FillKind::PdmRing,
-                });
+    /// Every row in one column, for a pane too narrow for more: the
+    /// Console's columns in order.
+    pub fn rows(&self, state: &DeviceState, s: &Stats) -> Vec<Row> {
+        let [a, b, c] = self.columns(state, s);
+        let mut rows = a;
+        for col in [b, c] {
+            if !col.is_empty() {
+                rows.push(Row::Blank);
+                rows.extend(col);
             }
         }
-
-        rows.push(Row::Blank);
-        // The Console's button, with the key that presses it in the value
-        // column where every other row's value is. It read backwards before.
-        rows.push(Row::info("Reset Watermarks", "r"));
         rows
+    }
+}
+
+/// A reading from 0 to 100 % in eight steps.
+const SPARK: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+const SPARK_ASCII: [&str; 8] = ["_", ".", ",", "-", "~", "=", "*", "#"];
+
+/// The narrowest column that still reads: a fill row's name, eight
+/// readings and `100-100%  100%`, or `Time between last two` and its time.
+const MIN_COL: u16 = 36;
+
+/// The columns the page is drawn in at `width`: the Console's three when
+/// they fit, else two, else one. Two columns keep the Console's order and
+/// break it where the taller column is shortest.
+fn arrange(width: u16, cols: [Vec<Row>; 3]) -> Vec<Vec<Row>> {
+    let [a, b, c] = cols;
+    let join = |mut x: Vec<Row>, y: Vec<Row>| {
+        if !y.is_empty() {
+            x.push(Row::Blank);
+            x.extend(y);
+        }
+        x
+    };
+    if c.is_empty() {
+        return if width > 2 * MIN_COL {
+            vec![a, b]
+        } else {
+            vec![join(a, b)]
+        };
+    }
+    if width > 3 * MIN_COL + 1 {
+        vec![a, b, c]
+    } else if width > 2 * MIN_COL {
+        let first = (a.len() + b.len() + 1).max(c.len());
+        let second = a.len().max(b.len() + c.len() + 1);
+        if first <= second {
+            vec![join(a, b), c]
+        } else {
+            vec![a, join(b, c)]
+        }
+    } else {
+        vec![join(join(a, b), c)]
     }
 }
 
@@ -529,7 +618,9 @@ fn draw_row(area: Rect, buf: &mut Buffer, theme: &Theme, row: &Row) {
         Row::Section(title) => SectionHeader::new(title, theme).render(area, buf),
         Row::Info { label, value } => {
             // `Label ......... value`: the leader is what keeps a long column
-            // of pairs readable at a glance.
+            // of pairs readable at a glance. A value too long for a narrow
+            // column (a development build's describe) gives way to its label.
+            let value = &truncate(value, w.saturating_sub(label.chars().count() + 4).max(1));
             let used = label.chars().count() + value.chars().count() + 4;
             buf.set_string(
                 area.x + 1,
@@ -595,58 +686,42 @@ fn draw_row(area: Rect, buf: &mut Buffer, theme: &Theme, row: &Row) {
             min,
             max,
             kind,
+            history,
         } => {
-            let readout = format!("{pct:>3}%  {min}-{max}%");
-            buf.set_string(area.x + 1, area.y, fit_left(label, 14), theme.value());
-            let bx = area.x + 16;
-            // A short meter, as `DESIGN.md` 7.10 asks: the number is the
-            // reading, the bar is only there to be glanced at.
-            let bw = area
-                .width
-                .saturating_sub(17 + readout.chars().count() as u16)
-                .min(24);
-            let tone = kind.tone(*pct);
-            let color = match tone {
+            // The Console's row: name, then the history, then the watermarks
+            // (lowest and highest since the last reset) and the reading in
+            // its threshold colour (`StatsView.swift`, `BufferFillRow`).
+            let tone_color = |v: u8| match kind.tone(v) {
                 StatusTone::Ok => theme.ok,
                 StatusTone::Warning => theme.warning,
                 StatusTone::Danger => theme.danger,
                 StatusTone::Neutral => theme.dim,
             };
-            if bw >= 6 {
-                let cell = |v: u8| ((v as u32 * (bw as u32 - 1)) / 100) as u16;
-                let filled = cell(*pct);
-                let (fill, empty) = if theme.glyphs == Glyphs::Ascii {
-                    ("#", ".")
+            let marks = format!("{min}-{max}%");
+            let reading = format!("{pct:>3}%");
+            buf.set_string(area.x + 1, area.y, fit_left(label, 9), theme.value());
+            let right = area.x + area.width - 1;
+            let rx = right.saturating_sub(reading.chars().count() as u16);
+            buf.set_string(rx, area.y, &reading, Style::default().fg(tone_color(*pct)));
+            let mx = rx.saturating_sub(marks.chars().count() as u16 + 2);
+            buf.set_string(mx, area.y, &marks, theme.label());
+            // One cell per two-second reading, newest on the right, each in
+            // the colour its reading had.
+            let sx = area.x + 11;
+            let room = mx.saturating_sub(sx + 1) as usize;
+            let shown = &history[history.len().saturating_sub(room.min(FillHistory::LEN))..];
+            for (i, v) in shown.iter().enumerate() {
+                let Some(v) = v else { continue };
+                let level = (*v as usize * 7 + 50) / 100;
+                let sym = if theme.glyphs == Glyphs::Ascii {
+                    SPARK_ASCII[level.min(7)]
                 } else {
-                    ("▓", "░")
+                    SPARK[level.min(7)]
                 };
-                for i in 0..bw {
-                    let (sym, style) = if i <= filled {
-                        (fill, Style::default().fg(color))
-                    } else {
-                        (empty, Style::default().fg(theme.chrome_faint))
-                    };
-                    buf[(bx + i, area.y)].set_symbol(sym).set_style(style);
-                }
-                // The watermarks: how far the buffer has been in either
-                // direction since the counters were last reset.
-                for (v, mark) in [(min, "▏"), (max, "▕")] {
-                    let x = bx + cell(*v);
-                    buf[(x, area.y)]
-                        .set_symbol(if theme.glyphs == Glyphs::Ascii {
-                            "|"
-                        } else {
-                            mark
-                        })
-                        .set_style(Style::default().fg(theme.fg));
-                }
+                buf[(sx + i as u16, area.y)]
+                    .set_symbol(sym)
+                    .set_style(Style::default().fg(tone_color(*v)));
             }
-            buf.set_string(
-                area.x + area.width - readout.chars().count() as u16 - 1,
-                area.y,
-                &readout,
-                theme.value(),
-            );
         }
         Row::Flags(flags) => {
             let mut x = area.x + 1;
@@ -727,23 +802,45 @@ impl Screen for StatsPanel {
             return;
         }
         let stats = self.shared.borrow().stats.clone();
-        let rows = self.rows(state, &stats);
+        let columns = arrange(area.width, self.columns(state, &stats));
         let header = Header::new(FOOTER);
         panel::draw_header(area, buf, theme, &header, false);
         if area.height < 2 {
             return;
         }
         let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
-        // Every row is one line tall, so the window is a plain clamp.
-        self.first = self
-            .first
-            .min(rows.len().saturating_sub(body.height as usize));
-        for (i, row) in rows.iter().enumerate().skip(self.first) {
-            let y = body.y + (i - self.first) as u16;
-            if y >= body.y + body.height {
-                break;
+        // Every row is one line tall, so the window is a plain clamp, and
+        // the columns scroll together.
+        let longest = columns.iter().map(Vec::len).max().unwrap_or(0);
+        self.first = self.first.min(longest.saturating_sub(body.height as usize));
+        let n = columns.len() as u16;
+        let col_w = (body.width + 1) / n - 1;
+        for (k, rows) in columns.iter().enumerate() {
+            let x = body.x + k as u16 * (col_w + 1);
+            // The last column takes whatever the division left over.
+            let w = if k as u16 == n - 1 {
+                body.x + body.width - x
+            } else {
+                col_w
+            };
+            if k > 0 {
+                for y in body.y..body.y + body.height {
+                    buf[(x - 1, y)]
+                        .set_symbol(if theme.glyphs == Glyphs::Ascii {
+                            "|"
+                        } else {
+                            "│"
+                        })
+                        .set_style(theme.chrome_style());
+                }
             }
-            draw_row(Rect::new(body.x, y, body.width, 1), buf, theme, row);
+            for (i, row) in rows.iter().enumerate().skip(self.first) {
+                let y = body.y + (i - self.first) as u16;
+                if y >= body.y + body.height {
+                    break;
+                }
+                draw_row(Rect::new(x, y, w, 1), buf, theme, row);
+            }
         }
         if !stats.read {
             buf.set_string(
@@ -1013,12 +1110,62 @@ mod tests {
         assert_eq!(FillKind::PdmRing.tone(10), StatusTone::Ok);
     }
 
+    /// The Console's row: the watermarks, then the reading, and before
+    /// them the last readings as a sparkline, newest on the right.
     #[test]
-    fn a_fill_row_carries_its_watermarks() {
-        let (mut p, state, _) = panel();
+    fn a_fill_row_carries_its_watermarks_and_its_history() {
+        let (mut p, state, shared) = panel();
         let f = testing::draw(&mut p, &state, 100, 90);
-        assert!(f.contains("50%  20-80%"), "{f}");
-        assert!(f.contains("▏") && f.contains("▕"), "the watermarks: {f}");
+        assert!(f.contains("20-80%   50%"), "{f}");
+        let mut b = shared.borrow().stats.buffers.clone().unwrap();
+        for pct in [0u8, 50, 100] {
+            b.spdif[0].consumer_fill_pct = pct;
+            shared.borrow_mut().stats.fill_history.push(Some(&b));
+        }
+        let f = testing::draw(&mut p, &state, 100, 90);
+        let row = f.lines().find(|l| l.contains("20-80%")).unwrap();
+        assert!(row.contains("▁▅█"), "{row}");
+        // Nothing yet for a buffer with no readings.
+        let row = f.lines().find(|l| l.contains("8-60%")).unwrap();
+        assert!(!row.contains('▁'), "{row}");
+    }
+
+    /// Columns when the pane allows: three at a wide terminal, two at
+    /// 120x40, one at 80x24, and never a column narrower than a fill row.
+    #[test]
+    fn the_page_takes_columns_when_the_width_allows() {
+        let (p, state, shared) = panel();
+        let stats = shared.borrow().stats.clone();
+        let cols = |w: u16| arrange(w, p.columns(&state, &stats)).len();
+        assert_eq!(cols(56), 1, "the 80x24 pane");
+        assert_eq!(cols(90), 2, "the 120x40 pane");
+        assert_eq!(cols(130), 3);
+        // Without interface sections there is no third column.
+        let mut bare = stats.clone();
+        (bare.spdif_rx, bare.lg, bare.adat, bare.i2s_slave) = (None, None, None, None);
+        assert_eq!(arrange(130, p.columns(&state, &bare)).len(), 2);
+        // The Console's column order: device and outputs, buffers, inputs.
+        let [a, b, c] = p.columns(&state, &stats);
+        assert_eq!(a[0], Row::section("Device Information"));
+        assert_eq!(b[0], Row::section("SPDIF DMA Starvation"));
+        assert_eq!(c[0], Row::section("S/PDIF Input"));
+        let audio = a.iter().position(|r| *r == Row::section("Audio Output"));
+        let pdm = a.iter().position(|r| *r == Row::section("PDM (Subwoofer)"));
+        assert!(audio < pdm, "audio output before PDM");
+    }
+
+    /// B1 reads `REQ_GET_BUILD_INFO`; the device section shows it, and "-"
+    /// when the firmware did not answer.
+    #[test]
+    fn the_device_section_shows_the_build() {
+        let (mut p, mut state, _) = panel();
+        let f = testing::draw(&mut p, &state, 100, 90);
+        assert!(f.contains("v1.1.6-beta4-0-g557bce7"), "{f}");
+        assert!(f.contains("2026-09-28"), "{f}");
+        state.caps.build_info = None;
+        let rows = p.rows(&state, &p.shared.borrow().stats);
+        assert!(rows.contains(&Row::info("Build", "-")), "{rows:?}");
+        assert!(rows.contains(&Row::info("Build Date", "-")), "{rows:?}");
     }
 
     #[test]
@@ -1038,10 +1185,11 @@ mod tests {
             ScreenEvent::Command("diag.buffers.reset".into())
         );
         // D58: the label is the button, the value is the key that presses it,
-        // the way round every other row on the panel reads.
-        let rows = p.rows(&state, &p.shared.borrow().stats);
+        // the way round every other row on the panel reads. It closes the
+        // buffer column, where the Console's button sits.
+        let [_, buffers, _] = p.columns(&state, &p.shared.borrow().stats);
         assert_eq!(
-            rows.last(),
+            buffers.last(),
             Some(&Row::Info {
                 label: "Reset Watermarks".into(),
                 value: "r".into(),
@@ -1068,6 +1216,16 @@ mod tests {
             // The Console's firmware row reads "v1.1.6 beta 4".
             assert!(f.contains("v1.1.6 beta 4"), "{w}x{h}:\n{f}");
             assert!(f.contains("Reset watermarks"), "the key line: {w}x{h}\n{f}");
+            assert!(f.contains("Build"), "{w}x{h}:\n{f}");
+            assert!(
+                !f.contains('\u{2014}'),
+                "a hyphen for a missing value: {w}x{h}\n{f}"
+            );
+            // Two columns side by side at 120x40, one at 80x24.
+            let beside = f
+                .lines()
+                .any(|l| l.contains("DEVICE INFORMATION") && l.contains("S/PDIF INPUT"));
+            assert_eq!(beside, w == 120, "{w}x{h}:\n{f}");
         }
     }
 
