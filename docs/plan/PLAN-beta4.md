@@ -355,8 +355,50 @@ Open: T5, the analyser overlay on the response graph and the RTA strip,
 deferred by decision 3; audit D50 and the graph height half of D66; the deep audits `PLAN.md` phase 10 still owes, plus
 the analyser engine and the limiter; and the pull request to `main`.
 
-Hardware checkpoints still to run, all on beta4: HW-1, HW-2, HW-2b and
-HW-3. None has been run on this branch yet.
+### Hardware results (2026-09-30)
+
+Run against an RP2350 board, serial `D1443D6A`, firmware 1.1.6 beta 4
+(build `v1.1.6-beta3-16-g557bce7`, 2026-09-28), with DSPi Console closed.
+Every value changed was restored; nothing was written to flash.
+
+- `dspi doctor` and `dspi dump`: interface claimed; 8 inputs and 9 outputs
+  (17 channels, 10 bands); wire V32; the beta-aware version; build info;
+  all 20 feature probes answered, including subharm, tube, limiter and
+  the analyser; CS caps v20, 16 slots, 79 nouns, 16 IR commands.
+- GET_PLATFORM returned 7 bytes `01 01 16 09 01 06 04`: 1.1.6 beta 4.
+- Tube: `tube.type 3` brought back the 12AT7 row's bias, asymmetry,
+  hardness and sag (5, +2, 55, 10); a bias edit set the type to Custom
+  (0); type 1 restored the 12AX7 row. The slot held pre-beta4 defaults
+  (drive -6, output stage off, 85 Hz), as the survey predicts for a slot
+  restored verbatim.
+- Limiter: linking outputs 1 and 2 in group 1 and writing output 1's
+  threshold moved output 2's; `limit.release all 250` reached output 9.
+  Switching output 1 on read the meter at 0 and status engaged, and off
+  again restored not-engaged. An output that has never engaged reads
+  12000 (120 dB) on the meter (limiter.c:217); the Terminal shows
+  reduction only for outputs whose limiter is on, so it is not drawn.
+- Analyser: caps v3, 120 dB range, 70 dB bass range, orders 8 to 10. Every
+  analyser transfer (82-byte bands, 738-byte all-bands, 529-byte bins,
+  24-byte status) costs well under a millisecond, lost in process-start
+  noise against a 7-byte read, so the per-tick budget is ample. In the
+  running interface (a pseudo-terminal, 120x40) `A` started it ("1
+  channel, each refreshed every 21 ms"), the Console's default config was
+  pushed and confirmed (output tap, 1024 points, 300 ms, 12 dB/s), and
+  closing the panel sent STOP (state idle).
+- The Tube Modeller and Spectrum Analyser panels render from the device's
+  own values.
+
+Found and fixed from these runs: `dspi get` printed "1 bytes" for the
+runtime status rows, and `dspi params` ran long value lists into their
+descriptions.
+
+Still to run by hand, because they need a physical control, a second
+host or wiring: notifications from a knob, remote, preset change or the OS
+volume (`dspi watch`; this Mac's default output is not the DSPi); HW-2's
+control surfaces with real buttons, an encoder, an LED, IR and a display,
+and an aux output driven from a button; audible checks of the tube,
+subharm and limiter; and an RP2040 board. Linux and Windows are covered
+by CI on the pull request.
 
 ## 4. Hardware checkpoints (all on beta4)
 
