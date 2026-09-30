@@ -388,7 +388,11 @@ impl Notifications {
                     match decode(&packet) {
                         Ok((_, Event::Idle)) => {}
                         Ok((seq, event)) => {
-                            let lost = seqs.observe(seq);
+                            // The v1 volume packet carries no sequence number
+                            // and does not consume one (notify.c:156-159,
+                            // 178), so it says nothing about loss.
+                            let lost = !matches!(event, Event::MasterVolume(_))
+                                && seqs.observe(seq);
                             if tx.send(Notification { seq, event, lost }).is_err() {
                                 break;
                             }
@@ -635,6 +639,26 @@ mod tests {
         assert!(matches!(second.event, Event::BulkInvalidated { .. }));
         assert!(n.next(Duration::from_millis(50)).is_none());
         assert!(!n.is_disconnected());
+    }
+
+    /// A master-volume change pushes the v1 packet, which has no sequence
+    /// number, just before its v2 `PARAM_CHANGED` (usb_audio.c:367-375,
+    /// notify.c:156-159). It must not read as a loss, before or after.
+    #[test]
+    fn the_legacy_volume_packet_is_not_a_loss() {
+        let mock = MockTransport::new();
+        let mut legacy = vec![1, 0, 0, 0];
+        legacy.extend((-20.0f32).to_le_bytes());
+        mock.push_notification(param(7, 4748, 7, &[0, 0, 0, 0]));
+        mock.push_notification(legacy.clone());
+        mock.push_notification(param(8, 4748, 7, &[0, 0, 0, 0]));
+        mock.push_notification(legacy);
+        mock.push_notification(param(9, 4748, 7, &[0, 0, 0, 0]));
+        let n = Notifications::start(mock.notifications().unwrap());
+        for _ in 0..5 {
+            let got = n.next(Duration::from_secs(2)).expect("a packet");
+            assert!(!got.lost, "{got:?}");
+        }
     }
 
     /// Beta4 paces the endpoint: an idle read blocks for the 100 ms
