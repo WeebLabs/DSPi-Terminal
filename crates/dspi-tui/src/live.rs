@@ -33,7 +33,7 @@ use crate::screens::{
 };
 use crate::settings::{AppConfig, SettingsData, SettingsScreen};
 use crate::shell::{
-    ChannelItem, Placeholder, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
+    ChannelItem, Screen, Selection, Shell, ShellEvent, ShellModel, Tool, VolumeMode,
 };
 use crate::theme::{ChannelRole, Glyphs, Theme};
 use crate::widgets::text::truncate;
@@ -72,45 +72,12 @@ pub trait Screens {
     fn refresh_settings(&self, _session: &mut Session) {}
 }
 
-pub struct PlaceholderScreens;
-
-impl Screens for PlaceholderScreens {
-    fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen> {
-        let (title, body) = match selection {
-            Selection::Overview => (
-                "Overview".to_string(),
-                "The dashboard cards arrive in Phase 4.".to_string(),
-            ),
-            Selection::Input(i) => (
-                state.channel_name(i),
-                "The input page arrives in Phase 4.".into(),
-            ),
-            Selection::Output(o) => (
-                state.channel_name(state.caps.num_inputs as usize + o),
-                "The output page arrives in Phase 4.".into(),
-            ),
-        };
-        Box::new(Placeholder::new(title, body))
-    }
-
-    fn tool(&self, _state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
-        Box::new(Placeholder::new(
-            tool.title(),
-            "This panel arrives in a later phase.",
-        ))
-    }
-
-    fn settings(&self, _state: &DeviceState) -> Box<dyn Screen> {
-        Box::new(Placeholder::new("Settings", "Settings arrive in Phase 7."))
-    }
-}
-
-/// The Console's screens: the dashboard, the input page and the output page.
+/// The Console's screens: the dashboard, the input and output pages, every
+/// tool panel and Settings.
 ///
-/// The Matrix Mixer is the one tool panel that exists; the rest, and Settings,
-/// are still placeholders that later phases replace. Every screen it makes
-/// shares one [`Shared`] handle, which is where the linked pairs, the preset
-/// names and the channel clipboard live.
+/// Every screen it makes shares one [`Shared`] handle, which is where the
+/// linked pairs, the preset names, the channel clipboard and the spectrum
+/// analyser's engine live.
 pub struct ConsoleScreens {
     pub shared: Shared,
     /// What Settings reads that the bulk packet does not carry, refreshed the
@@ -2586,12 +2553,37 @@ fn display_value(d: &dspi_proto::registry::ParamDesc, v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::Placeholder;
     use crate::theme::{ColorDepth, Glyphs};
     use crate::widgets::testing::key;
     use dspi_proto::generated::opcodes as op;
     use dspi_session::Capabilities;
     use dspi_transport::mock::LogHandle;
     use dspi_transport::{MockTransport, Transport};
+
+    /// A stand-in screen factory for the runner's tests: every region is a
+    /// titled placeholder, so what a test asserts is the runner and not a
+    /// screen, and nothing reads the user's config file.
+    struct StandInScreens;
+
+    impl Screens for StandInScreens {
+        fn detail(&self, state: &DeviceState, selection: Selection) -> Box<dyn Screen> {
+            let title = match selection {
+                Selection::Overview => "Overview".to_string(),
+                Selection::Input(i) => state.channel_name(i),
+                Selection::Output(o) => state.channel_name(state.caps.num_inputs as usize + o),
+            };
+            Box::new(Placeholder::new(title, ""))
+        }
+
+        fn tool(&self, _state: &DeviceState, tool: Tool) -> Box<dyn Screen> {
+            Box::new(Placeholder::new(tool.title(), ""))
+        }
+
+        fn settings(&self, _state: &DeviceState) -> Box<dyn Screen> {
+            Box::new(Placeholder::new("Settings", ""))
+        }
+    }
 
     fn packet() -> Vec<u8> {
         crate::shell::fixture::packet()
@@ -2616,12 +2608,7 @@ mod tests {
         let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
         // Tests run without the reveal and the easing, as --lite does, so a
         // value asserted right after a change is the value itself.
-        let live = Live::new(
-            state,
-            theme,
-            Performance::lite(),
-            Box::new(PlaceholderScreens),
-        );
+        let live = Live::new(state, theme, Performance::lite(), Box::new(StandInScreens));
         (live, session, log)
     }
 
@@ -3196,12 +3183,7 @@ mod tests {
             dspi_proto::wire::BulkPacket::decode(packet()).unwrap(),
         );
         let theme = Theme::console(ColorDepth::TrueColor, Glyphs::Braille);
-        let live = Live::new(
-            state,
-            theme,
-            Performance::lite(),
-            Box::new(PlaceholderScreens),
-        );
+        let live = Live::new(state, theme, Performance::lite(), Box::new(StandInScreens));
         (live, session, log)
     }
 
