@@ -13,8 +13,9 @@
 //! replace the graph as well. The default is the input page. `--settings`
 //! opens Settings on one of its pages, as `,` does: about, advanced, graphing,
 //! spectrum, overview, inputs, outputs, i2s, global, surfaces, interfaces,
-//! groups, macros. `--channels` picks the outputs the spectrum panel shows
-//! (one, with bins, by default) and `--bars` or `--both` how it draws them. `--expand n` opens the nth card on one of the three Control pages,
+//! groups, macros, aux. `--channels` picks the outputs the spectrum panel
+//! shows (one, with bins, by default) and `--bars` or `--both` how it draws
+//! them. `--expand n` opens the nth card on one of the four card pages,
 //! whose bodies are otherwise behind a collapsed header. `--busy` swaps in
 //! the fixture with every channel tuned, which is what the overview grid
 //! is for; `--full` the one where no two channels are alike.

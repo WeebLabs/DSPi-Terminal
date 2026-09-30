@@ -951,6 +951,7 @@ pub enum Page {
     Interfaces,
     Groups,
     Macros,
+    Aux,
 }
 
 impl Page {
@@ -970,6 +971,7 @@ impl Page {
             Page::Interfaces => "Control Interfaces",
             Page::Groups => "Channel Groups",
             Page::Macros => "Macros",
+            Page::Aux => "Auxiliary Outputs",
         }
     }
 
@@ -981,6 +983,7 @@ impl Page {
             Page::Surfaces => "Control Surf.",
             Page::Interfaces => "Control Interf.",
             Page::Spectrum => "Spectrum",
+            Page::Aux => "Aux Outputs",
             other => other.title(),
         }
     }
@@ -1002,7 +1005,13 @@ const GROUPS: [(&str, &[Page]); 4] = [
     ),
     (
         "Control",
-        &[Page::Surfaces, Page::Interfaces, Page::Groups, Page::Macros],
+        &[
+            Page::Surfaces,
+            Page::Interfaces,
+            Page::Groups,
+            Page::Macros,
+            Page::Aux,
+        ],
     ),
 ];
 
@@ -1031,6 +1040,13 @@ pub fn available(page: Page, state: &DeviceState, connected: bool) -> bool {
             .cs
             .as_ref()
             .is_some_and(|c| c.max_macros > 0 && c.max_macro_steps > 0),
+        // Caps v18 with the two aux types in the table (`csAuxSupported`,
+        // DSPViewModel.swift:1640-1642).
+        Page::Aux => state
+            .caps
+            .cs
+            .as_ref()
+            .is_some_and(|c| cs_model::aux_supported(&cs_model::CsCaps::from(c))),
         _ => true,
     }
 }
@@ -1314,6 +1330,7 @@ struct Pages {
     surfaces: surfaces::SurfacesPage,
     groups: groups::GroupsPage,
     macros: macros::MacrosPage,
+    aux: surfaces::SurfacesPage,
 }
 
 pub struct SettingsScreen {
@@ -1366,6 +1383,7 @@ impl SettingsScreen {
                 surfaces: surfaces::SurfacesPage::new(&data),
                 groups: groups::GroupsPage::new(&data),
                 macros: macros::MacrosPage::new(&data),
+                aux: surfaces::SurfacesPage::aux(&data),
             },
             data,
             config,
@@ -1440,6 +1458,7 @@ impl SettingsScreen {
                 n if n == "interfaces" || n == "controlinterfaces" => Page::Interfaces,
                 n if n == "groups" || n == "channelgroups" => Page::Groups,
                 n if n == "macros" => Page::Macros,
+                n if n == "aux" || n == "auxoutputs" || n == "auxiliaryoutputs" => Page::Aux,
                 _ => return None,
             },
         )
@@ -1486,6 +1505,7 @@ impl SettingsScreen {
             Page::Surfaces => self.pages.surfaces.observe(&cx),
             Page::Groups => self.pages.groups.observe(&cx),
             Page::Macros => self.pages.macros.observe(&cx),
+            Page::Aux => self.pages.aux.observe(&cx),
             _ => {}
         }
     }
@@ -1505,6 +1525,7 @@ impl SettingsScreen {
             Page::Surfaces => &mut self.pages.surfaces,
             Page::Groups => &mut self.pages.groups,
             Page::Macros => &mut self.pages.macros,
+            Page::Aux => &mut self.pages.aux,
         }
     }
 
@@ -1523,6 +1544,7 @@ impl SettingsScreen {
             Page::Surfaces => &self.pages.surfaces,
             Page::Groups => &self.pages.groups,
             Page::Macros => &self.pages.macros,
+            Page::Aux => &self.pages.aux,
         }
     }
 
@@ -1718,7 +1740,10 @@ impl SettingsScreen {
             // Only the three Control pages can change a control-surface
             // record, and reading them all back is about seventy transfers.
             PageEvent::Session(r) => {
-                let cs = matches!(self.page, Page::Surfaces | Page::Groups | Page::Macros);
+                let cs = matches!(
+                    self.page,
+                    Page::Surfaces | Page::Groups | Page::Macros | Page::Aux
+                );
                 ScreenEvent::Session(self.with_refresh(r, cs))
             }
             PageEvent::IoSession(r) => {
@@ -2002,6 +2027,7 @@ impl Screen for SettingsScreen {
                 Page::Surfaces => self.pages.surfaces.popup_result(choice, &cx),
                 Page::Groups => self.pages.groups.popup_result(choice, &cx),
                 Page::Macros => self.pages.macros.popup_result(choice, &cx),
+                Page::Aux => self.pages.aux.popup_result(choice, &cx),
             }
         };
         self.absorb(ev, state)
@@ -2015,8 +2041,10 @@ impl Screen for SettingsScreen {
     ) -> ScreenEvent {
         // Every control-surface write is a live preview: the device holds it in
         // RAM and reports itself dirty until a save reaches flash, which is the
-        // save bar's third category (survey-firmware 3.14).
-        if matches!(reply, SessionReply::Ok(_)) {
+        // save bar's third category (survey-firmware 3.14). An aux output's
+        // live switch and level are the exception: immediate and never dirty
+        // (config.h:136-142).
+        if matches!(reply, SessionReply::Ok(_)) && !surfaces::is_live_aux_tag(tag) {
             self.data.cs_dirty = true;
         }
         // The request re-read the device on its way home; take that on before
@@ -2038,6 +2066,7 @@ impl Screen for SettingsScreen {
                 Page::Surfaces => self.pages.surfaces.session_result(tag, reply, &cx),
                 Page::Groups => self.pages.groups.session_result(tag, reply, &cx),
                 Page::Macros => self.pages.macros.session_result(tag, reply, &cx),
+                Page::Aux => self.pages.aux.session_result(tag, reply, &cx),
                 Page::Interfaces => self.pages.interfaces.session_result(tag, reply, &cx),
                 Page::Inputs => self.pages.inputs.session_result(tag, reply, &cx),
                 Page::Outputs => self.pages.outputs.session_result(tag, reply, &cx),
@@ -2080,6 +2109,7 @@ impl Screen for SettingsScreen {
                         Page::Surfaces => self.pages.surfaces.dialog_result(outcome, &cx),
                         Page::Groups => self.pages.groups.dialog_result(outcome, &cx),
                         Page::Macros => self.pages.macros.dialog_result(outcome, &cx),
+                        Page::Aux => self.pages.aux.dialog_result(outcome, &cx),
                     }
                 };
                 self.absorb(ev, state)
@@ -2228,6 +2258,7 @@ impl SettingsScreen {
                     Page::Surfaces => self.pages.surfaces.act(cursor, action, &cx),
                     Page::Groups => self.pages.groups.act(cursor, action, &cx),
                     Page::Macros => self.pages.macros.act(cursor, action, &cx),
+                    Page::Aux => self.pages.aux.act(cursor, action, &cx),
                 }
             };
             return self.absorb(ev, state);
@@ -2250,6 +2281,7 @@ impl SettingsScreen {
                 Page::Surfaces => self.pages.surfaces.key(key, &cx),
                 Page::Groups => self.pages.groups.key(key, &cx),
                 Page::Macros => self.pages.macros.key(key, &cx),
+                Page::Aux => self.pages.aux.key(key, &cx),
                 _ => PageEvent::Unhandled,
             }
         };
@@ -2405,7 +2437,7 @@ pub(crate) mod tests {
     fn every_page_is_in_a_sidebar_group() {
         // `Page` has no reflection, so the count is the guard: a variant added
         // without a group would leave this stale.
-        assert_eq!(every_page().len(), 13);
+        assert_eq!(every_page().len(), 14);
         for page in every_page() {
             assert!(!page.title().is_empty());
             assert!(!page.short().is_empty());
@@ -2886,7 +2918,7 @@ pub(crate) mod tests {
             s.handle(key(KeyCode::Enter), &st);
             (s, st)
         };
-        for page in [Page::Surfaces, Page::Groups, Page::Macros] {
+        for page in [Page::Surfaces, Page::Groups, Page::Macros, Page::Aux] {
             let (s, st) = open(page);
             let cx = s.cx(&st);
             let controls = s

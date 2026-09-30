@@ -1560,6 +1560,7 @@ impl Live {
 
     fn open_settings(&mut self, session: &mut Session) {
         self.screens.refresh_settings(session);
+        self.refresh_cs_aux(session);
         let screen = self.screens.settings(&self.state);
         self.shell.open_settings(screen);
     }
@@ -2080,8 +2081,26 @@ impl Live {
         self.last_screen_poll = now;
         if let Some(s) = self.shell.settings.as_deref_mut() {
             s.poll(session, &self.state);
+            self.refresh_cs_aux(session);
         } else if let Some((_, s)) = self.shell.tool.as_mut() {
             s.poll(session, &self.state);
+        }
+    }
+
+    /// Re-read every auxiliary output's live state and level while Settings
+    /// is open, for its Auxiliary Outputs page: on open and on each poll, with
+    /// `NOTIFY_EVT_CS_AUX` keeping it current in between. Only a device with
+    /// aux outputs is asked (caps v18, control_surfaces.h:141-146).
+    fn refresh_cs_aux(&mut self, session: &mut Session) {
+        use crate::settings::cs_model::{CsCaps, aux_supported};
+        let supported = self
+            .state
+            .caps
+            .cs
+            .as_ref()
+            .is_some_and(|c| aux_supported(&CsCaps::from(c)));
+        if supported {
+            let _ = self.state.refresh_cs_aux(session);
         }
     }
 
