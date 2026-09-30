@@ -966,6 +966,7 @@ impl Live {
             self.state.begin_limiter_edit();
         }
         let mode = (path == "preset.iomode").then(|| value.as_u8()).flatten();
+        let master_mode = (path == "vol.master.mode").then(|| value.as_u8()).flatten();
         match session.write(path, indices, value) {
             // A packet parameter has no scalar readback: the confirming read
             // asks for one byte of a structure, so a byte-for-byte comparison
@@ -989,6 +990,9 @@ impl Live {
                 }
                 if let Some(mode) = mode {
                     self.state.output_config_mode = mode;
+                }
+                if let Some(mode) = master_mode {
+                    self.state.master_volume_mode = mode;
                 }
                 // Solo has no wire offset and no notification (config.h:201),
                 // so the re-read that follows every write cannot bring it.
@@ -2304,9 +2308,11 @@ impl Live {
                 shared.default_slot = (dir.startup_mode == 0).then_some(dir.default_slot);
             }
         }
-        // The same packet says whether a limiter edit is a preset change.
+        // The same packet says whether a limiter or master-volume edit is a
+        // preset change.
         if let Some(dir) = dir {
             self.state.output_config_mode = dir.output_config_mode;
+            self.state.master_volume_mode = dir.master_volume_mode;
         }
         self.sync_model();
     }
@@ -3730,6 +3736,30 @@ mod tests {
             .patch(section_at("limiter") + 4, &0.0f32.to_le_bytes());
         assert!(l.state.limiter_unsaved());
         assert!(!l.state.has_unsaved_changes(), "the preset is untouched");
+    }
+
+    /// The master-volume mode comes with the directory and follows a write,
+    /// so the unsaved check counts the master volume only with the preset.
+    #[test]
+    fn the_master_volume_mode_is_read_with_the_directory_and_follows_writes() {
+        let mut dir = dspi_proto::packets::PresetDirectory::default().encode();
+        dir[6] = 1; // master_volume_mode WITH_PRESET (config.h:485)
+        let (mut l, mut s, _) = beta4(
+            packet(),
+            MockTransport::new().data(op::REQ_PRESET_GET_DIR, dir.to_vec()),
+        );
+        assert_eq!(l.state.master_volume_mode, 0, "INDEPENDENT until read");
+        l.refresh_presets(&mut s);
+        assert_eq!(l.state.master_volume_mode, 1, "read with the directory");
+        l.state
+            .bulk
+            .patch(section_at("master_volume"), &(-30.0f32).to_le_bytes());
+        assert!(l.state.has_unsaved_changes());
+        // A flash write, confirmed as the Settings dialog would.
+        l.hazard_confirmed = true;
+        l.run_command(&mut s, "vol.master.mode independent");
+        assert_eq!(l.state.master_volume_mode, 0, "follows the write");
+        assert!(!l.state.has_unsaved_changes());
     }
 
     /// The gain-reduction meter is read on the meter tick only while an

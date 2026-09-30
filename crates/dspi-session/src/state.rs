@@ -206,6 +206,15 @@ pub mod output_config_mode {
     pub const WITH_PRESET: u8 = 1;
 }
 
+/// `MASTER_VOLUME_MODE_*` (config.h:484-485): whether a preset load restores
+/// the master volume (`apply_master_volume_from_mode`, flash_storage.c:3743).
+pub mod master_volume_mode {
+    /// The Console's default until the directory is read
+    /// (DSPViewModel.swift:1749).
+    pub const INDEPENDENT: u8 = 0;
+    pub const WITH_PRESET: u8 = 1;
+}
+
 /// What changed since the last snapshot, one line each, categorised as the
 /// Console's `PresetDiff` is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,11 +230,17 @@ pub struct DiffLine {
 /// The output-config mode is kept with the bytes, as the Console's snapshot
 /// keeps `outputConfigMode`: the limiters belong to the preset only in
 /// WITH_PRESET mode (bulk_params.c:1008 applies them from a preset only
-/// then), so the comparison and the diff are gated on the live mode.
+/// then), so the comparison and the diff are gated on the live mode. The
+/// master-volume mode is kept the same way, as the Console's
+/// `masterVolumeMode` (PresetSnapshot.swift:33-37), and the channel counts so
+/// the comparison can work out the default channel names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetSnapshot {
     bytes: Vec<u8>,
     output_config_mode: u8,
+    master_volume_mode: u8,
+    num_inputs: usize,
+    num_outputs: usize,
 }
 
 impl PresetSnapshot {
@@ -235,6 +250,9 @@ impl PresetSnapshot {
         Self {
             bytes,
             output_config_mode: state.output_config_mode,
+            master_volume_mode: state.master_volume_mode,
+            num_inputs: state.caps.num_inputs as usize,
+            num_outputs: state.caps.num_outputs as usize,
         }
     }
 
@@ -254,20 +272,58 @@ impl PresetSnapshot {
     /// `output_config_mode` is the live mode. In INDEPENDENT mode the output
     /// configuration (see [`Self::output_config`]) is not the preset's, so it
     /// is left out of the comparison, as the Console's diff leaves it out.
-    pub fn matches(&self, live: &[u8], output_config_mode: u8) -> bool {
+    /// `master_volume_mode` is the live master-volume mode, and the master
+    /// volume counts only in WITH_PRESET mode, as in the Console's diff
+    /// (PresetSnapshot.swift:186-198). The channel names are compared by
+    /// [`Self::names_match`].
+    pub fn matches(&self, live: &[u8], output_config_mode: u8, master_volume_mode: u8) -> bool {
         if live.len() != self.bytes.len() {
             return false;
         }
         let (_, hoff, hlen) = section("header");
         let (_, loff, _) = section("lg_sound_sync");
+        let (_, moff, mlen) = section("master_volume");
+        let (_, noff, nlen) = section("channel_names");
         let with_preset = output_config_mode == output_config_mode::WITH_PRESET;
+        let with_master = master_volume_mode == master_volume_mode::WITH_PRESET;
         let io = Self::output_config();
         live.iter().zip(&self.bytes).enumerate().all(|(i, (a, b))| {
             let blanked = (i >= hoff && i < hoff + hlen)
                 || (i > loff && i < loff + 4)
+                || (i >= noff && i < noff + nlen)
+                || (!with_master && i >= moff && i < moff + mlen)
                 || (!with_preset && io.iter().any(|(o, n)| i >= *o && i < o + n));
             blanked || a == b
+        }) && self.names_match(live)
+    }
+
+    /// Whether every channel name in `live` is this snapshot's, apart from
+    /// a rename from one default name to another. The firmware renames an
+    /// output still at its default when the output's type flips
+    /// (main.c:672-689), a consequence of the output configuration rather
+    /// than an edit, and the Console skips it (PresetSnapshot.swift:536-553).
+    fn names_match(&self, live: &[u8]) -> bool {
+        let (na, nb) = (
+            sec(&self.bytes, "channel_names"),
+            sec(live, "channel_names"),
+        );
+        let (ta, tb) = (sec(&self.bytes, "i2s_config"), sec(live, "i2s_config"));
+        (0..na.len() / 32).all(|ch| {
+            let (x, y) = (&na[ch * 32..ch * 32 + 32], &nb[ch * 32..ch * 32 + 32]);
+            x == y || self.default_rename(ch, x, ta, y, tb)
         })
+    }
+
+    /// Whether channel `ch` going from name `x` (with output types `tx`) to
+    /// `y` (with `ty`) is a default-to-default rename. Only an output can be
+    /// one: the Console's input defaults do not follow the input source
+    /// (DSPViewModel.swift:3079-3096), so an input whose old and new names
+    /// are both its default has not changed, and the Console never skips an
+    /// input rename, including the firmware's own on a source switch
+    /// (main.c:3740-3756).
+    fn default_rename(&self, ch: usize, x: &[u8], tx: &[u8], y: &[u8], ty: &[u8]) -> bool {
+        let (ni, no) = (self.num_inputs, self.num_outputs);
+        is_default_output_name(x, ch, ni, no, tx) && is_default_output_name(y, ch, ni, no, ty)
     }
 
     /// The byte ranges of the output configuration: what a preset load takes
@@ -460,8 +516,12 @@ impl PresetSnapshot {
         }
         if differs("channel_names", a, b) {
             let (na, nb) = (sec(a, "channel_names"), sec(b, "channel_names"));
+            let (ta, tb) = (sec(a, "i2s_config"), sec(b, "i2s_config"));
             for ch in 0..(num_inputs + num_outputs).min(17) {
-                if na[ch * 32..ch * 32 + 32] != nb[ch * 32..ch * 32 + 32] {
+                let (x, y) = (&na[ch * 32..ch * 32 + 32], &nb[ch * 32..ch * 32 + 32]);
+                // A default-to-default rename is the firmware's, not an edit
+                // (see `names_match`).
+                if x != y && !self.default_rename(ch, x, ta, y, tb) {
                     line(
                         &mut out,
                         "Names",
@@ -505,7 +565,11 @@ impl PresetSnapshot {
                 }
             }
         }
-        if differs("master_volume", a, b) {
+        // Gated on the live mode, as the Console's is
+        // (PresetSnapshot.swift:186-198).
+        if other.master_volume_mode == master_volume_mode::WITH_PRESET
+            && differs("master_volume", a, b)
+        {
             line(&mut out, "Global", "Master volume".into());
         }
         let (inputs_a, inputs_b) = (sec(a, "input_config"), sec(b, "input_config"));
@@ -859,6 +923,44 @@ fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..end]).into_owned()
 }
 
+/// Whether the wire name `name` is the firmware's default for output
+/// channel `ch` under the slot types `types` (the I2S block's
+/// `output_types`, bulk_params.h:155): `get_default_channel_name`,
+/// usb_audio.c:318-330, names the last channel `PDM` and the others
+/// `<SPDIF|I2S> <slot> <L|R>`, I2S for a slot of `OUTPUT_TYPE_I2S`
+/// (config.h:690). Written into a stack buffer: [`PresetSnapshot::matches`]
+/// must not allocate.
+fn is_default_output_name(
+    name: &[u8],
+    ch: usize,
+    num_inputs: usize,
+    num_outputs: usize,
+    types: &[u8],
+) -> bool {
+    use std::io::Write;
+    if ch < num_inputs || ch >= num_inputs + num_outputs {
+        return false;
+    }
+    let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
+    if ch + 1 == num_inputs + num_outputs {
+        return name == b"PDM";
+    }
+    let (slot, side) = ((ch - num_inputs) / 2, (ch - num_inputs) % 2);
+    let prefix = if types.get(slot) == Some(&1) {
+        "I2S"
+    } else {
+        "SPDIF"
+    };
+    let mut buf = [0u8; 32];
+    let mut w = &mut buf[..];
+    let side = if side == 0 { 'L' } else { 'R' };
+    if write!(w, "{prefix} {} {side}", slot + 1).is_err() {
+        return false;
+    }
+    let len = 32 - w.len();
+    name == &buf[..len]
+}
+
 fn section(name: &str) -> (&'static str, usize, usize) {
     *dspi_proto::generated::SECTIONS
         .iter()
@@ -1070,6 +1172,10 @@ pub struct DeviceState {
     /// It decides whether a limiter edit is a preset change or an output
     /// configuration change. WITH_PRESET, the firmware's default, until read.
     pub output_config_mode: u8,
+    /// `MASTER_VOLUME_MODE_*` (config.h:484-485), from the preset directory.
+    /// It decides whether a master-volume change is a preset change.
+    /// INDEPENDENT until read, as the Console's `presetMasterVolumeMode`.
+    pub master_volume_mode: u8,
     /// The limiter records as they stood before the first edit since the
     /// output configuration was last saved, in INDEPENDENT mode: the
     /// limiter part of the Console's `OutputConfigSnapshot`. See
@@ -1117,6 +1223,7 @@ impl DeviceState {
             limiter_meter: None,
             limiter_status: None,
             output_config_mode: output_config_mode::WITH_PRESET,
+            master_volume_mode: master_volume_mode::INDEPENDENT,
             limiter_baseline: None,
             upmix_status: None,
             stale: false,
@@ -1140,7 +1247,11 @@ impl DeviceState {
 
     pub fn has_unsaved_changes(&self) -> bool {
         match &self.saved {
-            Some(s) => !s.matches(self.bulk.as_bytes(), self.output_config_mode),
+            Some(s) => !s.matches(
+                self.bulk.as_bytes(),
+                self.output_config_mode,
+                self.master_volume_mode,
+            ),
             None => false,
         }
     }
@@ -2163,6 +2274,83 @@ mod tests {
         let was = s.bulk.as_bytes()[o];
         s.bulk.patch(o, &[was ^ 1]).unwrap();
         assert!(s.has_unsaved_changes(), "the input source is the preset's");
+    }
+
+    /// PresetSnapshot.swift:186-198: the master volume is a preset change
+    /// only in WITH_PRESET mode, gated on the live mode, so switching modes
+    /// with a diverged volume dirties the preset.
+    #[test]
+    fn master_volume_counts_only_with_the_preset() {
+        let mut s = state();
+        assert_eq!(s.master_volume_mode, master_volume_mode::INDEPENDENT);
+        let (_, m, _) = section("master_volume");
+        put_f32(&mut s, m, -20.0);
+        assert!(!s.has_unsaved_changes(), "not the preset's in INDEPENDENT");
+        assert!(s.unsaved_diff().is_empty());
+        s.master_volume_mode = master_volume_mode::WITH_PRESET;
+        assert!(s.has_unsaved_changes());
+        assert_eq!(texts(&s), vec!["Global: Master volume"]);
+        s.mark_saved();
+        assert!(!s.has_unsaved_changes());
+    }
+
+    fn set_name(s: &mut DeviceState, ch: usize, name: &str) {
+        let (_, n, _) = section("channel_names");
+        let mut b = [0u8; 32];
+        b[..name.len()].copy_from_slice(name.as_bytes());
+        s.bulk.patch(n + ch * 32, &b).unwrap();
+    }
+
+    /// The firmware's own names (usb_audio.c:318-330) on the fixture's
+    /// shape: eight inputs, then four output pairs by slot type, PDM last.
+    #[test]
+    fn default_output_names_follow_the_slot_types() {
+        let d = |name: &str, ch, types: &[u8]| {
+            let mut b = [0u8; 32];
+            b[..name.len()].copy_from_slice(name.as_bytes());
+            is_default_output_name(&b, ch, 8, 9, types)
+        };
+        assert!(d("SPDIF 1 L", 8, &[0, 0, 0, 0]));
+        assert!(d("SPDIF 1 R", 9, &[0, 0, 0, 0]));
+        assert!(d("I2S 2 R", 11, &[0, 1, 0, 0]));
+        assert!(!d("SPDIF 2 R", 11, &[0, 1, 0, 0]));
+        assert!(d("SPDIF 4 L", 14, &[0, 0, 0, 0]));
+        assert!(d("PDM", 16, &[1, 1, 1, 1]));
+        assert!(!d("USB 1", 0, &[0, 0, 0, 0]), "inputs are never skipped");
+        assert!(!d("SPDIF 1 L", 17, &[0, 0, 0, 0]), "past the outputs");
+    }
+
+    /// PresetSnapshot.swift:536-553: the firmware renames an output still at
+    /// its default when its slot type flips (main.c:672-689), and that
+    /// default-to-default rename is not an edit. A real rename still is.
+    #[test]
+    fn a_default_to_default_rename_is_not_a_preset_change() {
+        let mut s = state();
+        s.output_config_mode = output_config_mode::INDEPENDENT;
+        set_name(&mut s, 8, "SPDIF 1 L");
+        set_name(&mut s, 9, "SPDIF 1 R");
+        s.mark_saved();
+        // Slot 1 flips to I2S and the firmware relabels both sides.
+        let (_, i2s, _) = section("i2s_config");
+        s.bulk.patch(i2s, &[1]).unwrap();
+        set_name(&mut s, 8, "I2S 1 L");
+        set_name(&mut s, 9, "I2S 1 R");
+        assert!(!s.has_unsaved_changes());
+        assert!(texts(&s).is_empty(), "{:?}", texts(&s));
+        // In WITH_PRESET mode the type change counts, the relabel still not.
+        s.output_config_mode = output_config_mode::WITH_PRESET;
+        assert!(s.has_unsaved_changes());
+        assert_eq!(texts(&s), vec!["Hardware: I2S configuration"]);
+        // A rename by hand counts.
+        s.output_config_mode = output_config_mode::INDEPENDENT;
+        set_name(&mut s, 8, "Woofer");
+        assert!(s.has_unsaved_changes());
+        assert_eq!(texts(&s), vec!["Names: SPDIF 1 L renamed to Woofer"]);
+        // So does a rename to a default name that is not the slot type's.
+        s.bulk.patch(i2s, &[0]).unwrap();
+        set_name(&mut s, 8, "SPDIF 1 L");
+        assert!(s.has_unsaved_changes(), "SPDIF 1 R to I2S 1 R on S/PDIF");
+        assert_eq!(texts(&s), vec!["Names: SPDIF 1 R renamed to I2S 1 R"]);
     }
 
     /// In INDEPENDENT mode the limiters are output configuration: no preset
