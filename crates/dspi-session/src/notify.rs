@@ -391,8 +391,8 @@ impl Notifications {
                             // The v1 volume packet carries no sequence number
                             // and does not consume one (notify.c:156-159,
                             // 178), so it says nothing about loss.
-                            let lost = !matches!(event, Event::MasterVolume(_))
-                                && seqs.observe(seq);
+                            let lost =
+                                !matches!(event, Event::MasterVolume(_)) && seqs.observe(seq);
                             if tx.send(Notification { seq, event, lost }).is_err() {
                                 break;
                             }

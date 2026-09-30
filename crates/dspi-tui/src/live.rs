@@ -504,7 +504,8 @@ pub const WRITE_INTERVAL: Duration = Duration::from_millis(33);
 struct WriteGate {
     /// When each value was last written.
     sent: std::collections::HashMap<String, Instant>,
-    /// The newest line for a value inside its interval, and when it may go.
+    /// The newest line for a value inside its interval (with a band's
+    /// bypass flag when it has one), and when it may go.
     held: Vec<(String, String, Instant)>,
 }
 
@@ -825,6 +826,19 @@ impl Live {
         self.shell.model.echo = text.into();
     }
 
+    /// Echo a write the way the grammar types it, so what the echo line shows
+    /// can be typed back: output and slot indices are 0-based there.
+    fn echo_set(&mut self, path: &str, indices: &[u8], value: Value) {
+        if let Some(d) = dspi_proto::registry::by_path(path) {
+            let cmd = dspi_cmd::Command::Set {
+                path: d.path,
+                indices: indices.to_vec(),
+                value,
+            };
+            self.echo(dspi_cmd::format(&cmd, &self.ctx));
+        }
+    }
+
     /// Re-read the bulk packet and refresh the model.
     pub fn refresh(&mut self, session: &mut Session) {
         match session.snapshot() {
@@ -969,22 +983,67 @@ impl Live {
         }
     }
 
+    /// The band a line switches the bypass flag of, keyed as
+    /// [`Self::gate_key`] keys the band's `eq` line.
+    fn band_flag_key(&self, line: &str) -> Option<String> {
+        let tokens = dspi_cmd::tokenize(line);
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        match dspi_cmd::parse(&refs, &self.ctx).ok()? {
+            dspi_cmd::Command::Set { path, indices, .. } if path == "eq.bypass" => {
+                let (&channel, &band) = (indices.first()?, indices.get(1)?);
+                Some(format!("eq {channel} {band}"))
+            }
+            _ => None,
+        }
+    }
+
     /// Run the lines a screen asked for, holding back any value written less
     /// than [`WRITE_INTERVAL`] ago (see [`WriteGate`]).
+    ///
+    /// Order is kept. A band's `eq` line and the bypass flag after it are one
+    /// unit, held or sent together: the device applies the packet's bypass
+    /// byte (vendor_commands.c:545-550), which `eq` always sends clear, so a
+    /// flag sent ahead of a held `eq` would be undone when the `eq` went. A
+    /// line that is never held sends every held write first, so it cannot
+    /// overtake one.
     fn run_screen_commands(&mut self, session: &mut Session, lines: &str) {
         let now = self.now();
-        let mut run: Vec<&str> = Vec::new();
-        for line in lines.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let lines: Vec<&str> = lines
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut run: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            i += 1;
+            if line.starts_with('#') {
+                run.push(line.to_string());
+                continue;
+            }
             let Some(key) = self.gate_key(line) else {
-                run.push(line);
+                for (k, held, _) in std::mem::take(&mut self.gate.held) {
+                    self.gate.sent.insert(k, now);
+                    run.push(held);
+                }
+                run.push(line.to_string());
                 continue;
             };
+            let mut unit = line.to_string();
+            while let Some(next) = lines.get(i)
+                && self.band_flag_key(next).as_deref() == Some(key.as_str())
+            {
+                unit.push('\n');
+                unit.push_str(next);
+                i += 1;
+            }
             self.gate.held.retain(|(k, _, _)| *k != key);
             match self.gate.sent.get(&key).map(|at| *at + WRITE_INTERVAL) {
-                Some(due) if now < due => self.gate.held.push((key, line.to_string(), due)),
+                Some(due) if now < due => self.gate.held.push((key, unit, due)),
                 _ => {
                     self.gate.sent.insert(key, now);
-                    run.push(line);
+                    run.push(unit);
                 }
             }
         }
@@ -1011,14 +1070,22 @@ impl Live {
             .retain(|_, at| now.saturating_duration_since(*at) < WRITE_INTERVAL);
     }
 
+    /// Leave the device as the person would expect to find it, before quitting
+    /// or opening another one: every held write sent, and the sub solo off.
+    /// Solo mutes the program on the masked outputs and is runtime state the
+    /// device keeps until told (config.h:201), so the Console switches it off
+    /// when its window closes; quitting closes the panel too.
+    pub fn release(&mut self, session: &mut Session) {
+        self.flush_writes(session, true);
+        if self.state.subharm_solo == Some(true) {
+            self.set(session, "sub.solo", &[], Value::Bool(false));
+        }
+    }
+
     fn enable_output(&mut self, session: &mut Session, index: u8, enable: bool) {
         match session.enable_output(index, enable) {
             Ok(dspi_session::EnableOutcome::Done) => {
-                self.echo(format!(
-                    ":out.enable {} {}",
-                    index + 1,
-                    if enable { "on" } else { "off" }
-                ));
+                self.echo_set("out.enable", &[index], Value::Bool(enable));
                 self.refresh(session);
             }
             Ok(dspi_session::EnableOutcome::NeedsConfirm(c)) => {
@@ -1398,7 +1465,7 @@ impl Live {
             }
             Ok(_) => {
                 self.state.mark_saved();
-                self.echo(format!(":preset.save {}", slot + 1));
+                self.echo_set("preset.save", &[slot], Value::Trigger);
                 self.sync_model();
                 true
             }
@@ -1422,7 +1489,7 @@ impl Live {
                 self.state.caps.active_preset = Some(slot);
                 self.refresh(session);
                 self.state.mark_saved();
-                self.echo(format!(":preset.load {}", slot + 1));
+                self.echo_set("preset.load", &[slot], Value::Trigger);
                 self.sync_model();
             }
             Ok(_) | Err(_) => self.note("Load Failed"),
@@ -1454,6 +1521,12 @@ impl Live {
 
     /// Turn a shell event into device traffic or a state change.
     pub fn handle_event(&mut self, session: &mut Session, ev: ShellEvent) {
+        // Anything but a screen's writes or the volume slider sends the held
+        // writes first, so a toggle, a reset or a preset action lands after
+        // the values the person moved before it.
+        if !matches!(ev, ShellEvent::Command(_) | ShellEvent::VolumeChanged(_)) {
+            self.flush_writes(session, true);
+        }
         match ev {
             ShellEvent::Select(sel) => self.select(sel),
             ShellEvent::GraphPartner => {
@@ -1721,6 +1794,7 @@ impl Live {
     }
 
     fn finish_dialog(&mut self, session: &mut Session, kind: AppDialog, outcome: DialogOutcome) {
+        self.flush_writes(session, true);
         match (kind, outcome) {
             (AppDialog::Unsaved { then }, DialogOutcome::Button(0)) => {
                 if self.save_active_preset(session) {
@@ -1780,7 +1854,7 @@ impl Live {
             (AppDialog::Core1 { index }, DialogOutcome::Button(0)) => {
                 match session.enable_output_confirmed(index) {
                     Ok(dspi_session::EnableOutcome::Done) => {
-                        self.echo(format!(":out.enable {} on", index + 1));
+                        self.echo_set("out.enable", &[index], Value::Bool(true));
                         self.refresh(session);
                     }
                     Ok(_) => self.note("The device kept the output as it was"),
@@ -1977,6 +2051,8 @@ impl Live {
         let n = caps.num_channels as usize;
         self.peaks = vec![PeakHold::default(); n];
         self.popout_pinned = None;
+        // A held write was for the old device.
+        self.gate = WriteGate::default();
         self.state = state;
         // The Console discards Settings drafts and device facts on a different
         // serial; the pages re-read on their next open.
@@ -2077,7 +2153,7 @@ impl Live {
         }
         let _ = session.write("preset.save", &[source], Value::Trigger);
         self.refresh_presets(session);
-        self.echo(format!(":preset.save {}", dest + 1));
+        self.echo_set("preset.save", &[dest], Value::Trigger);
     }
 
     fn clear_preset(&mut self, session: &mut Session, slot: u8) {
@@ -2640,6 +2716,7 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
             // write goes out on time.
             live.flush_writes(session, false);
             if let Some(serial) = live.switch_to.take() {
+                live.release(session);
                 match open_device(&serial) {
                     Ok((next, state)) => {
                         *session = next;
@@ -2651,6 +2728,7 @@ pub fn run(mut live: Live, session: &mut Session) -> io::Result<()> {
                 }
             }
             if live.should_quit {
+                live.release(session);
                 return Ok(());
             }
         }
@@ -4018,5 +4096,141 @@ mod tests {
         assert_eq!(l.gate.held.len(), 1);
         l.flush_writes(&mut s, true);
         assert!(l.gate.held.is_empty());
+    }
+
+    /// The writes that reach the wire, by opcode, in order.
+    fn sent_ops(log: &LogHandle) -> Vec<u8> {
+        use dspi_transport::mock::Direction;
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|x| x.direction == Direction::Out)
+            .map(|x| x.opcode)
+            .collect()
+    }
+
+    /// A held arrow on a bypassed band: the band's `eq` line sends it active
+    /// (vendor_commands.c:545-550), so its bypass flag is held with it and
+    /// goes after it, never ahead of it.
+    #[test]
+    fn a_held_bypassed_band_keeps_its_bypass_after_the_band() {
+        let (mut l, mut s, log) = answering();
+        let t0 = Instant::now();
+        l.clock = Some(t0);
+        log.lock().unwrap().clear();
+        let band = |g: &str| format!("eq in.1 1 peak 1000 1 {g}\neq.bypass in.1 1 on");
+        l.handle_event(&mut s, ShellEvent::Command(band("3")));
+        l.clock = Some(t0 + Duration::from_millis(10));
+        l.handle_event(&mut s, ShellEvent::Command(band("3.5")));
+        assert_eq!(l.gate.held.len(), 1, "the band and its flag, held as one");
+        l.flush_writes(&mut s, false);
+        l.clock = Some(t0 + WRITE_INTERVAL + Duration::from_millis(1));
+        l.flush_writes(&mut s, false);
+        let ops: Vec<u8> = sent_ops(&log)
+            .into_iter()
+            .filter(|o| [op::REQ_SET_EQ_PARAM, op::REQ_SET_BAND_BYPASS].contains(o))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                op::REQ_SET_EQ_PARAM,
+                op::REQ_SET_BAND_BYPASS,
+                op::REQ_SET_EQ_PARAM,
+                op::REQ_SET_BAND_BYPASS
+            ],
+            "the flag always follows its band"
+        );
+    }
+
+    /// A write that is never held (a toggle, a reset, a menu action) sends
+    /// the held ones first, so it cannot overtake them.
+    #[test]
+    fn a_write_that_is_not_held_goes_after_the_held_ones() {
+        let (mut l, mut s, log) = answering();
+        l.clock = Some(Instant::now());
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -3".into()));
+        log.lock().unwrap().clear();
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -4\nbypass on".into()));
+        assert!(l.gate.held.is_empty());
+        let ops = sent_ops(&log);
+        let pre = ops.iter().position(|o| *o == op::REQ_SET_PREAMP_CH);
+        let byp = ops.iter().position(|o| *o == op::REQ_SET_BYPASS);
+        assert!(pre.is_some() && pre < byp, "{ops:02X?}");
+
+        // The same from the shell: the volume reset is not a screen's line.
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -5".into()));
+        assert_eq!(l.gate.held.len(), 1);
+        log.lock().unwrap().clear();
+        l.handle_event(&mut s, ShellEvent::VolumeReset);
+        let ops = sent_ops(&log);
+        let pre = ops.iter().position(|o| *o == op::REQ_SET_PREAMP_CH);
+        let vol = ops.iter().position(|o| *o == op::REQ_SET_USER_VOLUME);
+        assert!(pre.is_some() && pre < vol, "{ops:02X?}");
+    }
+
+    /// A held write is sent before the Terminal lets go of the device, and is
+    /// never carried over to the next one.
+    #[test]
+    fn held_writes_go_before_letting_go_and_not_to_the_next_device() {
+        let (mut l, mut s, log) = answering();
+        l.clock = Some(Instant::now());
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -3".into()));
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -4".into()));
+        log.lock().unwrap().clear();
+        l.release(&mut s);
+        assert!(sent_ops(&log).contains(&op::REQ_SET_PREAMP_CH));
+        assert!(l.gate.held.is_empty());
+
+        l.handle_event(&mut s, ShellEvent::Command("pre 1 -5".into()));
+        assert_eq!(l.gate.held.len(), 1);
+        let state = l.state.clone();
+        l.adopt(&mut s, state);
+        assert!(
+            l.gate.held.is_empty(),
+            "the held write was the old device's"
+        );
+    }
+
+    /// The echo line shows what the grammar accepts, so it can be typed back:
+    /// output and slot indices are 0-based there.
+    #[test]
+    fn the_echo_for_outputs_and_slots_is_what_the_grammar_takes() {
+        let (mut l, mut s, _) = answering();
+        l.run_command(&mut s, "out.enable 2 off");
+        assert_eq!(l.shell.model.echo, "out.enable 2 off");
+        l.echo_set("preset.save", &[4], Value::Trigger);
+        assert_eq!(l.shell.model.echo, "preset.save 4");
+        let tokens = dspi_cmd::tokenize(&l.shell.model.echo);
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        assert!(matches!(
+            dspi_cmd::parse(&refs, &l.ctx),
+            Ok(dspi_cmd::Command::Set { indices, .. }) if indices == vec![4]
+        ));
+    }
+
+    /// Quitting or switching device with the sub solo on switches it off, as
+    /// closing the panel does.
+    #[test]
+    fn letting_go_of_the_device_switches_the_sub_solo_off() {
+        let (mut l, mut s, log) = beta4(
+            packet(),
+            MockTransport::new().data(op::REQ_GET_SUBHARM_SOLO, vec![0]),
+        );
+        l.release(&mut s);
+        assert!(
+            !sent_ops(&log).contains(&op::REQ_SET_SUBHARM_SOLO),
+            "solo is not on"
+        );
+        l.state.subharm_solo = Some(true);
+        l.release(&mut s);
+        let offs: Vec<Vec<u8>> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.opcode == op::REQ_SET_SUBHARM_SOLO)
+            .map(|e| e.payload.clone())
+            .collect();
+        assert_eq!(offs, vec![vec![0]]);
+        assert_eq!(l.state.subharm_solo, Some(false));
     }
 }
